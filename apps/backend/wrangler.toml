@@ -1,0 +1,16 @@
+name = "didadida-api"
+main = "src/index.ts"
+compatibility_date = "2024-05-29"
+
+# [vars]
+# MY_VARIABLE = "production_value"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "didadida-db"
+database_id = "<YOUR_CLOUDFLARE_D1_DATABASE_ID>" # 請替換為您的 D1 資料庫 ID
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "didadida-photos"
+preview_bucket_name = "didadida-photos-preview"
