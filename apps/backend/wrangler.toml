@@ -5,10 +5,13 @@ compatibility_date = "2024-05-29"
 # [vars]
 # MY_VARIABLE = "production_value"
 
+[vars]
+APP_PASSWORD = "r32h9rf2hhntg209@P)"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "didadida-db"
-database_id = "<YOUR_CLOUDFLARE_D1_DATABASE_ID>" # 請替換為您的 D1 資料庫 ID
+database_id = "0ca8abc0-936e-4f15-892b-e998de168d5d" # 請替換為您的 D1 資料庫 ID
 
 [[r2_buckets]]
 binding = "BUCKET"
