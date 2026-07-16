@@ -1,0 +1,1 @@
+ALTER TABLE Photo ADD COLUMN url TEXT;
