@@ -35,9 +35,22 @@ export async function resizeImageFile(file: File, maxEdge: number = 2000): Promi
     console.error("EXIF 解析失敗:", e);
   }
 
+  // 2. 如果是 HEIC/HEIF 檔案，使用 heic2any 轉換為 JPEG
+  let processFile = file;
+  if (file.name.toLowerCase().endsWith('.heic') || file.name.toLowerCase().endsWith('.heif')) {
+    try {
+      const heic2any = (await import('heic2any')).default;
+      const convertedBlob = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.9 });
+      processFile = new File([Array.isArray(convertedBlob) ? convertedBlob[0] : convertedBlob], file.name.replace(/\.[^/.]+$/, "") + ".jpg", { type: 'image/jpeg' });
+    } catch (e) {
+      console.error("HEIC 轉換失敗:", e);
+      throw new Error("HEIC 轉換失敗");
+    }
+  }
+
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(processFile);
     reader.onload = (event) => {
       const img = new Image();
       img.src = event.target?.result as string;
@@ -46,8 +59,8 @@ export async function resizeImageFile(file: File, maxEdge: number = 2000): Promi
         let height = img.height;
 
         // 如果長邊小於等於 maxEdge，且檔案原本就是 jpeg 時，才能不縮圖直接回傳，否則也需要透過 canvas 轉換格式
-        if (width <= maxEdge && height <= maxEdge && file.type === 'image/jpeg') {
-          resolve({ file, exifData, takenAt });
+        if (width <= maxEdge && height <= maxEdge && processFile.type === 'image/jpeg') {
+          resolve({ file: processFile, exifData, takenAt });
           return;
         }
 
@@ -102,13 +115,13 @@ export async function resizeImageFile(file: File, maxEdge: number = 2000): Promi
             console.error("Failed to insert EXIF back:", e);
             canvas.toBlob((blob) => {
               if (blob) resolve({ file: new File([blob], outFileName, { type: outputType, lastModified: Date.now() }), exifData, takenAt });
-              else resolve({ file, exifData, takenAt });
+              else resolve({ file: processFile, exifData, takenAt });
             }, outputType, quality);
           }
         } else {
           canvas.toBlob((blob) => {
             if (!blob) {
-              resolve({ file, exifData, takenAt });
+              resolve({ file: processFile, exifData, takenAt });
               return;
             }
             const resizedFile = new File([blob], outFileName, {

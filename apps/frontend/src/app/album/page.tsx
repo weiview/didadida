@@ -19,6 +19,7 @@ function AlbumContent() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [selectedPhoto, setSelectedPhoto] = useState<Photo | null>(null);
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<{current: number, total: number, fileName: string} | null>(null);
 
   // 篩選與排序 State
   const [searchQuery, setSearchQuery] = useState("");
@@ -101,9 +102,11 @@ function AlbumContent() {
 
     setUploading(true);
     let allSuccess = true;
+    const total = files.length;
 
-    for (let i = 0; i < files.length; i++) {
+    for (let i = 0; i < total; i++) {
       const rawFile = files[i];
+      setUploadProgress({ current: i + 1, total, fileName: rawFile.name });
       try {
         // 縮圖處理 (長邊不超過 2000px)
         const { file, exifData, takenAt } = await resizeImageFile(rawFile, 2000);
@@ -123,6 +126,7 @@ function AlbumContent() {
     
     loadData(); // 重新整理照片
     setUploading(false);
+    setUploadProgress(null);
     
     // reset input
     if (fileInputRef.current) {
@@ -238,12 +242,24 @@ function AlbumContent() {
                 onClick={handleUploadClick}
                 disabled={uploading}
               >
-                {uploading ? "上傳中..." : "上傳照片"}
+                {uploading ? (uploadProgress ? `上傳中... (${uploadProgress.current}/${uploadProgress.total})` : "上傳中...") : "上傳照片"}
               </button>
             </div>
           )}
         </div>
       </div>
+      
+      {uploadProgress && (
+        <div className={styles.progressContainer}>
+          <div className={styles.progressBar}>
+            <div 
+              className={styles.progressFill} 
+              style={{ width: `${(uploadProgress.current / uploadProgress.total) * 100}%` }}
+            />
+          </div>
+          <p className={styles.progressText}>正在處理: {uploadProgress.fileName} ({uploadProgress.current} / {uploadProgress.total})</p>
+        </div>
+      )}
 
       {loading ? (
         <div className={styles.loading}>載入照片中...</div>
