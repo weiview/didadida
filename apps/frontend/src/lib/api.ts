@@ -134,3 +134,17 @@ export async function reorderAlbums(updates: { id: number; sort_order: number }[
     return false;
   }
 }
+
+export async function reorderPhotos(updates: { id: number; sort_order: number }[]): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/reorder`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(updates),
+    });
+    return res.ok;
+  } catch (error) {
+    console.error(error);
+    return false;
+  }
+}

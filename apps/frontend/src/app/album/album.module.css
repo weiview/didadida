@@ -78,6 +78,25 @@
   box-shadow: 0 15px 35px var(--shadow-color);
 }
 
+.photoCard:hover .photoImage {
+  transform: scale(1.05);
+}
+
+.dragging {
+  opacity: 0.5;
+  transform: scale(0.95) !important;
+  box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1) !important;
+  cursor: grabbing !important;
+  border: 2px dashed var(--accent-color);
+}
+
+.readyToDrag {
+  cursor: grab;
+  transform: scale(0.98);
+  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+  border: 1px solid var(--accent-color);
+}
+
 .photoImage {
   width: 100%;
   height: 100%;

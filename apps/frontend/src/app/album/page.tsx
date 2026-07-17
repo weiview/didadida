@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, Suspense } from "react";
 import styles from "./album.module.css";
 import Link from "next/link";
-import { Photo, fetchPhotos, uploadPhoto, fetchAlbums, deletePhoto, verifyLogin } from "@/lib/api";
+import { Photo, fetchPhotos, uploadPhoto, fetchAlbums, deletePhoto, verifyLogin, reorderPhotos } from "@/lib/api";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
 
@@ -19,6 +19,13 @@ function AlbumContent() {
   const [selectedPhoto, setSelectedPhoto] = useState<Photo | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Drag and drop state
+  const dragItem = useRef<number | null>(null);
+  const dragOverItem = useRef<number | null>(null);
+  const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
+  const [longPressIndex, setLongPressIndex] = useState<number | null>(null);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   const loadData = async () => {
     if (!id) return;
@@ -89,6 +96,59 @@ function AlbumContent() {
     }
   };
 
+  // Drag and Drop handlers
+  const handlePointerDown = (index: number) => {
+    if (!isAdmin) return;
+    timerRef.current = setTimeout(() => {
+      setLongPressIndex(index);
+    }, 1000);
+  };
+
+  const handlePointerUpOrLeave = () => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
+  const handleDragStart = (index: number) => {
+    dragItem.current = index;
+    setDraggingIndex(index);
+  };
+
+  const handleDragEnter = (index: number) => {
+    if (dragItem.current !== null && dragItem.current !== index) {
+      dragOverItem.current = index;
+      
+      const newPhotos = [...photos];
+      const draggedItemContent = newPhotos.splice(dragItem.current, 1)[0];
+      newPhotos.splice(index, 0, draggedItemContent);
+      setPhotos(newPhotos); // 立即樂觀更新 UI
+      
+      dragItem.current = index;
+      setDraggingIndex(index);
+    }
+  };
+
+  const handleDragEnd = async () => {
+    if (dragItem.current !== null) {
+      // 呼叫 API 儲存新的排序順序
+      const updates = photos.map((photo, index) => ({
+        id: photo.id,
+        sort_order: index,
+      }));
+      const success = await reorderPhotos(updates);
+      if (!success) {
+        alert("儲存排序失敗");
+        loadData(); // 恢復原狀
+      }
+    }
+    dragItem.current = null;
+    dragOverItem.current = null;
+    setDraggingIndex(null);
+    setLongPressIndex(null);
+  };
+
   return (
     <div className={styles.container}>
       <Link href="/" className={styles.backButton}>
@@ -124,11 +184,25 @@ function AlbumContent() {
         <div className={styles.loading}>載入照片中...</div>
       ) : (
         <div className={styles.photoGrid}>
-          {photos.map((photo) => (
+          {photos.map((photo, index) => (
             <div 
               key={photo.id} 
-              className={styles.photoCard}
-              onClick={() => setSelectedPhoto(photo)}
+              className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
+              draggable={isAdmin && longPressIndex === index}
+              onPointerDown={() => handlePointerDown(index)}
+              onPointerUp={handlePointerUpOrLeave}
+              onPointerLeave={handlePointerUpOrLeave}
+              onClick={(e) => {
+                if (longPressIndex !== null || draggingIndex !== null) {
+                  e.preventDefault();
+                  return;
+                }
+                setSelectedPhoto(photo);
+              }}
+              onDragStart={() => isAdmin && handleDragStart(index)}
+              onDragEnter={() => isAdmin && handleDragEnter(index)}
+              onDragEnd={isAdmin ? handleDragEnd : undefined}
+              onDragOver={(e) => isAdmin && e.preventDefault()}
             >
               <img src={photo.url} alt={photo.title} className={styles.photoImage} />
               {isAdmin && (

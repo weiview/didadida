@@ -21,6 +21,9 @@ export default function Home() {
   // Drag and drop state
   const dragItem = useRef<number | null>(null);
   const dragOverItem = useRef<number | null>(null);
+  const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
+  const [longPressIndex, setLongPressIndex] = useState<number | null>(null);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   const loadData = async () => {
     setLoading(true);
@@ -73,23 +76,44 @@ export default function Home() {
   };
 
   // Drag and Drop handlers
+  const handlePointerDown = (index: number) => {
+    if (!isAdmin) return;
+    timerRef.current = setTimeout(() => {
+      setLongPressIndex(index);
+    }, 1000);
+  };
+
+  const handlePointerUpOrLeave = () => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
   const handleDragStart = (index: number) => {
     dragItem.current = index;
+    setDraggingIndex(index);
   };
 
   const handleDragEnter = (index: number) => {
-    dragOverItem.current = index;
+    if (dragItem.current !== null && dragItem.current !== index) {
+      dragOverItem.current = index;
+      
+      const newAlbums = [...albums];
+      const draggedItemContent = newAlbums.splice(dragItem.current, 1)[0];
+      newAlbums.splice(index, 0, draggedItemContent);
+      setAlbums(newAlbums); // 立即樂觀更新 UI
+      
+      // 更新 dragItem 到新的位置
+      dragItem.current = index;
+      setDraggingIndex(index);
+    }
   };
 
   const handleDragEnd = async () => {
-    if (dragItem.current !== null && dragOverItem.current !== null && dragItem.current !== dragOverItem.current) {
-      const newAlbums = [...albums];
-      const draggedItemContent = newAlbums.splice(dragItem.current, 1)[0];
-      newAlbums.splice(dragOverItem.current, 0, draggedItemContent);
-      setAlbums(newAlbums); // 樂觀更新 UI
-
+    if (dragItem.current !== null) {
       // 呼叫 API 儲存新的排序順序
-      const updates = newAlbums.map((album, index) => ({
+      const updates = albums.map((album, index) => ({
         id: album.id,
         sort_order: index,
       }));
@@ -101,6 +125,8 @@ export default function Home() {
     }
     dragItem.current = null;
     dragOverItem.current = null;
+    setDraggingIndex(null);
+    setLongPressIndex(null);
   };
 
   return (
@@ -137,8 +163,16 @@ export default function Home() {
             <Link 
               href={`/album?id=${album.id}`} 
               key={album.id} 
-              className={`glass-panel ${styles.albumCard}`}
-              draggable={isAdmin}
+              className={`glass-panel ${styles.albumCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
+              draggable={isAdmin && longPressIndex === index}
+              onPointerDown={() => handlePointerDown(index)}
+              onPointerUp={handlePointerUpOrLeave}
+              onPointerLeave={handlePointerUpOrLeave}
+              onClick={(e) => {
+                if (longPressIndex !== null || draggingIndex !== null) {
+                  e.preventDefault();
+                }
+              }}
               onDragStart={() => isAdmin && handleDragStart(index)}
               onDragEnter={() => isAdmin && handleDragEnter(index)}
               onDragEnd={isAdmin ? handleDragEnd : undefined}
