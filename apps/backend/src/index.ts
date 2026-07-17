@@ -66,6 +66,21 @@ export default {
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
+      // 路由：重新排序照片
+      if (method === "PUT" && pathname === "/api/photos/reorder") {
+        const body: { id: number; sort_order: number }[] = await request.json();
+        
+        const statements = body.map(item => 
+          env.DB.prepare("UPDATE Photo SET sort_order = ? WHERE id = ?").bind(item.sort_order, item.id)
+        );
+        
+        if (statements.length > 0) {
+          await env.DB.batch(statements);
+        }
+        
+        return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
       // 路由：新增相簿
       if (method === "POST" && pathname === "/api/albums") {
         const body: any = await request.json();
@@ -91,7 +106,7 @@ export default {
         const albumId = parts[3];
         
         const { results } = await env.DB.prepare(
-          "SELECT * FROM Photo WHERE album_id = ? ORDER BY created_at DESC"
+          "SELECT * FROM Photo WHERE album_id = ? ORDER BY sort_order ASC, created_at DESC"
         ).bind(albumId).all();
         
         return new Response(JSON.stringify(results), { headers });

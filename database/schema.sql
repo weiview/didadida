@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS Photo (
   description TEXT,
   album_id INTEGER NOT NULL,
   taken_at DATETIME,
+  sort_order INTEGER DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   url TEXT,
   FOREIGN KEY (album_id) REFERENCES Album(id) ON DELETE CASCADE
