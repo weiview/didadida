@@ -18,18 +18,27 @@ export interface Album {
   id: number;
   name: string;
   description?: string;
+  sort_order: number;
   created_at: string;
+}
+
+export interface Tag {
+  id: number;
+  name: string;
 }
 
 export interface Photo {
   id: number;
   title: string;
-  file_name: string;
   description?: string;
+  file_name: string;
   album_id: number;
+  url: string;
+  sort_order: number;
   taken_at?: string;
+  exif?: string;
   created_at: string;
-  url?: string;
+  tags?: Tag[];
 }
 
 export async function verifyLogin(password: string): Promise<boolean> {
@@ -68,23 +77,17 @@ export async function fetchPhotos(albumId: string | number): Promise<Photo[]> {
   }
 }
 
-export async function uploadPhoto(albumId: string | number, file: File): Promise<boolean> {
+export async function uploadPhoto(albumId: string, file: File, exifData?: any, takenAt?: string): Promise<boolean> {
   const formData = new FormData();
   formData.append('file', file);
-  formData.append('album_id', String(albumId));
-
-  const headers: Record<string, string> = {};
-  if (typeof window !== 'undefined') {
-    const pwd = localStorage.getItem('admin_password');
-    if (pwd) {
-      headers['Authorization'] = `Bearer ${pwd}`;
-    }
-  }
+  formData.append('album_id', albumId);
+  if (exifData) formData.append('exif', JSON.stringify(exifData));
+  if (takenAt) formData.append('taken_at', takenAt);
 
   try {
     const res = await fetch(`${API_BASE_URL}/upload`, {
       method: 'POST',
-      headers,
+      headers: getAuthHeaders(),
       body: formData,
     });
     return res.ok;
@@ -146,5 +149,59 @@ export async function reorderPhotos(updates: { id: number; sort_order: number }[
   } catch (error) {
     console.error(error);
     return false;
+  }
+}
+
+export async function updatePhoto(id: number, data: { description?: string; taken_at?: string }): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/${id}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(data),
+    });
+    return res.ok;
+  } catch (error) {
+    console.error(error);
+    return false;
+  }
+}
+
+export async function addPhotoTag(photoId: number, tagName: string): Promise<Tag | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/${photoId}/tags`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ tagName }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.tag;
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+export async function removePhotoTag(photoId: number, tagId: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/${photoId}/tags/${tagId}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    return res.ok;
+  } catch (error) {
+    console.error(error);
+    return false;
+  }
+}
+
+export async function fetchTags(): Promise<Tag[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tags`);
+    if (!res.ok) throw new Error('Failed to fetch tags');
+    return await res.json();
+  } catch (error) {
+    console.error(error);
+    return [];
   }
 }

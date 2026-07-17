@@ -3,9 +3,10 @@
 import { useEffect, useState, useRef, Suspense } from "react";
 import styles from "./album.module.css";
 import Link from "next/link";
-import { Photo, fetchPhotos, uploadPhoto, fetchAlbums, deletePhoto, verifyLogin, reorderPhotos } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbums, deletePhoto, verifyLogin, reorderPhotos, fetchTags } from "@/lib/api";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
+import PhotoLightbox from "./PhotoLightbox";
 
 function AlbumContent() {
   const searchParams = useSearchParams();
@@ -17,6 +18,12 @@ function AlbumContent() {
   const [uploading, setUploading] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [selectedPhoto, setSelectedPhoto] = useState<Photo | null>(null);
+  const [availableTags, setAvailableTags] = useState<Tag[]>([]);
+
+  // 篩選與排序 State
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedTag, setSelectedTag] = useState<number | "all">("all");
+  const [sortBy, setSortBy] = useState<"custom" | "upload_date" | "taken_date">("custom");
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -36,6 +43,10 @@ function AlbumContent() {
     
     const photoData = await fetchPhotos(id);
     setPhotos(photoData || []);
+    
+    const tags = await fetchTags();
+    setAvailableTags(tags);
+    
     setLoading(false);
 
     // Check auth
@@ -55,29 +66,62 @@ function AlbumContent() {
     }
   }, [id]);
 
+  // 計算經過篩選與排序的照片
+  const displayPhotos = photos.filter(photo => {
+    // 關鍵字篩選
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      const matchTitle = photo.title.toLowerCase().includes(q);
+      const matchDesc = photo.description?.toLowerCase().includes(q);
+      if (!matchTitle && !matchDesc) return false;
+    }
+    // 標籤篩選
+    if (selectedTag !== "all") {
+      if (!photo.tags || !photo.tags.find(t => t.id === selectedTag)) return false;
+    }
+    return true;
+  }).sort((a, b) => {
+    if (sortBy === "custom") return a.sort_order - b.sort_order;
+    if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    if (sortBy === "taken_date") {
+      const getRealDate = (p: Photo) => p.taken_at ? new Date(p.taken_at).getTime() : new Date(p.created_at).getTime();
+      return getRealDate(b) - getRealDate(a);
+    }
+    return 0;
+  });
+
   const handleUploadClick = () => {
     fileInputRef.current?.click();
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!id) return;
-    const rawFile = e.target.files?.[0];
-    if (!rawFile) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
 
     setUploading(true);
-    try {
-      // 縮圖處理 (長邊不超過 2000px)
-      const file = await resizeImageFile(rawFile, 2000);
-      const success = await uploadPhoto(id, file);
-      if (success) {
-        loadData(); // 重新整理照片
-      } else {
-        alert("上傳失敗，請稍後再試。");
+    let allSuccess = true;
+
+    for (let i = 0; i < files.length; i++) {
+      const rawFile = files[i];
+      try {
+        // 縮圖處理 (長邊不超過 2000px)
+        const { file, exifData, takenAt } = await resizeImageFile(rawFile, 2000);
+        const success = await uploadPhoto(id, file, exifData, takenAt || undefined);
+        if (!success) {
+          allSuccess = false;
+        }
+      } catch (err) {
+        console.error(err);
+        allSuccess = false;
       }
-    } catch (err) {
-      console.error(err);
-      alert("縮圖或上傳過程中發生錯誤");
     }
+
+    if (!allSuccess) {
+      alert("部分或全部照片上傳失敗，請稍後再試。");
+    }
+    
+    loadData(); // 重新整理照片
     setUploading(false);
     
     // reset input
@@ -160,36 +204,57 @@ function AlbumContent() {
           <h1 className={styles.title}>{albumName}</h1>
           <p className={styles.meta}>共 {photos.length} 張照片</p>
         </div>
-        {isAdmin && (
-          <div>
+        <div className={styles.controls}>
+          <div className={styles.filters}>
             <input 
-              type="file" 
-              ref={fileInputRef} 
-              style={{ display: 'none' }} 
-              accept="image/*"
-              onChange={handleFileChange}
+              type="text" 
+              placeholder="搜尋說明或標題..." 
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              className={styles.searchInput}
             />
-            <button 
-              className={styles.uploadButton} 
-              onClick={handleUploadClick}
-              disabled={uploading}
-            >
-              {uploading ? "上傳中..." : "上傳照片"}
-            </button>
+            <select value={selectedTag} onChange={e => setSelectedTag(e.target.value === "all" ? "all" : Number(e.target.value))} className={styles.select}>
+              <option value="all">所有標籤</option>
+              {availableTags.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+            <select value={sortBy} onChange={e => setSortBy(e.target.value as any)} className={styles.select}>
+              <option value="custom">自訂排序 (可拖曳)</option>
+              <option value="upload_date">依上傳日期 (新到舊)</option>
+              <option value="taken_date">依拍攝日期 (新到舊)</option>
+            </select>
           </div>
-        )}
+          {isAdmin && (
+            <div>
+              <input 
+                type="file" 
+                ref={fileInputRef} 
+                style={{ display: 'none' }} 
+                accept="image/jpeg, image/png, image/webp, image/heic, image/heif"
+                multiple
+                onChange={handleFileChange}
+              />
+              <button 
+                className={styles.uploadButton} 
+                onClick={handleUploadClick}
+                disabled={uploading}
+              >
+                {uploading ? "上傳中..." : "上傳照片"}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {loading ? (
         <div className={styles.loading}>載入照片中...</div>
       ) : (
         <div className={styles.photoGrid}>
-          {photos.map((photo, index) => (
+          {displayPhotos.map((photo, index) => (
             <div 
               key={photo.id} 
               className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
-              draggable={isAdmin && longPressIndex === index}
-              onPointerDown={() => handlePointerDown(index)}
+              draggable={isAdmin && longPressIndex === index && sortBy === "custom"}
+              onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
               onPointerUp={handlePointerUpOrLeave}
               onPointerLeave={handlePointerUpOrLeave}
               onClick={(e) => {
@@ -199,10 +264,10 @@ function AlbumContent() {
                 }
                 setSelectedPhoto(photo);
               }}
-              onDragStart={() => isAdmin && handleDragStart(index)}
-              onDragEnter={() => isAdmin && handleDragEnter(index)}
-              onDragEnd={isAdmin ? handleDragEnd : undefined}
-              onDragOver={(e) => isAdmin && e.preventDefault()}
+              onDragStart={() => isAdmin && sortBy === "custom" && handleDragStart(index)}
+              onDragEnter={() => isAdmin && sortBy === "custom" && handleDragEnter(index)}
+              onDragEnd={isAdmin && sortBy === "custom" ? handleDragEnd : undefined}
+              onDragOver={(e) => isAdmin && sortBy === "custom" && e.preventDefault()}
             >
               <img src={photo.url} alt={photo.title} className={styles.photoImage} />
               {isAdmin && (
@@ -219,13 +284,19 @@ function AlbumContent() {
               )}
               <div className={styles.photoOverlay}>
                 <h3 className={styles.photoTitle}>{photo.title}</h3>
-                <p className={styles.photoDate}>{new Date(photo.created_at).toLocaleDateString()}</p>
+                <p className={styles.photoDate}>{photo.taken_at ? new Date(photo.taken_at).toLocaleDateString() : new Date(photo.created_at).toLocaleDateString()}</p>
+                {photo.tags && photo.tags.length > 0 && (
+                   <div className={styles.cardTags}>
+                     {photo.tags.slice(0,3).map(t => <span key={t.id} className={styles.cardTag}>{t.name}</span>)}
+                     {photo.tags.length > 3 && <span className={styles.cardTag}>+{photo.tags.length - 3}</span>}
+                   </div>
+                )}
               </div>
             </div>
           ))}
-          {photos.length === 0 && (
+          {displayPhotos.length === 0 && (
             <div className={styles.emptyState}>
-              <p>相簿空空如也，趕快點擊右上角上傳照片吧！</p>
+              <p>找不到符合條件的照片，或是相簿空空如也！</p>
             </div>
           )}
         </div>
@@ -233,12 +304,13 @@ function AlbumContent() {
 
       {/* Lightbox / 大圖檢視 */}
       {selectedPhoto && (
-        <div className={styles.lightboxOverlay} onClick={() => setSelectedPhoto(null)}>
-          <div className={styles.lightboxContent} onClick={e => e.stopPropagation()}>
-            <img src={selectedPhoto.url} alt={selectedPhoto.title} className={styles.lightboxImage} />
-            <button className={styles.lightboxClose} onClick={() => setSelectedPhoto(null)}>×</button>
-          </div>
-        </div>
+        <PhotoLightbox 
+          photo={photos.find(p => p.id === selectedPhoto.id) || selectedPhoto} 
+          isAdmin={isAdmin} 
+          availableTags={availableTags}
+          onClose={() => setSelectedPhoto(null)} 
+          onUpdate={loadData}
+        />
       )}
     </div>
   );

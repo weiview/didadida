@@ -17,3 +17,18 @@ database_id = "0ca8abc0-936e-4f15-892b-e998de168d5d" # 請替換為您的 D1 資
 binding = "BUCKET"
 bucket_name = "didadida-photos"
 preview_bucket_name = "didadida-photos-preview"
+
+[env.dev]
+name = "didadida-api-dev"
+[env.dev.vars]
+APP_PASSWORD = "r32h9rf2hhntg209@P)"
+
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "didadida-db"
+database_id = "0ca8abc0-936e-4f15-892b-e998de168d5d"
+
+[[env.dev.r2_buckets]]
+binding = "BUCKET"
+bucket_name = "didadida-photos"
+preview_bucket_name = "didadida-photos-preview"

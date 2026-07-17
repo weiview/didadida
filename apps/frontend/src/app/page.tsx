@@ -18,6 +18,10 @@ export default function Home() {
   const [passwordInput, setPasswordInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // 篩選與排序 State
+  const [searchQuery, setSearchQuery] = useState("");
+  const [sortBy, setSortBy] = useState<"custom" | "upload_date">("custom");
+
   // Drag and drop state
   const dragItem = useRef<number | null>(null);
   const dragOverItem = useRef<number | null>(null);
@@ -46,6 +50,19 @@ export default function Home() {
   useEffect(() => {
     loadData();
   }, []);
+
+  // 計算經過篩選與排序的相簿
+  const displayAlbums = albums.filter(album => {
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      return album.name.toLowerCase().includes(q) || album.description?.toLowerCase().includes(q);
+    }
+    return true;
+  }).sort((a, b) => {
+    if (sortBy === "custom") return a.sort_order - b.sort_order;
+    if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    return 0;
+  });
 
   const handleLogin = async () => {
     setIsSubmitting(true);
@@ -136,36 +153,51 @@ export default function Home() {
           <h1 className={styles.title}>DidaDida</h1>
           <p className={styles.subtitle}>質感相簿 紀錄每一個美好瞬間</p>
         </div>
-        {!isCheckingAuth && (
-          isAdmin ? (
-            <button 
-              className={styles.createButton}
-              onClick={() => setShowModal(true)}
-            >
-              + 建立相簿
-            </button>
-          ) : (
-            <button 
-              className={styles.createButton}
-              onClick={() => setShowLoginModal(true)}
-            >
-              管理員登入
-            </button>
-          )
-        )}
+        <div className={styles.controls}>
+          <div className={styles.filters}>
+            <input 
+              type="text" 
+              placeholder="搜尋相簿名稱..." 
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              className={styles.searchInput}
+            />
+            <select value={sortBy} onChange={e => setSortBy(e.target.value as any)} className={styles.select}>
+              <option value="custom">自訂排序 (可拖曳)</option>
+              <option value="upload_date">依建立日期 (新到舊)</option>
+            </select>
+          </div>
+          {!isCheckingAuth && (
+            isAdmin ? (
+              <button 
+                className={styles.createButton}
+                onClick={() => setShowModal(true)}
+              >
+                + 建立相簿
+              </button>
+            ) : (
+              <button 
+                className={styles.createButton}
+                onClick={() => setShowLoginModal(true)}
+              >
+                管理員登入
+              </button>
+            )
+          )}
+        </div>
       </header>
 
       {loading ? (
         <div className={styles.loading}>載入中...</div>
       ) : (
         <div className={styles.albumGrid}>
-          {albums.map((album, index) => (
+          {displayAlbums.map((album, index) => (
             <Link 
               href={`/album?id=${album.id}`} 
               key={album.id} 
               className={`glass-panel ${styles.albumCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
-              draggable={isAdmin && longPressIndex === index}
-              onPointerDown={() => handlePointerDown(index)}
+              draggable={isAdmin && longPressIndex === index && sortBy === "custom"}
+              onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
               onPointerUp={handlePointerUpOrLeave}
               onPointerLeave={handlePointerUpOrLeave}
               onClick={(e) => {
@@ -173,10 +205,10 @@ export default function Home() {
                   e.preventDefault();
                 }
               }}
-              onDragStart={() => isAdmin && handleDragStart(index)}
-              onDragEnter={() => isAdmin && handleDragEnter(index)}
-              onDragEnd={isAdmin ? handleDragEnd : undefined}
-              onDragOver={(e) => isAdmin && e.preventDefault()}
+              onDragStart={() => isAdmin && sortBy === "custom" && handleDragStart(index)}
+              onDragEnter={() => isAdmin && sortBy === "custom" && handleDragEnter(index)}
+              onDragEnd={isAdmin && sortBy === "custom" ? handleDragEnd : undefined}
+              onDragOver={(e) => isAdmin && sortBy === "custom" && e.preventDefault()}
             >
               <div className={styles.coverPlaceholder}>
                 {album.name.substring(0, 1)}
@@ -187,8 +219,8 @@ export default function Home() {
               </p>
             </Link>
           ))}
-          {albums.length === 0 && (
-            <div className={styles.emptyState}>目前還沒有相簿</div>
+          {displayAlbums.length === 0 && (
+            <div className={styles.emptyState}>找不到相簿</div>
           )}
         </div>
       )}

@@ -7,10 +7,40 @@
 .header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  margin-bottom: 3rem;
-  padding-bottom: 2rem;
-  border-bottom: 1px solid var(--border-color);
+  align-items: flex-start;
+  margin-bottom: 30px;
+  flex-wrap: wrap;
+  gap: 20px;
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  align-items: flex-end;
+}
+
+.filters {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.searchInput {
+  padding: 10px 15px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--card-bg);
+  color: var(--text-color);
+  min-width: 200px;
+}
+
+.select {
+  padding: 10px 15px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--card-bg);
+  color: var(--text-color);
 }
 
 .title {
@@ -108,28 +138,43 @@
   position: absolute;
   bottom: 0;
   left: 0;
-  right: 0;
-  padding: 2rem 1rem 1rem;
-  background: linear-gradient(to top, rgba(0,0,0,0.6) 0%, transparent 100%);
-  color: white;
+  width: 100%;
+  padding: 30px 20px 20px;
+  background: linear-gradient(transparent, rgba(0,0,0,0.8));
+  color: #fff;
   opacity: 0;
-  transition: opacity var(--transition-speed) ease;
+  transform: translateY(10px);
+  transition: all 0.3s ease;
 }
 
 .photoCard:hover .photoOverlay {
   opacity: 1;
+  transform: translateY(0);
 }
 
 .photoTitle {
-  font-size: 1rem;
-  font-weight: 400;
-  margin-bottom: 0.25rem;
+  margin: 0 0 5px 0;
+  font-size: 1.1rem;
 }
 
 .photoDate {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #bbb;
+}
+
+.cardTags {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.cardTag {
+  background: rgba(255, 255, 255, 0.2);
+  padding: 2px 8px;
+  border-radius: 12px;
   font-size: 0.75rem;
-  opacity: 0.8;
-  font-weight: 300;
 }
 
 .uploadButton:disabled {
