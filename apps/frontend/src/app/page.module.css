@@ -87,10 +87,42 @@
 .header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  margin-bottom: 4rem;
+  align-items: flex-start;
+  margin-bottom: 3rem;
+  padding-bottom: 2rem;
+  border-bottom: 1px solid var(--border-color);
   flex-wrap: wrap;
-  gap: 1rem;
+  gap: 20px;
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  align-items: flex-end;
+}
+
+.filters {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.searchInput {
+  padding: 10px 15px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--card-bg);
+  color: var(--text-color);
+  min-width: 200px;
+}
+
+.select {
+  padding: 10px 15px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--card-bg);
+  color: var(--text-color);
 }
 
 .headerContent {
