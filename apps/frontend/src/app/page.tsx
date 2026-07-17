@@ -9,6 +9,7 @@ export default function Home() {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [loading, setLoading] = useState(true);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   
   // Modal state
   const [showModal, setShowModal] = useState(false);
@@ -36,6 +37,7 @@ export default function Home() {
         if (!valid) localStorage.removeItem("admin_password");
       }
     }
+    setIsCheckingAuth(false);
   };
 
   useEffect(() => {
@@ -108,20 +110,22 @@ export default function Home() {
           <h1 className={styles.title}>DidaDida</h1>
           <p className={styles.subtitle}>質感相簿 紀錄每一個美好瞬間</p>
         </div>
-        {isAdmin ? (
-          <button 
-            className={styles.createButton}
-            onClick={() => setShowModal(true)}
-          >
-            + 建立相簿
-          </button>
-        ) : (
-          <button 
-            className={styles.createButton}
-            onClick={() => setShowLoginModal(true)}
-          >
-            管理員登入
-          </button>
+        {!isCheckingAuth && (
+          isAdmin ? (
+            <button 
+              className={styles.createButton}
+              onClick={() => setShowModal(true)}
+            >
+              + 建立相簿
+            </button>
+          ) : (
+            <button 
+              className={styles.createButton}
+              onClick={() => setShowLoginModal(true)}
+            >
+              管理員登入
+            </button>
+          )
         )}
       </header>
 
