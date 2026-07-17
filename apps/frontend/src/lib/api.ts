@@ -81,7 +81,15 @@ export async function uploadPhoto(albumId: string, file: File, exifData?: any, t
   const formData = new FormData();
   formData.append('file', file);
   formData.append('album_id', albumId);
-  if (exifData) formData.append('exif', JSON.stringify(exifData));
+  if (exifData) {
+    const safeExif = JSON.stringify(exifData, (key, value) => {
+      if (typeof value === 'bigint') return value.toString();
+      if (value instanceof Uint8Array || value instanceof ArrayBuffer) return undefined;
+      if (Array.isArray(value) && value.length > 50 && typeof value[0] === 'number') return undefined; // Filter out large buffers parsed as arrays (like MakerNote)
+      return value;
+    });
+    formData.append('exif', safeExif);
+  }
   if (takenAt) formData.append('taken_at', takenAt);
 
   try {
