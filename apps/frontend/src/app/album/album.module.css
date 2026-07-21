@@ -102,6 +102,7 @@
   background-color: #f0f0f0;
   transition: transform var(--transition-speed) ease, box-shadow var(--transition-speed) ease;
   cursor: pointer;
+  will-change: transform, box-shadow;
 }
 
 .photoCard:hover {

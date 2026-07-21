@@ -50,3 +50,8 @@ h1, h2, h3, h4, h5, h6 {
   border-radius: 20px;
   box-shadow: 0 10px 30px var(--shadow-color);
 }
+
+/* 效能優化：滾動時停用滑鼠事件，避免觸發大量 hover 重繪 */
+body.is-scrolling * {
+  pointer-events: none !important;
+}
