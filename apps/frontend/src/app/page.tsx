@@ -1,9 +1,105 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useMemo } from "react";
 import styles from "./page.module.css";
 import Link from "next/link";
-import { fetchAlbums, createAlbum, Album, reorderAlbums, verifyLogin } from "@/lib/api";
+import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, verifyLogin } from "@/lib/api";
+import SlideConfirmModal from "@/components/SlideConfirmModal";
+
+function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPressIndex, sortBy, index, handlePointerDown, handlePointerUpOrLeave, handleDragStart, handleDragEnter, handleDragEnd, isSelected, onSelectToggle }: any) {
+  const [hovered, setHovered] = useState(false);
+  const [photoIndex, setPhotoIndex] = useState(0);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (hovered && album.preview_photos && album.preview_photos.length > 0) {
+      interval = setInterval(() => {
+        setPhotoIndex(prev => (prev + 1) % album.preview_photos.length);
+      }, 4000);
+    } else {
+      setPhotoIndex(0);
+    }
+    return () => clearInterval(interval);
+  }, [hovered, album]);
+
+  const coverText = album.name;
+
+  return (
+    <div style={{ position: 'relative' }} className={styles.albumCardWrapper}>
+      {isAdmin && isEditing && (
+        <input
+          type="checkbox"
+          checked={isSelected}
+          onChange={(e) => {
+            e.stopPropagation();
+            onSelectToggle(album.id, e.target.checked);
+          }}
+          onClick={e => e.stopPropagation()}
+          style={{ position: 'absolute', top: '10px', right: '10px', width: '20px', height: '20px', zIndex: 10, cursor: 'pointer' }}
+        />
+      )}
+      <Link 
+        href={`/album?id=${album.id}`}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        className={`glass-panel ${styles.albumCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
+        draggable={isAdmin && longPressIndex === index && sortBy === "custom"}
+        onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
+        onPointerUp={handlePointerUpOrLeave}
+        onPointerLeave={handlePointerUpOrLeave}
+        onClick={(e) => {
+          if (longPressIndex !== null || draggingIndex !== null) {
+            e.preventDefault();
+          }
+        }}
+        onDragStart={() => isAdmin && sortBy === "custom" && handleDragStart(index)}
+        onDragEnter={() => isAdmin && sortBy === "custom" && handleDragEnter(index)}
+        onDragEnd={isAdmin && sortBy === "custom" ? handleDragEnd : undefined}
+        onDragOver={(e) => isAdmin && sortBy === "custom" && e.preventDefault()}
+      >
+        <div className={styles.coverPlaceholder}>
+          {/* Carousel images */}
+          {album.preview_photos?.map((photoUrl: string, i: number) => (
+            <div 
+              key={photoUrl} 
+              className={styles.coverImage} 
+              style={{
+                backgroundImage: `url(${photoUrl})`,
+                opacity: (hovered && photoIndex === i) ? 1 : 0
+              }}
+            />
+          ))}
+          {/* Static cover photo */}
+          {album.cover_photo_url && (
+            <div 
+              className={styles.coverImage} 
+              style={{
+                backgroundImage: `url(${album.cover_photo_url})`,
+                opacity: (hovered && album.preview_photos && album.preview_photos.length > 0) ? 0 : 1
+              }}
+            />
+          )}
+          
+          {/* Static cover text (if no cover photo is set) */}
+          {!album.cover_photo_url && (
+            <span style={{ 
+              position: 'relative', 
+              zIndex: 2,
+              opacity: (hovered && album.preview_photos && album.preview_photos.length > 0) ? 0 : 1,
+              transition: 'opacity 3s ease-in-out'
+            }}>
+              {coverText}
+            </span>
+          )}
+        </div>
+        <h2 className={styles.albumTitle}>{album.name}</h2>
+        <p className={styles.albumMeta}>
+          {new Date(album.created_at).toLocaleDateString()}
+        </p>
+      </Link>
+    </div>
+  );
+}
 
 export default function Home() {
   const [albums, setAlbums] = useState<Album[]>([]);
@@ -17,6 +113,12 @@ export default function Home() {
   const [newAlbumName, setNewAlbumName] = useState("");
   const [passwordInput, setPasswordInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Batch delete state
+  const [selectedAlbums, setSelectedAlbums] = useState<number[]>([]);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [isBatchDeleting, setIsBatchDeleting] = useState(false);
+  const [isEditingAlbums, setIsEditingAlbums] = useState(false);
 
   // 篩選與排序 State
   const [searchQuery, setSearchQuery] = useState("");
@@ -34,46 +136,52 @@ export default function Home() {
     const data = await fetchAlbums();
     setAlbums(data || []);
     setLoading(false);
-    
-    // Check auth
-    if (typeof window !== "undefined") {
-      const pwd = localStorage.getItem("admin_password");
-      if (pwd) {
-        const valid = await verifyLogin(pwd);
-        setIsAdmin(valid);
-        if (!valid) localStorage.removeItem("admin_password");
-      }
-    }
-    setIsCheckingAuth(false);
   };
 
   useEffect(() => {
     loadData();
+    if (typeof window !== "undefined") {
+      const pwd = localStorage.getItem("admin_password");
+      if (pwd) {
+        setIsAdmin(true);
+        const checkAdmin = async () => {
+          const result = await verifyLogin(pwd);
+          setIsAdmin(result.success);
+          if (!result.success) localStorage.removeItem("admin_password");
+          setIsCheckingAuth(false);
+        };
+        checkAdmin();
+      } else {
+        setIsCheckingAuth(false);
+      }
+    }
   }, []);
 
   // 計算經過篩選與排序的相簿
-  const displayAlbums = albums.filter(album => {
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
-      return album.name.toLowerCase().includes(q) || album.description?.toLowerCase().includes(q);
-    }
-    return true;
-  }).sort((a, b) => {
-    if (sortBy === "custom") return a.sort_order - b.sort_order;
-    if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    return 0;
-  });
+  const displayAlbums = useMemo(() => {
+    return albums.filter(album => {
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        return album.name.toLowerCase().includes(q) || album.description?.toLowerCase().includes(q);
+      }
+      return true;
+    }).sort((a, b) => {
+      if (sortBy === "custom") return a.sort_order - b.sort_order;
+      if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      return 0;
+    });
+  }, [albums, searchQuery, sortBy]);
 
   const handleLogin = async () => {
     setIsSubmitting(true);
-    const valid = await verifyLogin(passwordInput);
-    if (valid) {
-      localStorage.setItem("admin_password", passwordInput);
+    const result = await verifyLogin(passwordInput);
+    if (result.success) {
       setIsAdmin(true);
+      localStorage.setItem("admin_password", passwordInput);
       setShowLoginModal(false);
       setPasswordInput("");
     } else {
-      alert("密碼錯誤");
+      alert(result.message || "密碼錯誤");
     }
     setIsSubmitting(false);
   };
@@ -90,6 +198,18 @@ export default function Home() {
       alert("建立失敗，請稍後再試。");
     }
     setIsSubmitting(false);
+  };
+
+  const handleBatchDeleteAlbums = async () => {
+    setIsBatchDeleting(true);
+    for (const id of selectedAlbums) {
+      await deleteAlbum(id);
+    }
+    setIsBatchDeleting(false);
+    setShowDeleteConfirm(false);
+    setSelectedAlbums([]);
+    setIsEditingAlbums(false);
+    loadData();
   };
 
   // Drag and Drop handlers
@@ -151,7 +271,7 @@ export default function Home() {
       <header className={styles.header}>
         <div className={styles.headerContent}>
           <h1 className={styles.title}>DidaDida</h1>
-          <p className={styles.subtitle}>質感相簿 紀錄每一個美好瞬間</p>
+          <p className={styles.subtitle}>紀錄每一個美好瞬間</p>
         </div>
         <div className={styles.controls}>
           <div className={styles.filters}>
@@ -169,12 +289,30 @@ export default function Home() {
           </div>
           {!isCheckingAuth && (
             isAdmin ? (
-              <button 
-                className={styles.createButton}
-                onClick={() => setShowModal(true)}
-              >
-                + 建立相簿
-              </button>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button
+                  className={`${styles.createButton} ${isEditingAlbums ? styles.primary : ''}`}
+                  onClick={() => {
+                    if (isEditingAlbums) {
+                      setIsEditingAlbums(false);
+                      setSelectedAlbums([]);
+                    } else {
+                      setIsEditingAlbums(true);
+                    }
+                  }}
+                >
+                  {isEditingAlbums ? '完成' : '編輯'}
+                </button>
+
+                {!isEditingAlbums && (
+                  <button 
+                    className={styles.createButton}
+                    onClick={() => setShowModal(true)}
+                  >
+                    + 建立相簿
+                  </button>
+                )}
+              </div>
             ) : (
               <button 
                 className={styles.createButton}
@@ -192,36 +330,57 @@ export default function Home() {
       ) : (
         <div className={styles.albumGrid}>
           {displayAlbums.map((album, index) => (
-            <Link 
-              href={`/album?id=${album.id}`} 
-              key={album.id} 
-              className={`glass-panel ${styles.albumCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
-              draggable={isAdmin && longPressIndex === index && sortBy === "custom"}
-              onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
-              onPointerUp={handlePointerUpOrLeave}
-              onPointerLeave={handlePointerUpOrLeave}
-              onClick={(e) => {
-                if (longPressIndex !== null || draggingIndex !== null) {
-                  e.preventDefault();
-                }
+            <AlbumCardComponent 
+              key={album.id}
+              album={album}
+              index={index}
+              isAdmin={isAdmin}
+              isEditing={isEditingAlbums}
+              draggingIndex={draggingIndex}
+              longPressIndex={longPressIndex}
+              sortBy={sortBy}
+              handlePointerDown={handlePointerDown}
+              handlePointerUpOrLeave={handlePointerUpOrLeave}
+              handleDragStart={handleDragStart}
+              handleDragEnter={handleDragEnter}
+              handleDragEnd={handleDragEnd}
+              isSelected={selectedAlbums.includes(album.id)}
+              onSelectToggle={(id: number, checked: boolean) => {
+                if (checked) setSelectedAlbums(prev => [...prev, id]);
+                else setSelectedAlbums(prev => prev.filter(aid => aid !== id));
               }}
-              onDragStart={() => isAdmin && sortBy === "custom" && handleDragStart(index)}
-              onDragEnter={() => isAdmin && sortBy === "custom" && handleDragEnter(index)}
-              onDragEnd={isAdmin && sortBy === "custom" ? handleDragEnd : undefined}
-              onDragOver={(e) => isAdmin && sortBy === "custom" && e.preventDefault()}
-            >
-              <div className={styles.coverPlaceholder}>
-                {album.name.substring(0, 1)}
-              </div>
-              <h2 className={styles.albumTitle}>{album.name}</h2>
-              <p className={styles.albumMeta}>
-                {new Date(album.created_at).toLocaleDateString()}
-              </p>
-            </Link>
+            />
           ))}
           {displayAlbums.length === 0 && (
             <div className={styles.emptyState}>找不到相簿</div>
           )}
+        </div>
+      )}
+
+      {/* 底部動作列 (編輯模式) */}
+      {isEditingAlbums && (
+        <div className={styles.actionBar}>
+          <button
+            className={styles.actionButton}
+            onClick={() => {
+              if (selectedAlbums.length === displayAlbums.length) {
+                setSelectedAlbums([]);
+              } else {
+                setSelectedAlbums(displayAlbums.map(a => a.id));
+              }
+            }}
+          >
+            {selectedAlbums.length === displayAlbums.length ? '取消全選' : '全選'}
+          </button>
+          
+          <button
+            className={`${styles.actionButton} ${selectedAlbums.length > 0 ? styles.danger : ''}`}
+            onClick={() => setShowDeleteConfirm(true)}
+            disabled={selectedAlbums.length === 0 || isBatchDeleting}
+            style={{ opacity: selectedAlbums.length === 0 ? 0.5 : 1 }}
+          >
+            {isBatchDeleting ? '刪除中...' : `刪除 ${selectedAlbums.length} 個項目`}
+          </button>
         </div>
       )}
 
@@ -286,6 +445,15 @@ export default function Home() {
           </div>
         </div>
       )}
+
+      {/* Slide Confirm Modal for Albums */}
+      <SlideConfirmModal 
+        isOpen={showDeleteConfirm}
+        title={`刪除 ${selectedAlbums.length} 個相簿`}
+        message={`確定要刪除這 ${selectedAlbums.length} 個相簿嗎？這個動作無法復原，裡面的所有照片都會被刪除。`}
+        onConfirm={handleBatchDeleteAlbums}
+        onCancel={() => setShowDeleteConfirm(false)}
+      />
     </main>
   );
 }

@@ -19,12 +19,13 @@ export async function resizeImageFile(file: File, maxEdge: number = 2000): Promi
     }
     
     if (file.type === 'image/jpeg') {
-      // 讀取原始檔案轉 Base64 以提取 piexifjs 可用的 dump
-      const buffer = await file.arrayBuffer();
-      const base64Str = btoa(new Uint8Array(buffer).reduce((data, byte) => data + String.fromCharCode(byte), ''));
-      const dataURL = `data:image/jpeg;base64,${base64Str}`;
-      
       try {
+        const dataURL = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = (e) => resolve(e.target?.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
         const exifObj = piexif.load(dataURL);
         exifDump = piexif.dump(exifObj);
       } catch (e) {

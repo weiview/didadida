@@ -43,6 +43,39 @@
   box-shadow: 0 15px 35px rgba(0, 0, 0, 0.08);
 }
 
+.albumCardWrapper:hover .deleteAlbumButton {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.deleteAlbumButton {
+  position: absolute;
+  top: -10px;
+  right: -10px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background-color: #ff4757;
+  color: white;
+  border: none;
+  font-size: 14px;
+  font-weight: bold;
+  cursor: pointer;
+  z-index: 10;
+  opacity: 0;
+  pointer-events: none;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 10px rgba(255, 71, 87, 0.3);
+}
+
+.deleteAlbumButton:hover {
+  transform: scale(1.1);
+  background-color: #ff6b81;
+}
+
 .dragging {
   opacity: 0.5;
   transform: scale(0.95) !important;
@@ -59,6 +92,8 @@
 }
 
 .coverPlaceholder {
+  position: relative;
+  overflow: hidden;
   width: 100%;
   aspect-ratio: 4/3;
   background-color: rgba(209, 191, 174, 0.1);
@@ -71,6 +106,19 @@
   font-size: 2rem;
   font-weight: 300;
 }
+
+.coverImage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-size: cover;
+  background-position: center;
+  transition: opacity 3s ease-in-out;
+}
+
+
 
 .albumTitle {
   font-size: 1.25rem;
@@ -172,13 +220,15 @@
 }
 
 .modal {
-  background: white;
+  background: var(--card-bg);
   padding: 2.5rem;
   border-radius: 20px;
   width: 90%;
   max-width: 450px;
-  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.08);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
   animation: slideUp 0.3s ease;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--text-color);
 }
 
 .modalTitle {
@@ -204,19 +254,20 @@
 .inputGroup textarea {
   width: 100%;
   padding: 0.8rem 1rem;
-  border: 1px solid rgba(0,0,0,0.1);
+  border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 10px;
   font-family: inherit;
   font-size: 1rem;
   transition: border-color 0.2s ease;
-  background: rgba(250, 250, 250, 0.5);
+  background: rgba(0, 0, 0, 0.2);
+  color: white;
 }
 
 .inputGroup input:focus,
 .inputGroup textarea:focus {
   outline: none;
   border-color: var(--accent-color);
-  background: white;
+  background: rgba(0, 0, 0, 0.4);
 }
 
 .modalActions {
@@ -263,3 +314,11 @@
   from { opacity: 0; transform: translateY(20px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+.actionBar { position: fixed; bottom: 2rem; right: 2rem; display: flex; gap: 1rem; z-index: 100; align-items: center; }
+.actionButton { background: var(--card-bg); color: var(--text-color); border: 1px solid var(--border-color); padding: 0.75rem 1.5rem; border-radius: 2rem; font-size: 1rem; cursor: pointer; transition: all var(--transition-speed) ease; box-shadow: 0 4px 15px rgba(209, 191, 174, 0.3); }
+.actionButton:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(209, 191, 174, 0.5); }
+.actionButton.danger { color: white; background: #e57373; border: none; }
+.actionButton.danger:hover { background: #d32f2f; }
+.actionButton.primary { background: var(--accent-color); color: white; border: none; }
+.actionButton.primary:hover { background: #c3b0a0; }
