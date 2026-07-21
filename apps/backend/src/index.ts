@@ -128,11 +128,17 @@ if (method === "POST" && pathname === "/api/verify-password") {
       if (method === "GET" && pathname === "/api/albums") {
         const { results: albums } = await env.DB.prepare("SELECT * FROM Album ORDER BY sort_order ASC, created_at DESC").all();
         
-        // Fetch preview photos for the carousel
-        const { results: allPhotos } = await env.DB.prepare("SELECT album_id, url FROM Photo ORDER BY sort_order ASC, created_at DESC").all();
+        // Fetch preview photos for the carousel using a window function to limit to 10 per album
+        const { results: allPhotos } = await env.DB.prepare(`
+          SELECT album_id, COALESCE(thumb_url, url) as url FROM (
+            SELECT album_id, url, thumb_url, 
+                   ROW_NUMBER() OVER(PARTITION BY album_id ORDER BY sort_order ASC, created_at DESC) as rn
+            FROM Photo
+          ) WHERE rn <= 10
+        `).all();
         
         const albumsWithPhotos = albums.map((album: any) => {
-          const albumPhotos = allPhotos.filter((p: any) => p.album_id === album.id).slice(0, 10).map((p: any) => p.url);
+          const albumPhotos = allPhotos.filter((p: any) => p.album_id === album.id).map((p: any) => p.url);
           return { ...album, preview_photos: albumPhotos };
         });
 
@@ -277,6 +283,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
       if (method === "POST" && pathname === "/api/upload") {
         const formData = await request.formData();
         const file = formData.get('file') as File;
+        const thumb = formData.get('thumb') as File | null;
         const albumId = formData.get('album_id') as string;
         const exifData = formData.get('exif') as string || null;
         const takenAt = formData.get('taken_at') as string || null;
@@ -285,7 +292,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           return new Response(JSON.stringify({ error: "File and album_id are required" }), { status: 400, headers });
         }
         
-const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic'];
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic'];
         if (!allowedTypes.includes(file.type.toLowerCase())) {
           return new Response(JSON.stringify({ error: "Invalid file type. Only images are allowed." }), { status: 400, headers });
         }
@@ -295,14 +302,23 @@ const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'ima
           httpMetadata: { contentType: file.type }
         });
         
+        let thumbUrl = null;
+        if (thumb) {
+          const thumbFileName = `thumb_${fileName}`;
+          await env.BUCKET.put(thumbFileName, thumb.stream(), {
+            httpMetadata: { contentType: thumb.type || 'image/jpeg' }
+          });
+          thumbUrl = `${new URL(request.url).origin}/api/photos/view/${encodeURIComponent(thumbFileName)}`;
+        }
+        
         const host = new URL(request.url).origin;
         const fileUrl = `${host}/api/photos/view/${encodeURIComponent(fileName)}`;
         
         await env.DB.prepare(
-          "INSERT INTO Photo (title, file_name, album_id, url, exif, taken_at) VALUES (?, ?, ?, ?, ?, ?)"
-        ).bind(file.name, fileName, albumId, fileUrl, exifData, takenAt).run();
+          "INSERT INTO Photo (title, file_name, album_id, url, thumb_url, exif, taken_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        ).bind(file.name, fileName, albumId, fileUrl, thumbUrl, exifData, takenAt).run();
         
-        return new Response(JSON.stringify({ success: true, url: fileUrl }), { headers });
+        return new Response(JSON.stringify({ success: true, url: fileUrl, thumb_url: thumbUrl }), { headers });
       }
 
       // 路由：更新照片資訊 (description, taken_at)
@@ -594,13 +610,20 @@ const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'ima
           await env.BUCKET.delete(tempPhoto.file_name);
         } else if (decision === "replace") {
           // 刪除多個舊檔案
-          if (replacePhotoIds && Array.isArray(replacePhotoIds)) {
+          if (replacePhotoIds && Array.isArray(replacePhotoIds) && replacePhotoIds.length > 0) {
+            const filesToDelete: string[] = [];
+            const validIds: number[] = [];
             for (const id of replacePhotoIds) {
               const existingPhoto = (existingPhotos || []).find((p: any) => p.id === id);
               if (existingPhoto) {
-                await env.BUCKET.delete(existingPhoto.file_name);
-                await env.DB.prepare("DELETE FROM Photo WHERE id = ?").bind(existingPhoto.id).run();
+                filesToDelete.push(existingPhoto.file_name);
+                validIds.push(existingPhoto.id);
               }
+            }
+            if (filesToDelete.length > 0) {
+              await env.BUCKET.delete(filesToDelete);
+              const placeholders = validIds.map(() => '?').join(',');
+              await env.DB.prepare(`DELETE FROM Photo WHERE id IN (${placeholders})`).bind(...validIds).run();
             }
           }
           // 新增新檔案

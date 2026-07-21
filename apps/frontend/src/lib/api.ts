@@ -32,6 +32,7 @@ export interface Photo {
   file_name: string;
   album_id: number;
   url: string;
+  thumb_url?: string;
   sort_order: number;
   taken_at?: string;
   exif?: string;
@@ -88,10 +89,63 @@ export async function fetchPhotos(albumId: string | number): Promise<Photo[]> {
   }
 }
 
+async function generateThumbnail(file: File): Promise<Blob | null> {
+  if (!file.type.startsWith('image/')) return null;
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX_WIDTH = 400;
+        const MAX_HEIGHT = 400;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > MAX_WIDTH) {
+            height *= MAX_WIDTH / width;
+            width = MAX_WIDTH;
+          }
+        } else {
+          if (height > MAX_HEIGHT) {
+            width *= MAX_HEIGHT / height;
+            height = MAX_HEIGHT;
+          }
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.8);
+        } else {
+          resolve(null);
+        }
+      };
+      img.onerror = () => resolve(null);
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(file);
+  });
+}
+
 export async function uploadPhoto(albumId: string, file: File, exifData?: any, takenAt?: string): Promise<boolean> {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('album_id', albumId);
+  
+  // Generate and append thumbnail
+  try {
+    const thumbBlob = await generateThumbnail(file);
+    if (thumbBlob) {
+      formData.append('thumb', thumbBlob, `thumb_${file.name}`);
+    }
+  } catch (err) {
+    console.warn("Failed to generate thumbnail", err);
+  }
+
   if (exifData) {
     try {
       const allowedKeys = ['Make', 'Model', 'DateTimeOriginal', 'Software', 'Orientation', 'GPSLatitude', 'GPSLongitude', 'GPSAltitude', 'ExposureTime', 'FNumber', 'ISO', 'FocalLength', 'LensModel'];

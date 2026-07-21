@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, Suspense } from "react";
+import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
@@ -22,6 +22,7 @@ function AlbumContent() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [selectedPhotoIndex, setSelectedPhotoIndex] = useState<number | null>(null);
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
+  const [visibleCount, setVisibleCount] = useState<number>(24);
   const [uploadProgress, setUploadProgress] = useState<{current: number, total: number, fileName: string} | null>(null);
   const [hasGoogleToken, setHasGoogleToken] = useState(false);
 
@@ -74,25 +75,36 @@ function AlbumContent() {
   const loadData = async () => {
     if (!id) return;
     setLoading(true);
-    const allAlbums = await fetchAlbums();
+    
+    const [allAlbums, photoData, tags] = await Promise.all([
+      fetchAlbums(),
+      fetchPhotos(id),
+      fetchTags()
+    ]);
+    
     const current = allAlbums.find(a => String(a.id) === id);
     if (current) setAlbumName(current.name);
     
-    const photoData = await fetchPhotos(id);
     setPhotos(photoData || []);
-    
-    const tags = await fetchTags();
     setAvailableTags(tags);
     
     setLoading(false);
+  };
 
-    // Check auth
+  useEffect(() => {
+    if (id) {
+      loadData();
+    }
+    
+    // Check auth optimistically
     if (typeof window !== "undefined") {
       const pwd = localStorage.getItem("admin_password");
       if (pwd) {
-        const valid = await verifyLogin(pwd);
-        setIsAdmin(valid.success);
-        if (!valid.success) localStorage.removeItem("admin_password");
+        setIsAdmin(true); // Optimistic UI
+        verifyLogin(pwd).then(valid => {
+          setIsAdmin(valid.success);
+          if (!valid.success) localStorage.removeItem("admin_password");
+        });
       }
       
       const gToken = searchParams?.get("googleToken");
@@ -105,37 +117,33 @@ function AlbumContent() {
         setHasGoogleToken(true);
       }
     }
-  };
-
-  useEffect(() => {
-    if (id) {
-      loadData();
-    }
-  }, [id]);
+  }, [id, searchParams]);
 
   // 計算經過篩選與排序的照片
-  const displayPhotos = photos.filter(photo => {
-    // 關鍵字篩選
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
-      const matchTitle = photo.title.toLowerCase().includes(q);
-      const matchDesc = photo.description?.toLowerCase().includes(q);
-      if (!matchTitle && !matchDesc) return false;
-    }
-    // 標籤篩選
-    if (selectedTag !== "all") {
-      if (!photo.tags || !photo.tags.find(t => t.id === selectedTag)) return false;
-    }
-    return true;
-  }).sort((a, b) => {
-    if (sortBy === "custom") return a.sort_order - b.sort_order;
-    if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    if (sortBy === "taken_date") {
-      const getRealDate = (p: Photo) => p.taken_at ? new Date(p.taken_at).getTime() : new Date(p.created_at).getTime();
-      return getRealDate(b) - getRealDate(a);
-    }
-    return 0;
-  });
+  const displayPhotos = useMemo(() => {
+    return photos.filter(photo => {
+      // 關鍵字篩選
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        const matchTitle = photo.title.toLowerCase().includes(q);
+        const matchDesc = photo.description?.toLowerCase().includes(q);
+        if (!matchTitle && !matchDesc) return false;
+      }
+      // 標籤篩選
+      if (selectedTag !== "all") {
+        if (!photo.tags || !photo.tags.find(t => t.id === selectedTag)) return false;
+      }
+      return true;
+    }).sort((a, b) => {
+      if (sortBy === "custom") return a.sort_order - b.sort_order;
+      if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      if (sortBy === "taken_date") {
+        const getRealDate = (p: Photo) => p.taken_at ? new Date(p.taken_at).getTime() : new Date(p.created_at).getTime();
+        return getRealDate(b) - getRealDate(a);
+      }
+      return 0;
+    });
+  }, [photos, searchQuery, selectedTag, sortBy]);
 
   const handleUploadClick = () => {
     fileInputRef.current?.click();
@@ -511,7 +519,7 @@ function AlbumContent() {
         <div className={styles.loading}>載入照片中...</div>
       ) : (
         <div className={styles.photoGrid}>
-          {displayPhotos.map((photo, index) => (
+          {displayPhotos.slice(0, visibleCount).map((photo, index) => (
             <div 
               key={photo.id} 
               className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
@@ -547,7 +555,13 @@ function AlbumContent() {
                   style={{ position: 'absolute', top: '10px', left: '10px', width: '20px', height: '20px', zIndex: 10, cursor: 'pointer' }}
                 />
               )}
-              <img src={photo.url} alt={photo.title} className={styles.photoImage} />
+              <img 
+                src={photo.thumb_url || photo.url} 
+                alt={photo.title} 
+                className={styles.photoImage} 
+                loading="lazy" 
+                decoding="async" 
+              />
               <div className={styles.photoOverlay}>
                 <h3 className={styles.photoTitle}>{photo.title}</h3>
                 <p className={styles.photoDate}>{photo.taken_at ? new Date(photo.taken_at).toLocaleDateString() : new Date(photo.created_at).toLocaleDateString()}</p>
@@ -565,6 +579,20 @@ function AlbumContent() {
               <p>找不到符合條件的照片，或是相簿空空如也！</p>
             </div>
           )}
+        </div>
+      )}
+      
+      {!loading && visibleCount < displayPhotos.length && (
+        <div style={{ textAlign: 'center', margin: '30px 0' }}>
+          <button 
+            onClick={() => setVisibleCount(prev => prev + 24)}
+            style={{
+              padding: '12px 24px', borderRadius: '25px', backgroundColor: 'var(--accent-color)', 
+              color: 'white', border: 'none', cursor: 'pointer', fontSize: '1rem', fontWeight: 'bold'
+            }}
+          >
+            載入更多照片... ({visibleCount} / {displayPhotos.length})
+          </button>
         </div>
       )}
 
