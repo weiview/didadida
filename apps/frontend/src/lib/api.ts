@@ -2,16 +2,11 @@
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8787/api';
 
 function getAuthHeaders() {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json'
+  const token = typeof window !== 'undefined' ? localStorage.getItem('admin_token') : '';
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`
   };
-  if (typeof window !== 'undefined') {
-    const pwd = localStorage.getItem('admin_password');
-    if (pwd) {
-      headers['Authorization'] = `Bearer ${pwd}`;
-    }
-  }
-  return headers;
 }
 
 export interface Album {
@@ -20,6 +15,9 @@ export interface Album {
   description?: string;
   sort_order: number;
   created_at: string;
+  cover_photo_url?: string;
+  cover_text?: string;
+  preview_photos?: string[];
 }
 
 export interface Tag {
@@ -41,17 +39,30 @@ export interface Photo {
   tags?: Tag[];
 }
 
-export async function verifyLogin(password: string): Promise<boolean> {
+export async function verifyLogin(password: string): Promise<{ success: boolean; message?: string }> {
   try {
     const res = await fetch(`${API_BASE_URL}/verify-password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ password })
     });
-    return res.ok;
-  } catch (error) {
+    
+    // 如果不是 JSON 格式（例如被 Cloudflare 阻擋的 403 純文字）
+    const contentType = res.headers.get("content-type");
+    if (!contentType || !contentType.includes("application/json")) {
+      const text = await res.text();
+      return { success: false, message: `伺服器阻擋: ${res.status} ${text}` };
+    }
+
+    const data = await res.json();
+    if (res.ok && data.success && data.token) {
+      localStorage.setItem('admin_token', data.token);
+      return { success: true };
+    }
+    return { success: false, message: data.error || "密碼錯誤" };
+  } catch (error: any) {
     console.error(error);
-    return false;
+    return { success: false, message: `連線錯誤: ${error.message}` };
   }
 }
 
@@ -82,20 +93,26 @@ export async function uploadPhoto(albumId: string, file: File, exifData?: any, t
   formData.append('file', file);
   formData.append('album_id', albumId);
   if (exifData) {
-    const safeExif = JSON.stringify(exifData, (key, value) => {
-      if (typeof value === 'bigint') return value.toString();
-      if (value instanceof Uint8Array || value instanceof ArrayBuffer) return undefined;
-      if (Array.isArray(value) && value.length > 50 && typeof value[0] === 'number') return undefined; // Filter out large buffers parsed as arrays (like MakerNote)
-      return value;
-    });
-    formData.append('exif', safeExif);
+    try {
+      const allowedKeys = ['Make', 'Model', 'DateTimeOriginal', 'Software', 'Orientation', 'GPSLatitude', 'GPSLongitude', 'GPSAltitude', 'ExposureTime', 'FNumber', 'ISO', 'FocalLength', 'LensModel'];
+      const filteredExif: any = {};
+      for (const key of allowedKeys) {
+        if (exifData[key] !== undefined) {
+          filteredExif[key] = exifData[key];
+        }
+      }
+      formData.append('exif', JSON.stringify(filteredExif));
+    } catch (err) {
+      console.warn("Failed to stringify EXIF data", err);
+    }
   }
   if (takenAt) formData.append('taken_at', takenAt);
 
   try {
+    const token = localStorage.getItem('admin_token') || '';
     const res = await fetch(`${API_BASE_URL}/upload`, {
       method: 'POST',
-      headers: getAuthHeaders(),
+      headers: { 'Authorization': `Bearer ${token}` },
       body: formData,
     });
     return res.ok;
@@ -111,6 +128,33 @@ export async function createAlbum(name: string, description?: string): Promise<b
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify({ name, description }),
+    });
+    return res.ok;
+  } catch (error) {
+    console.error(error);
+    return false;
+  }
+}
+
+export async function deleteAlbum(id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/albums/${id}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    return res.ok;
+  } catch (error) {
+    console.error(error);
+    return false;
+  }
+}
+
+export async function updateAlbum(id: number, data: { name?: string; cover_photo_url?: string; cover_text?: string }): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/albums/${id}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(data),
     });
     return res.ok;
   } catch (error) {
@@ -211,5 +255,108 @@ export async function fetchTags(): Promise<Tag[]> {
   } catch (error) {
     console.error(error);
     return [];
+  }
+}
+
+function getGoogleAuthHeaders() {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('google_access_token') : '';
+  const adminToken = typeof window !== 'undefined' ? localStorage.getItem('admin_token') : '';
+  return {
+    'Content-Type': 'application/json',
+    'X-Google-Token': token || '',
+    'Authorization': `Bearer ${adminToken}`
+  };
+}
+
+export async function fetchGoogleAlbums(): Promise<any[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/google/albums`, {
+      headers: getGoogleAuthHeaders(),
+    });
+    if (res.status === 401) return [{ error: 'unauthorized' }];
+    if (!res.ok) {
+      console.log("Google API Failed:", await res.text());
+      return [];
+    }
+    const data = await res.json();
+    console.log("Google Albums API Response:", data);
+    return data.albums || [];
+  } catch (err) {
+    console.error(err);
+    return [];
+  }
+}
+
+export async function createGooglePickerSession(): Promise<{ id?: string, pickerUri?: string }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/google/picker/sessions`, {
+      method: "POST",
+      headers: getGoogleAuthHeaders(),
+    });
+    if (!res.ok) return {};
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return {};
+  }
+}
+
+export async function fetchGooglePickerPhotos(sessionId: string): Promise<{ ready: boolean, mediaItems?: any[] }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/google/picker/sessions/${sessionId}/photos`, {
+      headers: getGoogleAuthHeaders(),
+    });
+    if (!res.ok) return { ready: false };
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return { ready: false };
+  }
+}
+
+export async function syncGooglePhoto(albumId: string, googlePhotoUrl: string, filename: string, creationTime: string, exif?: any): Promise<boolean | any> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/google/sync-photo`, {
+      method: "POST",
+      headers: getGoogleAuthHeaders(),
+      body: JSON.stringify({
+        targetAlbumId: albumId,
+        googlePhotoUrl,
+        filename,
+        creationTime,
+        exif
+      })
+    });
+    
+    if (res.ok) {
+      const data = await res.json();
+      if (data.conflict) {
+        return data;
+      }
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+export async function resolveGooglePhotoConflict(decision: string, existingPhotos: any[], tempPhoto: any, replacePhotoIds?: number[]): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/google/resolve-conflict`, {
+      method: "POST",
+      headers: getGoogleAuthHeaders(),
+      body: JSON.stringify({
+        decision,
+        existingPhotos,
+        tempPhoto,
+        replacePhotoIds
+      })
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
   }
 }
