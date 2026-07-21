@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import ScrollOptimizer from "@/components/ScrollOptimizer";
 
 export const metadata: Metadata = {
   title: "DidaDida | 滴答生活",
@@ -14,6 +15,7 @@ export default function RootLayout({
   return (
     <html lang="zh-TW">
       <body>
+        <ScrollOptimizer />
         <main>{children}</main>
       </body>
     </html>
