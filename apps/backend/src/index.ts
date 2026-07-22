@@ -201,6 +201,29 @@ if (method === "POST" && pathname === "/api/verify-password") {
         return new Response(JSON.stringify(results), { headers });
       }
 
+      // 路由：取得全站所有照片 (含 Tags 與 所屬相簿名稱)
+      if (method === "GET" && pathname === "/api/all-photos") {
+        const { results: photos } = await env.DB.prepare(`
+          SELECT p.*, a.name as album_name 
+          FROM Photo p 
+          LEFT JOIN Album a ON p.album_id = a.id 
+          ORDER BY p.taken_at DESC, p.created_at DESC
+        `).all();
+
+        if (photos.length > 0) {
+          const { results: tags } = await env.DB.prepare(`
+            SELECT pt.photo_id, t.id, t.name 
+            FROM PhotoTag pt 
+            JOIN Tag t ON pt.tag_id = t.id
+          `).all();
+
+          for (let photo of photos) {
+            (photo as any).tags = tags.filter(t => String(t.photo_id) === String((photo as any).id)).map(t => ({ id: t.id, name: t.name }));
+          }
+        }
+        return new Response(JSON.stringify(photos), { headers });
+      }
+
       // 以下路由需要驗證
       const requiresAuth = ["POST", "PUT", "DELETE"].includes(method);
       if (requiresAuth && !(await isAuthorized(request, env))) {

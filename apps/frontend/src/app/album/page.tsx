@@ -62,6 +62,12 @@ function AlbumContent() {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTag, setSelectedTag] = useState<number | "all">("all");
   const [sortBy, setSortBy] = useState<"custom" | "upload_date" | "taken_date">("custom");
+
+  // 時間軸滾動條 State
+  const [currentTimelineDate, setCurrentTimelineDate] = useState<string>("");
+  const [isScrolling, setIsScrolling] = useState<boolean>(false);
+  const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const photoCardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -122,14 +128,15 @@ function AlbumContent() {
   // 計算經過篩選與排序的照片
   const displayPhotos = useMemo(() => {
     return photos.filter(photo => {
-      // 關鍵字篩選
+      // 關鍵字篩選 (搜尋照片 Story/描述、標題 或 標籤名稱)
       if (searchQuery) {
-        const q = searchQuery.toLowerCase();
-        const matchTitle = photo.title.toLowerCase().includes(q);
+        const q = searchQuery.toLowerCase().trim();
+        const matchTitle = photo.title?.toLowerCase().includes(q);
         const matchDesc = photo.description?.toLowerCase().includes(q);
-        if (!matchTitle && !matchDesc) return false;
+        const matchTag = photo.tags?.some(t => t.name.toLowerCase().includes(q));
+        if (!matchTitle && !matchDesc && !matchTag) return false;
       }
-      // 標籤篩選
+      // 標籤選單篩選
       if (selectedTag !== "all") {
         if (!photo.tags || !photo.tags.find(t => t.id === selectedTag)) return false;
       }
@@ -144,6 +151,91 @@ function AlbumContent() {
       return 0;
     });
   }, [photos, searchQuery, selectedTag, sortBy]);
+
+  // 整理時間軸標籤列表 (依年月或年份分類)
+  const timelineGroup = useMemo(() => {
+    if (displayPhotos.length === 0) return [];
+    const groups: { label: string; index: number }[] = [];
+    let lastLabel = "";
+
+    displayPhotos.forEach((photo, index) => {
+      const dateStr = photo.taken_at || photo.created_at;
+      if (!dateStr) return;
+      const dateObj = new Date(dateStr);
+      if (isNaN(dateObj.getTime())) return;
+      const label = `${dateObj.getFullYear()}/${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
+      if (label !== lastLabel) {
+        lastLabel = label;
+        groups.push({ label, index });
+      }
+    });
+
+    return groups;
+  }, [displayPhotos]);
+
+  // 監聽頁面滾動以動態計算目前畫面上可見照片的時間範圍
+  useEffect(() => {
+    const handleScroll = () => {
+      setIsScrolling(true);
+      if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
+      scrollTimeoutRef.current = setTimeout(() => {
+        setIsScrolling(false);
+      }, 1200);
+
+      // 收集目前在視窗範圍內 (Viewport) 的所有照片時間
+      const visibleDates: Date[] = [];
+      const windowHeight = window.innerHeight;
+
+      for (let i = 0; i < displayPhotos.length; i++) {
+        const el = photoCardRefs.current.get(i);
+        if (el) {
+          const rect = el.getBoundingClientRect();
+          // 卡片只要出現在螢幕視野內
+          if (rect.bottom >= 0 && rect.top <= windowHeight) {
+            const dateStr = displayPhotos[i].taken_at || displayPhotos[i].created_at;
+            if (dateStr) {
+              const d = new Date(dateStr);
+              if (!isNaN(d.getTime())) visibleDates.push(d);
+            }
+          }
+        }
+      }
+
+      if (visibleDates.length > 0) {
+        visibleDates.sort((a, b) => a.getTime() - b.getTime());
+        const startDate = visibleDates[0];
+        const endDate = visibleDates[visibleDates.length - 1];
+
+        const startStr = `${startDate.getFullYear()}年${startDate.getMonth() + 1}月`;
+        const endStr = `${endDate.getFullYear()}年${endDate.getMonth() + 1}月`;
+
+        if (startStr === endStr) {
+          setCurrentTimelineDate(startStr);
+        } else {
+          setCurrentTimelineDate(`${startStr} ~ ${endStr}`);
+        }
+      }
+    };
+
+    window.addEventListener("scroll", handleScroll, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", handleScroll);
+      if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
+    };
+  }, [displayPhotos]);
+
+  const handleScrollToTimelineIndex = (photoIdx: number) => {
+    // 若目標超過目前載入量，自動提升可見張數
+    if (photoIdx >= visibleCount) {
+      setVisibleCount(photoIdx + 24);
+    }
+    setTimeout(() => {
+      const el = photoCardRefs.current.get(photoIdx);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, 50);
+  };
 
   const handleUploadClick = () => {
     fileInputRef.current?.click();
@@ -296,17 +388,28 @@ function AlbumContent() {
   };
 
   const handleBatchDeletePhotos = async () => {
-    setIsBatchDeleting(true);
-    let successCount = 0;
-    for (const photoId of selectedPhotos) {
-      const success = await deletePhoto(photoId);
-      if (success) successCount++;
-    }
-    setIsBatchDeleting(false);
+    const idsToDelete = [...selectedPhotos];
+
+    // 1. 立即關閉確認視窗並結束編輯模式 (不阻塞使用者畫面)
     setShowDeleteConfirm(false);
     setSelectedPhotos([]);
     setIsEditingPhotos(false);
-    loadData();
+
+    // 2. 樂觀更新 (Optimistic UI): 立即從畫面上的 photos 列表中移除已刪除的照片
+    setPhotos(prevPhotos => prevPhotos.filter(photo => !idsToDelete.includes(photo.id)));
+
+    // 3. 在背景中默默執行刪除 API
+    (async () => {
+      let failCount = 0;
+      for (const photoId of idsToDelete) {
+        const success = await deletePhoto(photoId);
+        if (!success) failCount++;
+      }
+      // 如果極少數情況背景刪除失敗，默默補補同步最新數據
+      if (failCount > 0) {
+        loadData();
+      }
+    })();
   };
 
   // Drag and Drop handlers
@@ -377,13 +480,35 @@ function AlbumContent() {
         </div>
         <div className={styles.controls}>
           <div className={styles.filters}>
-            <input 
-              type="text" 
-              placeholder="搜尋說明或標題..." 
-              value={searchQuery}
-              onChange={e => setSearchQuery(e.target.value)}
-              className={styles.searchInput}
-            />
+            <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
+              <input 
+                type="text" 
+                placeholder="搜尋照片 Story 或標籤..." 
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                className={styles.searchInput}
+                style={{ paddingRight: searchQuery ? '32px' : '15px' }}
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  style={{
+                    position: 'absolute',
+                    right: '10px',
+                    background: 'none',
+                    border: 'none',
+                    color: 'var(--text-light, #888)',
+                    fontSize: '1.1rem',
+                    cursor: 'pointer',
+                    padding: 0,
+                    lineHeight: 1
+                  }}
+                  title="清除搜尋"
+                >
+                  ×
+                </button>
+              )}
+            </div>
             <select value={selectedTag} onChange={e => setSelectedTag(e.target.value === "all" ? "all" : Number(e.target.value))} className={styles.select}>
               <option value="all">所有標籤</option>
               {availableTags.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
@@ -519,6 +644,10 @@ function AlbumContent() {
           {displayPhotos.slice(0, visibleCount).map((photo, index) => (
             <div 
               key={photo.id} 
+              ref={(el) => {
+                if (el) photoCardRefs.current.set(index, el);
+                else photoCardRefs.current.delete(index);
+              }}
               className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
               draggable={isAdmin && longPressIndex === index && sortBy === "custom"}
               onClick={() => {
@@ -576,6 +705,30 @@ function AlbumContent() {
               <p>找不到符合條件的照片，或是相簿空空如也！</p>
             </div>
           )}
+        </div>
+      )}
+
+      {/* 右側懸浮照片時間軸滾動條 */}
+      {timelineGroup.length > 0 && (
+        <div className={`${styles.timelineTrack} ${isScrolling ? styles.timelineActive : ""}`}>
+          {currentTimelineDate && (
+            <div className={styles.timelineBubble}>
+              {currentTimelineDate}
+            </div>
+          )}
+          <div className={styles.timelineMarks}>
+            {timelineGroup.map((item) => (
+              <div 
+                key={item.label} 
+                className={styles.timelineNode}
+                onClick={() => handleScrollToTimelineIndex(item.index)}
+                title={`前往 ${item.label}`}
+              >
+                <span className={styles.timelineNodeDot} />
+                <span className={styles.timelineNodeText}>{item.label}</span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
       

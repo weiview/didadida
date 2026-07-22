@@ -350,3 +350,99 @@
   
 @keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }  
 .dropdownMenu { animation: fadeIn 0.2s ease-out forwards; } 
+
+/* 時間軸滾動條樣式 (類似 Google 相片滾動軸) */
+.timelineTrack {
+  position: fixed;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.timelineTrack:hover,
+.timelineActive {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.timelineBubble {
+  background: var(--accent-color, #d1bfae);
+  color: #111;
+  font-weight: bold;
+  font-size: 0.85rem;
+  padding: 6px 14px;
+  border-radius: 20px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  margin-bottom: 8px;
+  white-space: nowrap;
+  animation: fadeIn 0.2s ease;
+  pointer-events: auto;
+}
+
+.timelineMarks {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: flex-end;
+  background: rgba(20, 20, 20, 0.75);
+  backdrop-filter: blur(12px);
+  padding: 14px 10px;
+  border-radius: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  max-height: 65vh;
+  overflow-y: auto;
+  scrollbar-width: none; /* Firefox */
+  box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+}
+
+.timelineMarks::-webkit-scrollbar {
+  display: none; /* Chrome/Safari */
+}
+
+.timelineNode {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 3px 6px;
+  border-radius: 12px;
+  transition: all 0.2s ease;
+}
+
+.timelineNode:hover {
+  background: rgba(255, 255, 255, 0.15);
+  transform: translateX(-4px);
+}
+
+.timelineNodeText {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.8);
+  white-space: nowrap;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.timelineNode:hover .timelineNodeText {
+  color: #fff;
+  font-weight: bold;
+}
+
+.timelineNodeDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.4);
+  transition: all 0.2s ease;
+}
+
+.timelineNode:hover .timelineNodeDot {
+  background: var(--accent-color, #d1bfae);
+  transform: scale(1.6);
+}
