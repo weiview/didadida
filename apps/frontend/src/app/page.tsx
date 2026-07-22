@@ -270,7 +270,9 @@ export default function Home() {
     <main className={styles.container}>
       <header className={styles.header}>
         <div className={styles.headerContent}>
-          <h1 className={styles.title}>DidaDida</h1>
+          <h1 className={styles.title}>
+            DidaDida
+          </h1>
           <p className={styles.subtitle}>紀錄每一個美好瞬間</p>
         </div>
         <div className={styles.controls}>

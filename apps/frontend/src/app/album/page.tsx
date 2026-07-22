@@ -209,12 +209,9 @@ function AlbumContent() {
         return;
       }
       
-      // 非同步取得連結後，透過 a 標籤導向已經開啟的視窗
+      // 非同步取得連結後，直接將 popup 的網址更換為支援自動關閉的 pickerUri
       if (popup) {
-        const a = document.createElement("a");
-        a.href = session.pickerUri;
-        a.target = "GooglePicker";
-        a.click();
+        popup.location.href = session.pickerUri + "/autoclose";
       }
       
       setSyncingGoogle(true);
@@ -236,13 +233,11 @@ function AlbumContent() {
         }
         if (res.ready && res.mediaItems) {
           clearInterval(pollTimer);
-          console.log("Attempting to close popup...", popup, popup?.closed);
+          console.log("Attempting to close popup...");
           try {
-            popup?.close();
-            console.log("popup.close() executed. Is it closed?", popup?.closed);
-            // 備用方案，萬一 popup 遺失
-            const finalPopup = popup || window.open("", "GooglePicker");
-            finalPopup?.close();
+            if (popup) {
+              popup.close();
+            }
           } catch(e) {
             console.error("Error closing popup:", e);
           }
@@ -369,9 +364,11 @@ function AlbumContent() {
 
   return (
     <div className={styles.container}>
-      <Link href="/" className={styles.backButton}>
-        ← 返回相簿列表
-      </Link>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: '15px', marginBottom: '20px' }}>
+        <Link href="/" className={styles.backButton} style={{ marginBottom: 0 }}>
+          ← 返回相簿列表
+        </Link>
+      </div>
 
       <div className={styles.header}>
         <div>
