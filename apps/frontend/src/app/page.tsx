@@ -144,11 +144,11 @@ export default function Home() {
       const pwd = localStorage.getItem("admin_password");
       if (pwd) {
         setIsAdmin(true);
+        setIsCheckingAuth(false); // 立即顯示管理員按鈕
         const checkAdmin = async () => {
           const result = await verifyLogin(pwd);
           setIsAdmin(result.success);
           if (!result.success) localStorage.removeItem("admin_password");
-          setIsCheckingAuth(false);
         };
         checkAdmin();
       } else {
