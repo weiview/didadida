@@ -54,6 +54,38 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
     }
   };
 
+  // 燈箱開啟時鎖定背景 body 滾動，並支援鍵盤 (Left/Right/Esc) 與 滾輪切換照片
+  React.useEffect(() => {
+    const originalStyle = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+      else if (e.key === "ArrowLeft" && hasPrev && onPrev) onPrev();
+      else if (e.key === "ArrowRight" && hasNext && onNext) onNext();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.body.style.overflow = originalStyle;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [hasPrev, hasNext, onPrev, onNext, onClose]);
+
+  // 支援滑鼠滾輪切換照片 (滾輪往下: 下一張; 滾輪往上: 上一張)
+  const handleWheel = (e: React.WheelEvent) => {
+    // 若在編輯框或輸入框內滾動則不觸發切換
+    if ((e.target as HTMLElement).tagName === 'TEXTAREA' || (e.target as HTMLElement).tagName === 'INPUT') {
+      return;
+    }
+    if (e.deltaY > 30 && hasNext && onNext) {
+      onNext();
+    } else if (e.deltaY < -30 && hasPrev && onPrev) {
+      onPrev();
+    }
+  };
+
   const parsedExif = photo.exif ? JSON.parse(photo.exif) : null;
   const hasExifDate = !!(parsedExif?.DateTimeOriginal);
   
@@ -122,7 +154,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
 
   return (
     <div className={styles.overlay} onClick={onClose}>
-      <button className={styles.closeBtn} onClick={onClose} title="關閉">×</button>
+      <button className={styles.closeBtn} onClick={(e) => { e.stopPropagation(); onClose(); }} title="關閉">×</button>
       
       <div className={styles.content} onClick={e => e.stopPropagation()}>
         
@@ -226,7 +258,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                 {/* 拍攝時間整合至 EXIF 區域首位 */}
                 <div className={styles.exifItem}>
                   <span className={styles.exifLabel}>拍攝時間</span>
-                  {isAdmin && !hasExifDate ? (
+                  {isAdmin ? (
                     <div className={styles.exifDateEdit}>
                       <input 
                         type="date" 

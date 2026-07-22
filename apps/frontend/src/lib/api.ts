@@ -89,6 +89,17 @@ export async function fetchPhotos(albumId: string | number): Promise<Photo[]> {
   }
 }
 
+export async function fetchAllPhotos(): Promise<Photo[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/all-photos`);
+    if (!res.ok) throw new Error('Failed to fetch all photos');
+    return res.json();
+  } catch (error) {
+    console.error(error);
+    return [];
+  }
+}
+
 async function generateThumbnail(file: File): Promise<Blob | null> {
   if (!file.type.startsWith('image/')) return null;
   return new Promise((resolve) => {

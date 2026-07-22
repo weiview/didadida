@@ -4,12 +4,12 @@
   left: 0;
   width: 100vw;
   height: 100vh;
-  background: rgba(0, 0, 0, 0.9);
+  background: rgba(0, 0, 0, 0.92);
   display: flex;
   justify-content: center;
   align-items: center;
-  z-index: 1000;
-  backdrop-filter: blur(5px);
+  z-index: 3000;
+  backdrop-filter: blur(8px);
 }
 
 .content {
@@ -25,6 +25,7 @@
   box-shadow: 0 20px 40px rgba(0,0,0,0.6);
   scrollbar-width: thin;
   scrollbar-color: var(--accent-color) #111;
+  z-index: 3050;
 }
 
 .content::-webkit-scrollbar {
@@ -40,26 +41,23 @@
 
 .closeBtn {
   position: fixed;
-  top: 25px;
-  right: 35px;
+  top: 20px;
+  right: 25px;
   font-size: 2.5rem;
-  background: rgba(0,0,0,0.5);
-  border-radius: 50%;
-  width: 50px;
-  height: 50px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  background: transparent;
   border: none;
-  color: #fff;
+  color: rgba(255, 255, 255, 0.85);
   cursor: pointer;
-  z-index: 1100;
-  transition: all 0.3s;
+  z-index: 3200;
+  transition: all 0.2s ease;
+  touch-action: manipulation;
+  line-height: 1;
+  padding: 8px;
 }
 
 .closeBtn:hover {
-  background: var(--accent-color);
-  transform: scale(1.1);
+  color: var(--accent-color, #d1bfae);
+  transform: scale(1.15);
 }
 
 .navButton {
@@ -68,22 +66,22 @@
   transform: translateY(-50%);
   background: transparent;
   border: none;
-  color: rgba(255, 255, 255, 0.6);
-  font-size: 3.5rem;
-  width: 50px;
-  height: 50px;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 3rem;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  z-index: 1100;
-  transition: all 0.3s;
-  padding: 0;
+  z-index: 3200;
+  transition: all 0.2s ease;
+  padding: 10px;
+  touch-action: manipulation;
 }
 
 .navButton:hover {
-  color: var(--accent-color);
+  color: #ffffff;
   transform: translateY(-50%) scale(1.2);
+  filter: drop-shadow(0 2px 8px rgba(0,0,0,0.8));
 }
 
 .navButton:disabled {
