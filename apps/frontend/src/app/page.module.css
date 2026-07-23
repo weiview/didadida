@@ -28,6 +28,7 @@
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 2.5rem;
+  transition: grid-template-columns 0.25s ease;
 }
 
 .albumCard {
@@ -159,10 +160,13 @@
 .searchInput {
   padding: 10px 15px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(0, 0, 0, 0.1);
   background: var(--card-bg);
   color: var(--text-color);
-  min-width: 200px;
+  min-width: 270px;
+  font-family: inherit;
+  font-size: 0.95rem;
+  line-height: 1.4;
 }
 
 .select {

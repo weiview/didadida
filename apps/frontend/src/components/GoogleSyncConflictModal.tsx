@@ -32,35 +32,67 @@ export default function GoogleSyncConflictModal({
     }
   };
 
+  const isAllSelected = existingPhotos.length > 0 && selectedPhotoIds.length === existingPhotos.length;
+
+  const handleSelectAll = () => {
+    setDecision("replace");
+    if (isAllSelected) {
+      setSelectedPhotoIds([]);
+    } else {
+      setSelectedPhotoIds(existingPhotos.map(p => p.id!).filter(Boolean));
+    }
+  };
+
   return (
     <div style={{
       position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh',
-      backgroundColor: 'rgba(255,255,255,0.7)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)',
-      zIndex: 10001, display: 'flex', alignItems: 'center', justifyContent: 'center'
+      backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)',
+      zIndex: 10001, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      padding: '15px', boxSizing: 'border-box'
     }}>
       <div style={{
-        backgroundColor: 'var(--card-bg)', borderRadius: '20px', padding: '30px',
-        width: '700px', maxWidth: '95%',
-        border: '1px solid var(--border-color)', boxShadow: '0 20px 40px rgba(0,0,0,0.1)',
-        maxHeight: '90vh', overflowY: 'auto'
+        backgroundColor: 'var(--card-bg)', borderRadius: '20px', padding: '20px',
+        width: '700px', maxWidth: '100%',
+        border: '1px solid var(--border-color)', boxShadow: '0 20px 40px rgba(0,0,0,0.2)',
+        maxHeight: '90vh', overflowY: 'auto', boxSizing: 'border-box'
       }}>
-        <h3 style={{ margin: '0 0 15px 0', fontSize: '1.25rem', color: 'var(--text-color)' }}>
+        <h3 style={{ margin: '0 0 15px 0', fontSize: '1.15rem', color: 'var(--text-color)', lineHeight: '1.4' }}>
           此相簿中找到多個可能重複的版本。請問您想怎麼處理？
         </h3>
         
-        <div style={{ display: 'flex', gap: '20px', marginBottom: '20px' }}>
+        <div style={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap', gap: '20px', marginBottom: '20px' }}>
           {/* 準備匯入的新照片 */}
-          <div style={{ flex: 1 }}>
-            <h4 style={{ marginBottom: '10px' }}>準備匯入的新照片</h4>
+          <div style={{ flex: '1 1 200px', minWidth: '150px' }}>
+            <h4 style={{ marginBottom: '10px', fontSize: '0.95rem' }}>準備匯入的新照片</h4>
             <div style={{ border: '2px solid var(--accent-color)', borderRadius: '10px', overflow: 'hidden' }}>
-              <img src={tempPhoto.url} style={{ width: '100%', display: 'block' }} alt="New" />
+              <img src={tempPhoto.url} style={{ width: '100%', maxHeight: '200px', objectFit: 'cover', display: 'block' }} alt="New" />
             </div>
           </div>
           
           {/* 已存在的照片 */}
-          <div style={{ flex: 2 }}>
-            <h4 style={{ marginBottom: '10px' }}>相簿中已存在的版本 (共 {existingPhotos.length} 張)</h4>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))', gap: '10px' }}>
+          <div style={{ flex: '2 1 280px', minWidth: '200px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '5px' }}>
+              <h4 style={{ margin: 0, fontSize: '0.95rem' }}>相簿中已存在的版本 (共 {existingPhotos.length} 張)</h4>
+              {existingPhotos.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleSelectAll}
+                  style={{
+                    background: isAllSelected ? 'var(--accent-color)' : 'transparent',
+                    color: isAllSelected ? '#fff' : 'var(--accent-color)',
+                    border: '1px solid var(--accent-color)',
+                    borderRadius: '12px',
+                    padding: '4px 10px',
+                    fontSize: '0.8rem',
+                    cursor: 'pointer',
+                    fontWeight: 'bold'
+                  }}
+                >
+                  {isAllSelected ? "取消全選" : "全選"}
+                </button>
+              )}
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(100px, 1fr))', gap: '10px' }}>
               {existingPhotos.map(p => {
                 const isSelected = selectedPhotoIds.includes(p.id!);
                 return (
@@ -89,8 +121,8 @@ export default function GoogleSyncConflictModal({
                     style={{ position: 'absolute', top: '5px', left: '5px', width: '20px', height: '20px', cursor: 'pointer' }}
                     readOnly
                   />
-                  <img src={p.url} style={{ width: '100%', height: '120px', objectFit: 'cover', display: 'block' }} alt="Existing" />
-                  <div style={{ padding: '5px', fontSize: '0.8rem', textAlign: 'center', background: 'rgba(0,0,0,0.05)' }}>
+                  <img src={p.url} style={{ width: '100%', height: '100px', objectFit: 'cover', display: 'block' }} alt="Existing" />
+                  <div style={{ padding: '4px', fontSize: '0.75rem', textAlign: 'center', background: 'rgba(0,0,0,0.05)' }}>
                     {decision === 'replace' && isSelected ? '準備被取代' : '點擊選取'}
                   </div>
                 </div>
@@ -99,22 +131,22 @@ export default function GoogleSyncConflictModal({
           </div>
         </div>
 
-        <div style={{ display: 'flex', gap: '15px', marginTop: '20px' }}>
+        <div style={{ display: 'flex', gap: '10px', marginTop: '15px', flexWrap: 'wrap' }}>
           <button
             onClick={() => setDecision("keep_both")}
             style={{
-              flex: 1, padding: '12px', borderRadius: '10px',
+              flex: 1, minWidth: '140px', padding: '10px', borderRadius: '10px',
               background: decision === 'keep_both' ? 'var(--accent-color)' : 'transparent',
               color: decision === 'keep_both' ? '#fff' : 'var(--text-color)',
               border: `2px solid var(--accent-color)`,
-              cursor: 'pointer', fontSize: '1rem', fontWeight: 'bold'
+              cursor: 'pointer', fontSize: '0.95rem', fontWeight: 'bold'
             }}
           >
             全部保留 (都存下來)
           </button>
         </div>
 
-        <div style={{ marginTop: '30px', textAlign: 'right' }}>
+        <div style={{ marginTop: '20px', textAlign: 'right' }}>
           <button 
             onClick={handleConfirm}
             disabled={!decision || (decision === 'replace' && selectedPhotoIds.length === 0)}

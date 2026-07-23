@@ -128,8 +128,10 @@ async function generateThumbnail(file: File): Promise<Blob | null> {
         canvas.height = height;
         const ctx = canvas.getContext('2d');
         if (ctx) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
           ctx.drawImage(img, 0, 0, width, height);
-          canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.8);
+          canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 1.0);
         } else {
           resolve(null);
         }

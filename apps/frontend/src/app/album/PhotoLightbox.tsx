@@ -240,6 +240,42 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               )}
               {!photo.tags?.length && !isAdmin && <span style={{ color: '#777' }}>無標籤</span>}
             </div>
+
+            {/* 管理員新增標籤時：快捷選取既有標籤膠囊按鈕 */}
+            {isAdmin && (photo.tags?.length || 0) < 10 && availableTags.filter(t => !photo.tags?.some(pt => pt.name === t.name)).length > 0 && (
+              <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px', alignItems: 'center' }}>
+                <span style={{ fontSize: '0.75rem', color: '#888' }}>快速加入既有標籤：</span>
+                {availableTags
+                  .filter(t => !photo.tags?.some(pt => pt.name === t.name))
+                  .map(t => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        setIsAddingTag(true);
+                        const tag = await addPhotoTag(photo.id, t.name);
+                        if (tag) onUpdate();
+                        setIsAddingTag(false);
+                      }}
+                      style={{
+                        background: 'rgba(255, 255, 255, 0.08)',
+                        border: '1px solid rgba(255, 255, 255, 0.2)',
+                        color: 'rgba(255, 255, 255, 0.9)',
+                        padding: '2px 8px',
+                        borderRadius: '12px',
+                        fontSize: '0.75rem',
+                        cursor: 'pointer',
+                        transition: 'all 0.2s ease'
+                      }}
+                      onMouseOver={(e) => { e.currentTarget.style.background = 'var(--accent-color)'; e.currentTarget.style.color = '#fff'; }}
+                      onMouseOut={(e) => { e.currentTarget.style.background = 'rgba(255, 255, 255, 0.08)'; e.currentTarget.style.color = 'rgba(255, 255, 255, 0.9)'; }}
+                    >
+                      + {t.name}
+                    </button>
+                  ))}
+              </div>
+            )}
           </div>
 
           <div className={styles.exifToggleRow}>
@@ -258,7 +294,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                 {/* 拍攝時間整合至 EXIF 區域首位 */}
                 <div className={styles.exifItem}>
                   <span className={styles.exifLabel}>拍攝時間</span>
-                  {isAdmin ? (
+                  {isAdmin && !hasExifDate ? (
                     <div className={styles.exifDateEdit}>
                       <input 
                         type="date" 
