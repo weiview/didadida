@@ -326,3 +326,47 @@
 .actionButton.danger:hover { background: #d32f2f; }
 .actionButton.primary { background: var(--accent-color); color: white; border: none; }
 .actionButton.primary:hover { background: #c3b0a0; }
+
+.desktopOnly {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.mobileFilterBtn {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--border-color, rgba(0, 0, 0, 0.08));
+  background: var(--card-bg, rgba(255, 255, 255, 0.85));
+  color: var(--text-color, #333);
+  font-size: 0.92rem;
+  font-weight: 500;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+  .desktopOnly {
+    display: none !important;
+  }
+  .mobileFilterBtn {
+    display: inline-flex !important;
+  }
+  .searchInput {
+    min-width: 0;
+    width: 100%;
+    flex: 1;
+  }
+  .filters {
+    width: 100%;
+    justify-content: space-between;
+  }
+}

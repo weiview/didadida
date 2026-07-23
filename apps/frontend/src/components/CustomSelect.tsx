@@ -39,6 +39,8 @@ export default function CustomSelect<T extends string | number>({
 
   const isAllSelected = isMulti && options.length > 0 && selectedValues.length === options.length;
 
+  const [openUpward, setOpenUpward] = useState(false);
+
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
@@ -47,6 +49,15 @@ export default function CustomSelect<T extends string | number>({
     };
     if (isOpen) {
       document.addEventListener("mousedown", handleClickOutside);
+      if (containerRef.current) {
+        const rect = containerRef.current.getBoundingClientRect();
+        const spaceBelow = window.innerHeight - rect.bottom;
+        if (spaceBelow < 220 && rect.top > 220) {
+          setOpenUpward(true);
+        } else {
+          setOpenUpward(false);
+        }
+      }
     }
     return () => {
       document.removeEventListener("mousedown", handleClickOutside);
@@ -151,9 +162,10 @@ export default function CustomSelect<T extends string | number>({
         <div
           style={{
             position: "absolute",
-            top: "calc(100% + 6px)",
+            top: openUpward ? "auto" : "calc(100% + 6px)",
+            bottom: openUpward ? "calc(100% + 6px)" : "auto",
             left: 0,
-            zIndex: 999,
+            zIndex: 9999,
             minWidth: "100%",
             width: "max-content",
             maxWidth: "280px",

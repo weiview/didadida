@@ -11,6 +11,7 @@ import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
+import FilterBottomSheet from "@/components/FilterBottomSheet";
 
 function AlbumContent() {
   const searchParams = useSearchParams();
@@ -63,6 +64,8 @@ function AlbumContent() {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTags, setSelectedTags] = useState<number[]>([]);
   const [sortBy, setSortBy] = useState<"custom" | "upload_date" | "taken_date">("custom");
+  const [isMobileFilterOpen, setIsMobileFilterOpen] = useState(false);
+  const [isTagModalOpen, setIsTagModalOpen] = useState(false);
 
   // 手機版捏合縮放 (Pinch Zoom) 網格欄數控制 (預設 0 代表自動，1~5 欄可縮放)
   const [gridColumns, setGridColumns] = useState<number>(0);
@@ -698,36 +701,238 @@ function AlbumContent() {
                 </button>
               )}
             </div>
-            <CustomSelect
-              isMulti={true}
-              value={selectedTags}
-              onChange={(val) => setSelectedTags(val as number[])}
-              options={availableTags.map(t => ({ value: t.id, label: t.name }))}
-            />
+            <div className={pageStyles.desktopOnly}>
+              <CustomSelect
+                isMulti={true}
+                value={selectedTags}
+                onChange={(val) => setSelectedTags(val as number[])}
+                options={availableTags.map(t => ({ value: t.id, label: t.name }))}
+              />
 
-            <CustomSelect
-              value={sortBy}
-              onChange={(val) => setSortBy(val as any)}
-              options={[
-                { value: "custom", label: "自訂排序 (可拖曳)" },
-                { value: "upload_date", label: "依上傳日期 (新到舊)" },
-                { value: "taken_date", label: "依拍攝日期 (新到舊)" }
-              ]}
-            />
+              <CustomSelect
+                value={sortBy}
+                onChange={(val) => setSortBy(val as any)}
+                options={[
+                  { value: "custom", label: "自訂排序 (可拖曳)" },
+                  { value: "upload_date", label: "依上傳日期 (新到舊)" },
+                  { value: "taken_date", label: "依拍攝日期 (新到舊)" }
+                ]}
+              />
 
-            <CustomSelect
-              value={gridColumns || 0}
-              onChange={(val) => setGridColumns(Number(val))}
-              options={[
-                { value: 0, label: "縮圖版面: 自動" },
-                { value: 1, label: "縮圖版面: 1 欄 (大圖)" },
-                { value: 2, label: "縮圖版面: 2 欄 (雙排)" },
-                { value: 3, label: "縮圖版面: 3 欄 (精緻)" },
-                { value: 4, label: "縮圖版面: 4 欄 (多張)" },
-                { value: 5, label: "縮圖版面: 5 欄 (密集)" }
-              ]}
-            />
+              <CustomSelect
+                value={gridColumns || 0}
+                onChange={(val) => setGridColumns(Number(val))}
+                options={[
+                  { value: 0, label: "縮圖版面: 自動" },
+                  { value: 1, label: "縮圖版面: 1 欄 (大圖)" },
+                  { value: 2, label: "縮圖版面: 2 欄 (雙排)" },
+                  { value: 3, label: "縮圖版面: 3 欄 (精緻)" },
+                  { value: 4, label: "縮圖版面: 4 欄 (多張)" },
+                  { value: 5, label: "縮圖版面: 5 欄 (密集)" }
+                ]}
+              />
+            </div>
+
+            {/* 手機版滑出式篩選與排序觸控按鈕 */}
+            <button
+              type="button"
+              className={pageStyles.mobileFilterBtn}
+              onClick={() => setIsMobileFilterOpen(true)}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+              </svg>
+              篩選與排序
+              {(selectedTags.length > 0 || sortBy !== "custom" || gridColumns !== 0) && (
+                <span style={{
+                  background: 'var(--accent-color, #d1bfae)',
+                  color: '#fff',
+                  borderRadius: '50%',
+                  width: '8px',
+                  height: '8px',
+                  display: 'inline-block'
+                }} />
+              )}
+            </button>
           </div>
+
+          <FilterBottomSheet
+            isOpen={isMobileFilterOpen}
+            onClose={() => setIsMobileFilterOpen(false)}
+            activeFilterCount={selectedTags.length + (sortBy !== "custom" ? 1 : 0) + (gridColumns !== 0 ? 1 : 0)}
+            onReset={() => {
+              setSelectedTags([]);
+              setSortBy("custom");
+              setGridColumns(0);
+            }}
+          >
+            <div style={{ width: '100%', textAlign: 'center' }}>
+              <label style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600, color: 'var(--text-color)', marginBottom: '8px' }}>
+                標籤篩選
+              </label>
+              <button
+                type="button"
+                onClick={() => setIsTagModalOpen(true)}
+                style={{
+                  width: '100%',
+                  maxWidth: '280px',
+                  padding: '10px 16px',
+                  borderRadius: '12px',
+                  border: '1px solid var(--border-color, rgba(0,0,0,0.1))',
+                  background: 'var(--card-bg, rgba(255,255,255,0.9))',
+                  color: 'var(--text-color, #333)',
+                  fontSize: '0.9rem',
+                  fontWeight: '500',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  cursor: 'pointer',
+                  boxShadow: '0 2px 6px rgba(0,0,0,0.03)'
+                }}
+              >
+                <span>
+                  🏷️ {selectedTags.length === 0 ? '所有標籤' : selectedTags.length === availableTags.length ? '全選標籤 (所有)' : `已選取 ${selectedTags.length} 個標籤`}
+                </span>
+                <span style={{ fontSize: '0.8rem', color: '#888' }}>選擇 ❯</span>
+              </button>
+            </div>
+
+            <div style={{ width: '100%', textAlign: 'center' }}>
+              <label style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600, color: 'var(--text-color)', marginBottom: '10px' }}>
+                排序方式
+              </label>
+              <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}>
+                {[
+                  { value: "custom", label: "自訂排序" },
+                  { value: "upload_date", label: "依上傳日期 (新到舊)" },
+                  { value: "taken_date", label: "依拍攝日期 (新到舊)" }
+                ].map(opt => {
+                  const isSelected = sortBy === opt.value;
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => setSortBy(opt.value as any)}
+                      style={{
+                        padding: '8px 14px',
+                        borderRadius: '20px',
+                        border: isSelected ? '1px solid var(--accent-color, #d1bfae)' : '1px solid rgba(0,0,0,0.1)',
+                        background: isSelected ? 'rgba(209, 191, 174, 0.25)' : 'rgba(0,0,0,0.03)',
+                        color: isSelected ? 'var(--text-color, #111)' : 'var(--text-color, #555)',
+                        fontSize: '0.88rem',
+                        fontWeight: isSelected ? '600' : '400',
+                        cursor: 'pointer',
+                        transition: 'all 0.15s ease'
+                      }}
+                    >
+                      {isSelected ? `✓ ${opt.label}` : opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div style={{ width: '100%', textAlign: 'center' }}>
+              <label style={{ display: 'block', fontSize: '0.88rem', fontWeight: 600, color: 'var(--text-color)', marginBottom: '10px' }}>
+                縮圖版面欄數
+              </label>
+              <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}>
+                {[
+                  { value: 0, label: "自動" },
+                  { value: 1, label: "1 欄 (大圖)" },
+                  { value: 2, label: "2 欄 (雙排)" },
+                  { value: 3, label: "3 欄 (精緻)" },
+                  { value: 4, label: "4 欄 (多張)" },
+                  { value: 5, label: "5 欄 (密集)" }
+                ].map(opt => {
+                  const isSelected = (gridColumns || 0) === opt.value;
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => setGridColumns(opt.value)}
+                      style={{
+                        padding: '8px 12px',
+                        borderRadius: '20px',
+                        border: isSelected ? '1px solid var(--accent-color, #d1bfae)' : '1px solid rgba(0,0,0,0.1)',
+                        background: isSelected ? 'rgba(209, 191, 174, 0.25)' : 'rgba(0,0,0,0.03)',
+                        color: isSelected ? 'var(--text-color, #111)' : 'var(--text-color, #555)',
+                        fontSize: '0.85rem',
+                        fontWeight: isSelected ? '600' : '400',
+                        cursor: 'pointer',
+                        transition: 'all 0.15s ease'
+                      }}
+                    >
+                      {isSelected ? `✓ ${opt.label}` : opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </FilterBottomSheet>
+
+          {/* 標籤專屬彈出選擇 List 畫面 */}
+          <FilterBottomSheet
+            isOpen={isTagModalOpen}
+            onClose={() => setIsTagModalOpen(false)}
+            activeFilterCount={selectedTags.length}
+            onReset={() => setSelectedTags([])}
+            title="🏷️ 選擇標籤"
+          >
+            <div style={{ width: '100%', textAlign: 'center' }}>
+              {/* 全選 快捷捷徑 */}
+              <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '0 4px 10px 4px', marginBottom: '8px' }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (selectedTags.length === availableTags.length) setSelectedTags([]);
+                    else setSelectedTags(availableTags.map(t => t.id));
+                  }}
+                  style={{ background: 'none', border: 'none', color: 'var(--accent-color, #d1bfae)', fontWeight: 600, fontSize: '0.88rem', cursor: 'pointer' }}
+                >
+                  {selectedTags.length === availableTags.length ? '取消全選' : '全選所有標籤'}
+                </button>
+              </div>
+
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', justifyContent: 'center', padding: '6px 4px 20px 4px' }}>
+                {availableTags.length === 0 ? (
+                  <div style={{ padding: '20px', color: '#888', fontSize: '0.9rem' }}>本相簿尚無相片標籤</div>
+                ) : (
+                  availableTags.map(t => {
+                    const isSelected = selectedTags.includes(t.id);
+                    return (
+                      <button
+                        key={t.id}
+                        type="button"
+                        onClick={() => {
+                          if (isSelected) setSelectedTags(selectedTags.filter(id => id !== t.id));
+                          else setSelectedTags([...selectedTags, t.id]);
+                        }}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          padding: '10px 18px',
+                          borderRadius: '24px',
+                          border: isSelected ? '1.5px solid var(--accent-color, #d1bfae)' : '1px solid rgba(0,0,0,0.1)',
+                          background: isSelected ? 'rgba(209, 191, 174, 0.25)' : 'rgba(0,0,0,0.03)',
+                          color: isSelected ? 'var(--text-color, #111)' : 'var(--text-color, #555)',
+                          fontSize: '0.92rem',
+                          fontWeight: isSelected ? '600' : '400',
+                          cursor: 'pointer',
+                          transition: 'all 0.15s ease',
+                          boxShadow: isSelected ? '0 2px 8px rgba(209, 191, 174, 0.3)' : 'none'
+                        }}
+                      >
+                        <span>{t.name}</span>
+                        {isSelected && <span style={{ color: 'var(--accent-color, #d1bfae)', fontWeight: 'bold' }}>✓</span>}
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </FilterBottomSheet>
           {isAdmin && (
             <div style={{ display: 'flex', gap: '10px' }}>
               <button
