@@ -10,6 +10,7 @@ import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
+import CustomSelect from "@/components/CustomSelect";
 
 function AlbumContent() {
   const searchParams = useSearchParams();
@@ -60,8 +61,13 @@ function AlbumContent() {
 
   // 篩選與排序 State
   const [searchQuery, setSearchQuery] = useState("");
-  const [selectedTag, setSelectedTag] = useState<number | "all">("all");
+  const [selectedTags, setSelectedTags] = useState<number[]>([]);
   const [sortBy, setSortBy] = useState<"custom" | "upload_date" | "taken_date">("custom");
+
+  // 手機版捏合縮放 (Pinch Zoom) 網格欄數控制 (預設 0 代表自動，1~5 欄可縮放)
+  const [gridColumns, setGridColumns] = useState<number>(0);
+  const touchStartDistRef = useRef<number | null>(null);
+  const initialColumnsRef = useRef<number>(0);
 
   // 時間軸滾動條 State
   const [currentTimelineDate, setCurrentTimelineDate] = useState<string>("");
@@ -78,6 +84,66 @@ function AlbumContent() {
   const [longPressIndex, setLongPressIndex] = useState<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
+  // 雙指 Pinch 手勢即時連續縮放照片網格大小 (手機觸控)
+  useEffect(() => {
+    const getDistance = (touches: TouchList) => {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      return Math.hypot(dx, dy);
+    };
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        if (e.cancelable) e.preventDefault();
+        touchStartDistRef.current = getDistance(e.touches);
+        // 開始時記錄目前畫面的基準欄數（手機預設 2 欄，平板/電腦預設 4 欄）
+        const defaultCols = window.innerWidth <= 768 ? 2 : 4;
+        initialColumnsRef.current = gridColumns > 0 ? gridColumns : defaultCols;
+      }
+    };
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (e.touches.length >= 2) {
+        if (e.cancelable) e.preventDefault();
+      }
+
+      if (e.touches.length === 2 && touchStartDistRef.current && touchStartDistRef.current > 0) {
+        const currentDist = getDistance(e.touches);
+        const ratio = currentDist / touchStartDistRef.current;
+        const startCols = initialColumnsRef.current;
+        let deltaCols = 0;
+        
+        // 調降靈敏度：使用平緩穩定的 0.22 比例步階（手指移動約 22% 距離切換 1 欄）
+        if (ratio < 1) {
+          // 兩指靠近（內縮）：欄數漸進增加 (圖片變小，顯示更多張)
+          deltaCols = Math.floor((1 - ratio) / 0.22);
+        } else {
+          // 兩指遠離（拉開）：欄數漸進減少 (圖片變大，放大顯示)
+          deltaCols = -Math.floor((ratio - 1) / 0.22);
+        }
+
+        const calculatedCols = Math.min(6, Math.max(1, startCols + deltaCols));
+        setGridColumns(calculatedCols);
+      }
+    };
+
+    const handleTouchEnd = () => {
+      touchStartDistRef.current = null;
+    };
+
+    document.addEventListener("touchstart", handleTouchStart, { passive: false });
+    document.addEventListener("touchmove", handleTouchMove, { passive: false });
+    document.addEventListener("touchend", handleTouchEnd, { passive: true });
+
+    return () => {
+      document.removeEventListener("touchstart", handleTouchStart);
+      document.removeEventListener("touchmove", handleTouchMove);
+      document.removeEventListener("touchend", handleTouchEnd);
+    };
+  }, [gridColumns]);
+
+  const [currentCoverPhotoUrl, setCurrentCoverPhotoUrl] = useState<string | null>(null);
+
   const loadData = async () => {
     if (!id) return;
     setLoading(true);
@@ -89,7 +155,10 @@ function AlbumContent() {
     ]);
     
     const current = allAlbums.find(a => String(a.id) === id);
-    if (current) setAlbumName(current.name);
+    if (current) {
+      setAlbumName(current.name);
+      setCurrentCoverPhotoUrl(current.cover_photo_url || null);
+    }
     
     setPhotos(photoData || []);
     setAvailableTags(tags);
@@ -128,17 +197,16 @@ function AlbumContent() {
   // 計算經過篩選與排序的照片
   const displayPhotos = useMemo(() => {
     return photos.filter(photo => {
-      // 關鍵字篩選 (搜尋照片 Story/描述、標題 或 標籤名稱)
+      // 關鍵字篩選 (搜尋照片 Story/描述 或 標題)
       if (searchQuery) {
         const q = searchQuery.toLowerCase().trim();
         const matchTitle = photo.title?.toLowerCase().includes(q);
         const matchDesc = photo.description?.toLowerCase().includes(q);
-        const matchTag = photo.tags?.some(t => t.name.toLowerCase().includes(q));
-        if (!matchTitle && !matchDesc && !matchTag) return false;
+        if (!matchTitle && !matchDesc) return false;
       }
-      // 標籤選單篩選
-      if (selectedTag !== "all") {
-        if (!photo.tags || !photo.tags.find(t => t.id === selectedTag)) return false;
+      // 多選標籤篩選 (需包含選取的任一標籤)
+      if (selectedTags.length > 0) {
+        if (!photo.tags || !photo.tags.some(t => selectedTags.includes(t.id))) return false;
       }
       return true;
     }).sort((a, b) => {
@@ -150,7 +218,7 @@ function AlbumContent() {
       }
       return 0;
     });
-  }, [photos, searchQuery, selectedTag, sortBy]);
+  }, [photos, searchQuery, selectedTags, sortBy]);
 
   // 整理時間軸標籤列表 (依年月或年份分類)
   const timelineGroup = useMemo(() => {
@@ -215,11 +283,35 @@ function AlbumContent() {
           setCurrentTimelineDate(`${startStr} ~ ${endStr}`);
         }
       }
+
+      // 無限滾動：當滾動距離頁面底部小於 1000px 時自動載入更多
+      const scrollHeight = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
+      const scrollTop = window.scrollY || document.documentElement.scrollTop || document.body.scrollTop;
+      const clientHeight = window.innerHeight;
+
+      if (scrollHeight - scrollTop - clientHeight < 1000) {
+        setVisibleCount((prev) => {
+          if (prev < displayPhotos.length) {
+            return prev + 24;
+          }
+          return prev;
+        });
+      }
     };
 
     window.addEventListener("scroll", handleScroll, { passive: true });
+    window.addEventListener("touchmove", handleScroll, { passive: true });
+    window.addEventListener("resize", handleScroll, { passive: true });
+
+    // 初次載入與照片資料更新時，主動多檢查幾次
+    handleScroll();
+    const timer = setTimeout(handleScroll, 500);
+
     return () => {
       window.removeEventListener("scroll", handleScroll);
+      window.removeEventListener("touchmove", handleScroll);
+      window.removeEventListener("resize", handleScroll);
+      clearTimeout(timer);
       if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
     };
   }, [displayPhotos]);
@@ -280,38 +372,43 @@ function AlbumContent() {
     }
   };
 
-  const handleGoogleSync = async (session: any, popup: Window | null) => {
+  const handleGoogleSync = async (initialSession: any, popup: Window | null) => {
     try {
       if (!hasGoogleToken) {
         const loginUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8787/api';
         window.location.href = `${loginUrl}/auth/google/login?state=${id}`;
         return;
       }
-      
-      let session = googleSession;
-      if (!session) {
-        session = await createGooglePickerSession();
-      }
-      
-      if (!session || session.error || !session.pickerUri) {
+
+      // 立刻將 UI 設為載入鎖定狀態，避免異步建立 Session 期間 UI 切回
+      setSyncingGoogle(true);
+      setSyncProgress(null);
+
+      // 每次匯入都必須建立新的 Google Picker Session (舊 Session 無法重複選照片)
+      const session = await createGooglePickerSession();
+
+      if (!session || (session as any).error || !session.pickerUri) {
         alert("無法建立 Google Picker (可能登入已過期)，請重新連結 Google 相簿。");
         setHasGoogleToken(false);
         setSyncingGoogle(false);
         popup?.close();
         return;
       }
-      
+
       // 非同步取得連結後，直接將 popup 的網址更換為支援自動關閉的 pickerUri
       if (popup) {
         popup.location.href = session.pickerUri + "/autoclose";
       }
-      
-      setSyncingGoogle(true);
-      setSyncProgress(null);
-      
+
       const startTime = Date.now();
+      let photosProcessingStarted = false;
+
       const pollTimer = setInterval(async () => {
-        // 如果超過 10 分鐘，自動中斷 (避免 COOP 導致無法偵測視窗關閉)
+        if (photosProcessingStarted) {
+          return;
+        }
+
+        // 如果超過 10 分鐘，自動中斷
         if (Date.now() - startTime > 10 * 60 * 1000) {
           clearInterval(pollTimer);
           setSyncingGoogle(false);
@@ -321,22 +418,23 @@ function AlbumContent() {
 
         const res = await fetchGooglePickerPhotos(session!.id!);
         if (res.ready) {
-          console.log("Picker ready! MediaItems:", res.mediaItems);
+          console.log("[Google Picker Polling] ready is true, res:", res);
         }
         if (res.ready && res.mediaItems) {
           clearInterval(pollTimer);
-          console.log("Attempting to close popup...");
+          photosProcessingStarted = true;
+          setSyncingGoogle(true);
+
           try {
-            if (popup) {
+            if (popup && !popup.closed) {
               popup.close();
             }
-          } catch(e) {
-            console.error("Error closing popup:", e);
-          }
+          } catch(e) {}
           
           if (res.mediaItems.length === 0) {
+            console.log("[Google Picker Polling] mediaItems is empty array");
             setSyncingGoogle(false);
-            return; // No photos selected
+            return;
           }
 
           setSyncProgress({ current: 0, total: res.mediaItems.length });
@@ -344,6 +442,7 @@ function AlbumContent() {
 
           for (let i = 0; i < res.mediaItems.length; i++) {
             const item = res.mediaItems[i];
+            console.log(`[Google Picker Item ${i}]`, item);
             setSyncProgress({ current: i + 1, total: res.mediaItems.length });
             
             const baseUrl = item.mediaFile?.baseUrl || item.baseUrl;
@@ -465,6 +564,17 @@ function AlbumContent() {
     setLongPressIndex(null);
   };
 
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [editingNameInput, setEditingNameInput] = useState("");
+
+  const handleSaveAlbumName = async () => {
+    if (!editingNameInput.trim() || !id) return;
+    const newName = editingNameInput.trim();
+    setAlbumName(newName);
+    setIsEditingName(false);
+    await updateAlbum(Number(id), { name: newName });
+  };
+
   return (
     <div className={styles.container}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: '15px', marginBottom: '20px' }}>
@@ -475,15 +585,94 @@ function AlbumContent() {
 
       <div className={styles.header}>
         <div>
-          <h1 className={styles.title}>{albumName}</h1>
-          <p className={styles.meta}>共 {photos.length} 張照片</p>
+          {isEditingName ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '4px' }}>
+              <input
+                type="text"
+                value={editingNameInput}
+                onChange={e => setEditingNameInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleSaveAlbumName(); if (e.key === 'Escape') setIsEditingName(false); }}
+                autoFocus
+                style={{
+                  fontSize: '1.6rem',
+                  fontWeight: '600',
+                  padding: '4px 10px',
+                  borderRadius: '8px',
+                  border: '1px solid var(--accent-color, #d1bfae)',
+                  background: 'var(--card-bg, #fff)',
+                  color: 'var(--text-color, #333)',
+                  outline: 'none'
+                }}
+              />
+              <button
+                onClick={handleSaveAlbumName}
+                style={{
+                  background: 'var(--accent-color, #d1bfae)',
+                  color: '#fff',
+                  border: 'none',
+                  padding: '6px 14px',
+                  borderRadius: '8px',
+                  cursor: 'pointer',
+                  fontSize: '0.9rem',
+                  fontWeight: '500'
+                }}
+              >
+                儲存
+              </button>
+              <button
+                onClick={() => setIsEditingName(false)}
+                style={{
+                  background: 'transparent',
+                  color: '#888',
+                  border: '1px solid #ccc',
+                  padding: '6px 12px',
+                  borderRadius: '8px',
+                  cursor: 'pointer',
+                  fontSize: '0.9rem'
+                }}
+              >
+                取消
+              </button>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <h1 className={styles.title} style={{ marginBottom: 0 }}>{albumName}</h1>
+              {isAdmin && (
+                <button
+                  onClick={() => {
+                    setEditingNameInput(albumName);
+                    setIsEditingName(true);
+                  }}
+                  title="重新命名相簿"
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    color: '#888',
+                    cursor: 'pointer',
+                    padding: '4px',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    transition: 'color 0.2s ease'
+                  }}
+                  onMouseOver={e => e.currentTarget.style.color = 'var(--accent-color, #d1bfae)'}
+                  onMouseOut={e => e.currentTarget.style.color = '#888'}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                  </svg>
+                </button>
+              )}
+            </div>
+          )}
+          <p className={styles.meta} style={{ marginTop: '4px' }}>共 {photos.length} 張照片</p>
         </div>
         <div className={styles.controls}>
           <div className={styles.filters}>
             <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
               <input 
                 type="text" 
-                placeholder="搜尋照片 Story 或標籤..." 
+                placeholder="搜尋照片 Story..." 
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
                 className={styles.searchInput}
@@ -509,15 +698,35 @@ function AlbumContent() {
                 </button>
               )}
             </div>
-            <select value={selectedTag} onChange={e => setSelectedTag(e.target.value === "all" ? "all" : Number(e.target.value))} className={styles.select}>
-              <option value="all">所有標籤</option>
-              {availableTags.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
-            </select>
-            <select value={sortBy} onChange={e => setSortBy(e.target.value as any)} className={styles.select}>
-              <option value="custom">自訂排序 (可拖曳)</option>
-              <option value="upload_date">依上傳日期 (新到舊)</option>
-              <option value="taken_date">依拍攝日期 (新到舊)</option>
-            </select>
+            <CustomSelect
+              isMulti={true}
+              value={selectedTags}
+              onChange={(val) => setSelectedTags(val as number[])}
+              options={availableTags.map(t => ({ value: t.id, label: t.name }))}
+            />
+
+            <CustomSelect
+              value={sortBy}
+              onChange={(val) => setSortBy(val as any)}
+              options={[
+                { value: "custom", label: "自訂排序 (可拖曳)" },
+                { value: "upload_date", label: "依上傳日期 (新到舊)" },
+                { value: "taken_date", label: "依拍攝日期 (新到舊)" }
+              ]}
+            />
+
+            <CustomSelect
+              value={gridColumns || 0}
+              onChange={(val) => setGridColumns(Number(val))}
+              options={[
+                { value: 0, label: "縮圖版面: 自動" },
+                { value: 1, label: "縮圖版面: 1 欄 (大圖)" },
+                { value: 2, label: "縮圖版面: 2 欄 (雙排)" },
+                { value: 3, label: "縮圖版面: 3 欄 (精緻)" },
+                { value: 4, label: "縮圖版面: 4 欄 (多張)" },
+                { value: 5, label: "縮圖版面: 5 欄 (密集)" }
+              ]}
+            />
           </div>
           {isAdmin && (
             <div style={{ display: 'flex', gap: '10px' }}>
@@ -640,7 +849,10 @@ function AlbumContent() {
       {loading ? (
         <div className={styles.loading}>載入照片中...</div>
       ) : (
-        <div className={styles.photoGrid}>
+        <div 
+          className={styles.photoGrid}
+          style={gridColumns > 0 ? { gridTemplateColumns: `repeat(${gridColumns}, 1fr)` } : undefined}
+        >
           {displayPhotos.slice(0, visibleCount).map((photo, index) => (
             <div 
               key={photo.id} 
@@ -650,8 +862,16 @@ function AlbumContent() {
               }}
               className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
               draggable={isAdmin && longPressIndex === index && sortBy === "custom"}
-              onClick={() => {
+              onClick={async () => {
                 if (longPressIndex !== null || draggingIndex !== null) return;
+                if (isEditingPhotos) {
+                  // 在編輯模式下，若點擊已是封面的照片則取消封面設定，否則設為新封面
+                  const isCurrentCover = currentCoverPhotoUrl === photo.url;
+                  const newCoverUrl = isCurrentCover ? null : photo.url;
+                  setCurrentCoverPhotoUrl(newCoverUrl);
+                  await updateAlbum(Number(id), { cover_photo_url: newCoverUrl || "" });
+                  return;
+                }
                 setSelectedPhotoIndex(index);
               }}
               onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
@@ -669,17 +889,30 @@ function AlbumContent() {
               onDragOver={(e) => isAdmin && sortBy === "custom" && e.preventDefault()}
             >
               {isAdmin && isEditingPhotos && (
-                <input 
-                  type="checkbox"
-                  checked={selectedPhotos.includes(photo.id)}
-                  onChange={(e) => {
-                    e.stopPropagation();
-                    if (e.target.checked) setSelectedPhotos(prev => [...prev, photo.id]);
-                    else setSelectedPhotos(prev => prev.filter(id => id !== photo.id));
-                  }}
-                  onClick={e => e.stopPropagation()}
-                  style={{ position: 'absolute', top: '10px', left: '10px', width: '20px', height: '20px', zIndex: 10, cursor: 'pointer' }}
-                />
+                <>
+                  <input 
+                    type="checkbox"
+                    checked={selectedPhotos.includes(photo.id)}
+                    onChange={(e) => {
+                      e.stopPropagation();
+                      if (e.target.checked) setSelectedPhotos(prev => [...prev, photo.id]);
+                      else setSelectedPhotos(prev => prev.filter(id => id !== photo.id));
+                    }}
+                    onClick={e => e.stopPropagation()}
+                    style={{ position: 'absolute', top: '10px', left: '10px', width: '20px', height: '20px', zIndex: 10, cursor: 'pointer' }}
+                  />
+                  <div style={{
+                    position: 'absolute', bottom: '10px', right: '10px', zIndex: 10,
+                    background: currentCoverPhotoUrl === photo.url ? 'var(--accent-color)' : 'rgba(0, 0, 0, 0.55)',
+                    color: '#fff', padding: '4px 10px',
+                    borderRadius: '12px', fontSize: '0.75rem', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)',
+                    border: currentCoverPhotoUrl === photo.url ? '1px solid var(--accent-color)' : '1px solid rgba(255, 255, 255, 0.25)',
+                    pointerEvents: 'none', fontWeight: '500', transition: 'all 0.2s ease',
+                    boxShadow: currentCoverPhotoUrl === photo.url ? '0 2px 8px rgba(0,0,0,0.3)' : 'none'
+                  }}>
+                    {currentCoverPhotoUrl === photo.url ? "★ 封面" : "設為封面"}
+                  </div>
+                </>
               )}
               <img 
                 src={photo.thumb_url || photo.url} 
@@ -688,16 +921,19 @@ function AlbumContent() {
                 loading="lazy" 
                 decoding="async" 
               />
-              <div className={styles.photoOverlay}>
-                <h3 className={styles.photoTitle}>{photo.title}</h3>
-                <p className={styles.photoDate}>{photo.taken_at ? new Date(photo.taken_at).toLocaleDateString() : new Date(photo.created_at).toLocaleDateString()}</p>
-                {photo.tags && photo.tags.length > 0 && (
-                   <div className={styles.cardTags}>
-                     {photo.tags.slice(0,3).map(t => <span key={t.id} className={styles.cardTag}>{t.name}</span>)}
-                     {photo.tags.length > 3 && <span className={styles.cardTag}>+{photo.tags.length - 3}</span>}
-                   </div>
-                )}
-              </div>
+              {/* 當每排 3 欄 (含) 以上時，照片上隱藏文字與標籤資訊，只呈現純淨照片縮圖 */}
+              {(gridColumns === 1 || gridColumns === 2) && (
+                <div className={styles.photoOverlay}>
+                  <h3 className={styles.photoTitle}>{photo.title}</h3>
+                  <p className={styles.photoDate}>{photo.taken_at ? new Date(photo.taken_at).toLocaleDateString() : new Date(photo.created_at).toLocaleDateString()}</p>
+                  {photo.tags && photo.tags.length > 0 && (
+                     <div className={styles.cardTags}>
+                       {photo.tags.slice(0,3).map(t => <span key={t.id} className={styles.cardTag}>{t.name}</span>)}
+                       {photo.tags.length > 3 && <span className={styles.cardTag}>+{photo.tags.length - 3}</span>}
+                     </div>
+                  )}
+                </div>
+              )}
             </div>
           ))}
           {displayPhotos.length === 0 && (
@@ -732,19 +968,7 @@ function AlbumContent() {
         </div>
       )}
       
-      {!loading && visibleCount < displayPhotos.length && (
-        <div style={{ textAlign: 'center', margin: '30px 0' }}>
-          <button 
-            onClick={() => setVisibleCount(prev => prev + 24)}
-            style={{
-              padding: '12px 24px', borderRadius: '25px', backgroundColor: 'var(--accent-color)', 
-              color: 'white', border: 'none', cursor: 'pointer', fontSize: '1rem', fontWeight: 'bold'
-            }}
-          >
-            載入更多照片... ({visibleCount} / {displayPhotos.length})
-          </button>
-        </div>
-      )}
+
 
       {/* Lightbox / 大圖檢視 */}
       {selectedPhotoIndex !== null && (

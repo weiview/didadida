@@ -4,9 +4,10 @@ import { useEffect, useState, useRef, useMemo } from "react";
 import styles from "./page.module.css";
 import albumStyles from "./album/album.module.css";
 import Link from "next/link";
-import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, verifyLogin, fetchAllPhotos, Photo } from "@/lib/api";
+import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, verifyLogin, fetchAllPhotos, Photo, fetchTags, Tag } from "@/lib/api";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import PhotoLightbox from "./album/PhotoLightbox";
+import CustomSelect from "@/components/CustomSelect";
 
 function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPressIndex, sortBy, index, handlePointerDown, handlePointerUpOrLeave, handleDragStart, handleDragEnter, handleDragEnd, isSelected, onSelectToggle }: any) {
   const [hovered, setHovered] = useState(false);
@@ -124,7 +125,14 @@ export default function Home() {
 
   // 篩選與排序 State
   const [searchQuery, setSearchQuery] = useState("");
+  const [selectedTags, setSelectedTags] = useState<number[]>([]);
+  const [availableTags, setAvailableTags] = useState<Tag[]>([]);
   const [sortBy, setSortBy] = useState<"custom" | "upload_date">("custom");
+  const [gridColumns, setGridColumns] = useState<number>(0); // 0 代表預設/自動 RWD
+
+  // Pinch 手勢連續縮放觸控 Ref
+  const touchStartDistRef = useRef<number | null>(null);
+  const initialColumnsRef = useRef<number>(2);
 
   // Drag and drop state
   const dragItem = useRef<number | null>(null);
@@ -132,6 +140,62 @@ export default function Home() {
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [longPressIndex, setLongPressIndex] = useState<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // 雙指 Pinch 手勢即時連續縮放相簿網格大小 (手機觸控)
+  useEffect(() => {
+    const getDistance = (touches: TouchList) => {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      return Math.hypot(dx, dy);
+    };
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        if (e.cancelable) e.preventDefault();
+        touchStartDistRef.current = getDistance(e.touches);
+        const defaultCols = window.innerWidth <= 768 ? 2 : 3;
+        initialColumnsRef.current = gridColumns > 0 ? gridColumns : defaultCols;
+      }
+    };
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (e.touches.length >= 2) {
+        if (e.cancelable) e.preventDefault();
+      }
+
+      if (e.touches.length === 2 && touchStartDistRef.current && touchStartDistRef.current > 0) {
+        const currentDist = getDistance(e.touches);
+        const ratio = currentDist / touchStartDistRef.current;
+        const startCols = initialColumnsRef.current;
+        let deltaCols = 0;
+        
+        if (ratio < 1) {
+          // 兩指靠近（內縮）：欄數增加 (相簿卡片變小)
+          deltaCols = Math.floor((1 - ratio) / 0.22);
+        } else {
+          // 兩指遠離（拉開）：欄數減少 (相簿卡片變大)
+          deltaCols = -Math.floor((ratio - 1) / 0.22);
+        }
+
+        const calculatedCols = Math.min(5, Math.max(1, startCols + deltaCols));
+        setGridColumns(calculatedCols);
+      }
+    };
+
+    const handleTouchEnd = () => {
+      touchStartDistRef.current = null;
+    };
+
+    document.addEventListener("touchstart", handleTouchStart, { passive: false });
+    document.addEventListener("touchmove", handleTouchMove, { passive: false });
+    document.addEventListener("touchend", handleTouchEnd, { passive: true });
+
+    return () => {
+      document.removeEventListener("touchstart", handleTouchStart);
+      document.removeEventListener("touchmove", handleTouchMove);
+      document.removeEventListener("touchend", handleTouchEnd);
+    };
+  }, [gridColumns]);
 
   // 照片全站搜尋與大圖檢視 State
   const [allPhotos, setAllPhotos] = useState<Photo[]>([]);
@@ -145,12 +209,14 @@ export default function Home() {
 
   const loadData = async () => {
     setLoading(true);
-    const [albumsData, photosData] = await Promise.all([
+    const [albumsData, photosData, tagsData] = await Promise.all([
       fetchAlbums(),
-      fetchAllPhotos()
+      fetchAllPhotos(),
+      fetchTags()
     ]);
     setAlbums(albumsData || []);
     setAllPhotos(photosData || []);
+    setAvailableTags(tagsData || []);
     setLoading(false);
   };
 
@@ -173,17 +239,27 @@ export default function Home() {
     }
   }, []);
 
-  // 計算符合條件的全站照片
+  // 計算符合條件的全站照片 (搜尋關鍵字或選取標籤)
   const displayPhotos = useMemo(() => {
-    if (!searchQuery.trim()) return [];
-    const q = searchQuery.toLowerCase().trim();
+    if (!searchQuery.trim() && selectedTags.length === 0) return [];
+    
     return allPhotos.filter(photo => {
-      const matchTitle = photo.title?.toLowerCase().includes(q);
-      const matchDesc = photo.description?.toLowerCase().includes(q);
-      const matchTag = photo.tags?.some(t => t.name.toLowerCase().includes(q));
-      return matchTitle || matchDesc || matchTag;
+      // 標籤選單過濾 (照片需包含選取的任一標籤)
+      if (selectedTags.length > 0) {
+        if (!photo.tags?.some(t => selectedTags.includes(t.id))) return false;
+      }
+
+      // 搜尋關鍵字過濾
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase().trim();
+        const matchTitle = photo.title?.toLowerCase().includes(q);
+        const matchDesc = photo.description?.toLowerCase().includes(q);
+        if (!matchTitle && !matchDesc) return false;
+      }
+
+      return true;
     });
-  }, [allPhotos, searchQuery]);
+  }, [allPhotos, searchQuery, selectedTags]);
 
   // 時間軸標籤點 (照片模式)
   const timelineGroup = useMemo(() => {
@@ -264,41 +340,46 @@ export default function Home() {
     }
   };
 
-  // 計算經過篩選與排序的相簿 (包含：相簿名稱、相簿描述、或是底下照片包含匹配標籤/Story 的相簿)
+  // 計算經過篩選與排序的相簿 (包含：相簿名稱、相簿描述、或是底下照片包含 Story/標題 的相簿，若有選取標籤則過濾包含該標籤照片的相簿)
   const displayAlbums = useMemo(() => {
-    if (!searchQuery.trim()) {
-      return [...albums].sort((a, b) => {
-        if (sortBy === "custom") return a.sort_order - b.sort_order;
-        if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-        return 0;
+    let filtered = [...albums];
+
+    // 如果選取了標籤選單
+    if (selectedTags.length > 0) {
+      const taggedAlbumIds = new Set(
+        allPhotos
+          .filter(photo => photo.tags?.some(t => selectedTags.includes(t.id)))
+          .map(photo => photo.album_id)
+      );
+      filtered = filtered.filter(album => taggedAlbumIds.has(album.id));
+    }
+
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      const matchedAlbumIdsFromPhotos = new Set(
+        allPhotos
+          .filter(photo => {
+            const matchTitle = photo.title?.toLowerCase().includes(q);
+            const matchDesc = photo.description?.toLowerCase().includes(q);
+            return matchTitle || matchDesc;
+          })
+          .map(photo => photo.album_id)
+      );
+
+      filtered = filtered.filter(album => {
+        const matchAlbumName = album.name.toLowerCase().includes(q);
+        const matchAlbumDesc = album.description?.toLowerCase().includes(q);
+        const matchChildPhotos = matchedAlbumIdsFromPhotos.has(album.id);
+        return matchAlbumName || matchAlbumDesc || matchChildPhotos;
       });
     }
 
-    const q = searchQuery.toLowerCase().trim();
-
-    // 找出所有符合搜尋條件的照片所屬的 album_id
-    const matchedAlbumIdsFromPhotos = new Set(
-      allPhotos
-        .filter(photo => {
-          const matchTitle = photo.title?.toLowerCase().includes(q);
-          const matchDesc = photo.description?.toLowerCase().includes(q);
-          const matchTag = photo.tags?.some(t => t.name.toLowerCase().includes(q));
-          return matchTitle || matchDesc || matchTag;
-        })
-        .map(photo => photo.album_id)
-    );
-
-    return albums.filter(album => {
-      const matchAlbumName = album.name.toLowerCase().includes(q);
-      const matchAlbumDesc = album.description?.toLowerCase().includes(q);
-      const matchChildPhotos = matchedAlbumIdsFromPhotos.has(album.id);
-      return matchAlbumName || matchAlbumDesc || matchChildPhotos;
-    }).sort((a, b) => {
+    return filtered.sort((a, b) => {
       if (sortBy === "custom") return a.sort_order - b.sort_order;
       if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
       return 0;
     });
-  }, [albums, allPhotos, searchQuery, sortBy]);
+  }, [albums, allPhotos, searchQuery, selectedTags, sortBy]);
 
   const handleLogin = async () => {
     setIsSubmitting(true);
@@ -420,7 +501,7 @@ export default function Home() {
             <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
               <input 
                 type="text" 
-                placeholder="搜尋相簿、照片 Story 或標籤..." 
+                placeholder="搜尋相簿或照片 Story..." 
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
                 className={styles.searchInput}
@@ -446,10 +527,35 @@ export default function Home() {
                 </button>
               )}
             </div>
-            <select value={sortBy} onChange={e => setSortBy(e.target.value as any)} className={styles.select}>
-              <option value="custom">自訂排序 (可拖曳)</option>
-              <option value="upload_date">依建立日期 (新到舊)</option>
-            </select>
+
+            <CustomSelect
+              isMulti={true}
+              value={selectedTags}
+              onChange={(val) => setSelectedTags(val as number[])}
+              options={availableTags.map(t => ({ value: t.id, label: t.name }))}
+            />
+
+            <CustomSelect
+              value={sortBy}
+              onChange={(val) => setSortBy(val as any)}
+              options={[
+                { value: "custom", label: "自訂排序 (可拖曳)" },
+                { value: "upload_date", label: "依建立日期 (新到舊)" }
+              ]}
+            />
+
+            <CustomSelect
+              value={gridColumns || 0}
+              onChange={(val) => setGridColumns(Number(val))}
+              options={[
+                { value: 0, label: "縮圖版面: 自動" },
+                { value: 1, label: "縮圖版面: 1 欄 (大圖)" },
+                { value: 2, label: "縮圖版面: 2 欄 (雙排)" },
+                { value: 3, label: "縮圖版面: 3 欄 (精緻)" },
+                { value: 4, label: "縮圖版面: 4 欄 (多張)" },
+                { value: 5, label: "縮圖版面: 5 欄 (密集)" }
+              ]}
+            />
           </div>
           {!isCheckingAuth && (
             isAdmin ? (
@@ -491,8 +597,8 @@ export default function Home() {
 
       {loading ? (
         <div className={styles.loading}>載入中...</div>
-      ) : searchQuery.trim() ? (
-        /* 照片與相簿搜尋結果模式 */
+      ) : (searchQuery.trim() || selectedTags.length > 0) ? (
+        /* 照片與相簿分層搜尋/標籤篩選結果模式 */
         <div>
           {displayPhotos.length > 0 && (
             <div style={{ marginBottom: '40px' }}>
@@ -502,7 +608,9 @@ export default function Home() {
                   <circle cx="8.5" cy="8.5" r="1.5"></circle>
                   <polyline points="21 15 16 10 5 21"></polyline>
                 </svg>
-                照片搜尋結果 ({displayPhotos.length} 張)
+                {selectedTags.length > 0 && !searchQuery.trim()
+                  ? `標籤篩選照片 (${displayPhotos.length} 張)`
+                  : `照片搜尋結果 (${displayPhotos.length} 張)`}
               </h2>
               <div className={albumStyles.photoGrid}>
                 {displayPhotos.map((photo, index) => (
@@ -547,9 +655,14 @@ export default function Home() {
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
-                相簿搜尋結果 ({displayAlbums.length} 個)
+                {selectedTags.length > 0 && !searchQuery.trim()
+                  ? `包含標籤的相簿 (${displayAlbums.length} 個)`
+                  : `相簿搜尋結果 (${displayAlbums.length} 個)`}
               </h2>
-              <div className={styles.albumGrid}>
+              <div 
+                className={styles.albumGrid}
+                style={gridColumns > 0 ? { gridTemplateColumns: `repeat(${gridColumns}, 1fr)` } : undefined}
+              >
                 {displayAlbums.map((album, index) => (
                   <AlbumCardComponent 
                     key={album.id}
@@ -582,7 +695,10 @@ export default function Home() {
         </div>
       ) : (
         /* 預設相簿列表模式 */
-        <div className={styles.albumGrid}>
+        <div 
+          className={styles.albumGrid}
+          style={gridColumns > 0 ? { gridTemplateColumns: `repeat(${gridColumns}, 1fr)` } : undefined}
+        >
           {displayAlbums.map((album, index) => (
             <AlbumCardComponent 
               key={album.id}

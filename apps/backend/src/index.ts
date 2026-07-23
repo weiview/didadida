@@ -195,9 +195,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
         return new Response(JSON.stringify(photos), { headers });
       }
 
-      // 路由：取得所有標籤
+      // 路由：取得所有正在使用的標籤
       if (method === "GET" && pathname === "/api/tags") {
-        const { results } = await env.DB.prepare("SELECT * FROM Tag ORDER BY name ASC").all();
+        const { results } = await env.DB.prepare(`
+          SELECT DISTINCT t.* 
+          FROM Tag t 
+          INNER JOIN PhotoTag pt ON t.id = pt.tag_id 
+          ORDER BY t.name ASC
+        `).all();
         return new Response(JSON.stringify(results), { headers });
       }
 
@@ -302,6 +307,24 @@ if (method === "POST" && pathname === "/api/verify-password") {
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
+// 輔助函式：計算 ArrayBuffer 的 SHA-256 Hex 雜湊
+async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 輔助函式：計算 Hamming Distance 漢明距離 (用於比對 pHash)
+function hammingDistance(hex1: string, hex2: string): number {
+  if (!hex1 || !hex2 || hex1.length !== hex2.length) return 999;
+  let dist = 0;
+  for (let i = 0; i < hex1.length; i++) {
+    const val = parseInt(hex1[i], 16) ^ parseInt(hex2[i], 16);
+    dist += (val & 1) + ((val >> 1) & 1) + ((val >> 2) & 1) + ((val >> 3) & 1);
+  }
+  return dist;
+}
+
       // 路由：處理 R2 照片上傳
       if (method === "POST" && pathname === "/api/upload") {
         const formData = await request.formData();
@@ -310,6 +333,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const albumId = formData.get('album_id') as string;
         const exifData = formData.get('exif') as string || null;
         const takenAt = formData.get('taken_at') as string || null;
+        const clientPhash = formData.get('phash') as string || null;
         
         if (!file || !albumId) {
           return new Response(JSON.stringify({ error: "File and album_id are required" }), { status: 400, headers });
@@ -319,9 +343,12 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (!allowedTypes.includes(file.type.toLowerCase())) {
           return new Response(JSON.stringify({ error: "Invalid file type. Only images are allowed." }), { status: 400, headers });
         }
+
+        const buffer = await file.arrayBuffer();
+        const fileHash = await calculateFileHash(buffer);
         
         const fileName = `${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-        await env.BUCKET.put(fileName, file.stream(), {
+        await env.BUCKET.put(fileName, buffer, {
           httpMetadata: { contentType: file.type }
         });
         
@@ -338,10 +365,10 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const fileUrl = `${host}/api/photos/view/${encodeURIComponent(fileName)}`;
         
         await env.DB.prepare(
-          "INSERT INTO Photo (title, file_name, album_id, url, thumb_url, exif, taken_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        ).bind(file.name, fileName, albumId, fileUrl, thumbUrl, exifData, takenAt).run();
+          "INSERT INTO Photo (title, file_name, album_id, url, thumb_url, exif, taken_at, file_hash, phash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).bind(file.name, fileName, albumId, fileUrl, thumbUrl, exifData, takenAt, fileHash, clientPhash).run();
         
-        return new Response(JSON.stringify({ success: true, url: fileUrl, thumb_url: thumbUrl }), { headers });
+        return new Response(JSON.stringify({ success: true, url: fileUrl, thumb_url: thumbUrl, file_hash: fileHash }), { headers });
       }
 
       // 路由：更新照片資訊 (description, taken_at)
@@ -387,18 +414,28 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const photoId = parts[3];
         const tagId = parts[5];
         await env.DB.prepare("DELETE FROM PhotoTag WHERE photo_id = ? AND tag_id = ?").bind(photoId, tagId).run();
+        // 清理完全沒有任何照片使用的孤立標籤
+        await env.DB.prepare("DELETE FROM Tag WHERE id NOT IN (SELECT DISTINCT tag_id FROM PhotoTag)").run();
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
       // 路由：Google OAuth 登入跳轉
       if (method === "GET" && pathname === "/api/auth/google/login") {
         const urlObj = new URL(request.url);
-        const stateParam = urlObj.searchParams.get("state") || "";
-        const clientId = env.GOOGLE_CLIENT_ID;
+        const albumId = urlObj.searchParams.get("state") || "";
+        const referer = request.headers.get("referer") || request.headers.get("origin");
+        let redirectHost = "";
+        if (referer) {
+          try {
+            redirectHost = new URL(referer).origin;
+          } catch (e) {}
+        }
+        const combinedState = encodeURIComponent(JSON.stringify({ albumId, redirectHost }));
+        const clientId = env.GOOGLE_CLIENT_ID || "";
         const redirectUri = new URL(request.url).origin + "/api/auth/google/callback";
         const scope = "https://www.googleapis.com/auth/photospicker.mediaitems.readonly";
         
-        const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}&access_type=offline&prompt=consent&state=${stateParam}`;
+        const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}&access_type=offline&prompt=select_account&state=${combinedState}`;
         return Response.redirect(url, 302);
       }
 
@@ -406,27 +443,37 @@ if (method === "POST" && pathname === "/api/verify-password") {
       if (method === "GET" && pathname === "/api/auth/google/callback") {
         const urlObj = new URL(request.url);
         const code = urlObj.searchParams.get("code");
-        const state = urlObj.searchParams.get("state") || "";
+        const rawState = urlObj.searchParams.get("state") || "";
+        let albumId = rawState;
+        let redirectHost = "";
+        try {
+          const parsed = JSON.parse(decodeURIComponent(rawState));
+          if (parsed && typeof parsed === "object") {
+            albumId = parsed.albumId || "";
+            redirectHost = parsed.redirectHost || "";
+          }
+        } catch (e) {}
+
         if (!code) return new Response("Missing code", { status: 400 });
 
-        const clientId = env.GOOGLE_CLIENT_ID;
-        const clientSecret = env.GOOGLE_CLIENT_SECRET;
+        const clientId = env.GOOGLE_CLIENT_ID || "";
+        const clientSecret = env.GOOGLE_CLIENT_SECRET || "";
         const redirectUri = new URL(request.url).origin + "/api/auth/google/callback";
 
         const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body: new URLSearchParams({
-            client_id: clientId || "",
-            client_secret: clientSecret || "",
-            code: code,
+            code,
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uri: redirectUri,
             grant_type: "authorization_code",
-            redirect_uri: redirectUri
-          }).toString()
+          }),
         });
-        
-        const tokenData = await tokenRes.json() as any;
-        
+
+        const tokenData: any = await tokenRes.json();
+
         if (!tokenData.access_token) {
           return new Response(`
             <html><body>
@@ -437,9 +484,13 @@ if (method === "POST" && pathname === "/api/verify-password") {
           `, { headers: { "Content-Type": "text/html" } });
         }
         
-        const isLocal = urlObj.hostname.includes("localhost") || urlObj.hostname.includes("127.0.0.1");
-        const baseFrontEndUrl = isLocal ? "http://localhost:3000" : "https://didadida-frontend.pages.dev";
-        const finalUrl = state ? `${baseFrontEndUrl}/album?id=${state}&googleToken=${tokenData.access_token}` : `${baseFrontEndUrl}/?googleToken=${tokenData.access_token}`;
+        // 優先使用傳過來的 redirectHost
+        let baseFrontEndUrl = redirectHost || "https://didadida-frontend.pages.dev";
+        if (!redirectHost && (urlObj.hostname.includes("localhost") || urlObj.hostname.includes("127.0.0.1"))) {
+          baseFrontEndUrl = "http://localhost:3000";
+        }
+        
+        const finalUrl = albumId ? `${baseFrontEndUrl}/album?id=${albumId}&googleToken=${tokenData.access_token}` : `${baseFrontEndUrl}/?googleToken=${tokenData.access_token}`;
         
         return Response.redirect(finalUrl, 302);
       }
@@ -491,16 +542,21 @@ if (method === "POST" && pathname === "/api/verify-password") {
         });
         const statusData = await statusRes.json() as any;
         
-        if (!statusData.mediaItemsSet) {
-          return new Response(JSON.stringify({ ready: false }), { headers });
+        // Google Photospicker API: 當使用者點擊「完成/選擇」後，mediaItemsSet 會變為 true
+        const isReady = statusData.mediaItemsSet === true || statusData.mediaItemsSet === "true";
+        
+        if (!isReady) {
+          return new Response(JSON.stringify({ ready: false, statusData }), { headers });
         }
         
         // 2. 如果使用者選完了，就去抓照片清單
         const itemsRes = await fetch(`https://photospicker.googleapis.com/v1/mediaItems?sessionId=${sessionId}`, {
           headers: { Authorization: `Bearer ${googleToken}` }
         });
-        const itemsData = await itemsRes.json();
-        return new Response(JSON.stringify({ ready: true, mediaItems: itemsData.mediaItems || [] }), { headers });
+        const itemsData = await itemsRes.json() as any;
+        const mediaItems = itemsData.mediaItems || [];
+        
+        return new Response(JSON.stringify({ ready: true, mediaItems, itemsData, statusData }), { headers });
       }
 
       // 路由：從 Google 相簿抓照片
@@ -527,7 +583,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
       // 路由：同步 Google 照片到 R2
       if (method === "POST" && pathname === "/api/google/sync-photo") {
         const body = await request.json() as any;
-        const { targetAlbumId, googlePhotoUrl, filename, creationTime, exif } = body;
+        const { targetAlbumId, googlePhotoUrl, filename, creationTime, exif, clientPhash } = body;
         
         const googleToken = request.headers.get("X-Google-Token");
         
@@ -536,16 +592,26 @@ if (method === "POST" && pathname === "/api/verify-password") {
           return new Response(JSON.stringify({ error: "Missing googlePhotoUrl" }), { status: 400, headers });
         }
         
-        // 取得照片原始檔案 (Picker API 的 baseUrl 加上 =d 來下載原始解析度，而且必須帶有 Authorization token)
-        const fetchPhotoRes = await fetch(googlePhotoUrl + "=d", {
+        // 取得照片原始檔案 (Picker API 的 baseUrl 加上 =d 來下載原始解析度)
+        let downloadUrl = googlePhotoUrl;
+        if (!downloadUrl.includes("=")) {
+          downloadUrl += "=d";
+        }
+        let fetchPhotoRes = await fetch(downloadUrl, {
           headers: {
             "Authorization": `Bearer ${googleToken}`
           }
         });
+
+        // 如果帶 Token 失敗 (部分 Picker API baseUrl 不需要 Bearer Token)，則嘗試直接 fetch
+        if (!fetchPhotoRes.ok) {
+          fetchPhotoRes = await fetch(downloadUrl);
+        }
+
         if (!fetchPhotoRes.ok) {
           const errText = await fetchPhotoRes.text();
           console.error("下載照片失敗:", fetchPhotoRes.status, errText);
-          return new Response(JSON.stringify({ error: "Download failed" }), { status: 500, headers });
+          return new Response(JSON.stringify({ error: "Download failed", details: errText }), { status: 500, headers });
         }
         
         // 嘗試從 Content-Disposition 抓取 Google 給的原始檔名
@@ -562,14 +628,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const baseName = baseNameMatch ? baseNameMatch[1] : finalTitle;
         const ext = baseNameMatch ? baseNameMatch[2] : "";
         
-        // 檢查是否已存在同名檔案 (包含 _new 後綴)
-        const existingPhotosResult = await env.DB.prepare(
-          "SELECT * FROM Photo WHERE album_id = ? AND (title = ? OR title LIKE ?)"
-        ).bind(targetAlbumId, finalTitle, `${baseName}_new%${ext}`).all();
-        
-        const existingPhotos = existingPhotosResult.results;
-        
         const arrayBuffer = await fetchPhotoRes.arrayBuffer();
+        const fileHash = await calculateFileHash(arrayBuffer);
         
         let parsedExif = exif;
         let finalTakenAt = creationTime;
@@ -594,6 +654,34 @@ if (method === "POST" && pathname === "/api/verify-password") {
           console.error("Exif parsing error in backend", err);
         }
 
+        // 多層檢測重複照片 (按優先度：1. 精確 Hash 2. EXIF 拍攝時間 3. pHash 視覺特徵 4. 檔名)
+        const candidates = await env.DB.prepare(
+          "SELECT * FROM Photo WHERE album_id = ?"
+        ).bind(targetAlbumId).all();
+
+        const existingPhotosMap = new Map<number, any>();
+
+        for (const p of candidates.results as any[]) {
+          // Layer 1: SHA-256 檔案完全相同
+          if (p.file_hash && p.file_hash === fileHash) {
+            existingPhotosMap.set(p.id, p);
+          }
+          // Layer 2: EXIF 拍攝時間完全一致
+          else if (finalTakenAt && p.taken_at && new Date(p.taken_at).getTime() === new Date(finalTakenAt).getTime()) {
+            existingPhotosMap.set(p.id, p);
+          }
+          // Layer 3: pHash 視覺相似 (漢明距離 <= 8 視為同一張圖)
+          else if (clientPhash && p.phash && hammingDistance(clientPhash, p.phash) <= 8) {
+            existingPhotosMap.set(p.id, p);
+          }
+          // Layer 4: 檔名完全相同或含 _new 後綴
+          else if (p.title === finalTitle || p.title.startsWith(`${baseName}_new`)) {
+            existingPhotosMap.set(p.id, p);
+          }
+        }
+
+        const existingPhotos = Array.from(existingPhotosMap.values());
+
         const finalFileName = `${Date.now()}_${finalTitle.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
         await env.BUCKET.put(finalFileName, arrayBuffer, {
           httpMetadata: { contentType: "image/jpeg" }
@@ -609,7 +697,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
           album_id: targetAlbumId,
           url: fileUrl,
           taken_at: finalTakenAt || new Date().toISOString(),
-          exif: finalExif
+          exif: finalExif,
+          file_hash: fileHash,
+          phash: clientPhash || null
         };
 
         if (existingPhotos && existingPhotos.length > 0) {
@@ -617,8 +707,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }
         
         await env.DB.prepare(
-          "INSERT INTO Photo (title, file_name, album_id, url, taken_at, exif) VALUES (?, ?, ?, ?, ?, ?)"
-        ).bind(tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url, tempPhoto.taken_at, tempPhoto.exif).run();
+          "INSERT INTO Photo (title, file_name, album_id, url, taken_at, exif, file_hash, phash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        ).bind(tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url, tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash, tempPhoto.phash).run();
         
         return new Response(JSON.stringify({ success: true, url: fileUrl }), { headers });
       }
@@ -651,8 +741,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
           }
           // 新增新檔案
           await env.DB.prepare(
-            "INSERT INTO Photo (title, file_name, album_id, url, taken_at, exif) VALUES (?, ?, ?, ?, ?, ?)"
-          ).bind(tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url, tempPhoto.taken_at, tempPhoto.exif).run();
+            "INSERT INTO Photo (title, file_name, album_id, url, taken_at, exif, file_hash, phash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          ).bind(tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url, tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash || null, tempPhoto.phash || null).run();
         } else if (decision === "keep_both") {
           // 修改標題避免混淆
           const count = existingPhotos ? existingPhotos.length : 1;

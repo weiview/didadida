@@ -27,10 +27,15 @@ CREATE TABLE IF NOT EXISTS Photo (
   taken_at DATETIME,
   sort_order INTEGER DEFAULT 0,
   exif TEXT,
+  file_hash TEXT,
+  phash TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   url TEXT,
   FOREIGN KEY (album_id) REFERENCES Album(id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_photo_file_hash ON Photo(file_hash);
+CREATE INDEX IF NOT EXISTS idx_photo_phash ON Photo(phash);
 
 -- Tag Table
 CREATE TABLE IF NOT EXISTS Tag (
