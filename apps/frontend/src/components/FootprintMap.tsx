@@ -133,6 +133,7 @@ export default function FootprintMap({ points, height = 520, styleUrl, onSelectP
           'circle-color': [
             'match', ['get', 'geo_source'],
             'exif', '#2563eb',
+            'timeline', '#0891b2',
             'interpolated', '#2563eb',
             'manual', '#ffffff',
             '#94a3b8',
@@ -140,6 +141,7 @@ export default function FootprintMap({ points, height = 520, styleUrl, onSelectP
           'circle-opacity': [
             'match', ['get', 'geo_source'],
             'exif', 1,
+            'timeline', 1,
             'interpolated', 0.45,
             'manual', 1,
             0.6,
@@ -353,6 +355,7 @@ export default function FootprintMap({ points, height = 520, styleUrl, onSelectP
                 </div>
                 <div style={{ color: '#64748b' }}>
                   {shortTime(current.local_time)}
+                  {current.geo_source === 'timeline' && '（Google 時間軸）'}
                   {current.geo_source === 'interpolated' && '（推估位置）'}
                   {current.geo_source === 'manual' && '（手動指定）'}
                 </div>

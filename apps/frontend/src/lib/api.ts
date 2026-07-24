@@ -51,8 +51,8 @@ export interface Photo {
   geo_private?: number;
 }
 
-/** null 代表尚未定位 */
-export type GeoSource = 'exif' | 'interpolated' | 'manual' | null;
+/** null 代表尚未定位。'timeline' 來自 Google 時間軸比對 */
+export type GeoSource = 'exif' | 'timeline' | 'interpolated' | 'manual' | null;
 
 export interface FootprintPoint {
   id: number;
@@ -664,5 +664,27 @@ export async function searchPlace(query: string): Promise<{ name: string; lat: n
   } catch (err) {
     console.error(err);
     return [];
+  }
+}
+
+/**
+ * 寫入由 Google 時間軸比對出來的位置。
+ * 只送出比對結果，原始的 Timeline.json 不會離開瀏覽器。
+ */
+export async function applyTimelineMatches(
+  matches: { photoId: number; lat: number; lng: number; placeName?: string; tzOffsetMinutes?: number }[],
+  overwriteExif = false,
+): Promise<{ updated: number; invalid: number; skipped: number } | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/from-timeline`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ matches, overwriteExif }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
   }
 }
