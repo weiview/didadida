@@ -25,6 +25,13 @@ out/
 # wrangler / cloudflare
 .wrangler/
 .mf/
+.dev.vars
+.dev.vars.*
+
+# 非 .local 結尾的 env 檔也要擋，這些同樣含機密
+.env.development
+.env.test
+.env.production
 
 # vercel
 .vercel
