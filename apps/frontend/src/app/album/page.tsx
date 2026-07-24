@@ -7,6 +7,7 @@ import Link from "next/link";
 import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbums, deletePhoto, verifyLogin, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict } from "@/lib/api";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
+import AssignPlaceModal from "@/components/AssignPlaceModal";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
@@ -30,6 +31,9 @@ function AlbumContent() {
 
   // 批次刪除 State
   const [selectedPhotos, setSelectedPhotos] = useState<number[]>([]);
+  const [showAssignPlace, setShowAssignPlace] = useState(false);
+  // Shift 連選的錨點（顯示順序上的 index）
+  const lastSelectedIndexRef = useRef<number | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isBatchDeleting, setIsBatchDeleting] = useState(false);
   const [isEditingPhotos, setIsEditingPhotos] = useState(false);
@@ -487,6 +491,23 @@ function AlbumContent() {
       console.error(err);
       setSyncingGoogle(false);
     }
+  };
+
+  // Shift 連選：點第一張，再按住 Shift 點最後一張，中間整段一起選起來。
+  // 注意這是「顯示順序」上的連續區間，不一定等於拍攝時間上的連續 ——
+  // 指定地點時 AssignPlaceModal 會把推導出的時間範圍攤開來讓使用者確認。
+  const handlePhotoSelectClick = (index: number, photoId: number, shiftKey: boolean) => {
+    if (shiftKey && lastSelectedIndexRef.current !== null) {
+      const start = Math.min(lastSelectedIndexRef.current, index);
+      const end = Math.max(lastSelectedIndexRef.current, index);
+      const rangeIds = displayPhotos.slice(start, end + 1).map((p: any) => p.id);
+      setSelectedPhotos(prev => Array.from(new Set([...prev, ...rangeIds])));
+    } else {
+      setSelectedPhotos(prev =>
+        prev.includes(photoId) ? prev.filter(id => id !== photoId) : [...prev, photoId]
+      );
+    }
+    lastSelectedIndexRef.current = index;
   };
 
   const handleBatchDeletePhotos = async () => {
@@ -1095,15 +1116,16 @@ function AlbumContent() {
             >
               {isAdmin && isEditingPhotos && (
                 <>
-                  <input 
+                  <input
                     type="checkbox"
                     checked={selectedPhotos.includes(photo.id)}
-                    onChange={(e) => {
+                    // 勾選狀態一律由 onClick 處理，才拿得到 shiftKey；
+                    // onChange 保留空實作以避免 React 對受控 input 發出警告
+                    onChange={() => {}}
+                    onClick={(e) => {
                       e.stopPropagation();
-                      if (e.target.checked) setSelectedPhotos(prev => [...prev, photo.id]);
-                      else setSelectedPhotos(prev => prev.filter(id => id !== photo.id));
+                      handlePhotoSelectClick(index, photo.id, e.shiftKey);
                     }}
-                    onClick={e => e.stopPropagation()}
                     style={{ position: 'absolute', top: '10px', left: '10px', width: '20px', height: '20px', zIndex: 10, cursor: 'pointer' }}
                   />
                   <div style={{
@@ -1211,6 +1233,15 @@ function AlbumContent() {
           </button>
           
           <button
+            className={pageStyles.actionButton}
+            onClick={() => setShowAssignPlace(true)}
+            disabled={selectedPhotos.length === 0}
+            style={{ opacity: selectedPhotos.length === 0 ? 0.5 : 1 }}
+          >
+            📍 指定地點
+          </button>
+
+          <button
             className={`${pageStyles.actionButton} ${selectedPhotos.length > 0 ? pageStyles.danger : ''}`}
             onClick={() => setShowDeleteConfirm(true)}
             disabled={selectedPhotos.length === 0 || isBatchDeleting}
@@ -1228,6 +1259,20 @@ function AlbumContent() {
         message={`確定要刪除選取的 ${selectedPhotos.length} 張照片嗎？此動作無法復原。`}
         onConfirm={handleBatchDeletePhotos}
         onCancel={() => setShowDeleteConfirm(false)}
+      />
+
+      <AssignPlaceModal
+        isOpen={showAssignPlace}
+        photoIds={selectedPhotos}
+        albumId={id ? Number(id) : undefined}
+        onClose={() => setShowAssignPlace(false)}
+        onDone={({ updated, skippedExif }) => {
+          setSelectedPhotos([]);
+          lastSelectedIndexRef.current = null;
+          loadData();
+          const skipped = skippedExif > 0 ? `，${skippedExif} 張已有 GPS 未覆蓋` : '';
+          alert(`已為 ${updated} 張照片指定地點${skipped}`);
+        }}
       />
 
       <GoogleSyncConflictModal

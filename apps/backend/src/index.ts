@@ -1,4 +1,5 @@
 import exifr from 'exifr';
+import { normalizeGeo, formatWallClock, wallClockFromUtc } from './geo';
 
 export interface Env {
   DB: D1Database;
@@ -48,6 +49,42 @@ async function isAuthorized(request: Request, env: Env): Promise<boolean> {
   const token = authHeader.replace("Bearer ", "");
   if (token === env.APP_PASSWORD) return true; // Backward compatibility
   return await verifyJWT(token, env);
+}
+
+/**
+ * 移除不該對外曝光的座標。
+ *
+ * 注意：所有 GET 路由都是公開的（只有 POST/PUT/DELETE 需要驗證），所以座標必須在
+ * 後端就拿掉 —— 只在前端不繪製地圖是無效的，按 F12 就能從 JSON 看到經緯度。
+ * 相簿層級 (map_private) 或照片層級 (geo_private) 任一為私密，就不輸出座標。
+ *
+ * 傳入的 row 需含 map_private 欄位（由 JOIN Album 帶入），輸出時會移除該欄位。
+ */
+function applyGeoPrivacy(rows: any[], isAdmin: boolean): any[] {
+  return rows.map((row) => {
+    const { map_private, ...rest } = row;
+    if (isAdmin) return rest;
+    const visible = Number(map_private) === 0 && Number(rest.geo_private) === 0;
+    if (visible) return rest;
+    return { ...rest, lat: null, lng: null, place_name: null, geo_source: null };
+  });
+}
+
+/**
+ * 取得照片的「當地牆上時間」，統一成 'YYYY-MM-DD HH:MM:SS'。
+ * 新資料直接用 taken_at_local；舊資料沒有這欄，就把 taken_at 的 ISO 格式
+ * ('2026-03-01T09:30:00.000Z') 截到秒並把 T 換成空白，才能跟行程段做字串比對。
+ * 使用此常數的 SQL 必須把 Photo 表別名為 p。
+ */
+const LOCAL_TIME_EXPR =
+  "COALESCE(p.taken_at_local, REPLACE(SUBSTR(p.taken_at, 1, 19), 'T', ' '))";
+
+/** 座標合法性檢查 —— 手動輸入與 API 傳入都要過這關 */
+function isValidLatLng(lat: unknown, lng: unknown): boolean {
+  return (
+    typeof lat === 'number' && Number.isFinite(lat) && Math.abs(lat) <= 90 &&
+    typeof lng === 'number' && Number.isFinite(lng) && Math.abs(lng) <= 180
+  );
 }
 
 // Rate Limiting (In-memory)
@@ -170,10 +207,15 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const parts = pathname.split("/");
         const albumId = parts[3];
         
-        const { results: photos } = await env.DB.prepare(
-          "SELECT * FROM Photo WHERE album_id = ? ORDER BY sort_order ASC, created_at DESC"
-        ).bind(albumId).all();
-        
+        const { results: rawPhotos } = await env.DB.prepare(`
+          SELECT p.*, a.map_private
+          FROM Photo p
+          LEFT JOIN Album a ON a.id = p.album_id
+          WHERE p.album_id = ?
+          ORDER BY p.sort_order ASC, p.created_at DESC
+        `).bind(albumId).all();
+        const photos = applyGeoPrivacy(rawPhotos as any[], await isAuthorized(request, env));
+
         // 取得這些照片的標籤
         if (photos.length > 0) {
           const tagsQuery = `
@@ -208,12 +250,13 @@ if (method === "POST" && pathname === "/api/verify-password") {
 
       // 路由：取得全站所有照片 (含 Tags 與 所屬相簿名稱)
       if (method === "GET" && pathname === "/api/all-photos") {
-        const { results: photos } = await env.DB.prepare(`
-          SELECT p.*, a.name as album_name 
-          FROM Photo p 
-          LEFT JOIN Album a ON p.album_id = a.id 
+        const { results: rawAllPhotos } = await env.DB.prepare(`
+          SELECT p.*, a.name as album_name, a.map_private
+          FROM Photo p
+          LEFT JOIN Album a ON p.album_id = a.id
           ORDER BY p.taken_at DESC, p.created_at DESC
         `).all();
+        const photos = applyGeoPrivacy(rawAllPhotos as any[], await isAuthorized(request, env));
 
         if (photos.length > 0) {
           const { results: tags } = await env.DB.prepare(`
@@ -363,11 +406,28 @@ function hammingDistance(hex1: string, hex2: string): number {
         
         const host = new URL(request.url).origin;
         const fileUrl = `${host}/api/photos/view/${encodeURIComponent(fileName)}`;
-        
+
+        // 由 EXIF 推導座標與時區。前端送來的 exif 已把時間欄位保留為原始字串，
+        // 這裡才能還原出未經時區位移的牆上時間。
+        let parsedForGeo: any = null;
+        try {
+          parsedForGeo = exifData ? JSON.parse(exifData) : null;
+        } catch (e) {
+          console.warn("上傳的 exif 不是合法 JSON，略過地理正規化:", e);
+        }
+        const geo = normalizeGeo(parsedForGeo, takenAt);
+
         await env.DB.prepare(
-          "INSERT INTO Photo (title, file_name, album_id, url, thumb_url, exif, taken_at, file_hash, phash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ).bind(file.name, fileName, albumId, fileUrl, thumbUrl, exifData, takenAt, fileHash, clientPhash).run();
-        
+          `INSERT INTO Photo
+             (title, file_name, album_id, url, thumb_url, exif, taken_at, file_hash, phash,
+              lat, lng, geo_source, taken_at_local, tz_offset_minutes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          file.name, fileName, albumId, fileUrl, thumbUrl, exifData,
+          geo.takenAtUtc || takenAt, fileHash, clientPhash,
+          geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
+        ).run();
+
         return new Response(JSON.stringify({ success: true, url: fileUrl, thumb_url: thumbUrl, file_hash: fileHash }), { headers });
       }
 
@@ -651,15 +711,21 @@ function hammingDistance(hex1: string, hex2: string): number {
               latitude: rawExif.latitude ?? (exif ? exif.latitude : undefined),
               longitude: rawExif.longitude ?? (exif ? exif.longitude : undefined),
               GPSAltitude: rawExif.GPSAltitude ?? (exif ? exif.GPSAltitude : undefined),
-              OffsetTimeOriginal: rawExif.OffsetTimeOriginal || (exif ? exif.OffsetTimeOriginal : undefined)
+              // Google 的 =d 下載保留非位置類 EXIF，所以 OffsetTimeOriginal 通常還在，
+              // 這批照片的時區反而能準確還原
+              OffsetTimeOriginal: rawExif.OffsetTimeOriginal || (exif ? exif.OffsetTimeOriginal : undefined),
+              GPSDateStamp: rawExif.GPSDateStamp || (exif ? exif.GPSDateStamp : undefined),
+              GPSTimeStamp: rawExif.GPSTimeStamp || (exif ? exif.GPSTimeStamp : undefined)
             };
-            if (rawExif.DateTimeOriginal) {
-              finalTakenAt = new Date(rawExif.DateTimeOriginal).toISOString();
-            }
           }
         } catch (err) {
           console.error("Exif parsing error in backend", err);
         }
+
+        // Workers 執行環境的時區固定為 UTC，exifr revive 出來的 Date 其 UTC 欄位
+        // 即為原始牆上時間，normalizeGeo 內部以 UTC getter 取值，不會二次位移。
+        const syncGeo = normalizeGeo(parsedExif, creationTime);
+        if (syncGeo.takenAtUtc) finalTakenAt = syncGeo.takenAtUtc;
 
         // 多層檢測重複照片 (按優先度：1. 精確 Hash 2. EXIF 拍攝時間 3. pHash 視覺特徵 4. 檔名)
         const candidates = await env.DB.prepare(
@@ -706,17 +772,30 @@ function hammingDistance(hex1: string, hex2: string): number {
           taken_at: finalTakenAt || new Date().toISOString(),
           exif: finalExif,
           file_hash: fileHash,
-          phash: clientPhash || null
+          phash: clientPhash || null,
+          lat: syncGeo.lat,
+          lng: syncGeo.lng,
+          geo_source: syncGeo.geoSource,
+          taken_at_local: syncGeo.takenAtLocal,
+          tz_offset_minutes: syncGeo.tzOffsetMinutes
         };
 
         if (existingPhotos && existingPhotos.length > 0) {
           return new Response(JSON.stringify({ conflict: true, existingPhotos, tempPhoto }), { headers });
         }
-        
+
         await env.DB.prepare(
-          "INSERT INTO Photo (title, file_name, album_id, url, taken_at, exif, file_hash, phash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        ).bind(tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url, tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash, tempPhoto.phash).run();
-        
+          `INSERT INTO Photo
+             (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
+              lat, lng, geo_source, taken_at_local, tz_offset_minutes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
+          tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash, tempPhoto.phash,
+          tempPhoto.lat, tempPhoto.lng, tempPhoto.geo_source,
+          tempPhoto.taken_at_local, tempPhoto.tz_offset_minutes,
+        ).run();
+
         return new Response(JSON.stringify({ success: true, url: fileUrl }), { headers });
       }
 
@@ -724,7 +803,14 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "POST" && pathname === "/api/google/resolve-conflict") {
         const body = await request.json() as any;
         const { decision, existingPhotos, tempPhoto, replacePhotoIds } = body;
-        
+
+        // tempPhoto 是由前端原樣送回來的，座標不能照單全收
+        const tpLat = isValidLatLng(tempPhoto?.lat, tempPhoto?.lng) ? tempPhoto.lat : null;
+        const tpLng = tpLat === null ? null : tempPhoto.lng;
+        const tpGeoSource = tpLat === null ? null : (tempPhoto.geo_source ?? null);
+        const tpLocal = typeof tempPhoto?.taken_at_local === 'string' ? tempPhoto.taken_at_local : null;
+        const tpTz = Number.isFinite(tempPhoto?.tz_offset_minutes) ? tempPhoto.tz_offset_minutes : null;
+
         if (decision === "skip") {
           // 刪除暫存在 R2 的新檔案
           await env.BUCKET.delete(tempPhoto.file_name);
@@ -748,17 +834,338 @@ function hammingDistance(hex1: string, hex2: string): number {
           }
           // 新增新檔案
           await env.DB.prepare(
-            "INSERT INTO Photo (title, file_name, album_id, url, taken_at, exif, file_hash, phash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          ).bind(tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url, tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash || null, tempPhoto.phash || null).run();
+            `INSERT INTO Photo
+               (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
+                lat, lng, geo_source, taken_at_local, tz_offset_minutes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
+            tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash || null, tempPhoto.phash || null,
+            tpLat, tpLng, tpGeoSource, tpLocal, tpTz,
+          ).run();
         } else if (decision === "keep_both") {
           // 修改標題避免混淆
           const count = existingPhotos ? existingPhotos.length : 1;
           const newTitle = tempPhoto.title.replace(/(\.[^.]+)$/, `_new_${count}$1`);
           await env.DB.prepare(
-            "INSERT INTO Photo (title, file_name, album_id, url, taken_at, exif) VALUES (?, ?, ?, ?, ?, ?)"
-          ).bind(newTitle, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url, tempPhoto.taken_at, tempPhoto.exif).run();
+            `INSERT INTO Photo
+               (title, file_name, album_id, url, taken_at, exif,
+                lat, lng, geo_source, taken_at_local, tz_offset_minutes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            newTitle, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
+            tempPhoto.taken_at, tempPhoto.exif,
+            tpLat, tpLng, tpGeoSource, tpLocal, tpTz,
+          ).run();
         }
         return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      // ===== 足跡地圖 =====
+
+      // 路由：取得足跡點位
+      // 時間篩選一律用當地牆上時間 —— 使用者說「3/1 我在京都」指的是當地時間。
+      // 舊資料若無 taken_at_local，就把 taken_at 的 ISO 格式轉成同樣格式再比對。
+      if (method === "GET" && pathname === "/api/footprint") {
+        const isAdmin = await isAuthorized(request, env);
+        const conds = ["p.lat IS NOT NULL", "p.lng IS NOT NULL"];
+        const binds: any[] = [];
+
+        // 非管理者只看得到雙層隱私都放行的照片
+        if (!isAdmin) conds.push("a.map_private = 0", "p.geo_private = 0");
+
+        const qAlbum = url.searchParams.get("album_id");
+        if (qAlbum) { conds.push("p.album_id = ?"); binds.push(qAlbum); }
+        const qFrom = url.searchParams.get("from");
+        if (qFrom) { conds.push(`${LOCAL_TIME_EXPR} >= ?`); binds.push(qFrom); }
+        const qTo = url.searchParams.get("to");
+        if (qTo) { conds.push(`${LOCAL_TIME_EXPR} <= ?`); binds.push(qTo); }
+
+        const { results } = await env.DB.prepare(`
+          SELECT p.id, p.title, p.album_id, a.name AS album_name,
+                 COALESCE(p.thumb_url, p.url) AS url,
+                 p.lat, p.lng, p.place_name, p.geo_source,
+                 ${LOCAL_TIME_EXPR} AS local_time
+          FROM Photo p
+          LEFT JOIN Album a ON a.id = p.album_id
+          WHERE ${conds.join(" AND ")}
+          ORDER BY local_time ASC
+        `).bind(...binds).all();
+
+        return new Response(JSON.stringify(results), { headers });
+      }
+
+      // 路由：列出行程段（會直接暴露地點，僅管理者可讀）
+      if (method === "GET" && pathname === "/api/trip-segments") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const qAlbum = url.searchParams.get("album_id");
+        const { results } = qAlbum
+          ? await env.DB.prepare(
+              "SELECT * FROM TripSegment WHERE album_id = ? OR album_id IS NULL ORDER BY start_local ASC"
+            ).bind(qAlbum).all()
+          : await env.DB.prepare("SELECT * FROM TripSegment ORDER BY start_local ASC").all();
+        return new Response(JSON.stringify(results), { headers });
+      }
+
+      // 路由：預覽批次指定地點的影響範圍
+      // 這支專門處理「顯示順序 != 時間順序」的陷阱：使用者 shift 連選的是顯示順序上的
+      // 連續區間，但推導出的時間區段可能涵蓋到其他未被選取的照片。先讓使用者看清楚再決定。
+      if (method === "POST" && pathname === "/api/photos/geo/preview") {
+        const body: any = await request.json();
+        const ids: number[] = Array.isArray(body?.photoIds) ? body.photoIds.map(Number).filter(Number.isFinite) : [];
+        if (ids.length === 0) {
+          return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
+        }
+
+        const ph = ids.map(() => "?").join(",");
+        const { results: sel } = await env.DB.prepare(`
+          SELECT p.id, p.album_id, p.geo_source, ${LOCAL_TIME_EXPR} AS local_time
+          FROM Photo p WHERE p.id IN (${ph})
+        `).bind(...ids).all();
+
+        const times = (sel as any[]).map(r => r.local_time).filter(Boolean).sort();
+        const startLocal = times[0] ?? null;
+        const endLocal = times[times.length - 1] ?? null;
+        const withExif = (sel as any[]).filter(r => r.geo_source === 'exif').length;
+        const albumIds = Array.from(new Set((sel as any[]).map(r => r.album_id)));
+
+        // 落在同一時間範圍、同相簿，卻沒被選到的照片
+        let alsoInRange: any[] = [];
+        if (startLocal && endLocal && albumIds.length > 0) {
+          const aph = albumIds.map(() => "?").join(",");
+          const { results } = await env.DB.prepare(`
+            SELECT p.id, p.title, COALESCE(p.thumb_url, p.url) AS url, ${LOCAL_TIME_EXPR} AS local_time
+            FROM Photo p
+            WHERE p.album_id IN (${aph})
+              AND p.id NOT IN (${ph})
+              AND ${LOCAL_TIME_EXPR} BETWEEN ? AND ?
+            ORDER BY local_time ASC
+          `).bind(...albumIds, ...ids, startLocal, endLocal).all();
+          alsoInRange = results as any[];
+        }
+
+        return new Response(JSON.stringify({
+          selectedCount: sel.length,
+          startLocal,
+          endLocal,
+          missingTimeCount: sel.length - times.length,
+          existingExifCount: withExif,
+          alsoInRange,
+        }), { headers });
+      }
+
+      // 路由：批次指定地點
+      // 同時寫入照片層級座標（事實）與選擇性建立 TripSegment（規則）。
+      // 預設不覆蓋 geo_source='exif' 的照片 —— 照片自帶的 GPS 比手動指定可信。
+      if (method === "POST" && pathname === "/api/photos/geo/batch") {
+        const body: any = await request.json();
+        const ids: number[] = Array.isArray(body?.photoIds) ? body.photoIds.map(Number).filter(Number.isFinite) : [];
+        const { lat, lng } = body || {};
+
+        if (ids.length === 0) {
+          return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
+        }
+        if (!isValidLatLng(lat, lng)) {
+          return new Response(JSON.stringify({ error: "Invalid lat/lng" }), { status: 400, headers });
+        }
+
+        const placeName = typeof body.placeName === 'string' ? body.placeName : null;
+        const overwriteExif = body.overwriteExif === true;
+
+        const ph = ids.map(() => "?").join(",");
+        const guard = overwriteExif ? "" : " AND (geo_source IS NULL OR geo_source != 'exif')";
+        const upd = await env.DB.prepare(`
+          UPDATE Photo SET lat = ?, lng = ?, place_name = ?, geo_source = 'manual'
+          WHERE id IN (${ph})${guard}
+        `).bind(lat, lng, placeName, ...ids).run();
+
+        // 推導時間區段
+        const { results: sel } = await env.DB.prepare(`
+          SELECT ${LOCAL_TIME_EXPR} AS local_time FROM Photo p WHERE p.id IN (${ph})
+        `).bind(...ids).all();
+        const times = (sel as any[]).map(r => r.local_time).filter(Boolean).sort();
+        const startLocal = times[0] ?? null;
+        const endLocal = times[times.length - 1] ?? null;
+
+        let segmentId: number | null = null;
+        if (body.createSegment === true && startLocal && endLocal) {
+          const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : (placeName || '未命名地點');
+          const tz = Number.isFinite(body.tzOffsetMinutes) ? body.tzOffsetMinutes : null;
+          const albumId = Number.isFinite(body.albumId) ? body.albumId : null;
+          const res = await env.DB.prepare(`
+            INSERT INTO TripSegment (album_id, label, start_local, end_local, lat, lng, place_name, tz_offset_minutes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(albumId, label, startLocal, endLocal, lat, lng, placeName, tz).run();
+          segmentId = (res.meta as any)?.last_row_id ?? null;
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          updated: (upd.meta as any)?.changes ?? 0,
+          skippedExif: ids.length - ((upd.meta as any)?.changes ?? 0),
+          startLocal,
+          endLocal,
+          segmentId,
+        }), { headers });
+      }
+
+      // 路由：把行程段套用到還沒有座標的照片
+      // 多個區段命中同一張照片時，取最晚建立的（後寫入的贏）。
+      // geo_source='exif' 的照片永遠不動。
+      if (method === "POST" && pathname === "/api/photos/geo/apply-segments") {
+        const body: any = await request.json().catch(() => ({}));
+        const albumId = Number.isFinite(body?.albumId) ? body.albumId : null;
+
+        const { results: segments } = await env.DB.prepare(
+          "SELECT * FROM TripSegment ORDER BY created_at ASC, id ASC"
+        ).all();
+        if (segments.length === 0) {
+          return new Response(JSON.stringify({ success: true, updated: 0, reason: "no segments" }), { headers });
+        }
+
+        const { results: photos } = albumId !== null
+          ? await env.DB.prepare(`
+              SELECT p.id, p.album_id, ${LOCAL_TIME_EXPR} AS local_time
+              FROM Photo p WHERE p.lat IS NULL AND p.album_id = ?
+            `).bind(albumId).all()
+          : await env.DB.prepare(`
+              SELECT p.id, p.album_id, ${LOCAL_TIME_EXPR} AS local_time
+              FROM Photo p WHERE p.lat IS NULL
+            `).all();
+
+        const stmts: D1PreparedStatement[] = [];
+        for (const p of photos as any[]) {
+          if (!p.local_time) continue;
+          let hit: any = null;
+          for (const s of segments as any[]) {
+            const scoped = s.album_id === null || String(s.album_id) === String(p.album_id);
+            if (scoped && p.local_time >= s.start_local && p.local_time <= s.end_local) hit = s;
+          }
+          if (!hit) continue;
+          stmts.push(env.DB.prepare(
+            "UPDATE Photo SET lat = ?, lng = ?, place_name = ?, geo_source = 'manual' WHERE id = ? AND geo_source IS NOT 'exif'"
+          ).bind(hit.lat, hit.lng, hit.place_name, p.id));
+        }
+        if (stmts.length > 0) await env.DB.batch(stmts);
+
+        return new Response(JSON.stringify({ success: true, updated: stmts.length }), { headers });
+      }
+
+      // 路由：以時間對無座標照片做線性內插
+      // 用途：手機拍的有 GPS、相機拍的沒有，混拍時可自動補上中間那些。
+      // 只在前後兩個 exif 錨點的時間差夠近時才內插，否則推論沒有意義。
+      if (method === "POST" && pathname === "/api/photos/geo/interpolate") {
+        const body: any = await request.json().catch(() => ({}));
+        const albumId = Number.isFinite(body?.albumId) ? body.albumId : null;
+        const maxGapHours = Number.isFinite(body?.maxGapHours) ? body.maxGapHours : 24;
+
+        const { results: rows } = albumId !== null
+          ? await env.DB.prepare(`
+              SELECT p.id, p.lat, p.lng, p.geo_source, ${LOCAL_TIME_EXPR} AS local_time
+              FROM Photo p WHERE p.album_id = ? ORDER BY local_time ASC
+            `).bind(albumId).all()
+          : await env.DB.prepare(`
+              SELECT p.id, p.lat, p.lng, p.geo_source, ${LOCAL_TIME_EXPR} AS local_time
+              FROM Photo p ORDER BY local_time ASC
+            `).all();
+
+        const list = (rows as any[]).filter(r => r.local_time);
+        const msOf = (s: string) => {
+          const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
+          return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : NaN;
+        };
+
+        const anchors = list
+          .map((r, i) => ({ ...r, idx: i, ms: msOf(r.local_time) }))
+          .filter(r => r.geo_source === 'exif' && r.lat !== null && Number.isFinite(r.ms));
+
+        const stmts: D1PreparedStatement[] = [];
+        for (let a = 0; a < anchors.length - 1; a++) {
+          const left = anchors[a];
+          const right = anchors[a + 1];
+          const spanMs = right.ms - left.ms;
+          if (spanMs <= 0 || spanMs > maxGapHours * 3600_000) continue;
+
+          for (let i = left.idx + 1; i < right.idx; i++) {
+            const p = list[i];
+            if (p.lat !== null) continue; // 已有座標（含手動指定）就不覆蓋
+            const ms = msOf(p.local_time);
+            if (!Number.isFinite(ms)) continue;
+            const t = (ms - left.ms) / spanMs;
+            // 註：跨換日線的經度內插會繞遠路，屬已知限制，實務上極少遇到
+            const lat = left.lat + (right.lat - left.lat) * t;
+            const lng = left.lng + (right.lng - left.lng) * t;
+            stmts.push(env.DB.prepare(
+              "UPDATE Photo SET lat = ?, lng = ?, geo_source = 'interpolated' WHERE id = ?"
+            ).bind(lat, lng, p.id));
+          }
+        }
+        if (stmts.length > 0) await env.DB.batch(stmts);
+
+        return new Response(JSON.stringify({ success: true, updated: stmts.length, anchors: anchors.length }), { headers });
+      }
+
+      // 路由：批次切換照片層級的位置隱私
+      if (method === "PUT" && pathname === "/api/photos/geo/privacy") {
+        const body: any = await request.json();
+        const ids: number[] = Array.isArray(body?.photoIds) ? body.photoIds.map(Number).filter(Number.isFinite) : [];
+        if (ids.length === 0) {
+          return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
+        }
+        const value = body?.geoPrivate === 0 || body?.geoPrivate === false ? 0 : 1;
+        const ph = ids.map(() => "?").join(",");
+        const res = await env.DB.prepare(
+          `UPDATE Photo SET geo_private = ? WHERE id IN (${ph})`
+        ).bind(value, ...ids).run();
+        return new Response(JSON.stringify({ success: true, updated: (res.meta as any)?.changes ?? 0 }), { headers });
+      }
+
+      // 路由：切換相簿層級的地圖隱私
+      if (method === "PUT" && pathname.startsWith("/api/albums/") && pathname.endsWith("/map-privacy")) {
+        const albumId = pathname.split("/")[3];
+        const body: any = await request.json();
+        const value = body?.mapPrivate === 0 || body?.mapPrivate === false ? 0 : 1;
+        await env.DB.prepare("UPDATE Album SET map_private = ? WHERE id = ?").bind(value, albumId).run();
+        return new Response(JSON.stringify({ success: true, map_private: value }), { headers });
+      }
+
+      // 路由：刪除行程段
+      if (method === "DELETE" && pathname.startsWith("/api/trip-segments/")) {
+        const segId = pathname.split("/")[3];
+        await env.DB.prepare("DELETE FROM TripSegment WHERE id = ?").bind(segId).run();
+        return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      // 路由：回填舊資料的 taken_at_local
+      // 舊照片的 taken_at 是用瀏覽器時區解讀出來的，時區資訊已經遺失，
+      // 只能由呼叫端指定一個預設偏移來還原牆上時間。
+      if (method === "POST" && pathname === "/api/photos/geo/backfill-local-time") {
+        const body: any = await request.json().catch(() => ({}));
+        const defaultOffset = Number.isFinite(body?.defaultOffsetMinutes) ? body.defaultOffsetMinutes : 0;
+
+        const { results } = await env.DB.prepare(
+          "SELECT id, taken_at, tz_offset_minutes FROM Photo WHERE taken_at_local IS NULL AND taken_at IS NOT NULL"
+        ).all();
+
+        const stmts: D1PreparedStatement[] = [];
+        for (const r of results as any[]) {
+          const ms = Date.parse(r.taken_at);
+          if (!Number.isFinite(ms)) continue;
+          const off = Number.isFinite(r.tz_offset_minutes) ? r.tz_offset_minutes : defaultOffset;
+          const local = formatWallClock(wallClockFromUtc(ms, off));
+          stmts.push(env.DB.prepare(
+            "UPDATE Photo SET taken_at_local = ?, tz_offset_minutes = COALESCE(tz_offset_minutes, ?) WHERE id = ?"
+          ).bind(local, off, r.id));
+        }
+        if (stmts.length > 0) {
+          // D1 batch 有大小上限，分批送
+          for (let i = 0; i < stmts.length; i += 100) {
+            await env.DB.batch(stmts.slice(i, i + 100));
+          }
+        }
+        return new Response(JSON.stringify({ success: true, updated: stmts.length }), { headers });
       }
 
       return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });

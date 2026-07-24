@@ -498,6 +498,15 @@ export default function Home() {
             DidaDida
           </h1>
           <p className={styles.subtitle}>紀錄每一個美好瞬間</p>
+          <Link
+            href="/map"
+            style={{
+              display: 'inline-block', marginTop: 10, fontSize: 14,
+              color: 'var(--accent-color, #2563eb)', textDecoration: 'none',
+            }}
+          >
+            🗺️ 足跡地圖
+          </Link>
         </div>
         <div className={styles.controls}>
           <div className={styles.filters}>
