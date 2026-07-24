@@ -161,7 +161,18 @@ export async function uploadPhoto(albumId: string, file: File, exifData?: any, t
 
   if (exifData) {
     try {
-      const allowedKeys = ['Make', 'Model', 'DateTimeOriginal', 'Software', 'Orientation', 'GPSLatitude', 'GPSLongitude', 'GPSAltitude', 'ExposureTime', 'FNumber', 'ISO', 'FocalLength', 'LensModel'];
+      const allowedKeys = [
+        'Make', 'Model', 'DateTimeOriginal', 'Software', 'Orientation',
+        'ExposureTime', 'FNumber', 'ISO', 'FocalLength', 'LensModel',
+        // GPS：latitude/longitude 是 exifr 已換算好的十進位座標，優先採用
+        'latitude', 'longitude',
+        // 原始 GPS 值 + 半球參考 (N/S、E/W)，缺 Ref 就無法判斷南北半球
+        'GPSLatitude', 'GPSLatitudeRef', 'GPSLongitude', 'GPSLongitudeRef',
+        'GPSAltitude', 'GPSAltitudeRef',
+        // 時區還原：OffsetTimeOriginal 是拍攝當下的 UTC 偏移；
+        // GPSDateStamp/GPSTimeStamp 為 UTC，可與 DateTimeOriginal 相減反推偏移
+        'OffsetTimeOriginal', 'GPSDateStamp', 'GPSTimeStamp',
+      ];
       const filteredExif: any = {};
       for (const key of allowedKeys) {
         if (exifData[key] !== undefined) {

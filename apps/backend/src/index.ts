@@ -635,7 +635,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         let finalTakenAt = creationTime;
         try {
           // 在後端直接解析 EXIF
-          const rawExif = await exifr.parse(arrayBuffer, { tiff: true, ifd0: true, exif: true });
+          const rawExif = await exifr.parse(arrayBuffer, { tiff: true, ifd0: true, exif: true, gps: true });
           if (rawExif) {
             parsedExif = {
               Make: rawExif.Make || (exif ? exif.Make : undefined),
@@ -644,7 +644,14 @@ function hammingDistance(hex1: string, hex2: string): number {
               FNumber: rawExif.FNumber || (exif ? exif.FNumber : undefined),
               ISO: rawExif.ISO || (exif ? exif.ISO : undefined),
               ExposureTime: rawExif.ExposureTime || (exif ? exif.ExposureTime : undefined),
-              DateTimeOriginal: rawExif.DateTimeOriginal || (exif ? exif.DateTimeOriginal : undefined)
+              DateTimeOriginal: rawExif.DateTimeOriginal || (exif ? exif.DateTimeOriginal : undefined),
+              // GPS 用 ?? 而非 ||：赤道/本初子午線的 0 是合法座標，會被 || 誤判掉
+              // 註：Google Picker 的 =d 下載一律移除位置資訊，這裡對 Google 來源預期為 undefined，
+              // 保留是為了日後其他同步來源
+              latitude: rawExif.latitude ?? (exif ? exif.latitude : undefined),
+              longitude: rawExif.longitude ?? (exif ? exif.longitude : undefined),
+              GPSAltitude: rawExif.GPSAltitude ?? (exif ? exif.GPSAltitude : undefined),
+              OffsetTimeOriginal: rawExif.OffsetTimeOriginal || (exif ? exif.OffsetTimeOriginal : undefined)
             };
             if (rawExif.DateTimeOriginal) {
               finalTakenAt = new Date(rawExif.DateTimeOriginal).toISOString();
