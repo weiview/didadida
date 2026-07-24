@@ -60,6 +60,8 @@ export default function FootprintMap({ points, height = 520, styleUrl, onSelectP
     });
     map.addControl(new NavigationControl({ showCompass: false }), 'top-right');
     mapRef.current = map;
+    // 底圖或圖磚載入失敗時要留下線索 —— 沒有這個 handler 時地圖只會靜靜地一片空白
+    map.on('error', (e: any) => console.error('[FootprintMap] 地圖錯誤:', e?.error?.message || e));
 
     map.on('load', () => {
       map.addSource('route', {
@@ -109,7 +111,13 @@ export default function FootprintMap({ points, height = 520, styleUrl, onSelectP
         type: 'symbol',
         source: 'photos',
         filter: ['has', 'point_count'],
-        layout: { 'text-field': ['get', 'point_count_abbreviated'], 'text-size': 12 },
+        // 必須指定 OpenFreeMap 實際提供的字型；用 maplibre 預設的
+        // "Open Sans Regular,Arial Unicode MS Regular" 會 404 而退化成本地字型
+        layout: {
+          'text-field': ['get', 'point_count_abbreviated'],
+          'text-font': ['Noto Sans Bold'],
+          'text-size': 12,
+        },
         paint: { 'text-color': '#ffffff' },
       });
 
