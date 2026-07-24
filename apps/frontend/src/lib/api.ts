@@ -18,6 +18,8 @@ export interface Album {
   cover_photo_url?: string;
   cover_text?: string;
   preview_photos?: string[];
+  /** 1 = 足跡地圖不對外公開（預設） */
+  map_private?: number;
 }
 
 export interface Tag {
@@ -35,9 +37,59 @@ export interface Photo {
   thumb_url?: string;
   sort_order: number;
   taken_at?: string;
+  /** 牆上時間 'YYYY-MM-DD HH:MM:SS'，顯示與行程段比對都用這個 */
+  taken_at_local?: string | null;
+  tz_offset_minutes?: number | null;
   exif?: string;
   created_at: string;
   tags?: Tag[];
+  lat?: number | null;
+  lng?: number | null;
+  geo_source?: GeoSource;
+  place_name?: string | null;
+  /** 1 = 私密（預設）。非管理者取得的資料中，私密照片的座標一律為 null */
+  geo_private?: number;
+}
+
+/** null 代表尚未定位 */
+export type GeoSource = 'exif' | 'interpolated' | 'manual' | null;
+
+export interface FootprintPoint {
+  id: number;
+  title: string;
+  album_id: number;
+  album_name?: string;
+  url: string;
+  lat: number;
+  lng: number;
+  place_name: string | null;
+  geo_source: GeoSource;
+  local_time: string;
+}
+
+export interface TripSegment {
+  id: number;
+  album_id: number | null;
+  label: string;
+  start_local: string;
+  end_local: string;
+  lat: number;
+  lng: number;
+  place_name: string | null;
+  tz_offset_minutes: number | null;
+  created_at: string;
+}
+
+export interface GeoPreview {
+  selectedCount: number;
+  startLocal: string | null;
+  endLocal: string | null;
+  /** 選取的照片中缺少拍攝時間的張數，這些無法納入時間區段 */
+  missingTimeCount: number;
+  /** 選取的照片中已有 EXIF 座標的張數，預設不會被覆蓋 */
+  existingExifCount: number;
+  /** 落在同一時間範圍卻沒被選到的照片 —— 顯示順序與時間順序不一致時就會出現 */
+  alsoInRange: { id: number; title: string; url: string; local_time: string }[];
 }
 
 export async function verifyLogin(password: string): Promise<{ success: boolean; message?: string }> {
@@ -436,5 +488,181 @@ export async function resolveGooglePhotoConflict(decision: string, existingPhoto
   } catch (err) {
     console.error(err);
     return false;
+  }
+}
+
+// ===== 足跡地圖 =====
+
+/** 取得足跡點位。時間參數為當地牆上時間，格式 'YYYY-MM-DD' 或 'YYYY-MM-DD HH:MM:SS' */
+export async function fetchFootprint(opts: {
+  from?: string;
+  to?: string;
+  albumId?: number;
+} = {}): Promise<FootprintPoint[]> {
+  try {
+    const qs = new URLSearchParams();
+    if (opts.from) qs.set('from', opts.from);
+    if (opts.to) qs.set('to', opts.to);
+    if (opts.albumId !== undefined) qs.set('album_id', String(opts.albumId));
+    const res = await fetch(`${API_BASE_URL}/footprint?${qs.toString()}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return [];
+  }
+}
+
+export async function fetchTripSegments(albumId?: number): Promise<TripSegment[]> {
+  try {
+    const qs = albumId !== undefined ? `?album_id=${albumId}` : '';
+    const res = await fetch(`${API_BASE_URL}/trip-segments${qs}`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return [];
+  }
+}
+
+export async function deleteTripSegment(id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/trip-segments/${id}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+/** 套用地點前先預覽影響範圍，用來提示「顯示順序 != 時間順序」造成的意外涵蓋 */
+export async function previewGeoBatch(photoIds: number[]): Promise<GeoPreview | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/preview`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ photoIds }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+export async function assignGeoBatch(params: {
+  photoIds: number[];
+  lat: number;
+  lng: number;
+  placeName?: string;
+  label?: string;
+  createSegment?: boolean;
+  albumId?: number;
+  tzOffsetMinutes?: number;
+  overwriteExif?: boolean;
+}): Promise<{ success: boolean; updated: number; skippedExif: number; segmentId: number | null } | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/batch`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(params),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/** 把行程段套用到還沒有座標的照片 */
+export async function applyTripSegments(albumId?: number): Promise<number> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/apply-segments`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ albumId }),
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return data.updated ?? 0;
+  } catch (err) {
+    console.error(err);
+    return 0;
+  }
+}
+
+/** 對前後有 EXIF 座標的照片之間做時間內插 */
+export async function interpolateGeo(albumId?: number, maxGapHours = 24): Promise<number> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/interpolate`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ albumId, maxGapHours }),
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return data.updated ?? 0;
+  } catch (err) {
+    console.error(err);
+    return 0;
+  }
+}
+
+export async function setPhotoGeoPrivacy(photoIds: number[], geoPrivate: boolean): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/privacy`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ photoIds, geoPrivate: geoPrivate ? 1 : 0 }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+export async function setAlbumMapPrivacy(albumId: number, mapPrivate: boolean): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/albums/${albumId}/map-privacy`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ mapPrivate: mapPrivate ? 1 : 0 }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+/** 搜尋地名（Photon，免費且免 API key）。回傳前幾筆候選讓使用者挑 */
+export async function searchPlace(query: string): Promise<{ name: string; lat: number; lng: number }[]> {
+  if (!query.trim()) return [];
+  try {
+    const res = await fetch(
+      `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=6`
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.features || []).map((f: any) => {
+      const p = f.properties || {};
+      const parts = [p.name, p.city, p.state, p.country].filter(Boolean);
+      return {
+        name: parts.join(', '),
+        lng: f.geometry?.coordinates?.[0],
+        lat: f.geometry?.coordinates?.[1],
+      };
+    }).filter((r: any) => Number.isFinite(r.lat) && Number.isFinite(r.lng));
+  } catch (err) {
+    console.error(err);
+    return [];
   }
 }

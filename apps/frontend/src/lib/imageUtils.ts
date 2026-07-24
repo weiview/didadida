@@ -1,5 +1,6 @@
 import exifr from 'exifr';
 import piexif from 'piexifjs';
+import { normalizeGeo } from './geo';
 
 export async function resizeImageFile(file: File, maxEdge: number = 2000): Promise<{ file: File; exifData: any; takenAt: string | null }> {
   // 檢查是否為圖片
@@ -14,10 +15,29 @@ export async function resizeImageFile(file: File, maxEdge: number = 2000): Promi
 
   try {
     exifData = await exifr.parse(file, true);
-    if (exifData && exifData.DateTimeOriginal) {
-      takenAt = new Date(exifData.DateTimeOriginal).toISOString();
+
+    if (exifData) {
+      // exifr 預設會把 EXIF 時間字串 revive 成 Date，但 EXIF 時間不帶時區，
+      // revive 是以「瀏覽器當下時區」解讀的 —— 一旦 JSON.stringify 送到後端就會位移。
+      // 例：在台灣(+8)上傳日本拍的 09:30，會變成 01:30Z，行程段比對就整批對不上。
+      // 因此另取一次未經轉換的原始字串覆寫回去，讓後端拿到真正的牆上時間。
+      try {
+        const rawTime: any = await exifr.parse(file, { reviveValues: false, exif: true, gps: true });
+        if (rawTime) {
+          for (const key of ['DateTimeOriginal', 'OffsetTimeOriginal', 'GPSDateStamp', 'GPSTimeStamp']) {
+            const v = rawTime[key];
+            if (typeof v === 'string' || Array.isArray(v)) exifData[key] = v;
+          }
+        }
+      } catch (e) {
+        console.warn("原始 EXIF 時間字串解析失敗，時區可能不準:", e);
+      }
+
+      // 由 OffsetTimeOriginal 或 GPS UTC 時戳推導時區後，才換算出正確的 UTC 瞬間
+      takenAt = normalizeGeo(exifData).takenAtUtc;
     }
-    
+
+
     if (file.type === 'image/jpeg') {
       try {
         const dataURL = await new Promise<string>((resolve, reject) => {
