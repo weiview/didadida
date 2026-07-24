@@ -15,6 +15,9 @@ const FootprintMap = dynamic(() => import('@/components/FootprintMap'), {
   loading: () => <div style={{ height: 520, display: 'grid', placeItems: 'center', color: '#64748b' }}>地圖載入中…</div>,
 });
 
+// 只有按下按鈕才需要載入解析器，不拖累首次進頁
+const TimelineImportModal = dynamic(() => import('@/components/TimelineImportModal'), { ssr: false });
+
 export default function MapPage() {
   const [points, setPoints] = useState<FootprintPoint[]>([]);
   const [albums, setAlbums] = useState<Album[]>([]);
@@ -22,6 +25,7 @@ export default function MapPage() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
+  const [showTimelineImport, setShowTimelineImport] = useState(false);
 
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
@@ -108,9 +112,10 @@ export default function MapPage() {
       <FootprintMap points={points} />
 
       <div style={{ marginTop: 10, fontSize: 12.5, color: '#64748b', display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-        <span>● 實心 = 照片自帶 GPS</span>
-        <span>◍ 半透明 = 由前後照片推估</span>
-        <span>○ 空心 = 手動指定</span>
+        <span style={{ color: '#2563eb' }}>● 照片自帶 GPS</span>
+        <span style={{ color: '#0891b2' }}>● Google 時間軸</span>
+        <span>◍ 由前後照片推估</span>
+        <span>○ 手動指定</span>
       </div>
 
       {isAdmin && (
@@ -131,6 +136,13 @@ export default function MapPage() {
               style={toolBtn}
             >
               {busy === '內插補點' ? '處理中…' : '對有 GPS 的照片之間內插補點'}
+            </button>
+            <button
+              disabled={!!busy}
+              onClick={() => setShowTimelineImport(true)}
+              style={{ ...toolBtn, borderColor: '#0891b2', color: '#0891b2' }}
+            >
+              📍 從 Google 時間軸匯入
             </button>
           </div>
 
@@ -196,6 +208,12 @@ export default function MapPage() {
           )}
         </div>
       )}
+
+      <TimelineImportModal
+        isOpen={showTimelineImport}
+        onClose={() => setShowTimelineImport(false)}
+        onDone={() => load()}
+      />
     </div>
   );
 }

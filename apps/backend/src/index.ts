@@ -1044,8 +1044,11 @@ function hammingDistance(hex1: string, hex2: string): number {
             if (scoped && p.local_time >= s.start_local && p.local_time <= s.end_local) hit = s;
           }
           if (!hit) continue;
+          // 行程段是粗略規則，不覆蓋更精確的來源：
+          // 照片自帶 GPS > Google 時間軸 > 行程段
           stmts.push(env.DB.prepare(
-            "UPDATE Photo SET lat = ?, lng = ?, place_name = ?, geo_source = 'manual' WHERE id = ? AND geo_source IS NOT 'exif'"
+            `UPDATE Photo SET lat = ?, lng = ?, place_name = ?, geo_source = 'manual'
+             WHERE id = ? AND geo_source IS NOT 'exif' AND geo_source IS NOT 'timeline'`
           ).bind(hit.lat, hit.lng, hit.place_name, p.id));
         }
         if (stmts.length > 0) await env.DB.batch(stmts);
@@ -1105,6 +1108,50 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (stmts.length > 0) await env.DB.batch(stmts);
 
         return new Response(JSON.stringify({ success: true, updated: stmts.length, anchors: anchors.length }), { headers });
+      }
+
+      // 路由：寫入由 Google 時間軸比對出來的位置
+      // 比對全在瀏覽器內完成，這裡只收到「哪張照片在哪個座標」，
+      // 原始的 Timeline.json（含住家標記與 WiFi MAC）不會離開使用者的電腦。
+      if (method === "POST" && pathname === "/api/photos/geo/from-timeline") {
+        const body: any = await request.json();
+        const matches: any[] = Array.isArray(body?.matches) ? body.matches : [];
+        if (matches.length === 0) {
+          return new Response(JSON.stringify({ error: "matches is required" }), { status: 400, headers });
+        }
+
+        const overwriteExif = body?.overwriteExif === true;
+        const guard = overwriteExif ? "" : " AND geo_source IS NOT 'exif'";
+
+        const stmts: D1PreparedStatement[] = [];
+        let invalid = 0;
+        for (const m of matches) {
+          const id = Number(m?.photoId);
+          if (!Number.isFinite(id) || !isValidLatLng(m?.lat, m?.lng)) { invalid++; continue; }
+          const place = typeof m.placeName === 'string' ? m.placeName : null;
+          const tz = Number.isFinite(m?.tzOffsetMinutes) ? m.tzOffsetMinutes : null;
+          stmts.push(env.DB.prepare(
+            `UPDATE Photo
+               SET lat = ?, lng = ?, place_name = COALESCE(?, place_name),
+                   geo_source = 'timeline',
+                   tz_offset_minutes = COALESCE(tz_offset_minutes, ?)
+             WHERE id = ?${guard}`
+          ).bind(m.lat, m.lng, place, tz, id));
+        }
+
+        let updated = 0;
+        // D1 batch 有大小上限，分批送
+        for (let i = 0; i < stmts.length; i += 100) {
+          const res = await env.DB.batch(stmts.slice(i, i + 100));
+          for (const r of res) updated += (r.meta as any)?.changes ?? 0;
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          updated,
+          invalid,
+          skipped: stmts.length - updated,
+        }), { headers });
       }
 
       // 路由：批次切換照片層級的位置隱私
