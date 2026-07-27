@@ -21,12 +21,14 @@ preview_bucket_name = "didadida-photos-preview"
 name = "didadida-api-dev"
 [env.dev.vars]
 
+# dev 使用獨立的 D1，與 production 完整切開（2026-07-27）
 [[env.dev.d1_databases]]
 binding = "DB"
-database_name = "didadida-db"
-database_id = "0ca8abc0-936e-4f15-892b-e998de168d5d"
+database_name = "didadida-db-dev"
+database_id = "609aac06-672b-4594-a102-99d078724684"
 
+# dev 使用獨立的 R2，與 production 完整切開（2026-07-27）
 [[env.dev.r2_buckets]]
 binding = "BUCKET"
-bucket_name = "didadida-photos"
+bucket_name = "didadida-photos-dev"
 preview_bucket_name = "didadida-photos-preview"
