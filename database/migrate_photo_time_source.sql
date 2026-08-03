@@ -1,0 +1,32 @@
+-- 手動編輯 / 時間可信度：新增 Photo.time_source
+--
+-- 先套 dev（didadida-db-dev），prod 待使用者同意再套。
+--   npx wrangler d1 execute didadida-db-dev --remote --file=database/migrate_photo_time_source.sql
+--
+-- 為什麼需要這一欄：
+-- taken_at 這個「UTC 瞬間」的可信度差距很大。有 OffsetTimeOriginal 或 GPS UTC 的照片，
+-- 瞬間是精確的；只有牆上時間的照片（Nikon D800 這類不寫時區、無內建 GPS 的機身），
+-- 時區只能用站台預設值假設，瞬間可能整整差上數小時。
+-- 沒有這一欄就無法分辨「校正錯誤」與「軌跡本身有雜訊」——
+-- 拿 'assumed' 的時間去比對 GPS 軌跡會查到完全錯誤的位置，因此後續軌跡定位必須排除它們。
+--
+-- 值域（可信度由高而低）：
+--   'manual'     使用者親手修正，最高權威，不再被任何自動流程覆蓋
+--   'offset_tag' EXIF OffsetTimeOriginal，相機自己寫的時區
+--   'gps_utc'    GPSTimeStamp(UTC) 與牆上時間相減而得
+--   'file_time'  檔案時間（Google creationTime）—— 瞬間精確，但可能不是快門時間
+--   'assumed'    時區用 DEFAULT_TZ_OFFSET_MINUTES 假設，不可用於軌跡定位
+--   NULL         完全沒有時間資訊
+ALTER TABLE Photo ADD COLUMN time_source TEXT;
+
+-- geo_source 值域同步更新（不需 DDL，僅記錄語意）。權威由高而低：
+--   'manual'       使用者親手指定，最高權威，任何自動流程都不得覆蓋
+--   'exif'         照片自帶 GPS
+--   'track'        比對 GPS 軌跡（TrackPoint）而來
+--   'timeline'     比對 Google 時間軸而來
+--   'segment'      套用行程段規則而來（原本誤用 'manual'，此版更名；
+--                  行程段是「規則」而非使用者對單張照片的親手指定，語意必須分開）
+--   'interpolated' 前後照片內插推估（有軌跡後已無用，保留以相容既有資料）
+--
+-- 舊的 'manual' 值同時混著「批次指定地點」（真的是人指定的）與「套用行程段」
+-- （自動流程）兩種來源，無法區分。既有資料皆為測試資料且已清空，故不做資料轉換。
