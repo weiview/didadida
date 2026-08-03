@@ -1,5 +1,9 @@
 import exifr from 'exifr';
-import { normalizeGeo, formatWallClock, wallClockFromUtc } from './geo';
+import {
+  normalizeGeo, formatWallClock, utcFromLocal,
+  parseExifDateTime, geoOverwriteGuard, DEFAULT_TZ_OFFSET_MINUTES,
+} from './geo';
+import { listGpxFiles, fetchGpxBytes } from './drive';
 
 export interface Env {
   DB: D1Database;
@@ -7,6 +11,10 @@ export interface Env {
   APP_PASSWORD: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
+  /** service account 金鑰 JSON 全文。唯讀，只看得到被分享的那一個 Drive 資料夾 */
+  GOOGLE_DRIVE_SA_KEY?: string;
+  /** GPSLogger 上傳目的地資料夾的 Drive file id */
+  GOOGLE_DRIVE_FOLDER_ID?: string;
 }
 
 async function generateJWT(env: Env): Promise<string> {
@@ -43,11 +51,16 @@ async function verifyJWT(token: string, env: Env): Promise<boolean> {
   }
 }
 
+/**
+ * 只認 /api/verify-password 發出的 JWT。
+ *
+ * 以前這裡也接受裸的 APP_PASSWORD 當 bearer（backward compatibility），已經移除：
+ * 那個密碼同時是 JWT 的簽章金鑰，一旦外流等於可以自簽任意 token，而且撤不掉。
+ */
 async function isAuthorized(request: Request, env: Env): Promise<boolean> {
   const authHeader = request.headers.get("Authorization");
   if (!authHeader) return false;
   const token = authHeader.replace("Bearer ", "");
-  if (token === env.APP_PASSWORD) return true; // Backward compatibility
   return await verifyJWT(token, env);
 }
 
@@ -86,6 +99,25 @@ function isValidLatLng(lat: unknown, lng: unknown): boolean {
     typeof lng === 'number' && Number.isFinite(lng) && Math.abs(lng) <= 180
   );
 }
+
+/** 時區偏移合法性檢查。真實時區介於 UTC-12 ~ UTC+14 且都是 15 分鐘的倍數 */
+function isValidTzOffset(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v)
+    && v >= -12 * 60 && v <= 14 * 60 && v % 15 === 0;
+}
+
+/**
+ * 把請求送來的 photoIds 清成一串正整數。
+ * 去重後截斷，避免單一請求就把 D1 的每日寫入額度吃掉一大塊。
+ */
+function sanitizePhotoIds(raw: unknown, max = 2000): number[] {
+  if (!Array.isArray(raw)) return [];
+  const ids = raw.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  return [...new Set(ids)].slice(0, max);
+}
+
+/** SQLite 日期修飾字串。-90 -> '-90 minutes'、90 -> '+90 minutes' */
+const minutesModifier = (n: number) => `${n >= 0 ? '+' : ''}${n} minutes`;
 
 // Rate Limiting (In-memory)
 interface LoginAttempt {
@@ -159,6 +191,18 @@ if (method === "POST" && pathname === "/api/verify-password") {
         loginAttempts.set(ip, attempt);
         
         return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+      }
+
+      // 路由：確認手上的 token 還有效（沒過期、簽章對）
+      //
+      // 前端每次進站都靠這一條決定要不要顯示編輯介面 —— 只看 localStorage 有沒有
+      // token 是不夠的，過期後那個 key 還在。刻意不套 verify-password 的 2 秒延遲
+      // 與登入節流：它不接受密碼，沒有可暴力破解的東西，也沒有任何副作用。
+      if (method === "GET" && pathname === "/api/auth/me") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ admin: false }), { status: 401, headers });
+        }
+        return new Response(JSON.stringify({ admin: true }), { headers });
       }
 
       // 路由：取得所有相簿
@@ -417,26 +461,56 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
         const geo = normalizeGeo(parsedForGeo, takenAt);
 
-        await env.DB.prepare(
+        // geo 沒算出時間就退回前端送來的 takenAt，那是檔案時間而非快門時間
+        const uploadTakenAt = geo.takenAtUtc || takenAt || null;
+        const uploadTimeSource =
+          geo.timeSource ?? (uploadTakenAt ? 'file_time' : null);
+
+        const inserted = await env.DB.prepare(
           `INSERT INTO Photo
              (title, file_name, album_id, url, thumb_url, exif, taken_at, file_hash, phash,
-              lat, lng, geo_source, taken_at_local, tz_offset_minutes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           file.name, fileName, albumId, fileUrl, thumbUrl, exifData,
-          geo.takenAtUtc || takenAt, fileHash, clientPhash,
+          uploadTakenAt, fileHash, clientPhash,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
+          uploadTimeSource,
         ).run();
 
-        return new Response(JSON.stringify({ success: true, url: fileUrl, thumb_url: thumbUrl, file_hash: fileHash }), { headers });
+        // 回傳 id 與座標，前端才有辦法在上傳結束後認出「這一批」是哪幾張、
+        // 以及其中哪幾張沒有 EXIF 位置需要補。
+        return new Response(JSON.stringify({
+          success: true,
+          id: inserted.meta?.last_row_id ?? null,
+          url: fileUrl,
+          thumb_url: thumbUrl,
+          file_hash: fileHash,
+          lat: geo.lat,
+          lng: geo.lng,
+        }), { headers });
       }
 
       // 路由：更新照片資訊 (description, taken_at)
       if (method === "PUT" && pathname.startsWith("/api/photos/") && pathname.split("/").length === 4) {
         const photoId = pathname.split("/")[3];
         const body: any = await request.json();
-        await env.DB.prepare("UPDATE Photo SET description = ?, taken_at = ? WHERE id = ?")
-          .bind(body.description || null, body.taken_at || null, photoId).run();
+        // body.taken_at 是 UTC 瞬間。改了它就必須同步重算 taken_at_local，
+        // 否則兩欄會各說各話（顯示與行程段比對用 local、排序與軌跡比對用 taken_at）。
+        // 這裡把瞬間視為權威、時區不變，用 tz 把 local 推回來。
+        await env.DB.prepare(
+          `UPDATE Photo SET
+             description = ?,
+             taken_at = ?,
+             taken_at_local = strftime('%Y-%m-%d %H:%M:%S', ?,
+               COALESCE(tz_offset_minutes, ${DEFAULT_TZ_OFFSET_MINUTES}) || ' minutes'),
+             time_source = CASE WHEN ? IS NULL THEN NULL ELSE 'manual' END
+           WHERE id = ?`
+        ).bind(
+          body.description || null,
+          body.taken_at || null, body.taken_at || null, body.taken_at || null,
+          photoId,
+        ).run();
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
@@ -777,7 +851,8 @@ function hammingDistance(hex1: string, hex2: string): number {
           lng: syncGeo.lng,
           geo_source: syncGeo.geoSource,
           taken_at_local: syncGeo.takenAtLocal,
-          tz_offset_minutes: syncGeo.tzOffsetMinutes
+          tz_offset_minutes: syncGeo.tzOffsetMinutes,
+          time_source: syncGeo.timeSource
         };
 
         if (existingPhotos && existingPhotos.length > 0) {
@@ -787,13 +862,13 @@ function hammingDistance(hex1: string, hex2: string): number {
         await env.DB.prepare(
           `INSERT INTO Photo
              (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
-              lat, lng, geo_source, taken_at_local, tz_offset_minutes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
           tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash, tempPhoto.phash,
           tempPhoto.lat, tempPhoto.lng, tempPhoto.geo_source,
-          tempPhoto.taken_at_local, tempPhoto.tz_offset_minutes,
+          tempPhoto.taken_at_local, tempPhoto.tz_offset_minutes, tempPhoto.time_source,
         ).run();
 
         return new Response(JSON.stringify({ success: true, url: fileUrl }), { headers });
@@ -804,12 +879,16 @@ function hammingDistance(hex1: string, hex2: string): number {
         const body = await request.json() as any;
         const { decision, existingPhotos, tempPhoto, replacePhotoIds } = body;
 
-        // tempPhoto 是由前端原樣送回來的，座標不能照單全收
+        // tempPhoto 是由前端原樣送回來的，座標與來源標記都不能照單全收
         const tpLat = isValidLatLng(tempPhoto?.lat, tempPhoto?.lng) ? tempPhoto.lat : null;
         const tpLng = tpLat === null ? null : tempPhoto.lng;
-        const tpGeoSource = tpLat === null ? null : (tempPhoto.geo_source ?? null);
+        // 這條路徑只可能產出 'exif'（照片自帶 GPS），不接受前端宣稱更高的權威
+        const tpGeoSource = tpLat !== null && tempPhoto?.geo_source === 'exif' ? 'exif' : null;
         const tpLocal = typeof tempPhoto?.taken_at_local === 'string' ? tempPhoto.taken_at_local : null;
-        const tpTz = Number.isFinite(tempPhoto?.tz_offset_minutes) ? tempPhoto.tz_offset_minutes : null;
+        const tpTz = isValidTzOffset(tempPhoto?.tz_offset_minutes) ? tempPhoto.tz_offset_minutes : null;
+        // 同理，同步流程不可能產生 'manual'，只放行 normalizeGeo 真的會回傳的值
+        const tpTimeSource = ['offset_tag', 'gps_utc', 'file_time', 'assumed']
+          .includes(tempPhoto?.time_source) ? tempPhoto.time_source : null;
 
         if (decision === "skip") {
           // 刪除暫存在 R2 的新檔案
@@ -836,12 +915,12 @@ function hammingDistance(hex1: string, hex2: string): number {
           await env.DB.prepare(
             `INSERT INTO Photo
                (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
-                lat, lng, geo_source, taken_at_local, tz_offset_minutes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
             tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
             tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash || null, tempPhoto.phash || null,
-            tpLat, tpLng, tpGeoSource, tpLocal, tpTz,
+            tpLat, tpLng, tpGeoSource, tpLocal, tpTz, tpTimeSource,
           ).run();
         } else if (decision === "keep_both") {
           // 修改標題避免混淆
@@ -850,12 +929,12 @@ function hammingDistance(hex1: string, hex2: string): number {
           await env.DB.prepare(
             `INSERT INTO Photo
                (title, file_name, album_id, url, taken_at, exif,
-                lat, lng, geo_source, taken_at_local, tz_offset_minutes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
             newTitle, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
             tempPhoto.taken_at, tempPhoto.exif,
-            tpLat, tpLng, tpGeoSource, tpLocal, tpTz,
+            tpLat, tpLng, tpGeoSource, tpLocal, tpTz, tpTimeSource,
           ).run();
         }
         return new Response(JSON.stringify({ success: true }), { headers });
@@ -885,7 +964,10 @@ function hammingDistance(hex1: string, hex2: string): number {
           SELECT p.id, p.title, p.album_id, a.name AS album_name,
                  COALESCE(p.thumb_url, p.url) AS url,
                  p.lat, p.lng, p.place_name, p.geo_source,
-                 ${LOCAL_TIME_EXPR} AS local_time
+                 ${LOCAL_TIME_EXPR} AS local_time,
+                 -- 顯示用的是 local_time，但要跟 GPS 軌跡排到同一條時間軸上
+                 -- 就得用 UTC，否則台北的照片會被擺到軌跡上錯 8 小時的位置
+                 p.taken_at
           FROM Photo p
           LEFT JOIN Album a ON a.id = p.album_id
           WHERE ${conds.join(" AND ")}
@@ -961,7 +1043,7 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 預設不覆蓋 geo_source='exif' 的照片 —— 照片自帶的 GPS 比手動指定可信。
       if (method === "POST" && pathname === "/api/photos/geo/batch") {
         const body: any = await request.json();
-        const ids: number[] = Array.isArray(body?.photoIds) ? body.photoIds.map(Number).filter(Number.isFinite) : [];
+        const ids = sanitizePhotoIds(body?.photoIds);
         const { lat, lng } = body || {};
 
         if (ids.length === 0) {
@@ -975,7 +1057,10 @@ function hammingDistance(hex1: string, hex2: string): number {
         const overwriteExif = body.overwriteExif === true;
 
         const ph = ids.map(() => "?").join(",");
-        const guard = overwriteExif ? "" : " AND (geo_source IS NULL OR geo_source != 'exif')";
+        // 這是使用者親手指定，權威最高，唯一預設不動的是照片自帶的 GPS。
+        // 用 IS NOT 而非 != ：後者遇到 geo_source IS NULL 會得到 NULL，
+        // 反而把最需要寫入的「還沒定位」那些照片排除掉。
+        const guard = overwriteExif ? "" : " AND geo_source IS NOT 'exif'";
         const upd = await env.DB.prepare(`
           UPDATE Photo SET lat = ?, lng = ?, place_name = ?, geo_source = 'manual'
           WHERE id IN (${ph})${guard}
@@ -1044,11 +1129,17 @@ function hammingDistance(hex1: string, hex2: string): number {
             if (scoped && p.local_time >= s.start_local && p.local_time <= s.end_local) hit = s;
           }
           if (!hit) continue;
-          // 行程段是粗略規則，不覆蓋更精確的來源：
-          // 照片自帶 GPS > Google 時間軸 > 行程段
+          // 行程段是粗略規則，只贏得過內插；寫 'segment' 而非 'manual'，
+          // 因為這是自動流程套用規則，不是使用者對這張照片親手指定。
+          //
+          // 刻意不寫 tz_offset_minutes：行程段的時區是「地點的時區」，
+          // 而 tz_offset_minutes 是「taken_at_local 該用哪個時區讀」。
+          // 在這裡改它會連帶讓照片顯示的拍攝時間整批位移（否則就破壞
+          // taken_at === taken_at_local − tz 這條不變式），那是指定地點不該有的副作用。
+          // 時區要改請走批次改時區，那是使用者明確的操作。
           stmts.push(env.DB.prepare(
-            `UPDATE Photo SET lat = ?, lng = ?, place_name = ?, geo_source = 'manual'
-             WHERE id = ? AND geo_source IS NOT 'exif' AND geo_source IS NOT 'timeline'`
+            `UPDATE Photo SET lat = ?, lng = ?, place_name = ?, geo_source = 'segment'
+             WHERE id = ?${geoOverwriteGuard('segment')}`
           ).bind(hit.lat, hit.lng, hit.place_name, p.id));
         }
         if (stmts.length > 0) await env.DB.batch(stmts);
@@ -1101,7 +1192,8 @@ function hammingDistance(hex1: string, hex2: string): number {
             const lat = left.lat + (right.lat - left.lat) * t;
             const lng = left.lng + (right.lng - left.lng) * t;
             stmts.push(env.DB.prepare(
-              "UPDATE Photo SET lat = ?, lng = ?, geo_source = 'interpolated' WHERE id = ?"
+              `UPDATE Photo SET lat = ?, lng = ?, geo_source = 'interpolated'
+               WHERE id = ?${geoOverwriteGuard('interpolated')}`
             ).bind(lat, lng, p.id));
           }
         }
@@ -1121,7 +1213,11 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
 
         const overwriteExif = body?.overwriteExif === true;
-        const guard = overwriteExif ? "" : " AND geo_source IS NOT 'exif'";
+        // overwriteExif 只放行 'exif' 這一層；'manual' 是使用者親手指定的，
+        // 任何自動流程都不得覆蓋，所以它不在放行範圍內。
+        const guard = overwriteExif
+          ? " AND geo_source IS NOT 'manual'"
+          : geoOverwriteGuard('timeline');
 
         const stmts: D1PreparedStatement[] = [];
         let invalid = 0;
@@ -1157,7 +1253,7 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：批次切換照片層級的位置隱私
       if (method === "PUT" && pathname === "/api/photos/geo/privacy") {
         const body: any = await request.json();
-        const ids: number[] = Array.isArray(body?.photoIds) ? body.photoIds.map(Number).filter(Number.isFinite) : [];
+        const ids = sanitizePhotoIds(body?.photoIds);
         if (ids.length === 0) {
           return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
         }
@@ -1185,34 +1281,498 @@ function hammingDistance(hex1: string, hex2: string): number {
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
-      // 路由：回填舊資料的 taken_at_local
-      // 舊照片的 taken_at 是用瀏覽器時區解讀出來的，時區資訊已經遺失，
-      // 只能由呼叫端指定一個預設偏移來還原牆上時間。
-      if (method === "POST" && pathname === "/api/photos/geo/backfill-local-time") {
+      // ===== 手動編輯 =====
+      // 不管照片有沒有 GPS、有沒有時區標籤，都要能靠手改到正確位置與時間。
+      // 全站不變式：taken_at === taken_at_local − tz_offset_minutes。
+      // 以下每個操作都必須維持它，否則排序（用 taken_at）與顯示／行程段比對
+      //（用 taken_at_local）會各說各話。
+
+      // 路由：單張照片的手動編輯（座標、地點名稱、拍攝時間、時區）
+      // 手動是最高權威，寫進來之後任何自動流程都不會再覆蓋（見 geoOverwriteGuard）。
+      //
+      // 時間有兩種改法，語意刻意分開，請只送使用者真的動過的欄位：
+      //   送 takenAtLocal      → 相機時鐘記錯了。牆上時間為準，taken_at 重算成 local − tz
+      //   只送 tzOffsetMinutes → 瞬間沒錯，只是拿錯時區在顯示。taken_at 不動，local 重算成 taken_at + tz
+      //   兩者都送             → 牆上時間與時區都由使用者指定，taken_at = local − tz
+      if (method === "PUT" && /^\/api\/photos\/\d+\/geo$/.test(pathname)) {
+        const photoId = Number(pathname.split("/")[3]);
         const body: any = await request.json().catch(() => ({}));
-        const defaultOffset = Number.isFinite(body?.defaultOffsetMinutes) ? body.defaultOffsetMinutes : 0;
 
-        const { results } = await env.DB.prepare(
-          "SELECT id, taken_at, tz_offset_minutes FROM Photo WHERE taken_at_local IS NULL AND taken_at IS NOT NULL"
-        ).all();
-
-        const stmts: D1PreparedStatement[] = [];
-        for (const r of results as any[]) {
-          const ms = Date.parse(r.taken_at);
-          if (!Number.isFinite(ms)) continue;
-          const off = Number.isFinite(r.tz_offset_minutes) ? r.tz_offset_minutes : defaultOffset;
-          const local = formatWallClock(wallClockFromUtc(ms, off));
-          stmts.push(env.DB.prepare(
-            "UPDATE Photo SET taken_at_local = ?, tz_offset_minutes = COALESCE(tz_offset_minutes, ?) WHERE id = ?"
-          ).bind(local, off, r.id));
+        const row = await env.DB.prepare(
+          "SELECT tz_offset_minutes FROM Photo WHERE id = ?"
+        ).bind(photoId).first() as any;
+        if (!row) {
+          return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
         }
-        if (stmts.length > 0) {
-          // D1 batch 有大小上限，分批送
-          for (let i = 0; i < stmts.length; i += 100) {
-            await env.DB.batch(stmts.slice(i, i + 100));
+
+        const sets: string[] = [];
+        const binds: any[] = [];
+
+        // 明確送 lat: null 代表「清掉這個位置」，整個欄位不存在才是「不要動」
+        if ('lat' in body || 'lng' in body) {
+          if (body.lat === null && body.lng === null) {
+            sets.push("lat = NULL", "lng = NULL", "geo_source = NULL");
+          } else if (isValidLatLng(body.lat, body.lng)) {
+            sets.push("lat = ?", "lng = ?", "geo_source = 'manual'");
+            binds.push(body.lat, body.lng);
+          } else {
+            return new Response(JSON.stringify({ error: "Invalid lat/lng" }), { status: 400, headers });
           }
         }
-        return new Response(JSON.stringify({ success: true, updated: stmts.length }), { headers });
+        if ('placeName' in body) {
+          const pn = typeof body.placeName === 'string' ? body.placeName.trim() : '';
+          sets.push("place_name = ?");
+          binds.push(pn || null);
+        }
+
+        const hasTz = 'tzOffsetMinutes' in body;
+        if (hasTz && !isValidTzOffset(body.tzOffsetMinutes)) {
+          return new Response(JSON.stringify({ error: "Invalid tzOffsetMinutes" }), { status: 400, headers });
+        }
+        const tz = hasTz
+          ? body.tzOffsetMinutes
+          : (isValidTzOffset(row.tz_offset_minutes) ? row.tz_offset_minutes : DEFAULT_TZ_OFFSET_MINUTES);
+
+        if ('takenAtLocal' in body) {
+          const wc = parseExifDateTime(body.takenAtLocal);
+          if (!wc) {
+            return new Response(JSON.stringify({ error: "Invalid takenAtLocal" }), { status: 400, headers });
+          }
+          const localStr = formatWallClock(wc);
+          sets.push("taken_at_local = ?", "taken_at = ?", "tz_offset_minutes = ?", "time_source = 'manual'");
+          binds.push(localStr, utcFromLocal(localStr, tz), tz);
+        } else if (hasTz) {
+          // 只改時區：瞬間不動，牆上時間跟著新時區重算。這個操作對「瞬間準不準」
+          // 沒有任何主張，所以 time_source 不動。
+          // taken_at 為 NULL 時 strftime 回傳 NULL，local 也就留空，不變式仍然成立。
+          sets.push("tz_offset_minutes = ?", "taken_at_local = strftime('%Y-%m-%d %H:%M:%S', taken_at, ?)");
+          binds.push(tz, minutesModifier(tz));
+        }
+
+        if (sets.length === 0) {
+          return new Response(JSON.stringify({ error: "nothing to update" }), { status: 400, headers });
+        }
+        binds.push(photoId);
+        await env.DB.prepare(`UPDATE Photo SET ${sets.join(", ")} WHERE id = ?`).bind(...binds).run();
+
+        const updated = await env.DB.prepare(
+          `SELECT id, lat, lng, place_name, geo_source,
+                  taken_at, taken_at_local, tz_offset_minutes, time_source
+           FROM Photo WHERE id = ?`
+        ).bind(photoId).first();
+        return new Response(JSON.stringify({ success: true, photo: updated }), { headers });
+      }
+
+      // 路由：批次平移拍攝時間（相機時鐘走差了，例如 D800 每年慢約一分鐘）
+      // 瞬間與牆上時間一起移動、時區不變 —— 兩者的差就是時區，得一起動才守得住不變式。
+      if (method === "POST" && pathname === "/api/photos/geo/shift-time") {
+        const body: any = await request.json().catch(() => ({}));
+        const ids = sanitizePhotoIds(body?.photoIds);
+        const minutes = body?.minutes;
+        if (ids.length === 0) {
+          return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
+        }
+        // 一年以上的位移不會是時鐘誤差，那是打錯字
+        if (!Number.isInteger(minutes) || minutes === 0 || Math.abs(minutes) > 366 * 24 * 60) {
+          return new Response(JSON.stringify({ error: "Invalid minutes" }), { status: 400, headers });
+        }
+
+        const mod = minutesModifier(minutes);
+        const ph = ids.map(() => "?").join(",");
+        // 一句 UPDATE 做完，不逐張讀回來在 JS 算：D1 免費額度是按寫入列數計費的，
+        // 這樣整批只花 ids.length 列。同一句 UPDATE 裡右側取到的都是舊值。
+        const res = await env.DB.prepare(`
+          UPDATE Photo SET
+            taken_at = strftime('%Y-%m-%dT%H:%M:%fZ', taken_at, ?),
+            taken_at_local = strftime('%Y-%m-%d %H:%M:%S', taken_at_local, ?),
+            time_source = 'manual'
+          WHERE id IN (${ph}) AND taken_at IS NOT NULL
+        `).bind(mod, mod, ...ids).run();
+
+        const updated = (res.meta as any)?.changes ?? 0;
+        return new Response(JSON.stringify({
+          success: true,
+          updated,
+          skippedNoTime: ids.length - updated,
+        }), { headers });
+      }
+
+      // 路由：批次改時區（出國拍照但機身時區沒改）
+      // taken_at 是對的 —— 相機時鐘走的還是原本那個時區的正確時間，換算出來的瞬間沒錯，
+      // 錯的只是「拿哪個時區去顯示」。所以 taken_at 一律不動，只重算牆上時間。
+      // 同理不動 time_source：這個操作對瞬間的可信度沒有任何主張。
+      if (method === "POST" && pathname === "/api/photos/geo/set-timezone") {
+        const body: any = await request.json().catch(() => ({}));
+        const ids = sanitizePhotoIds(body?.photoIds);
+        if (ids.length === 0) {
+          return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
+        }
+        if (!isValidTzOffset(body?.tzOffsetMinutes)) {
+          return new Response(JSON.stringify({ error: "Invalid tzOffsetMinutes" }), { status: 400, headers });
+        }
+
+        const tz = body.tzOffsetMinutes;
+        const ph = ids.map(() => "?").join(",");
+        const res = await env.DB.prepare(`
+          UPDATE Photo SET
+            tz_offset_minutes = ?,
+            taken_at_local = strftime('%Y-%m-%d %H:%M:%S', taken_at, ?)
+          WHERE id IN (${ph}) AND taken_at IS NOT NULL
+        `).bind(tz, minutesModifier(tz), ...ids).run();
+
+        const updated = (res.meta as any)?.changes ?? 0;
+        return new Response(JSON.stringify({
+          success: true,
+          updated,
+          skippedNoTime: ids.length - updated,
+        }), { headers });
+      }
+
+      // ===== GPS 軌跡 =====
+      //
+      // Worker 只做 Drive 的 I/O 與 D1 的讀寫。GPX 解析與抽稀在瀏覽器跑，
+      // 所以不需要 cron，同步是使用者按下按鈕才發生的。
+
+      // 路由：列出 Drive 上的 GPX 檔與各自的同步狀態
+      // 會暴露檔名（＝出門的日期），僅管理者可讀
+      if (method === "GET" && pathname === "/api/tracks/drive/files") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!env.GOOGLE_DRIVE_SA_KEY || !env.GOOGLE_DRIVE_FOLDER_ID) {
+          return new Response(JSON.stringify({
+            error: "尚未設定 GOOGLE_DRIVE_SA_KEY 或 GOOGLE_DRIVE_FOLDER_ID",
+          }), { status: 503, headers });
+        }
+
+        const files = await listGpxFiles(env.GOOGLE_DRIVE_SA_KEY, env.GOOGLE_DRIVE_FOLDER_ID);
+        const { results: days } = await env.DB.prepare(
+          "SELECT day_key, md5, point_count, synced_at, ingest_source FROM TrackDay"
+        ).all();
+        const byKey = new Map((days as any[]).map(d => [d.day_key, d]));
+
+        // md5 相同就代表內容一個點都沒變 —— 每次 auto-send 都會動 modifiedTime，
+        // 只看時間會把整天的檔案白抓白解析一遍
+        const list = files.map(f => {
+          const known = byKey.get(f.name);
+          return {
+            dayKey: f.name,
+            driveFileId: f.id,
+            md5: f.md5Checksum ?? null,
+            modifiedTime: f.modifiedTime ?? null,
+            size: f.size ? Number(f.size) : null,
+            syncedPointCount: known?.point_count ?? 0,
+            syncedAt: known?.synced_at ?? null,
+            // 手動編輯過軌跡點的日子，ingest_source 會被改成 'manual'。
+            // 重灌會整批刪掉那天的點，把手工修的東西一起洗掉，所以前端預設跳過它。
+            ingestSource: known?.ingest_source ?? null,
+            needsSync: !known || !f.md5Checksum || known.md5 !== f.md5Checksum,
+          };
+        });
+        return new Response(JSON.stringify(list), { headers });
+      }
+
+      // 路由：代理單一 GPX 檔的原始 bytes 給前端解析
+      if (method === "GET" && pathname.startsWith("/api/tracks/drive/file/")) {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!env.GOOGLE_DRIVE_SA_KEY) {
+          return new Response(JSON.stringify({ error: "尚未設定 GOOGLE_DRIVE_SA_KEY" }), { status: 503, headers });
+        }
+        const fileId = decodeURIComponent(pathname.split("/")[5] || "");
+        if (!fileId) {
+          return new Response(JSON.stringify({ error: "file id is required" }), { status: 400, headers });
+        }
+
+        const upstream = await fetchGpxBytes(env.GOOGLE_DRIVE_SA_KEY, fileId);
+        return new Response(upstream.body, {
+          headers: { ...headers, "Content-Type": "application/gpx+xml" },
+        });
+      }
+
+      // 路由：列出已同步的軌跡日
+      //
+      // 會暴露出門的日期，僅管理者可讀（同 /api/tracks/drive/files）。
+      // 跟那條的差別：這裡問的是「D1 裡有什麼」，不需要 Drive 設定，
+      // 所以就算 Drive 壞了或檔案被清掉，還原介面仍然打得開。
+      if (method === "GET" && pathname === "/api/tracks/days") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        // drive_file_id / md5 也一起給：還原是走 ingest，而 ingest 會把這兩欄
+        // 整個覆蓋掉，前端得原封不動送回來，否則下次同步會誤判成「檔案有變」
+        const { results } = await env.DB.prepare(`
+          SELECT day_key, ingest_source, drive_file_id, md5, point_count,
+                 tz_offset_minutes, synced_at, is_private,
+                 raw_key IS NOT NULL AS has_raw
+          FROM TrackDay
+          ORDER BY day_key DESC
+        `).all();
+        return new Response(JSON.stringify(results), { headers });
+      }
+
+      // 路由：讀回某一天的原始 GPX（給「恢復原始軌跡」用）
+      // 原文就是完整的一日行蹤，比軌跡點更敏感，只給管理者
+      if (method === "GET" && pathname.startsWith("/api/tracks/raw/")) {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const dayKey = decodeURIComponent(pathname.slice("/api/tracks/raw/".length));
+        if (!dayKey) {
+          return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
+        }
+        const row = await env.DB.prepare(
+          "SELECT raw_key FROM TrackDay WHERE day_key = ?"
+        ).bind(dayKey).first<{ raw_key: string | null }>();
+        if (!row?.raw_key) {
+          return new Response(JSON.stringify({ error: "這一天沒有留存原始軌跡檔" }), { status: 404, headers });
+        }
+        const object = await env.BUCKET.get(row.raw_key);
+        if (!object) {
+          return new Response(JSON.stringify({ error: "原始軌跡檔已不存在" }), { status: 404, headers });
+        }
+        return new Response(object.body, {
+          headers: { ...headers, "Content-Type": "application/gpx+xml" },
+        });
+      }
+
+      // 路由：留存原始 GPX
+      //
+      // body 直接就是 GPX 原文 —— 前端同步時本來就已經把檔案下載到手上了，
+      // 讓它順手上傳一份，比 Worker 再往 Drive 抓第二次省。
+      if (method === "PUT" && pathname.startsWith("/api/tracks/raw/")) {
+        const dayKey = decodeURIComponent(pathname.slice("/api/tracks/raw/".length));
+        if (!dayKey) {
+          return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
+        }
+        const xml = await request.text();
+        if (!xml.trim()) {
+          return new Response(JSON.stringify({ error: "內容是空的" }), { status: 400, headers });
+        }
+        // key 用 encodeURIComponent 包起來：day_key 就是 Drive 檔名，
+        // 不保證不含斜線之類會在 R2 裡長出假目錄的字元
+        const rawKey = `tracks/${encodeURIComponent(dayKey)}.gpx`;
+        await env.BUCKET.put(rawKey, xml, {
+          httpMetadata: { contentType: "application/gpx+xml" },
+        });
+        // 這一天可能還沒 ingest（先存檔再寫點），所以用 UPDATE 而不是要求列已存在；
+        // 影響 0 列也不算錯，ingest 之後再存一次就補上了
+        await env.DB.prepare(
+          "UPDATE TrackDay SET raw_key = ? WHERE day_key = ?"
+        ).bind(rawKey, dayKey).run();
+        return new Response(JSON.stringify({ success: true, dayKey, rawKey }), { headers });
+      }
+
+      // 路由：寫入解析後的軌跡點
+      // 冪等：同一個 day_key 重灌就是整批換掉，所以重複同步不會長出重複的點
+      if (method === "POST" && pathname === "/api/tracks/ingest") {
+        const body: any = await request.json().catch(() => ({}));
+        const dayKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
+        if (!dayKey) {
+          return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
+        }
+
+        const rawPoints = Array.isArray(body?.points) ? body.points : [];
+        // 上限擋的是「一次匯入十年份時間軸」那種會直接吃掉整天 D1 寫入額度的情況
+        if (rawPoints.length > 20000) {
+          return new Response(JSON.stringify({ error: "單次最多 20000 點" }), { status: 400, headers });
+        }
+
+        const points = rawPoints
+          .filter((p: any) => isValidLatLng(p?.lat, p?.lng) && typeof p?.t === 'string' && p.t)
+          .map((p: any) => ({
+            t: p.t,
+            lat: p.lat,
+            lng: p.lng,
+            src: typeof p.src === 'string' ? p.src : null,
+            hdop: Number.isFinite(p?.hdop) ? p.hdop : null,
+            seg: Number.isFinite(p?.seg) ? Math.trunc(p.seg) : 0,
+            // 停留秒數由瀏覽器的 collapseStays 算好，這裡只收。0 或負數視同沒有
+            staySec: Number.isFinite(p?.staySec) && p.staySec > 0 ? Math.trunc(p.staySec) : null,
+          }));
+
+        const stmts: D1PreparedStatement[] = [
+          env.DB.prepare(
+            `INSERT INTO TrackDay (day_key, ingest_source, drive_file_id, md5, point_count, tz_offset_minutes)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(day_key) DO UPDATE SET
+               ingest_source = excluded.ingest_source,
+               drive_file_id = excluded.drive_file_id,
+               md5 = excluded.md5,
+               point_count = excluded.point_count,
+               tz_offset_minutes = excluded.tz_offset_minutes,
+               synced_at = CURRENT_TIMESTAMP`
+          ).bind(
+            dayKey,
+            typeof body?.ingestSource === 'string' ? body.ingestSource : 'gpslogger',
+            body?.driveFileId ?? null,
+            body?.md5 ?? null,
+            points.length,
+            isValidTzOffset(body?.tzOffsetMinutes) ? body.tzOffsetMinutes : null,
+          ),
+          env.DB.prepare("DELETE FROM TrackPoint WHERE day_key = ?").bind(dayKey),
+        ];
+
+        for (const p of points) {
+          stmts.push(env.DB.prepare(
+            "INSERT INTO TrackPoint (day_key, t_utc, lat, lng, src, hdop, seg, stay_sec) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          ).bind(dayKey, p.t, p.lat, p.lng, p.src, p.hdop, p.seg, p.staySec));
+        }
+
+        await env.DB.batch(stmts);
+        return new Response(JSON.stringify({
+          success: true,
+          dayKey,
+          inserted: points.length,
+          skipped: rawPoints.length - points.length,
+        }), { headers });
+      }
+
+      // 路由：取得軌跡點供地圖繪製
+      // 軌跡是獨立的隱私旗標，不繼承相簿的 map_private ——
+      // 它記錄的是人的整日移動（含住家），比單張照片的位置敏感得多。
+      // 所有 GET 路由都是公開的，所以過濾必須發生在 SQL 裡。
+      if (method === "GET" && pathname === "/api/tracks") {
+        const isAdmin = await isAuthorized(request, env);
+        const conds: string[] = [];
+        const binds: any[] = [];
+
+        if (!isAdmin) conds.push("d.is_private = 0");
+
+        const qFrom = url.searchParams.get("from");
+        if (qFrom) { conds.push("p.t_utc >= ?"); binds.push(qFrom); }
+        const qTo = url.searchParams.get("to");
+        if (qTo) { conds.push("p.t_utc <= ?"); binds.push(qTo); }
+        const qDay = url.searchParams.get("day_key");
+        if (qDay) { conds.push("p.day_key = ?"); binds.push(qDay); }
+
+        const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+        // 一定要有上限。軌跡一天就好幾百點，不設限的話「不選日期直接進地圖頁」
+        // 會把好幾年份一次讀出來，D1 免費額度的每日讀取列數撐不住。
+        const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20000, 1), 50000);
+        const { results } = await env.DB.prepare(`
+          SELECT p.id, p.day_key, p.t_utc, p.lat, p.lng, p.src, p.seg, p.stay_sec
+          FROM TrackPoint p
+          JOIN TrackDay d ON d.day_key = p.day_key
+          ${where}
+          ORDER BY p.t_utc DESC
+          LIMIT ?
+        `).bind(...binds, limit).all();
+
+        // 取最近的 N 點，但回傳仍要按時間遞增 —— 前端畫線與分段都假設是遞增的
+        return new Response(JSON.stringify((results as any[]).reverse()), { headers });
+      }
+
+      // 路由：手動編修軌跡點（刪除、合併）
+      //
+      // 刪除與合併是同一個操作的兩種用法：合併就是「刪掉 N 個點，插入質心上的
+      // 兩個點（進入、離開）」，跟匯入時的停留點濃縮產生的形狀完全一樣。
+      // 質心與時間由前端算好送過來 —— Worker 只做 I/O，跟 GPX 解析放在瀏覽器同一個理由。
+      if (method === "POST" && pathname === "/api/tracks/points/edit") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const body: any = await request.json().catch(() => ({}));
+        const dayKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
+        if (!dayKey) {
+          return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
+        }
+
+        const deleteIds = (Array.isArray(body?.deleteIds) ? body.deleteIds : [])
+          .filter((n: any) => Number.isFinite(n)).map((n: any) => Math.trunc(n));
+        const insert = (Array.isArray(body?.insert) ? body.insert : [])
+          .filter((p: any) => isValidLatLng(p?.lat, p?.lng) && typeof p?.t === 'string' && p.t)
+          .map((p: any) => ({
+            t: p.t,
+            lat: p.lat,
+            lng: p.lng,
+            src: typeof p.src === 'string' ? p.src : null,
+            seg: Number.isFinite(p?.seg) ? Math.trunc(p.seg) : 0,
+            staySec: Number.isFinite(p?.staySec) && p.staySec > 0 ? Math.trunc(p.staySec) : null,
+          }));
+
+        if (deleteIds.length === 0 && insert.length === 0) {
+          return new Response(JSON.stringify({ error: "沒有要變更的內容" }), { status: 400, headers });
+        }
+        // 一次刪太多通常是前端選取邏輯出錯，而不是使用者真的想這麼做
+        if (deleteIds.length > 5000) {
+          return new Response(JSON.stringify({ error: "單次最多刪除 5000 點" }), { status: 400, headers });
+        }
+
+        const stmts: D1PreparedStatement[] = [];
+        if (deleteIds.length > 0) {
+          // 一定要同時比對 day_key：否則帶著別天的 id 進來就能刪掉任意軌跡點
+          const holes = deleteIds.map(() => '?').join(',');
+          stmts.push(env.DB.prepare(
+            `DELETE FROM TrackPoint WHERE day_key = ? AND id IN (${holes})`
+          ).bind(dayKey, ...deleteIds));
+        }
+        for (const p of insert) {
+          stmts.push(env.DB.prepare(
+            "INSERT INTO TrackPoint (day_key, t_utc, lat, lng, src, hdop, seg, stay_sec) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)"
+          ).bind(dayKey, p.t, p.lat, p.lng, p.src, p.seg, p.staySec));
+        }
+        // 改成 'manual' 之後，前端的「立即同步足跡」預設會跳過這一天 ——
+        // 重灌是整批刪掉再寫入，會把這裡的手工修改一起洗掉
+        stmts.push(env.DB.prepare(
+          `UPDATE TrackDay
+           SET ingest_source = 'manual',
+               point_count = (SELECT COUNT(*) FROM TrackPoint WHERE day_key = ?)
+           WHERE day_key = ?`
+        ).bind(dayKey, dayKey));
+
+        await env.DB.batch(stmts);
+        return new Response(JSON.stringify({
+          success: true, dayKey, deleted: deleteIds.length, inserted: insert.length,
+        }), { headers });
+      }
+
+      // 路由：每段軌跡的交通工具
+      //
+      // 這裡只回「使用者指定過的那些段」，不做任何統計。段的點數、時間範圍、
+      // 平均速度都能從 /api/tracks 已經回傳的點自己算出來，
+      // 再讓 D1 為了 GROUP BY 掃一次 TrackPoint 是白花讀取額度。
+      if (method === "GET" && pathname === "/api/tracks/segments") {
+        const isAdmin = await isAuthorized(request, env);
+        // 跟 /api/tracks 同一套隱私規則：看不到那天的軌跡就不該看到它的交通工具
+        const where = isAdmin ? "" : "WHERE d.is_private = 0";
+        const { results } = await env.DB.prepare(`
+          SELECT s.day_key, s.seg, s.vehicle
+          FROM TrackSegment s
+          JOIN TrackDay d ON d.day_key = s.day_key
+          ${where}
+        `).all();
+        return new Response(JSON.stringify(results), { headers });
+      }
+
+      if (method === "PUT" && pathname === "/api/tracks/segments") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const body: any = await request.json().catch(() => ({}));
+        const dayKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
+        const seg = Number.isFinite(body?.seg) ? Math.trunc(body.seg) : NaN;
+        if (!dayKey || !Number.isFinite(seg)) {
+          return new Response(JSON.stringify({ error: "dayKey 與 seg 為必填" }), { status: 400, headers });
+        }
+        // 白名單。這個值會直接對到前端的圖示表，放任意字串進來只會變成沒有圖示
+        const ALLOWED = ['walk', 'bike', 'motorbike', 'car', 'bus', 'train', 'plane', 'boat'];
+        const raw = typeof body?.vehicle === 'string' ? body.vehicle : null;
+        if (raw !== null && !ALLOWED.includes(raw)) {
+          return new Response(JSON.stringify({ error: `vehicle 必須是 ${ALLOWED.join('/')} 之一` }), { status: 400, headers });
+        }
+
+        // vehicle 傳 null 代表「取消指定」，回到依速度自動判斷
+        if (raw === null) {
+          await env.DB.prepare("DELETE FROM TrackSegment WHERE day_key = ? AND seg = ?").bind(dayKey, seg).run();
+        } else {
+          await env.DB.prepare(
+            `INSERT INTO TrackSegment (day_key, seg, vehicle) VALUES (?, ?, ?)
+             ON CONFLICT(day_key, seg) DO UPDATE SET vehicle = excluded.vehicle`
+          ).bind(dayKey, seg, raw).run();
+        }
+        return new Response(JSON.stringify({ success: true, dayKey, seg, vehicle: raw }), { headers });
       }
 
       return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });

@@ -5,16 +5,71 @@
 // 專案的 workspaces 尚未建立 packages/ 共用套件，目前以複製取代建置設定的複雜度。
 // **修改時請同步兩邊**。
 
+/**
+ * 座標來源，權威由高而低（GEO_RANK 即此順序）：
+ *   'manual'       使用者親手指定，最高權威，任何自動流程都不得覆蓋
+ *   'exif'         照片自帶 GPS
+ *   'track'        比對 GPS 軌跡（TrackPoint）而來
+ *   'timeline'     比對 Google 時間軸而來
+ *   'segment'      套用行程段規則而來（城市級精度）
+ *   'interpolated' 前後照片內插推估（有軌跡後已無用，保留以相容既有資料）
+ */
+export type GeoSource =
+  | 'manual' | 'exif' | 'track' | 'timeline' | 'segment' | 'interpolated' | null;
+
+/** 權威順序。索引越小越權威。 */
+export const GEO_RANK = [
+  'manual', 'exif', 'track', 'timeline', 'segment', 'interpolated',
+] as const;
+
+/**
+ * 產生「不覆蓋更權威來源」的 SQL 條件片段。
+ * 值來自 GEO_RANK 這個字面量陣列，不含外部輸入，無注入風險。
+ *
+ * 用 `IS NOT` 而非 `!=`：SQLite 的 `geo_source != 'exif'` 在 geo_source 為 NULL 時
+ * 結果是 NULL（falsy），會把「還沒定位」的照片一起排除掉，正是這些照片最該被寫入。
+ */
+export function geoOverwriteGuard(writing: Exclude<GeoSource, null>): string {
+  return GEO_RANK.slice(0, GEO_RANK.indexOf(writing as any))
+    .map((s) => ` AND geo_source IS NOT '${s}'`)
+    .join('');
+}
+
+/**
+ * taken_at（UTC 瞬間）的來源，可信度由高而低：
+ *   'manual'     使用者親手修正，最高權威
+ *   'offset_tag' EXIF OffsetTimeOriginal，相機自己寫的時區，精確
+ *   'gps_utc'    由 GPSTimeStamp（UTC）與牆上時間相減得出，精確
+ *   'file_time'  檔案時間（如 Google creationTime）—— 瞬間精確，但可能不是快門時間
+ *   'assumed'    照片只有牆上時間，時區是用 DEFAULT_TZ_OFFSET_MINUTES 假設的。
+ *                這種 taken_at 可能整整差上數小時，**不可**拿去比對 GPS 軌跡定位。
+ */
+export type TimeSource = 'manual' | 'offset_tag' | 'gps_utc' | 'file_time' | 'assumed';
+
+/**
+ * 站台預設時區偏移（分鐘）。UTC+8 台灣。
+ *
+ * 用途：照片只有牆上時間、拿不到任何時區資訊時（Nikon D800 這類 EXIF 2.3 世代的
+ * 機身不寫 OffsetTimeOriginal，也沒有內建 GPS），只能假設它就是這個時區。
+ * 使用者的機身時鐘常年設在台灣時間、出國也不改，所以這個假設對絕大多數照片成立；
+ * 不成立的少數（出國拍攝）由手動編輯或批次改時區修正。
+ *
+ * 先前這裡是 `?? 0`，等於假設牆上時間就是 UTC，對台灣照片是固定 8 小時的誤差。
+ */
+export const DEFAULT_TZ_OFFSET_MINUTES = 480;
+
 export interface NormalizedGeo {
   lat: number | null;
   lng: number | null;
-  /** 有座標時為 'exif'，否則 null（留給行程段/內插填） */
+  /** 有座標時為 'exif'，否則 null（留給軌跡/行程段填） */
   geoSource: 'exif' | null;
   /** UTC 瞬間 ISO 字串，用於排序與去重 */
   takenAtUtc: string | null;
   /** 牆上時間 'YYYY-MM-DD HH:MM:SS'，用於顯示與行程段比對 */
   takenAtLocal: string | null;
   tzOffsetMinutes: number | null;
+  /** takenAtUtc 是怎麼算出來的。沒有任何時間資訊時為 null */
+  timeSource: TimeSource | null;
 }
 
 /** 地球上實際存在的最大時區偏移為 UTC+14 */
@@ -41,6 +96,7 @@ export function parseOffsetTime(raw: unknown): number | null {
 /**
  * 解析 EXIF 日期時間字串 'YYYY:MM:DD HH:MM:SS'。
  * EXIF 此欄位不帶時區，讀出來的就是拍攝當下的牆上時間。
+ * 也接受 'YYYY-MM-DD HH:MM:SS'，因此可直接餵 DB 裡的 taken_at_local。
  *
  * 也接受 Date 物件（exifr 預設會 revive），但那已被 exifr 以執行環境時區解讀過，
  * 這裡以 UTC getter 取回原始數字才不會二次位移。
@@ -92,15 +148,17 @@ export function gpsUtcMs(dateStamp: unknown, timeStamp: unknown): number | null 
 }
 
 /**
- * 推導拍攝當下的時區偏移（分鐘）。
+ * 推導拍攝當下的時區偏移（分鐘），並回報是哪一層算出來的。
  *   第一層：OffsetTimeOriginal，直接可用。
  *   第二層：GPSDateStamp/GPSTimeStamp 記的是 UTC，DateTimeOriginal 是牆上時間，
  *           兩者相減就是偏移。只要照片有 GPS 就一定算得出來，不需查任何時區資料庫。
- *   第三層（不在此處）：由呼叫端以行程段的 tz_offset_minutes 兜底。
+ *   兩層都不成立時回 null，由呼叫端以 DEFAULT_TZ_OFFSET_MINUTES 兜底。
  */
-export function deriveTzOffsetMinutes(exif: any): number | null {
+export function deriveTzOffset(
+  exif: any,
+): { offsetMinutes: number; source: 'offset_tag' | 'gps_utc' } | null {
   const direct = parseOffsetTime(exif?.OffsetTimeOriginal);
-  if (direct !== null) return direct;
+  if (direct !== null) return { offsetMinutes: direct, source: 'offset_tag' };
 
   const wc = parseExifDateTime(exif?.DateTimeOriginal);
   const utcMs = gpsUtcMs(exif?.GPSDateStamp, exif?.GPSTimeStamp);
@@ -111,7 +169,7 @@ export function deriveTzOffsetMinutes(exif: any): number | null {
 
   // 真實時區都是 15 分鐘的倍數；四捨五入到 15 分可吸收相機時鐘的少量誤差。
   // 相機時鐘若偏離超過 7.5 分鐘，推出來的偏移就會差一格，屬已知限制。
-  return Math.round(diffMinutes / 15) * 15;
+  return { offsetMinutes: Math.round(diffMinutes / 15) * 15, source: 'gps_utc' };
 }
 
 const pad = (n: number, len = 2) => String(Math.abs(n)).padStart(len, '0');
@@ -128,6 +186,19 @@ export function wallClockFromUtc(utcMs: number, offsetMinutes: number): WallCloc
     y: d.getUTCFullYear(), mo: d.getUTCMonth() + 1, d: d.getUTCDate(),
     h: d.getUTCHours(), mi: d.getUTCMinutes(), s: d.getUTCSeconds(),
   };
+}
+
+/**
+ * 由牆上時間 + 時區偏移，算回 taken_at 該存的 UTC 瞬間 ISO 字串。
+ *
+ * 全站不變式：**taken_at === taken_at_local − tz_offset_minutes**。
+ * taken_at_local 是「拍攝地的牆上時間」，tz_offset_minutes 是「該地的 UTC 偏移」。
+ * 任何寫入這兩欄的路徑都必須維持這個關係，否則排序、去重與軌跡比對會各自看到不同的時間。
+ */
+export function utcFromLocal(local: unknown, tzOffsetMinutes: number): string | null {
+  const wc = parseExifDateTime(local);
+  if (!wc) return null;
+  return new Date(wallClockAsUtcMs(wc) - tzOffsetMinutes * 60000).toISOString();
 }
 
 /**
@@ -169,7 +240,7 @@ export function toDecimalCoord(
 export function normalizeGeo(exif: any, fallbackIso?: string | null): NormalizedGeo {
   const out: NormalizedGeo = {
     lat: null, lng: null, geoSource: null,
-    takenAtUtc: null, takenAtLocal: null, tzOffsetMinutes: null,
+    takenAtUtc: null, takenAtLocal: null, tzOffsetMinutes: null, timeSource: null,
   };
   if (!exif || typeof exif !== 'object') exif = {};
 
@@ -184,22 +255,29 @@ export function normalizeGeo(exif: any, fallbackIso?: string | null): Normalized
   }
 
   // --- 時區與時間 ---
-  out.tzOffsetMinutes = deriveTzOffsetMinutes(exif);
+  // 推不出時區就寫入站台預設值，而不是留 null：這樣 taken_at 與 taken_at_local
+  // 的不變式（見 utcFromLocal）永遠成立，下游查詢不必到處 COALESCE。
+  // 「這個值是猜的」這件事由 timeSource = 'assumed' 記錄。
+  const tz = deriveTzOffset(exif);
+  out.tzOffsetMinutes = tz ? tz.offsetMinutes : DEFAULT_TZ_OFFSET_MINUTES;
 
   const wc = parseExifDateTime(exif.DateTimeOriginal);
   if (wc) {
     out.takenAtLocal = formatWallClock(wc);
-    // 牆上時間扣掉偏移 = 真正的 UTC 瞬間。無偏移時只能當作已是 UTC，
-    // 此時 taken_at 會有誤差，待行程段補上 tz 後可重算。
-    out.takenAtUtc = new Date(
-      wallClockAsUtcMs(wc) - (out.tzOffsetMinutes ?? 0) * 60000,
-    ).toISOString();
+    out.takenAtUtc = utcFromLocal(out.takenAtLocal, out.tzOffsetMinutes);
+    out.timeSource = tz ? tz.source : 'assumed';
   } else if (fallbackIso) {
     const ms = Date.parse(fallbackIso);
     if (Number.isFinite(ms)) {
       out.takenAtUtc = new Date(ms).toISOString();
-      out.takenAtLocal = formatWallClock(wallClockFromUtc(ms, out.tzOffsetMinutes ?? 0));
+      out.takenAtLocal = formatWallClock(wallClockFromUtc(ms, out.tzOffsetMinutes));
+      // 瞬間本身精確（來源已是 UTC），但可能是檔案時間而非快門時間
+      out.timeSource = 'file_time';
     }
+  }
+  // 完全沒有時間資訊時，留著預設時區也沒有意義，一併清掉
+  if (out.takenAtUtc === null) {
+    out.tzOffsetMinutes = null;
   }
 
   return out;

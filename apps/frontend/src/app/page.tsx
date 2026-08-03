@@ -4,7 +4,8 @@ import { useEffect, useState, useRef, useMemo } from "react";
 import styles from "./page.module.css";
 import albumStyles from "./album/album.module.css";
 import Link from "next/link";
-import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, verifyLogin, fetchAllPhotos, Photo, fetchTags, Tag } from "@/lib/api";
+import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, fetchAllPhotos, Photo, fetchTags, Tag } from "@/lib/api";
+import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import PhotoLightbox from "./album/PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
@@ -108,9 +109,8 @@ function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPres
 export default function Home() {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [loading, setLoading] = useState(true);
-  const [isAdmin, setIsAdmin] = useState(false);
-  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
-  
+  const { isAdmin, checking: isCheckingAuth, login } = useAdmin();
+
   // Modal state
   const [showModal, setShowModal] = useState(false);
   const [showLoginModal, setShowLoginModal] = useState(false);
@@ -223,23 +223,9 @@ export default function Home() {
     setLoading(false);
   };
 
+  // 管理員狀態由 useAdmin 負責（會去問後端 token 還有沒有效）
   useEffect(() => {
     loadData();
-    if (typeof window !== "undefined") {
-      const pwd = localStorage.getItem("admin_password");
-      if (pwd) {
-        setIsAdmin(true);
-        setIsCheckingAuth(false); // 立即顯示管理員按鈕
-        const checkAdmin = async () => {
-          const result = await verifyLogin(pwd);
-          setIsAdmin(result.success);
-          if (!result.success) localStorage.removeItem("admin_password");
-        };
-        checkAdmin();
-      } else {
-        setIsCheckingAuth(false);
-      }
-    }
   }, []);
 
   // 計算符合條件的全站照片 (搜尋關鍵字或選取標籤)
@@ -386,10 +372,8 @@ export default function Home() {
 
   const handleLogin = async () => {
     setIsSubmitting(true);
-    const result = await verifyLogin(passwordInput);
+    const result = await login(passwordInput);
     if (result.success) {
-      setIsAdmin(true);
-      localStorage.setItem("admin_password", passwordInput);
       setShowLoginModal(false);
       setPasswordInput("");
     } else {
