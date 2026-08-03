@@ -991,6 +991,90 @@ export async function fetchTrackRaw(dayKey: string): Promise<string | null> {
   }
 }
 
+/**
+ * 把一段軌跡送去貼路。經自家 Worker 轉手到 Valhalla ——
+ * 前端直打會把使用者家裡的 IP 連同完整行蹤一起交出去。
+ *
+ * 回傳 Valhalla 的原始回應（`shape` + `matched_points`），交給
+ * `buildMatchedTrack` 組裝。失敗回 null，呼叫端要能安靜退回原本的線。
+ */
+export async function matchTrackShape(
+  shape: { lat: number; lon: number }[],
+  costing: string,
+): Promise<any | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/match`, {
+      method: 'POST',
+      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shape, costing }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/** 存下這一天貼路後的軌跡（R2，不進 D1） */
+export async function saveTrackMatched(dayKey: string, data: unknown): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/matched/${encodeURIComponent(dayKey)}`, {
+      method: 'PUT',
+      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+/** 取回貼路後的軌跡。還沒貼過（404）回 null */
+export async function fetchTrackMatched(dayKey: string): Promise<MatchedTrack | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/matched/${encodeURIComponent(dayKey)}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/** 刪掉貼路結果。重貼之前先清掉，免得部分失敗時新舊混在一起 */
+export async function deleteTrackMatched(dayKey: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/matched/${encodeURIComponent(dayKey)}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+/**
+ * 存在 R2 的貼路結果。刻意存成「一段一個物件」而不是攤平的點列 ——
+ * 段與段之間是關機或沒訊號，接起來會多出一條沒走過的直線。
+ */
+export interface MatchedTrack {
+  dayKey: string;
+  /** 產生時間，之後要判斷新舊時用得到 */
+  builtAt: string;
+  segments: {
+    seg: number;
+    costing: string;
+    /** [lng, lat, 毫秒 epoch]，壓成陣列是為了讓檔案小一點 */
+    points: [number, number, number][];
+  }[];
+}
+
 /** 取得軌跡點。未登入時只拿得到被標為公開的日子 */
 export async function fetchTracks(opts: { from?: string; to?: string; dayKey?: string } = {}): Promise<TrackPoint[]> {
   try {

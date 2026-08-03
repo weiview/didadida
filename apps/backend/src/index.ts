@@ -15,6 +15,13 @@ export interface Env {
   GOOGLE_DRIVE_SA_KEY?: string;
   /** GPSLogger 上傳目的地資料夾的 Drive file id */
   GOOGLE_DRIVE_FOLDER_ID?: string;
+  /**
+   * map matching（軌跡貼路）用的 Valhalla 服務位址，例如
+   * https://valhalla1.openstreetmap.de。放在設定裡而不是寫死在程式碼，
+   * 是 FOSSGIS 使用條款明文要求的（「不要把服務網址硬寫進 app」），
+   * 這樣要換實例或臨時關掉都不必改程式。沒設就等於這個功能關閉。
+   */
+  VALHALLA_URL?: string;
 }
 
 async function generateJWT(env: Env): Promise<string> {
@@ -91,6 +98,12 @@ function applyGeoPrivacy(rows: any[], isAdmin: boolean): any[] {
  */
 const LOCAL_TIME_EXPR =
   "COALESCE(p.taken_at_local, REPLACE(SUBSTR(p.taken_at, 1, 19), 'T', ' '))";
+
+/**
+ * 貼路軌跡在 R2 的 key。跟原始 GPX 同一套規則用 encodeURIComponent 包起來：
+ * day_key 就是 Drive 檔名，不保證不含斜線之類會在 R2 裡長出假目錄的字元。
+ */
+const matchedKey = (dayKey: string) => `tracks/${encodeURIComponent(dayKey)}.matched.json`;
 
 /** 座標合法性檢查 —— 手動輸入與 API 傳入都要過這關 */
 function isValidLatLng(lat: unknown, lng: unknown): boolean {
@@ -1564,6 +1577,144 @@ function hammingDistance(hex1: string, hex2: string): number {
         return new Response(JSON.stringify({ success: true, dayKey, rawKey }), { headers });
       }
 
+      /*
+       * 路由：把一段軌跡送去 Valhalla 做 map matching（貼路），純轉手。
+       *
+       * 為什麼要繞 Worker 而不是讓前端直打：
+       *   1. 隱私 —— 對方看到的是 Cloudflare 的 IP，不是使用者家裡的。
+       *      送出去的是一串座標，等同完整行蹤，起點終點通常就是住家。
+       *   2. FOSSGIS 條款要求服務網址不可以硬寫進 app，得能隨時換掉或關掉。
+       *   3. 條款要求送出合法的 User-Agent，那是瀏覽器不給程式碼指定的標頭。
+       *
+       * Worker 這裡不解析回應內容，CPU 幾乎為零；解析與抽時間戳都在瀏覽器做。
+       * 速率限制（每秒 1 次）由前端負責排隊 —— 那裡才知道總共要跑幾段。
+       */
+      if (method === "POST" && pathname === "/api/tracks/match") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!env.VALHALLA_URL) {
+          return new Response(JSON.stringify({
+            error: "尚未設定 VALHALLA_URL，軌跡貼路功能未啟用",
+          }), { status: 503, headers });
+        }
+
+        const body: any = await request.json().catch(() => ({}));
+        const shape = (Array.isArray(body?.shape) ? body.shape : [])
+          .filter((p: any) => isValidLatLng(p?.lat, p?.lon))
+          .map((p: any) => ({ lat: p.lat, lon: p.lon }));
+        if (shape.length < 2) {
+          return new Response(JSON.stringify({ error: "至少要兩個點才能貼路" }), { status: 400, headers });
+        }
+        // Valhalla 對單次 trace 的點數有上限，而且點越多它算越久。
+        // 貼路不需要 1Hz 的密度，前端會先抽稀到這個量級再送
+        if (shape.length > 1000) {
+          return new Response(JSON.stringify({ error: "單次最多 1000 點" }), { status: 400, headers });
+        }
+        // 白名單。這個值直接進第三方 API，而且錯的 costing 會貼到錯的路網上
+        const COSTINGS = ['auto', 'bicycle', 'pedestrian', 'motorcycle', 'bus'];
+        const costing = typeof body?.costing === 'string' && COSTINGS.includes(body.costing)
+          ? body.costing : 'auto';
+
+        const upstream = await fetch(`${env.VALHALLA_URL.replace(/\/+$/, '')}/trace_attributes`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            // 條款要求可識別的 User-Agent；X-Client-Id 是 Valhalla 維護者另外請求的
+            "User-Agent": "didadida-photo-album (personal, https://github.com/)",
+            "X-Client-Id": "didadida-photo-album",
+          },
+          body: JSON.stringify({
+            shape,
+            costing,
+            // map_snap = 「這是一串 GPS 點，幫我貼到路上」。
+            // 另一種 edge_walk 是給已經確定走在哪些路段的資料用的，不適用
+            shape_match: "map_snap",
+            // 只要形狀跟每個輸入點對到的位置，其餘屬性（速限、路名…）不必回，
+            // 回應會小很多 —— 一天的軌跡差在幾百 KB
+            // 屬性名是 'matched.point'（一個帶 lat/lon 的物件），不是
+            // 'matched.point.lat' —— 寫成後者不會報錯，只會安靜地回一批
+            // 只有 type 沒有座標的點，然後貼路整個算不出來
+            filters: {
+              attributes: ["shape", "matched.point", "matched.type"],
+              action: "include",
+            },
+          }),
+        });
+
+        // 對方是單一台志工維護的伺服器，明文寫「不保證可用性」。
+        // 壞掉的時候要讓前端安靜退回原本的線，所以錯誤原封不動往上傳
+        const text = await upstream.text();
+        return new Response(text, {
+          status: upstream.ok ? 200 : 502,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
+
+      /*
+       * 路由：讀 / 寫貼路後的軌跡。
+       *
+       * 存 R2 不存 D1：貼路的結果是密集的道路幾何，一天可以到上萬點，
+       * 寫進 D1 會吃掉免費方案每日 10 萬列的寫入額度。而且它是衍生資料，
+       * 掉了重跑一次就有，不值得佔資料庫。
+       *
+       * 沒有另開 matched_key 欄位 —— key 由 day_key 直接推得，
+       * 拿不到就是還沒貼過，用 404 表示，省一次 schema 異動。
+       */
+      if (method === "GET" && pathname.startsWith("/api/tracks/matched/")) {
+        const dayKey = decodeURIComponent(pathname.slice("/api/tracks/matched/".length));
+        if (!dayKey) {
+          return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
+        }
+        // 隱私比照 /api/tracks 而不是 /api/tracks/raw：這是從已存的軌跡點
+        // 推出來的，沒有比那些點更敏感。私密的日子還是要擋
+        if (!(await isAuthorized(request, env))) {
+          const day = await env.DB.prepare(
+            "SELECT is_private FROM TrackDay WHERE day_key = ?"
+          ).bind(dayKey).first<{ is_private: number }>();
+          if (!day || day.is_private) {
+            return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers });
+          }
+        }
+        const object = await env.BUCKET.get(matchedKey(dayKey));
+        if (!object) {
+          return new Response(JSON.stringify({ error: "這一天還沒有貼路軌跡" }), { status: 404, headers });
+        }
+        return new Response(object.body, {
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
+
+      if (method === "PUT" && pathname.startsWith("/api/tracks/matched/")) {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const dayKey = decodeURIComponent(pathname.slice("/api/tracks/matched/".length));
+        if (!dayKey) {
+          return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
+        }
+        const json = await request.text();
+        if (!json.trim()) {
+          return new Response(JSON.stringify({ error: "內容是空的" }), { status: 400, headers });
+        }
+        await env.BUCKET.put(matchedKey(dayKey), json, {
+          httpMetadata: { contentType: "application/json" },
+        });
+        return new Response(JSON.stringify({ success: true, dayKey }), { headers });
+      }
+
+      if (method === "DELETE" && pathname.startsWith("/api/tracks/matched/")) {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const dayKey = decodeURIComponent(pathname.slice("/api/tracks/matched/".length));
+        if (!dayKey) {
+          return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
+        }
+        await env.BUCKET.delete(matchedKey(dayKey));
+        return new Response(JSON.stringify({ success: true, dayKey }), { headers });
+      }
+
       // 路由：寫入解析後的軌跡點
       // 冪等：同一個 day_key 重灌就是整批換掉，所以重複同步不會長出重複的點
       if (method === "POST" && pathname === "/api/tracks/ingest") {
@@ -1621,6 +1772,9 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
 
         await env.DB.batch(stmts);
+        // 點整批換掉了，之前貼路的結果就對不上了。留著會讓地圖畫出一條
+        // 跟現有軌跡無關的線，比沒有更糟 —— 直接丟掉，要用再貼一次
+        await env.BUCKET.delete(matchedKey(dayKey));
         return new Response(JSON.stringify({
           success: true,
           dayKey,
@@ -1723,6 +1877,8 @@ function hammingDistance(hex1: string, hex2: string): number {
         ).bind(dayKey, dayKey));
 
         await env.DB.batch(stmts);
+        // 同 ingest：軌跡點動過，貼路的結果就過期了
+        await env.BUCKET.delete(matchedKey(dayKey));
         return new Response(JSON.stringify({
           success: true, dayKey, deleted: deleteIds.length, inserted: insert.length,
         }), { headers });
