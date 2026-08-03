@@ -247,6 +247,8 @@ input:checked + .slider:before {
   padding: 8px 12px;
   border-radius: 8px;
   font-size: 0.9rem;
+  /* 讓原生日期／時間選單也跟著深色，不然會跳出一塊白的 */
+  color-scheme: dark;
 }
 
 .btn {
@@ -367,21 +369,6 @@ input:checked + .slider:before {
   font-size: 0.9rem;
   color: #eee;
   font-weight: 500;
-}
-
-.exifDateEdit {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-}
-
-.exifDateEdit .input {
-  padding: 6px 10px;
-  font-size: 0.95rem;
-}
-
-.exifDateEdit .btn {
-  padding: 6px 12px;
 }
 
 @media (max-width: 768px) {

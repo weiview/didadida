@@ -1,6 +1,17 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import styles from "./lightbox.module.css";
-import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, updateAlbum } from "@/lib/api";
+import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag } from "@/lib/api";
+import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime } from "@/lib/geo";
+import { formatTzOffset } from "@/lib/tz";
+
+// 只有顯示用的中文說明，值域本身定義在 geo.ts
+const TIME_SOURCE_LABEL: Record<string, string> = {
+  manual: '手動修正',
+  offset_tag: '相機寫入的時區',
+  gps_utc: 'GPS 時間推算',
+  file_time: '檔案時間',
+  assumed: `假設為 ${formatTzOffset(DEFAULT_TZ_OFFSET_MINUTES)}（未經確認）`,
+};
 
 interface PhotoLightboxProps {
   photo: Photo;
@@ -21,11 +32,13 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   const [isSavingDesc, setIsSavingDesc] = useState(false);
   const [isEditingDesc, setIsEditingDesc] = useState(false);
   
-  const [dateValue, setDateValue] = useState(photo.taken_at ? photo.taken_at.split('T')[0] : "");
-  const [isSavingDate, setIsSavingDate] = useState(false);
-  
   const [newTagName, setNewTagName] = useState("");
   const [isAddingTag, setIsAddingTag] = useState(false);
+
+  useEffect(() => {
+    setDescValue(photo.description || "");
+    setIsEditingDesc(false);
+  }, [photo.id, photo.description]);
 
   // Swipe State
   const [touchStart, setTouchStart] = useState<number | null>(null);
@@ -87,15 +100,17 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   };
 
   const parsedExif = photo.exif ? JSON.parse(photo.exif) : null;
-  const hasExifDate = !!(parsedExif?.DateTimeOriginal);
-  
-  // 決定要顯示的日期：優先用手動設定的 taken_at，再來用 EXIF 的時間
-  let displayDate = null;
-  if (photo.taken_at) {
-    displayDate = new Date(photo.taken_at).toLocaleString();
-  } else if (parsedExif?.DateTimeOriginal) {
-    displayDate = new Date(parsedExif.DateTimeOriginal).toLocaleString();
-  }
+
+  // 拍攝時間一律顯示照片自己的牆上時間加上時區標籤。
+  // 不用 new Date(taken_at).toLocaleString() —— 那會換算成「看照片的人所在的時區」，
+  // 在日本拍的照片用台灣的瀏覽器打開會少三小時，看起來像資料壞了。
+  const exifWall = parseExifDateTime(parsedExif?.DateTimeOriginal);
+  const wallClock = photo.taken_at_local || (exifWall ? formatWallClock(exifWall) : null);
+  const displayDate = wallClock
+    ? (photo.tz_offset_minutes != null
+        ? `${wallClock}　${formatTzOffset(photo.tz_offset_minutes)}`
+        : wallClock)
+    : null;
 
   const handleSaveDesc = async () => {
     setIsSavingDesc(true);
@@ -105,17 +120,6 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
       setIsEditingDesc(false);
     }
     setIsSavingDesc(false);
-  };
-
-  const handleSaveDate = async () => {
-    setIsSavingDate(true);
-    const success = await updatePhoto(photo.id, { taken_at: dateValue ? new Date(dateValue).toISOString() : undefined });
-    if (success) {
-      onUpdate();
-      // Update local state temporarily for snappy UI
-      photo.taken_at = dateValue ? new Date(dateValue).toISOString() : undefined;
-    }
-    setIsSavingDate(false);
   };
 
   const handleAddTag = async () => {
@@ -278,6 +282,17 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             )}
           </div>
 
+          {/* 位置與時間的編輯已移到「上傳後的補件視窗」與相簿頁的批次操作 ——
+              燈箱是看照片的地方，這裡只留唯讀的地點 */}
+          {isAdmin && (
+            <div className={styles.section}>
+              <div className={styles.sectionHeader}>
+                <h3>地點</h3>
+              </div>
+              <span className={styles.exifValue}>{photo.place_name || '尚未指定地點'}</span>
+            </div>
+          )}
+
           <div className={styles.exifToggleRow}>
             <div className={styles.switchWrapper}>
               <span>顯示照片資訊 (EXIF)</span>
@@ -291,24 +306,21 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           {showExif && (
             <div className={styles.exifContainer}>
               <div className={styles.exifGrid}>
-                {/* 拍攝時間整合至 EXIF 區域首位 */}
+                {/* 拍攝時間整合至 EXIF 區域首位。要改時間請在相簿頁選取照片後用「修正時間」，
+                    那裡才會一起維護牆上時間與時區的對應關係 */}
                 <div className={styles.exifItem}>
                   <span className={styles.exifLabel}>拍攝時間</span>
-                  {isAdmin && !hasExifDate ? (
-                    <div className={styles.exifDateEdit}>
-                      <input 
-                        type="date" 
-                        value={dateValue} 
-                        onChange={e => setDateValue(e.target.value)} 
-                        className={styles.input}
-                      />
-                      <button className={styles.btn} onClick={handleSaveDate} disabled={isSavingDate}>儲存</button>
-                    </div>
-                  ) : (
-                    <span className={styles.exifValue}>{displayDate || "未知"}</span>
-                  )}
+                  <span className={styles.exifValue}>{displayDate || "未知"}</span>
                 </div>
-                
+
+                {/* 時間來源決定這張照片的時間可不可信 —— assumed 的照片不該拿去比對 GPS 軌跡 */}
+                <div className={styles.exifItem}>
+                  <span className={styles.exifLabel}>時間來源</span>
+                  <span className={styles.exifValue}>
+                    {(photo.time_source && TIME_SOURCE_LABEL[photo.time_source]) || '—'}
+                  </span>
+                </div>
+
                 {exifItems.length > 0 ? (
                   exifItems.map(item => (
                     <div className={styles.exifItem} key={item.label}>

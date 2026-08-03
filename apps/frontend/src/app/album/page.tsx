@@ -4,10 +4,13 @@ import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbums, deletePhoto, verifyLogin, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbums, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, type UploadedPhoto } from "@/lib/api";
+import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
 import AssignPlaceModal from "@/components/AssignPlaceModal";
+import FixTimeModal from "@/components/FixTimeModal";
+import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
@@ -22,7 +25,7 @@ function AlbumContent() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const [isAdmin, setIsAdmin] = useState(false);
+  const { isAdmin } = useAdmin();
   const [selectedPhotoIndex, setSelectedPhotoIndex] = useState<number | null>(null);
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
   const [visibleCount, setVisibleCount] = useState<number>(24);
@@ -32,6 +35,9 @@ function AlbumContent() {
   // 批次刪除 State
   const [selectedPhotos, setSelectedPhotos] = useState<number[]>([]);
   const [showAssignPlace, setShowAssignPlace] = useState(false);
+  const [showFixTime, setShowFixTime] = useState(false);
+  // 剛上傳的那一批。非空即代表補件視窗開著
+  const [postUploadIds, setPostUploadIds] = useState<number[]>([]);
   // Shift 連選的錨點（顯示順序上的 index）
   const lastSelectedIndexRef = useRef<number | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -178,17 +184,8 @@ function AlbumContent() {
       loadData();
     }
     
-    // Check auth optimistically
+    // 管理員狀態由 useAdmin 負責（會去問後端 token 還有沒有效）
     if (typeof window !== "undefined") {
-      const pwd = localStorage.getItem("admin_password");
-      if (pwd) {
-        setIsAdmin(true); // Optimistic UI
-        verifyLogin(pwd).then(valid => {
-          setIsAdmin(valid.success);
-          if (!valid.success) localStorage.removeItem("admin_password");
-        });
-      }
-      
       const gToken = searchParams?.get("googleToken");
       if (gToken) {
         localStorage.setItem("google_access_token", gToken);
@@ -348,6 +345,7 @@ function AlbumContent() {
     setUploading(true);
     let allSuccess = true;
     const total = files.length;
+    const uploaded: UploadedPhoto[] = [];
 
     for (let i = 0; i < total; i++) {
       const rawFile = files[i];
@@ -355,8 +353,10 @@ function AlbumContent() {
       try {
         // 縮圖處理 (長邊不超過 2000px)
         const { file, exifData, takenAt } = await resizeImageFile(rawFile, 2000);
-        const success = await uploadPhoto(id, file, exifData, takenAt || undefined);
-        if (!success) {
+        const result = await uploadPhoto(id, file, exifData, takenAt || undefined);
+        if (result) {
+          uploaded.push(result);
+        } else {
           allSuccess = false;
         }
       } catch (err) {
@@ -368,10 +368,15 @@ function AlbumContent() {
     if (!allSuccess) {
       alert("部分或全部照片上傳失敗，請稍後再試。");
     }
-    
-    loadData(); // 重新整理照片
+
+    await loadData(); // 重新整理照片。要 await，補件視窗才拿得到縮圖
     setUploading(false);
     setUploadProgress(null);
+
+    // 這批只要有任何一張沒有 EXIF 座標就跳出補件視窗；全部都有 GPS 的話不打擾。
+    if (uploaded.some((p) => p.lat === null || p.lng === null)) {
+      setPostUploadIds(uploaded.map((p) => p.id));
+    }
     
     // reset input
     if (fileInputRef.current) {
@@ -1242,6 +1247,15 @@ function AlbumContent() {
           </button>
 
           <button
+            className={pageStyles.actionButton}
+            onClick={() => setShowFixTime(true)}
+            disabled={selectedPhotos.length === 0}
+            style={{ opacity: selectedPhotos.length === 0 ? 0.5 : 1 }}
+          >
+            🕒 修正時間
+          </button>
+
+          <button
             className={`${pageStyles.actionButton} ${selectedPhotos.length > 0 ? pageStyles.danger : ''}`}
             onClick={() => setShowDeleteConfirm(true)}
             disabled={selectedPhotos.length === 0 || isBatchDeleting}
@@ -1261,6 +1275,23 @@ function AlbumContent() {
         onCancel={() => setShowDeleteConfirm(false)}
       />
 
+      {/* 上傳後的補件關卡。自己不寫入任何東西，只負責挑出要處理的照片後轉交下面兩個 modal */}
+      <PostUploadReviewModal
+        isOpen={postUploadIds.length > 0}
+        photos={photos.filter((p) => postUploadIds.includes(p.id))}
+        onClose={() => setPostUploadIds([])}
+        onAssignPlace={(ids) => {
+          setSelectedPhotos(ids);
+          setPostUploadIds([]);
+          setShowAssignPlace(true);
+        }}
+        onFixTime={(ids) => {
+          setSelectedPhotos(ids);
+          setPostUploadIds([]);
+          setShowFixTime(true);
+        }}
+      />
+
       <AssignPlaceModal
         isOpen={showAssignPlace}
         photoIds={selectedPhotos}
@@ -1272,6 +1303,19 @@ function AlbumContent() {
           loadData();
           const skipped = skippedExif > 0 ? `，${skippedExif} 張已有 GPS 未覆蓋` : '';
           alert(`已為 ${updated} 張照片指定地點${skipped}`);
+        }}
+      />
+
+      <FixTimeModal
+        isOpen={showFixTime}
+        photoIds={selectedPhotos}
+        onClose={() => setShowFixTime(false)}
+        onDone={({ updated, skippedNoTime, what }) => {
+          setSelectedPhotos([]);
+          lastSelectedIndexRef.current = null;
+          loadData();
+          const skipped = skippedNoTime > 0 ? `，${skippedNoTime} 張沒有拍攝時間未處理` : '';
+          alert(`已為 ${updated} 張照片${what}${skipped}`);
         }}
       />
 

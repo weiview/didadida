@@ -40,6 +40,8 @@ export interface Photo {
   /** 牆上時間 'YYYY-MM-DD HH:MM:SS'，顯示與行程段比對都用這個 */
   taken_at_local?: string | null;
   tz_offset_minutes?: number | null;
+  /** taken_at 是怎麼算出來的，決定它能不能拿去比對 GPS 軌跡 */
+  time_source?: TimeSource | null;
   exif?: string;
   created_at: string;
   tags?: Tag[];
@@ -51,8 +53,10 @@ export interface Photo {
   geo_private?: number;
 }
 
-/** null 代表尚未定位。'timeline' 來自 Google 時間軸比對 */
-export type GeoSource = 'exif' | 'timeline' | 'interpolated' | 'manual' | null;
+// 值域與權威順序定義在 geo.ts（前後端共用同一份），這裡只做轉出，
+// 避免兩邊各維護一份字串聯集而慢慢長歪。
+export type { GeoSource, TimeSource } from './geo';
+import type { GeoSource, TimeSource } from './geo';
 
 export interface FootprintPoint {
   id: number;
@@ -64,7 +68,10 @@ export interface FootprintPoint {
   lng: number;
   place_name: string | null;
   geo_source: GeoSource;
+  /** 顯示用的當地牆上時間 'YYYY-MM-DD HH:MM:SS' */
   local_time: string;
+  /** UTC 瞬間。要跟 GPS 軌跡排到同一條時間軸上只能用這個 */
+  taken_at: string | null;
 }
 
 export interface TripSegment {
@@ -116,6 +123,33 @@ export async function verifyLogin(password: string): Promise<{ success: boolean;
   } catch (error: any) {
     console.error(error);
     return { success: false, message: `連線錯誤: ${error.message}` };
+  }
+}
+
+/**
+ * 確認 localStorage 裡的 token 還有效（沒過期、簽章對）。
+ *
+ * 這是「是不是管理員」的唯一依據。以前是把明文密碼存在 localStorage 再重打一次
+ * verify-password，那個密碼同時是 JWT 的簽章金鑰，不該留在瀏覽器裡；而只檢查
+ * token 這個 key 存不存在也不行 —— 過期後 key 還在，編輯介面會繼續出現然後每一
+ * 個按鈕都被後端 401 擋掉。
+ */
+export async function checkAuth(): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+  // 舊版把明文密碼存在這個 key。清掉已經留在使用者瀏覽器裡的那一份，
+  // 否則它會一直躺在那裡。等所有裝置都開過一次站之後這行就可以刪了。
+  localStorage.removeItem('admin_password');
+  if (!localStorage.getItem('admin_token')) return false;
+  try {
+    const res = await fetch(`${API_BASE_URL}/auth/me`, { headers: getAuthHeaders() });
+    if (res.ok) return true;
+    // 401 = 過期或無效。留著只會讓下次進站又錯判一遍
+    if (res.status === 401) localStorage.removeItem('admin_token');
+    return false;
+  } catch (error) {
+    // 連不上就當作沒登入 —— 寧可少顯示編輯介面，也不要顯示一堆會失敗的按鈕
+    console.error(error);
+    return false;
   }
 }
 
@@ -196,7 +230,15 @@ async function generateThumbnail(file: File): Promise<Blob | null> {
   });
 }
 
-export async function uploadPhoto(albumId: string, file: File, exifData?: any, takenAt?: string): Promise<boolean> {
+/** 上傳成功後回傳的那一筆，null 代表失敗 */
+export interface UploadedPhoto {
+  id: number;
+  /** EXIF 有帶座標才有值。null 代表這張需要事後補位置 */
+  lat: number | null;
+  lng: number | null;
+}
+
+export async function uploadPhoto(albumId: string, file: File, exifData?: any, takenAt?: string): Promise<UploadedPhoto | null> {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('album_id', albumId);
@@ -245,10 +287,17 @@ export async function uploadPhoto(albumId: string, file: File, exifData?: any, t
       headers: { 'Authorization': `Bearer ${token}` },
       body: formData,
     });
-    return res.ok;
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (typeof data?.id !== 'number') return null;
+    return {
+      id: data.id,
+      lat: typeof data.lat === 'number' ? data.lat : null,
+      lng: typeof data.lng === 'number' ? data.lng : null,
+    };
   } catch (error) {
     console.error(error);
-    return false;
+    return null;
   }
 }
 
@@ -598,6 +647,96 @@ export async function applyTripSegments(albumId?: number): Promise<number> {
   }
 }
 
+// ===== 手動編輯 =====
+// 不管照片有沒有 GPS、有沒有時區標籤，都要能靠手改到正確位置與時間。
+// 後端維持不變式 taken_at === taken_at_local − tz_offset_minutes，
+// 所以「改牆上時間」與「改時區」是兩個不同的操作，別混在一起送。
+
+/**
+ * 單張照片的手動編輯。**只送使用者真的動過的欄位**，
+ * 欄位存在與不存在對後端是不同語意。
+ */
+export interface PhotoGeoPatch {
+  /** lat/lng 要成對送。兩個都給 null 代表清掉座標；整組省略才是「不要動」 */
+  lat?: number | null;
+  lng?: number | null;
+  placeName?: string | null;
+  /** 牆上時間 'YYYY-MM-DD HH:MM:SS'。送了代表相機時鐘記錯，taken_at 會重算 */
+  takenAtLocal?: string;
+  /** 只送這個代表瞬間沒錯、只是拿錯時區在顯示，taken_at 不動 */
+  tzOffsetMinutes?: number;
+}
+
+type PhotoGeoFields = Pick<
+  Photo,
+  'id' | 'lat' | 'lng' | 'place_name' | 'geo_source'
+  | 'taken_at' | 'taken_at_local' | 'tz_offset_minutes' | 'time_source'
+>;
+
+/** 手動編輯單張照片的座標與時間。手動是最高權威，之後任何自動流程都不會覆蓋 */
+export async function updatePhotoGeo(
+  photoId: number,
+  patch: PhotoGeoPatch,
+): Promise<PhotoGeoFields | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/${photoId}/geo`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.photo ?? null;
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/**
+ * 批次平移拍攝時間，用於相機時鐘走差（D800 每年慢約一分鐘）。
+ * 瞬間與牆上時間一起移動、時區不變。
+ */
+export async function shiftPhotoTime(
+  photoIds: number[],
+  minutes: number,
+): Promise<{ success: boolean; updated: number; skippedNoTime: number } | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/shift-time`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ photoIds, minutes }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/**
+ * 批次改時區，用於出國拍照但機身時區沒改。
+ * taken_at 是對的，錯的只是「拿哪個時區去顯示」，所以只重算牆上時間。
+ */
+export async function setPhotoTimezone(
+  photoIds: number[],
+  tzOffsetMinutes: number,
+): Promise<{ success: boolean; updated: number; skippedNoTime: number } | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/set-timezone`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ photoIds, tzOffsetMinutes }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
 /** 對前後有 EXIF 座標的照片之間做時間內插 */
 export async function interpolateGeo(albumId?: number, maxGapHours = 24): Promise<number> {
   try {
@@ -686,5 +825,245 @@ export async function applyTimelineMatches(
   } catch (err) {
     console.error(err);
     return null;
+  }
+}
+
+// ===== GPS 軌跡 =====
+
+/** Drive 上的一個 GPX 檔，以及它跟資料庫的同步狀態 */
+export interface DriveGpxFile {
+  /** 就是 Drive 上的檔名，同時當作 TrackDay 的主鍵。不透明，不要拿去解析日期 */
+  dayKey: string;
+  driveFileId: string;
+  md5: string | null;
+  modifiedTime: string | null;
+  size: number | null;
+  syncedPointCount: number;
+  syncedAt: string | null;
+  /** md5 跟已同步的不一樣（或根本沒同步過）才需要重抓 */
+  needsSync: boolean;
+  /** 'manual' 代表這天的軌跡點被手動編修過，重灌會洗掉，同步時預設跳過 */
+  ingestSource: string | null;
+}
+
+export interface TrackPoint {
+  /** TrackPoint.id，手動編修時用來指定要刪哪些點 */
+  id: number;
+  day_key: string;
+  t_utc: string;
+  lat: number;
+  lng: number;
+  /** GPX 的 <src>（'gps' | 'network'），或 'stay' 表示這是濃縮後的停留點 */
+  src: string | null;
+  seg: number;
+  /**
+   * 停留秒數。停留是「進入 + 離開」兩個同座標的點，前者帶秒數、後者為 null。
+   * 一般的移動點也是 null。
+   */
+  stay_sec?: number | null;
+}
+
+/** 交通工具。值域與後端 PUT /api/tracks/segments 的白名單必須一致 */
+export type Vehicle = 'walk' | 'bike' | 'motorbike' | 'car' | 'bus' | 'train' | 'plane' | 'boat';
+
+/** 使用者對某一段軌跡指定的交通工具。沒有指定的段不會出現在這個清單裡 */
+export interface TrackSegmentVehicle {
+  day_key: string;
+  seg: number;
+  vehicle: Vehicle | null;
+}
+
+/** 列出 Drive 資料夾裡的 GPX 檔。僅管理者可用 */
+export async function fetchDriveGpxFiles(): Promise<{ files: DriveGpxFile[]; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/drive/files`, { headers: getAuthHeaders() });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      return { files: [], error: body?.error || `伺服器回應 ${res.status}` };
+    }
+    return { files: await res.json() };
+  } catch (err) {
+    console.error(err);
+    return { files: [], error: '無法連線到伺服器' };
+  }
+}
+
+/** 取回單一 GPX 檔的原始內容，交給瀏覽器解析 */
+export async function fetchDriveGpxText(fileId: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/drive/file/${encodeURIComponent(fileId)}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/**
+ * 寫入一天份的軌跡點。
+ * 同一個 dayKey 會整批換掉，所以重複同步不會長出重複的點。
+ */
+export async function ingestTrack(payload: {
+  dayKey: string;
+  driveFileId?: string;
+  md5?: string | null;
+  ingestSource?: string;
+  tzOffsetMinutes?: number;
+  points: {
+    t: string; lat: number; lng: number; src: string | null;
+    hdop: number | null; seg: number; staySec?: number | null;
+  }[];
+}): Promise<{ inserted: number; skipped: number } | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/ingest`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return { inserted: data?.inserted ?? 0, skipped: data?.skipped ?? 0 };
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/** 已同步的一天軌跡。`hasRaw` 為真才還原得回原始軌跡 */
+export interface TrackDay {
+  day_key: string;
+  ingest_source: 'gpslogger' | 'timeline' | 'manual' | string;
+  drive_file_id: string | null;
+  md5: string | null;
+  point_count: number;
+  tz_offset_minutes: number | null;
+  synced_at: string | null;
+  is_private: number;
+  has_raw: number;
+}
+
+export async function fetchTrackDays(): Promise<TrackDay[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/days`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return [];
+  }
+}
+
+/**
+ * 留存這一天的原始 GPX。
+ * 必須在 ingestTrack 成功之後才呼叫 —— 後端是 UPDATE TrackDay，那一列還不存在的話會沒寫到。
+ */
+export async function saveTrackRaw(dayKey: string, xml: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/raw/${encodeURIComponent(dayKey)}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/gpx+xml',
+        'Authorization': getAuthHeaders().Authorization,
+      },
+      body: xml,
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+/** 取回留存的原始 GPX 原文。沒留存過回 null */
+export async function fetchTrackRaw(dayKey: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/raw/${encodeURIComponent(dayKey)}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/** 取得軌跡點。未登入時只拿得到被標為公開的日子 */
+export async function fetchTracks(opts: { from?: string; to?: string; dayKey?: string } = {}): Promise<TrackPoint[]> {
+  try {
+    const qs = new URLSearchParams();
+    if (opts.from) qs.set('from', opts.from);
+    if (opts.to) qs.set('to', opts.to);
+    if (opts.dayKey) qs.set('day_key', opts.dayKey);
+    const res = await fetch(`${API_BASE_URL}/tracks?${qs.toString()}`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return [];
+  }
+}
+
+/**
+ * 取得使用者指定過交通工具的軌跡段。
+ * 只回被指定過的段 —— 段的點數與速度前端從 fetchTracks 的結果自己算，
+ * 不需要 D1 再為了統計掃一次 TrackPoint。
+ */
+export async function fetchTrackSegments(): Promise<TrackSegmentVehicle[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/segments`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return [];
+  }
+}
+
+/** 手動編修軌跡點：刪掉 deleteIds，再插入 insert（合併就是刪一批、插入質心上的兩個點） */
+export interface TrackPointEdit {
+  dayKey: string;
+  deleteIds: number[];
+  insert: {
+    t: string;
+    lat: number;
+    lng: number;
+    src: string | null;
+    seg: number;
+    staySec?: number | null;
+  }[];
+}
+
+export async function editTrackPoints(edit: TrackPointEdit): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/points/edit`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(edit),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+/** 指定某一段軌跡的交通工具。傳 null 代表取消指定，回到依速度自動判斷 */
+export async function setSegmentVehicle(
+  dayKey: string, seg: number, vehicle: Vehicle | null,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tracks/segments`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ dayKey, seg, vehicle }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
   }
 }
