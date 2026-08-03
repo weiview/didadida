@@ -40,6 +40,30 @@ interface Props {
    * 跟 onEditPoints 分開是因為改的是不同資料表，後端也是兩條路由。
    */
   onMovePhoto?: (photoId: number, lat: number, lng: number) => Promise<boolean>;
+  /**
+   * 未經濃縮／抽稀的原始軌跡點（由頁面解析 GPX 而來，這裡只負責畫與跑動畫）。
+   *
+   * 刻意跟 tracks 分開而不是合併：這些點不在 D1 裡，沒有真的 id，
+   * 不可以進編輯模式 —— 選了也刪不掉、合併不了。
+   *
+   * 純檢視用，不寫進 D1 —— 完整軌跡動輒好幾萬點，寫進去會吃掉免費方案
+   * 每日 10 萬列的寫入額度，而且編輯模式的段內點號會變成五位數而不能用。
+   */
+  rawTracks?: TrackPoint[];
+  /** 要不要把原始軌跡畫成橘色虛線。跟 animateOn 分開：可以只跑動畫不畫線，反之亦然 */
+  showRawLine?: boolean;
+  /**
+   * 貼路（map matching）後的軌跡點。幾何來自 OSM 路網，時間是從原本的點內插回來的，
+   * 所以跟 rawTracks 一樣可以直接畫、直接跑動畫。
+   *
+   * 同樣不在 D1 裡（存 R2），不可編輯 —— 這是衍生資料，改它沒有意義，
+   * 真要修的是原本的軌跡點。
+   */
+  matchedTracks?: TrackPoint[];
+  /** 要不要把貼路軌跡畫成紫色實線 */
+  showMatchedLine?: boolean;
+  /** 動畫沿著哪一份軌跡跑。選到的那份沒資料時自動退回 'track' */
+  animateOn?: 'track' | 'raw' | 'matched';
 }
 
 /** 動畫路徑上的一個節點 */
@@ -192,9 +216,28 @@ function humanDuration(sec: number): string {
   return m === 0 ? `${h} 小時` : `${h} 小時 ${m} 分`;
 }
 
+/**
+ * 把軌跡點按「哪一天的第幾段」切成一條條折線。
+ * 跨段不可以連線 —— 中間是關機或收不到訊號，接起來會憑空畫出一條沒走過的直線。
+ * 資料本來就按時間遞增，這裡只做分組。
+ */
+function groupLines(points: TrackPoint[] | undefined): [number, number][][] {
+  const groups = new Map<string, [number, number][]>();
+  for (const p of points || []) {
+    const key = segmentKey(p.day_key, p.seg);
+    const line = groups.get(key);
+    if (line) line.push([p.lng, p.lat]);
+    else groups.set(key, [[p.lng, p.lat]]);
+  }
+  return Array.from(groups.values()).filter((line) => line.length >= 2);
+}
+
 export default function FootprintMap({
   points, tracks, connectPhotos = false, vehicleByKey, height = 520, styleUrl, onSelectPhoto,
   editable = false, onEditPoints, onMovePhoto,
+  rawTracks, showRawLine = false,
+  matchedTracks, showMatchedLine = false,
+  animateOn = 'track',
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -232,18 +275,19 @@ export default function FootprintMap({
   );
   const coords = useMemo(() => sorted.map((p) => [p.lng, p.lat] as [number, number]), [sorted]);
 
-  // 軌跡按「哪一天的第幾段」切開。跨段不可以連線 —— 中間是關機或收不到訊號，
-  // 直接接起來會憑空畫出一條沒走過的直線。後端已按 t_utc 排序，這裡只做分組。
-  const trackLines = useMemo(() => {
-    const groups = new Map<string, [number, number][]>();
-    for (const p of tracks || []) {
-      const key = segmentKey(p.day_key, p.seg);
-      const line = groups.get(key);
-      if (line) line.push([p.lng, p.lat]);
-      else groups.set(key, [[p.lng, p.lat]]);
-    }
-    return Array.from(groups.values()).filter((line) => line.length >= 2);
-  }, [tracks]);
+  const trackLines = useMemo(() => groupLines(tracks), [tracks]);
+
+  // 原始軌跡與貼路軌跡的線，分組規則跟 trackLines 一樣
+  const rawLines = useMemo(() => groupLines(rawTracks), [rawTracks]);
+  const matchedLines = useMemo(() => groupLines(matchedTracks), [matchedTracks]);
+
+  // 動畫沿著哪一份軌跡跑。選了某一份卻還沒載到資料時退回濃縮版 ——
+  // 否則切過去的那一瞬間動畫會整個空掉，看起來像壞了
+  const animTracks = useMemo(() => {
+    if (animateOn === 'raw' && (rawTracks?.length ?? 0) > 0) return rawTracks!;
+    if (animateOn === 'matched' && (matchedTracks?.length ?? 0) > 0) return matchedTracks!;
+    return tracks || [];
+  }, [animateOn, rawTracks, matchedTracks, tracks]);
 
   // 每個軌跡點在它那一段裡的序號（從 1 起算）。地圖上的號碼跟工具列的訊息共用這一份。
   //
@@ -296,7 +340,7 @@ export default function FootprintMap({
     // group 為 null 代表「不會自己造成斷點」—— 照片會接上它時間上落在的那一段軌跡
     const raw: { t: number; lng: number; lat: number; group: string | null }[] = [];
 
-    for (const p of tracks || []) {
+    for (const p of animTracks) {
       const t = Date.parse(p.t_utc);
       if (Number.isFinite(t)) raw.push({ t, lng: p.lng, lat: p.lat, group: segmentKey(p.day_key, p.seg) });
     }
@@ -341,7 +385,7 @@ export default function FootprintMap({
       });
     }
     return out;
-  }, [tracks, sorted, connectPhotos, stays]);
+  }, [animTracks, sorted, connectPhotos, stays]);
 
   const maxIndex = Math.max(path.length - 1, 0);
   // head 是動畫算出來的浮點數，會被拿來當陣列索引，所以夾在合法範圍內再用。
@@ -386,6 +430,45 @@ export default function FootprintMap({
     map.on('error', (e: any) => console.error('[FootprintMap] 地圖錯誤:', e?.error?.message || e));
 
     map.on('load', () => {
+      // 原始軌跡的對照底線，排在 gps-track 之前才會墊在它下面 ——
+      // 要看的是「濃縮後的線偏離原始路徑多少」，濃縮後那條必須疊在上面
+      map.addSource('raw-track', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      });
+      map.addLayer({
+        id: 'raw-track-line',
+        type: 'line',
+        source: 'raw-track',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        // 橘色虛線：跟綠色實線的軌跡明顯區隔，一眼看得出哪條是原始的
+        paint: {
+          'line-color': '#f97316',
+          'line-width': 1.5,
+          'line-opacity': 0.7,
+          'line-dasharray': [2, 1.5],
+        },
+      });
+
+      // 貼路軌跡。也墊在 gps-track 底下，一樣是為了對照 ——
+      // 要看的是原本的線偏離道路多少，原本那條得在上面
+      map.addSource('matched-track', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      });
+      map.addLayer({
+        id: 'matched-track-line',
+        type: 'line',
+        source: 'matched-track',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        // 紫色粗實線：畫的是道路本身，比原始軌跡的虛線更該被看見
+        paint: {
+          'line-color': '#7c3aed',
+          'line-width': 3.5,
+          'line-opacity': 0.75,
+        },
+      });
+
       // 先加軌跡，才會壓在照片路線與標記底下 —— 它是背景，不是主角
       map.addSource('gps-track', {
         type: 'geojson',
@@ -780,6 +863,36 @@ export default function FootprintMap({
       })),
     });
   }, [trackLines, ready]);
+
+  // --- 原始軌跡對照底線 ---
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource('raw-track') as GeoJSONSource | undefined;
+    src?.setData({
+      type: 'FeatureCollection',
+      features: (showRawLine ? rawLines : []).map((line) => ({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates: line },
+      })),
+    });
+  }, [rawLines, showRawLine, ready]);
+
+  // --- 貼路軌跡 ---
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource('matched-track') as GeoJSONSource | undefined;
+    src?.setData({
+      type: 'FeatureCollection',
+      features: (showMatchedLine ? matchedLines : []).map((line) => ({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates: line },
+      })),
+    });
+  }, [matchedLines, showMatchedLine, ready]);
 
   // --- 停留點 ---
   useEffect(() => {

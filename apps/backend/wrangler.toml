@@ -6,6 +6,10 @@ compatibility_date = "2024-05-29"
 # MY_VARIABLE = "production_value"
 
 [vars]
+# 軌跡貼路（map matching）用的 Valhalla 實例。FOSSGIS e.V.（OSM 德國分會）
+# 提供的公開服務，免 API key，條款允許私人使用、每秒最多 1 個請求。
+# 放在設定而非程式碼裡是條款的明文要求 —— 清空這一行就等於關掉這個功能。
+VALHALLA_URL = "https://valhalla1.openstreetmap.de"
 
 [[d1_databases]]
 binding = "DB"
@@ -20,6 +24,7 @@ preview_bucket_name = "didadida-photos-preview"
 [env.dev]
 name = "didadida-api-dev"
 [env.dev.vars]
+VALHALLA_URL = "https://valhalla1.openstreetmap.de"
 
 # dev 使用獨立的 D1，與 production 完整切開（2026-07-27）
 [[env.dev.d1_databases]]
