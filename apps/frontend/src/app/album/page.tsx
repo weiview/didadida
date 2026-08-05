@@ -11,6 +11,7 @@ import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
 import AssignPlaceModal from "@/components/AssignPlaceModal";
 import FixTimeModal from "@/components/FixTimeModal";
 import PostUploadReviewModal from "@/components/PostUploadReviewModal";
+import PlaceCheckinModal from "@/components/PlaceCheckinModal";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
@@ -36,6 +37,10 @@ function AlbumContent() {
   const [selectedPhotos, setSelectedPhotos] = useState<number[]>([]);
   const [showAssignPlace, setShowAssignPlace] = useState(false);
   const [showFixTime, setShowFixTime] = useState(false);
+  // 相簿層級的打卡補件畫面（整本攤開、照日期分組）
+  const [showPlaceCheckin, setShowPlaceCheckin] = useState(false);
+  // 從打卡畫面轉去指定地點時，套用完要回到打卡畫面繼續處理下一批
+  const [returnToCheckin, setReturnToCheckin] = useState(false);
   // 剛上傳的那一批。非空即代表補件視窗開著
   const [postUploadIds, setPostUploadIds] = useState<number[]>([]);
   // Shift 連選的錨點（顯示順序上的 index）
@@ -976,6 +981,16 @@ function AlbumContent() {
               </button>
 
               {!isEditingPhotos && (
+                <button
+                  className={styles.uploadButton}
+                  onClick={() => setShowPlaceCheckin(true)}
+                  title="整本相簿攤開，照日期看哪些照片還缺位置或地名"
+                >
+                  📍 地點
+                </button>
+              )}
+
+              {!isEditingPhotos && (
                 <div style={{ position: 'relative' }}>
                   <input 
                     type="file" 
@@ -1292,11 +1307,30 @@ function AlbumContent() {
         }}
       />
 
+      {/* 相簿層級的打卡補件。同樣不自己寫座標，挑完照片交給下面的 AssignPlaceModal */}
+      <PlaceCheckinModal
+        isOpen={showPlaceCheckin}
+        albumId={id ? Number(id) : undefined}
+        photos={photos}
+        onClose={() => setShowPlaceCheckin(false)}
+        onRefresh={loadData}
+        onAssignPlace={(ids) => {
+          setSelectedPhotos(ids);
+          setShowPlaceCheckin(false);
+          setReturnToCheckin(true);
+          setShowAssignPlace(true);
+        }}
+      />
+
       <AssignPlaceModal
         isOpen={showAssignPlace}
         photoIds={selectedPhotos}
         albumId={id ? Number(id) : undefined}
-        onClose={() => setShowAssignPlace(false)}
+        onClose={() => {
+          setShowAssignPlace(false);
+          // 從打卡畫面來的就回去，讓使用者接著處理下一批
+          if (returnToCheckin) { setReturnToCheckin(false); setShowPlaceCheckin(true); }
+        }}
         onDone={({ updated, skippedExif }) => {
           setSelectedPhotos([]);
           lastSelectedIndexRef.current = null;

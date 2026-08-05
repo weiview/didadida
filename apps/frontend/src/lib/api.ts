@@ -49,7 +49,10 @@ export interface Photo {
   lng?: number | null;
   geo_source?: GeoSource;
   place_name?: string | null;
-  /** 1 = 私密（預設）。非管理者取得的資料中，私密照片的座標一律為 null */
+  /**
+   * 「這一張特別不要出現在地圖上」。預設 0 ＝ 跟著相簿的 map_private 走。
+   * 非管理者取得的資料中，被扣住的照片座標一律為 null
+   */
   geo_private?: number;
 }
 
@@ -744,23 +747,6 @@ export async function setPhotoTimezone(
   }
 }
 
-/** 對前後有 EXIF 座標的照片之間做時間內插 */
-export async function interpolateGeo(albumId?: number, maxGapHours = 24): Promise<number> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/photos/geo/interpolate`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: JSON.stringify({ albumId, maxGapHours }),
-    });
-    if (!res.ok) return 0;
-    const data = await res.json();
-    return data.updated ?? 0;
-  } catch (err) {
-    console.error(err);
-    return 0;
-  }
-}
-
 export async function setPhotoGeoPrivacy(photoIds: number[], geoPrivate: boolean): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE_URL}/photos/geo/privacy`, {
@@ -789,13 +775,19 @@ export async function setAlbumMapPrivacy(albumId: number, mapPrivate: boolean): 
   }
 }
 
-/** 搜尋地名（Photon，免費且免 API key）。回傳前幾筆候選讓使用者挑 */
+/**
+ * 搜尋地名（Photon，免費且免 API key）。回傳前幾筆候選讓使用者挑。
+ *
+ * 走自家 Worker 轉手而不是瀏覽器直連：反向查詢送出去的是照片的實際座標，
+ * 直連等於把「這台裝置查過哪些位置」交給第三方。正向查詢一起收進來只是為了
+ * 兩條路一致（理由同 /api/tracks/match 轉手 Valhalla）。
+ */
 export async function searchPlace(query: string): Promise<{ name: string; lat: number; lng: number }[]> {
   if (!query.trim()) return [];
   try {
-    const res = await fetch(
-      `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=6`
-    );
+    const res = await fetch(`${API_BASE_URL}/geo/search?q=${encodeURIComponent(query)}`, {
+      headers: getAuthHeaders(),
+    });
     if (!res.ok) return [];
     const data = await res.json();
     return (data.features || []).map((f: any) => {
@@ -810,6 +802,70 @@ export async function searchPlace(query: string): Promise<{ name: string; lat: n
   } catch (err) {
     console.error(err);
     return [];
+  }
+}
+
+/**
+ * 反查一個座標叫什麼名字。給自帶 GPS 的照片用 —— 座標已經是最準的一份，
+ * 缺的只是「這是哪裡」。回傳 null 代表附近沒有值得記的地標。
+ */
+export async function reverseGeocode(lat: number, lng: number): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/geo/reverse?lat=${lat}&lng=${lng}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return pickPlaceName(data.features || []);
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/**
+ * 從 Photon 反查結果裡挑出最像「打卡地點」的一筆。
+ *
+ * 最近的那筆常常是一條路或一棟無名住宅，那不是人會想寫在照片上的東西。
+ * 所以先找有名字、而且分類是地標／景點／店家的；都沒有才退回行政區名。
+ */
+const PLACE_KEYS = ['tourism', 'historic', 'leisure', 'amenity', 'natural', 'railway', 'aeroway', 'shop'];
+
+function pickPlaceName(features: any[]): string | null {
+  for (const f of features) {
+    const p = f?.properties || {};
+    if (p.name && PLACE_KEYS.includes(p.osm_key)) {
+      return [p.name, p.city || p.district, p.country].filter(Boolean).join(', ');
+    }
+  }
+  for (const f of features) {
+    const p = f?.properties || {};
+    const area = p.city || p.district || p.county || p.state;
+    if (area) return [area, p.country].filter(Boolean).join(', ');
+  }
+  return null;
+}
+
+/**
+ * 只補地名，座標一個字都不動。
+ * 走 assignGeoBatch 會把精確的 EXIF 座標換成地名的中心點，這裡刻意不那樣做。
+ */
+export async function setPlaceNames(
+  items: { photoId: number; placeName: string }[],
+): Promise<number> {
+  if (items.length === 0) return 0;
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/place-name`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ items }),
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    return data.updated ?? 0;
+  } catch (err) {
+    console.error(err);
+    return 0;
   }
 }
 
@@ -870,15 +926,12 @@ export interface TrackPoint {
   stay_sec?: number | null;
 }
 
-/** 交通工具。值域與後端 PUT /api/tracks/segments 的白名單必須一致 */
+/**
+ * 交通工具。只剩貼路在用 —— 依速度猜出來，決定送給 Valhalla 的 costing，
+ * 並記在 R2 的貼路結果裡（見 MatchedTrack.segments[].vehicle）。
+ * 手動指定的介面與 TrackSegment 那條路都已經拿掉。
+ */
 export type Vehicle = 'walk' | 'bike' | 'motorbike' | 'car' | 'bus' | 'train' | 'plane' | 'boat';
-
-/** 使用者對某一段軌跡指定的交通工具。沒有指定的段不會出現在這個清單裡 */
-export interface TrackSegmentVehicle {
-  day_key: string;
-  seg: number;
-  vehicle: Vehicle | null;
-}
 
 /** 列出 Drive 資料夾裡的 GPX 檔。僅管理者可用 */
 export async function fetchDriveGpxFiles(): Promise<{ files: DriveGpxFile[]; error?: string }> {
@@ -1116,22 +1169,6 @@ export async function fetchTracks(opts: { from?: string; to?: string; dayKey?: s
   }
 }
 
-/**
- * 取得使用者指定過交通工具的軌跡段。
- * 只回被指定過的段 —— 段的點數與速度前端從 fetchTracks 的結果自己算，
- * 不需要 D1 再為了統計掃一次 TrackPoint。
- */
-export async function fetchTrackSegments(): Promise<TrackSegmentVehicle[]> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/tracks/segments`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
-    return await res.json();
-  } catch (err) {
-    console.error(err);
-    return [];
-  }
-}
-
 /** 手動編修軌跡點：刪掉 deleteIds，再插入 insert（合併就是刪一批、插入質心上的兩個點） */
 export interface TrackPointEdit {
   dayKey: string;
@@ -1160,22 +1197,6 @@ export async function editTrackPoints(edit: TrackPointEdit): Promise<boolean> {
   }
 }
 
-/** 指定某一段軌跡的交通工具。傳 null 代表取消指定，回到依速度自動判斷 */
-export async function setSegmentVehicle(
-  dayKey: string, seg: number, vehicle: Vehicle | null,
-): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/tracks/segments`, {
-      method: 'PUT',
-      headers: getAuthHeaders(),
-      body: JSON.stringify({ dayKey, seg, vehicle }),
-    });
-    return res.ok;
-  } catch (err) {
-    console.error(err);
-    return false;
-  }
-}
 
 /* ---- Google 時間軸紀念層 ----
  *
