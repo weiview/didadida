@@ -250,12 +250,17 @@ export default function MapPage() {
     return () => { cancelled = true; };
   }, [albumId]);
 
-  // 拆成基本型別再進 deps —— range 物件每次都是新的，照片重載時會白打一次 API
+  /*
+   * 拆成基本型別再進 deps —— range 物件每次都是新的，照片重載時會白打一次 API。
+   *
+   * 訪客不打這支：軌跡一律要登入（後端會回 401，這裡不打是省一趟白費的請求）。
+   * 訪客在這一頁看到的只有相簿的打卡點，而那還要相簿自己被設成公開。
+   */
   const { from: trackFrom, to: trackTo, skip: skipTracks } = range;
   const loadTracks = useCallback(async () => {
-    if (skipTracks) { setTracks([]); return; }
+    if (!isAdmin || skipTracks) { setTracks([]); return; }
     setTracks(await fetchTracks({ from: trackFrom, to: trackTo }));
-  }, [trackFrom, trackTo, skipTracks]);
+  }, [isAdmin, trackFrom, trackTo, skipTracks]);
 
   useEffect(() => {
     fetchAlbums().then(setAlbums);
@@ -1102,7 +1107,9 @@ export default function MapPage() {
                     : '這段範圍沒有 Google 足跡'}
             </div>
           )}
-          <div style={{ fontSize: 12, color: '#7c3aed', marginTop: 2 }}>
+          {/* 軌跡整條線是登入才有的東西，訪客連「這段範圍沒有軌跡」都不該看到 ——
+              那句話會讓人以為換個日期就找得到 */}
+          {isAdmin && <div style={{ fontSize: 12, color: '#7c3aed', marginTop: 2 }}>
             {/* 貼路已經是自動的，所以這裡不再叫人去按什麼。剩下的只有兩種情況：
                 正在補（matching）、或這段範圍根本沒有軌跡 */}
             {matchedLoading ? '讀取軌跡…'
@@ -1116,7 +1123,7 @@ export default function MapPage() {
                     : tracks.length === 0 && timelineDaysInRange.length === 0
                       ? '這段範圍沒有軌跡'
                       : '這段範圍畫不出軌跡（來源太疏或整天沒移動）'}
-          </div>
+          </div>}
         </div>
       </div>
 
@@ -1143,10 +1150,11 @@ export default function MapPage() {
       <div style={{ marginTop: 10, fontSize: 12.5, color: '#64748b', display: 'flex', gap: 16, flexWrap: 'wrap' }}>
         {showPhotos && <span style={{ color: '#2563eb' }}>● 照片</span>}
         {/* 同一條線兩種來源：有 GPS 的日子是貼路結果，沒有的是 Google 歷史原始點。
-            不分色 —— 兩者的差別看線本身就知道（一個貼著路走，一個是折線） */}
-        <span style={{ color: '#7c3aed' }}>
+            不分色 —— 兩者的差別看線本身就知道（一個貼著路走，一個是折線）。
+            訪客畫面上沒有這條線，圖例也就不列 */}
+        {isAdmin && <span style={{ color: '#7c3aed' }}>
           — 軌跡（GPS 貼 OSM 路網{timelineTracks.length > 0 ? '／Google 歷史原始點' : ''}）
-        </span>
+        </span>}
         {showTimeline && <span style={{ color: '#db2777' }}>— Google 足跡（唯讀）</span>}
       </div>
 
@@ -1255,15 +1263,38 @@ export default function MapPage() {
                   type="checkbox"
                   checked={Number(currentAlbum.map_private ?? 1) === 0}
                   onChange={async (e) => {
-                    const ok = await setAlbumMapPrivacy(currentAlbum.id, !e.target.checked);
+                    const turningPublic = e.target.checked;
+                    /*
+                     * 轉公開一定要再確認一次。這是全站唯一會把座標交給訪客的開關，
+                     * 而 checkbox 是最容易誤點的控制項 —— 點錯的代價與點對的代價不對稱，
+                     * 所以只擋這個方向；轉回私密不問。
+                     *
+                     * 訊息裡把「會被公開幾個點」講出來，不要只寫「確定嗎」——
+                     * 使用者要能判斷的是數量與範圍，不是自己剛剛有沒有按到。
+                     */
+                    if (turningPublic) {
+                      const n = points.filter(p => p.album_id === currentAlbum.id).length;
+                      const ok = confirm(
+                        `要公開「${currentAlbum.name}」的打卡點嗎？\n\n`
+                        + `任何人不必登入就能在地圖上看到這本相簿的${n > 0 ? ` ${n} 個` : ''}拍攝位置`
+                        + `（含經緯度與地點名稱）。\n`
+                        + `軌跡不受影響，訪客一律看不到。\n\n`
+                        + `個別標記為私密的照片仍不會出現。隨時可以再關掉。`,
+                      );
+                      // 取消時要主動觸發一次重繪，把 DOM 上已經被勾起來的框推回去 ——
+                      // state 沒變的話 React 不會重新渲染，畫面會停在「已勾選」的假象
+                      if (!ok) { setAlbums(prev => [...prev]); return; }
+                    }
+                    const ok = await setAlbumMapPrivacy(currentAlbum.id, !turningPublic);
                     if (ok) fetchAlbums().then(setAlbums);
                   }}
                   style={{ marginTop: 3 }}
                 />
                 <span>
-                  公開「{currentAlbum.name}」的足跡地圖
+                  公開「{currentAlbum.name}」的打卡點
                   <span style={{ display: 'block', color: '#64748b', fontSize: 12.5 }}>
-                    預設為私密。即使開啟，個別標記為私密的照片仍不會出現在地圖上。
+                    預設不公開。開啟後訪客只看得到這本相簿的拍攝位置，軌跡一律不公開。
+                    個別標記為私密的照片仍不會出現在地圖上。
                   </span>
                 </span>
               </label>
