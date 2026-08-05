@@ -83,15 +83,23 @@ export default function FootprintDayPicker({
   from, to, onChange, month, onMonthChange, daysWithData, years, loading = false, min, max,
 }: Props) {
   const [open, setOpen] = useState(false);
+  /**
+   * 範圍的起點，等著第二下把它收成一段。null 代表下一次點擊是「重新開始」。
+   *
+   * 拿它當狀態而不是直接看 from/to：從外面看不出「使用者剛點了第一下、正在等第二下」
+   * 和「已經選好一段」的差別，而這兩個狀態下同一個點擊要做完全不同的事。
+   */
+  const [anchor, setAnchor] = useState<string | null>(null);
   const boxRef = useRef<HTMLDivElement | null>(null);
 
   // 點面板外面、或按 Esc 就收起來
   useEffect(() => {
     if (!open) return;
+    const close = () => { setOpen(false); setAnchor(null); };
     const onDown = (e: MouseEvent) => {
-      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) close();
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
     return () => {
@@ -100,10 +108,12 @@ export default function FootprintDayPicker({
     };
   }, [open]);
 
-  // 打開時跳到已選日期所在的月份，沒選就維持外面給的月份
+  // 打開時跳到已選日期所在的月份，沒選就維持外面給的月份。
+  // 關起來時順手把等待中的起點丟掉 —— 下次打開是全新的一次選取
   useEffect(() => {
-    if (open && from) onMonthChange(monthOf(from));
-    // 只在打開的那一刻對齊，之後使用者自己翻月份不能被拉回來
+    if (open) { if (from) onMonthChange(monthOf(from)); }
+    else setAnchor(null);
+    // 只在開闔的那一刻對齊，之後使用者自己翻月份不能被拉回來
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -118,14 +128,23 @@ export default function FootprintDayPicker({
 
   /*
    * 點一天的語意：
-   *   第一下 → 開始日與結束日都設成那天（＝就看這一天）
-   *   已經是單日、又點了更後面的一天 → 把結束日延到那天（＝一段範圍）
-   * 兩下就能框出一段範圍，而最常見的「只看某一天」一下就到位。
+   *   第一下 → 記下起點，開始日與結束日都設成那天（＝就看這一天）
+   *   第二下 → 跟起點收成一段範圍。點更前面的日子也行，前後會自動對調
+   *   第三下 → 重新開始，回到「就看這一天」
+   *
+   * 面板刻意不在點完後關起來。原本點一下就收，等於第二下永遠沒有機會發生 ——
+   * 範圍選取的程式碼一直都在，只是使用者碰不到它。要離開就按「完成」或點面板外面。
    */
   const pick = (day: string) => {
-    if (from && from === to && day > from) onChange(from, day);
-    else onChange(day, day);
-    setOpen(false);
+    if (anchor === null) {
+      setAnchor(day);
+      onChange(day, day);
+    } else {
+      const lo = day < anchor ? day : anchor;
+      const hi = day < anchor ? anchor : day;
+      onChange(lo, hi);
+      setAnchor(null);
+    }
   };
 
   const label = !from && !to ? '全部日期'
@@ -151,7 +170,7 @@ export default function FootprintDayPicker({
           padding: '7px 12px', borderRadius: 7, border: '1px solid #cbd5e1',
           background: '#fff', cursor: 'pointer', fontSize: 13, minWidth: 168, textAlign: 'left',
         }}
-        title="只有留下足跡的日子選得到"
+        title="只有留下足跡的日子選得到。點一天＝就看那天，再點第二天＝框出一段範圍"
       >
         {label} ▾
       </button>
@@ -227,8 +246,11 @@ export default function FootprintDayPicker({
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10 }}>
-            <span style={{ fontSize: 11.5, color: '#94a3b8', flex: 1 }}>
-              {loading ? '讀取這個月的足跡…'
+            <span style={{ fontSize: 11.5, color: anchor ? '#2563eb' : '#94a3b8', flex: 1 }}>
+              {/* 等第二下的時候，這行字要蓋過月份統計 —— 那是此刻唯一需要知道的事，
+                  而且它同時解釋了「為什麼面板還開著」 */}
+              {anchor ? '再點一天框出範圍，或按「完成」就看這一天'
+                : loading ? '讀取這個月的足跡…'
                 : daysWithData === null ? '（尚未載入足跡索引）'
                 : daysWithData.size === 0 ? '這個月沒有任何足跡'
                 : `這個月有 ${daysWithData.size} 天有足跡`}
@@ -242,6 +264,16 @@ export default function FootprintDayPicker({
                 全部日期
               </button>
             )}
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              style={{
+                ...navBtn, width: 'auto', padding: '4px 12px',
+                borderColor: '#2563eb', color: '#2563eb',
+              }}
+            >
+              完成
+            </button>
           </div>
         </div>
       )}

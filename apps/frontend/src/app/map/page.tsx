@@ -5,21 +5,24 @@ import Link from 'next/link';
 import dynamic from 'next/dynamic';
 import {
   fetchFootprint, fetchAlbums, fetchTripSegments, deleteTripSegment,
-  applyTripSegments, interpolateGeo, setAlbumMapPrivacy,
+  setAlbumMapPrivacy,
   fetchDriveGpxFiles, fetchDriveGpxText, ingestTrack, fetchTracks,
-  fetchTrackSegments, setSegmentVehicle, editTrackPoints,
+  editTrackPoints,
   saveTrackRaw, fetchTrackRaw, fetchTrackDays, updatePhotoGeo,
   matchTrackShape, saveTrackMatched, fetchTrackMatched, deleteTrackMatched,
   fetchTimelineIndex, fetchTimelineMonth,
-  type FootprintPoint, type Album, type TripSegment, type TrackPoint, type Vehicle,
+  type FootprintPoint, type Album, type TripSegment, type TrackPoint,
   type TrackPointEdit, type TrackDay, type MatchedTrack,
   type TimelineIndex, type TimelineMonthData,
 } from '@/lib/api';
-import { toLineStrings, type TrackTuple } from '@/lib/timelineTrack';
+import { toLineStrings, segmentIndices, type TrackTuple } from '@/lib/timelineTrack';
 import { useAdmin } from '@/lib/useAdmin';
-import { parseGpx, simplifyTrack, collapseStays, rejectSpikes, extractTrips } from '@/lib/gpx';
+import { parseGpx, simplifyTrack, collapseStays, rejectSpikes, extractTrips, type GpxPoint } from '@/lib/gpx';
 import { subsampleForMatch, buildMatchedTrack, costingFor, type MatchInput } from '@/lib/mapmatch';
-import { buildSegments, MOVER_EMOJI, VEHICLES, vehicleLabel, vehicleFromSpeed } from '@/lib/vehicles';
+// 交通工具只剩貼路要用：Valhalla 的 costing 得知道這一趟是走路還是開車，
+// 火車與飛機則整趟跳過（它們走的不是道路網）。地圖上一律是幽浮，
+// 手動指定的介面也拿掉了，所以這裡只留「依速度猜」與它的中文名
+import { vehicleLabel, vehicleFromSpeed } from '@/lib/vehicles';
 import FootprintDayPicker, { monthOf, todayLocal } from '@/components/FootprintDayPicker';
 
 // maplibre 需要 window，不能在伺服器端渲染
@@ -55,6 +58,22 @@ interface MatchTarget {
   md5: string | null;
 }
 
+/*
+ * Google 時間軸貼路後的 day_key 前綴。
+ *
+ * 貼路結果存在 R2 的 `tracks/<day_key>.matched.json`，而時間軸的日子在 D1 的
+ * TrackDay 裡根本沒有一列 —— 那一層是唯讀紀念層，刻意不進資料庫。加上前綴是
+ * 為了讓這兩批結果在同一個 bucket 裡不會撞在一起，也讓後端一眼認得出
+ * 「這個 key 沒有 TrackDay 可查，隱私要走另一條路」（見 isTrackDayPublic）。
+ */
+const TIMELINE_DAY_PREFIX = 'timeline:';
+/**
+ * 一次最多處理幾天的時間軸。
+ * 這個數字同時擋住兩件事：讀取時每天一次 R2 GET，貼路時每趟一次 Valhalla 請求。
+ * 沒有上限的話「不選日期」就等於一次讀十二年、打爆別人家的伺服器。
+ */
+const TIMELINE_MAX_DAYS = 62;
+
 /** 上次自動同步的時間戳（毫秒）存這個 key */
 const AUTO_SYNC_KEY = 'didadida:lastAutoSync';
 /**
@@ -70,36 +89,36 @@ export default function MapPage() {
   const [segments, setSegments] = useState<TripSegment[]>([]);
   const { isAdmin } = useAdmin();
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState<string | null>(null);
   const [showTimelineImport, setShowTimelineImport] = useState(false);
-  // null = 使用者還沒碰過這個開關，用底下的預設值
-  const [connectPhotos, setConnectPhotos] = useState<boolean | null>(null);
+  // 管理工具整區收合。預設收起來 —— 平常來這一頁是要看地圖的，
+  // 而貼路與同步都已經自動化，工具區不再是每次都要用的東西
+  const [showAdminTools, setShowAdminTools] = useState(false);
   const [syncing, setSyncing] = useState(false);
   // 同步過程逐行累積，每個檔案結束就更新一次 —— 這是一個會跑好幾秒的操作
   const [syncLog, setSyncLog] = useState<string[]>([]);
   // 停留點濃縮的參數是在匯入時寫死進資料的，改了參數就得繞過 md5 比對整批重灌
   const [forceSync, setForceSync] = useState(false);
-  // 使用者指定過交通工具的段，key 是 'day_key#seg'
-  const [manualVehicles, setManualVehicles] = useState<Map<string, Vehicle | null>>(new Map());
-  // D1 裡有的所有軌跡日（不受畫面上的日期篩選影響），還原介面用
+  // D1 裡有的所有軌跡日（不受畫面上的日期篩選影響）。
+  // 拿來算 gpsDays（決定哪幾天輪得到 Google 時間軸貼路）與查 has_raw / md5
   const [trackDays, setTrackDays] = useState<TrackDay[]>([]);
-  const [restoring, setRestoring] = useState<string | null>(null);
 
-  // 未經濃縮／抽稀的原始軌跡對照層。純檢視，不寫 D1
-  const [showRaw, setShowRaw] = useState(false);
-  // D1 濃縮軌跡（綠線）與停留圈。平常看的是貼路軌跡，這層是它的原料，
-  // 預設收起來 —— 兩條疊在一起反而看不出貼路貼得準不準
-  const [showTrack, setShowTrack] = useState(false);
-  // 動畫沿著哪一份軌跡跑
-  const [animateOn, setAnimateOn] = useState<'track' | 'raw' | 'matched'>('matched');
-  const [rawTracks, setRawTracks] = useState<TrackPoint[]>([]);
-  // 原始點數與跳過的天數，拿來跟 D1 裡的點數對照
-  const [rawStats, setRawStats] = useState<{ points: number; days: number; missing: number } | null>(null);
-  const [rawLoading, setRawLoading] = useState(false);
+  /*
+   * 地圖上畫哪幾層，已經不再是開關而是定案：
+   *
+   * 貼路軌跡是唯一畫出來的軌跡，動畫也沿著它跑。濃縮軌跡（綠線＋停留圈）與原始 GPX
+   * 對照層都拿掉了 —— 它們是拿來檢查「貼路貼得準不準」的除錯工具，三條線疊在一起
+   * 反而看不出東西。照片之間的連線也拿掉：那是推測出來的路徑，不是走過的路，
+   * 地圖上只留一個一個的點。
+   *
+   * 這些常數留著而不是把 FootprintMap 的參數一起砍掉，是因為那些圖層在元件裡
+   * 仍然完整可用，只是這一頁不用它們。要回頭比對時改這裡就行。
+   */
+  const SHOW_RAW_LINE = false;
+  const SHOW_TRACK_LINE = false;
+  const SHOW_MATCHED_LINE = true;
+  const ANIMATE_ON = 'matched' as const;
 
-  // 貼路（map matching）後的軌跡。同樣存 R2、純檢視，不寫 D1。
-  // 這是地圖上的主角，預設就開著
-  const [showMatched, setShowMatched] = useState(true);
+  // 貼路（map matching）後的軌跡。存 R2、純檢視，不寫 D1
   const [matchedTracks, setMatchedTracks] = useState<TrackPoint[]>([]);
   const [matchedDays, setMatchedDays] = useState(0);
   const [matchedLoading, setMatchedLoading] = useState(false);
@@ -108,6 +127,16 @@ export default function MapPage() {
   const [matchLog, setMatchLog] = useState<string[]>([]);
   // 貼完之後要重讀 R2。日期與天數都沒變，只能靠這個計數器叫醒讀取的 effect
   const [matchedVersion, setMatchedVersion] = useState(0);
+  // 這段範圍裡「R2 上還沒有貼路結果」的日子。自動貼路就照這份清單去補
+  const [unmatchedKeys, setUnmatchedKeys] = useState<string[]>([]);
+  /*
+   * 這次進頁已經試著貼過的日子（不論成功與否）。
+   *
+   * 沒有這個閂會無限打轉：貼完 → matchedVersion 變動 → 重讀 R2 → 整天沒移動、
+   * 或對方掛掉的日子照樣讀不到結果 → 又被列進 unmatchedKeys → 再貼一次。
+   * FOSSGIS 是志工用捐款養的單一伺服器，這種迴圈直接就是在打人家。
+   */
+  const attemptedMatch = useRef<Set<string>>(new Set());
   /*
    * Google 時間軸的紀念層。跟上面三層完全獨立的一個開關 ——
    * 使用者要的是「兩個都開時顏色分得開、同時看得見」，而不是逐日互相讓位。
@@ -115,6 +144,8 @@ export default function MapPage() {
    * 預設關：它是十二年的背景，不是今天要看的東西。
    */
   const [showTimeline, setShowTimeline] = useState(false);
+  // 照片圓點／縮圖。預設開 —— 關掉是為了看清楚底下的軌跡線
+  const [showPhotos, setShowPhotos] = useState(true);
   const [timelineIndex, setTimelineIndex] = useState<TimelineIndex | null>(null);
   const [timelineLines, setTimelineLines] = useState<[number, number][][]>([]);
   const [timelineStats, setTimelineStats] = useState<{ points: number; days: number } | null>(null);
@@ -230,12 +261,7 @@ export default function MapPage() {
     fetchAlbums().then(setAlbums);
   }, []);
 
-  const loadVehicles = useCallback(async () => {
-    const rows = await fetchTrackSegments();
-    setManualVehicles(new Map(rows.map(r => [`${r.day_key}#${r.seg}`, r.vehicle])));
-  }, []);
-
-  // 只有管理者讀得到（會暴露出門的日期），而且只有管理工具區用得到
+  // 只有管理者讀得到（會暴露出門的日期）
   const loadTrackDays = useCallback(async () => {
     if (!isAdmin) { setTrackDays([]); return; }
     setTrackDays(await fetchTrackDays());
@@ -243,12 +269,7 @@ export default function MapPage() {
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => { loadTracks(); }, [loadTracks]);
-  useEffect(() => { loadVehicles(); }, [loadVehicles]);
   useEffect(() => { loadTrackDays(); }, [loadTrackDays]);
-
-  // 段的統計（時間範圍、代表速度）從已經拿到的軌跡點自己算，
-  // 不再打一次 API —— 讓 D1 為了 GROUP BY 再掃一遍 TrackPoint 是白花讀取額度
-  const segInfos = useMemo(() => buildSegments(tracks, manualVehicles), [tracks, manualVehicles]);
 
   useEffect(() => {
     if (isAdmin) fetchTripSegments(albumId === '' ? undefined : albumId).then(setSegments);
@@ -267,7 +288,7 @@ export default function MapPage() {
   }, [loadTracks, loadTrackDays]);
 
   // 地圖上把照片搬到軌跡點的位置。後端會把 geo_source 設成 'manual'，
-  // 所以之後的內插補點與套用行程段都不會再覆蓋它
+  // 所以之後任何自動推論（行程段、內插）都不會再覆蓋它
   const handleMovePhoto = useCallback(async (photoId: number, lat: number, lng: number) => {
     const updated = await updatePhotoGeo(photoId, { lat, lng });
     if (!updated) return false;
@@ -275,59 +296,59 @@ export default function MapPage() {
     return true;
   }, [load]);
 
-  /**
-   * 恢復原始軌跡：把留在 R2 的 GPX 原文重跑一次匯入流程，
-   * 蓋掉這一天所有手動編修（合併、刪除）的結果。
-   *
-   * 走的是跟同步完全同一條管線（parse → 濃縮 → 抽稀 → ingest），
-   * 所以還原出來的結果跟當初匯入時一模一樣，而不是另一種近似。
-   */
-  const restoreDay = useCallback(async (day: TrackDay) => {
-    if (!confirm(
-      `恢復「${day.day_key}」的原始軌跡？\n\n`
-      + '這一天手動合併或刪除過的軌跡點會全部還原成剛匯入時的樣子，無法復原。'
-    )) return;
-
-    setRestoring(day.day_key);
-    try {
-      const xml = await fetchTrackRaw(day.day_key);
-      if (!xml) { alert('讀不到原始軌跡檔'); return; }
-
-      const parsed = parseGpx(xml);
-      if (parsed.error) { alert(`解析失敗：${parsed.error}`); return; }
-
-      const result = await ingestTrack({
-        dayKey: day.day_key,
-        // 原封不動送回去：ingest 會整個覆蓋這兩欄，漏掉的話下次同步
-        // 會以為檔案有變而重抓一次
-        driveFileId: day.drive_file_id ?? undefined,
-        md5: day.md5 ?? undefined,
-        // ingest_source 從 'manual' 轉回 'gpslogger'，這一天才會重新
-        // 納入正常的 md5 比對（手動編修過的日子平常會被跳過）
-        ingestSource: 'gpslogger',
-        tzOffsetMinutes: day.tz_offset_minutes ?? undefined,
-        points: simplifyTrack(collapseStays(parsed.points)),
-      });
-      if (!result) { alert('寫入失敗'); return; }
-
-      await Promise.all([loadTracks(), loadTrackDays()]);
-      alert(`已恢復 ${day.day_key}：${result.inserted} 個軌跡點`);
-    } finally {
-      setRestoring(null);
-    }
-  }, [loadTracks, loadTrackDays]);
-
-  // 畫面上這批軌跡涵蓋哪幾天，以及其中哪幾天留得到原始檔。
-  // 兩個都壓成字串再進 deps —— 陣列每次重載都是新物件，直接放會讓底下的
-  // effect 在每次編修軌跡後都重抓一輪 GPX
+  // 畫面上這批軌跡涵蓋哪幾天。壓成字串再進 deps —— 陣列每次重載都是新物件，
+  // 直接放會讓底下的 effect 在每次編修軌跡後都重讀一輪 R2
   const rawDayKeys = useMemo(
     () => Array.from(new Set(tracks.map(p => p.day_key))).sort().join(','),
     [tracks],
   );
-  const rawReadyKeys = useMemo(
-    () => trackDays.filter(d => d.has_raw).map(d => d.day_key).sort().join(','),
-    [trackDays],
-  );
+
+  /** 有 GPS 軌跡的日子（當地日）。一份 GPX 跨夜的話兩天都算 */
+  const gpsDays = useMemo(() => {
+    const days = new Set<string>();
+    for (const d of trackDays) {
+      if (!d.first_local_day) continue;
+      const last = d.last_local_day ?? d.first_local_day;
+      // 幾乎都是同一天，跨夜才會有第二天。用 Date 逐日推進，不要自己算月底
+      for (let t = Date.parse(`${d.first_local_day}T00:00:00Z`);
+           t <= Date.parse(`${last}T00:00:00Z`);
+           t += 86400000) {
+        days.add(new Date(t).toISOString().slice(0, 10));
+      }
+    }
+    return days;
+  }, [trackDays]);
+
+  /**
+   * 目前這段日期範圍裡，要拿 Google 時間軸來貼路的日子（YYYY-MM-DD）。
+   *
+   * **有 GPSLogger 軌跡的日子直接排除** —— 那一天的貼路以實測軌跡為準，
+   * 時間軸只在「那天根本沒帶手機記軌跡」時才頂上。這是唯一的來源優先序，
+   * 兩邊不會同時畫，也就不會有兩條線打架的問題。
+   *
+   * 只看索引不看月檔：月檔要真的去 R2 抓，而這份清單的用途是「哪幾天值得試著
+   * 讀貼路結果 / 值得送去貼路」，用月的粒度先篩掉大半已經夠了。
+   * 邊界各放寬一天 —— 範圍是 UTC 瞬間，月檔的日是當地日，兩者差幾小時。
+   */
+  const timelineDaysInRange = useMemo(() => {
+    if (skipTracks || !trackFrom || !trackTo || !timelineIndex) return [];
+    const months = new Set(timelineIndex.months.map(m => m.monthKey));
+    if (months.size === 0) return [];
+
+    const lo = Date.parse(trackFrom) - 86400000;
+    const hi = Date.parse(trackTo) + 86400000;
+    if (!Number.isFinite(lo) || !Number.isFinite(hi)) return [];
+
+    const out: string[] = [];
+    for (let t = lo; t <= hi && out.length < TIMELINE_MAX_DAYS; t += 86400000) {
+      const day = new Date(t).toISOString().slice(0, 10);
+      if (months.has(day.slice(0, 7)) && !gpsDays.has(day)) out.push(day);
+    }
+    return out;
+  }, [skipTracks, trackFrom, trackTo, timelineIndex, gpsDays]);
+
+  // 壓成字串再進 deps，理由同 rawDayKeys
+  const timelineDayKeys = timelineDaysInRange.join(',');
 
   /*
    * Google 時間軸紀念層。
@@ -402,22 +423,6 @@ export default function MapPage() {
     if (from || to || albumId !== '' || points.length === 0) return;
     setPhotoDays(new Set(points.map(p => p.local_time.slice(0, 10))));
   }, [points, from, to, albumId]);
-
-  /** 有 GPS 軌跡的日子（當地日）。一份 GPX 跨夜的話兩天都算 */
-  const gpsDays = useMemo(() => {
-    const days = new Set<string>();
-    for (const d of trackDays) {
-      if (!d.first_local_day) continue;
-      const last = d.last_local_day ?? d.first_local_day;
-      // 幾乎都是同一天，跨夜才會有第二天。用 Date 逐日推進，不要自己算月底
-      for (let t = Date.parse(`${d.first_local_day}T00:00:00Z`);
-           t <= Date.parse(`${last}T00:00:00Z`);
-           t += 86400000) {
-        days.add(new Date(t).toISOString().slice(0, 10));
-      }
-    }
-    return days;
-  }, [trackDays]);
 
   /*
    * 日期選擇器上，這個月哪幾天有足跡 —— Google 足跡、GPS 軌跡、照片，三者任一。
@@ -502,103 +507,34 @@ export default function MapPage() {
   }, [showTimeline, timelineMonthKeys, from, to]);
 
   /*
-   * 原始軌跡對照層：直接把留在 R2 的 GPX 抓下來在瀏覽器解析，完全不經過 D1。
-   *
-   * 為什麼不乾脆關掉濃縮／抽稀重新匯入：完整軌跡一天可到好幾萬點，
-   * 寫進 D1 會吃掉免費方案每日 10 萬列的寫入額度，而且段內點號會變成五位數，
-   * 編輯模式就不能用了。看歸看，存進去的還是濃縮過的版本。
-   *
-   * 只在要用到的時候才抓 —— GPX 動輒好幾 MB，預設下載等於每次開地圖都白花讀取額度。
-   * 「畫出來」和「動畫沿著它跑」是兩個獨立開關，任一個要用都得先有資料。
-   */
-  const needRaw = showRaw || animateOn === 'raw';
-  useEffect(() => {
-    if (!needRaw) { setRawTracks([]); setRawStats(null); return; }
-
-    // 開關打開後才切日期／相簿的話，舊的請求可能比新的晚回來
-    let cancelled = false;
-    (async () => {
-      setRawLoading(true);
-      try {
-        const dayKeys = rawDayKeys ? rawDayKeys.split(',') : [];
-        const ready = new Set(rawReadyKeys ? rawReadyKeys.split(',') : []);
-        // R2 上的 GPX 是「一天一檔」，時間範圍卻可以切在半天。要抓的日子已經
-        // 由 tracks 限縮過了，但頭尾那兩天整天的點都在檔案裡，不逐點濾的話
-        // 選 3/5 早上會連當天晚上的路一起畫出來，跟綠色的濃縮線對不起來。
-        // 界線跟 D1 那邊一樣用 UTC 比（range 產出的就是 UTC）
-        const tMin = trackFrom ? Date.parse(trackFrom) : -Infinity;
-        const tMax = trackTo ? Date.parse(trackTo) : Infinity;
-        const out: TrackPoint[] = [];
-        let days = 0;
-        let missing = 0;
-
-        for (const dayKey of dayKeys) {
-          // 這功能之前同步的、或來自 Google 時間軸的日子沒有 GPX 可還原
-          if (!ready.has(dayKey)) { missing++; continue; }
-
-          const xml = await fetchTrackRaw(dayKey);
-          if (cancelled) return;
-          if (!xml) { missing++; continue; }
-
-          const parsed = parseGpx(xml);
-          if (parsed.error) { missing++; continue; }
-
-          let kept = 0;
-          for (const p of parsed.points) {
-            const t = Date.parse(p.t);
-            if (!(t >= tMin && t <= tMax)) continue;
-            out.push({
-              // 負數 id：這些點不在 D1 裡，給個一看就知道不是真列的值，
-              // 免得哪天不小心被當成可編輯的點送進 editTrackPoints
-              id: -(out.length + 1),
-              day_key: dayKey,
-              t_utc: p.t,
-              lat: p.lat,
-              lng: p.lng,
-              src: p.src,
-              seg: p.seg,
-            });
-            kept++;
-          }
-          // 整天都被範圍濾掉就不算數，也不算「無原始檔」—— 檔案有，只是不在範圍內
-          if (kept > 0) days++;
-        }
-
-        if (cancelled) return;
-        setRawTracks(out);
-        setRawStats({ points: out.length, days, missing });
-      } finally {
-        if (!cancelled) setRawLoading(false);
-      }
-    })();
-
-    return () => { cancelled = true; };
-  }, [needRaw, rawDayKeys, rawReadyKeys, trackFrom, trackTo]);
-
-  /*
    * 貼路軌跡：從 R2 讀回上次「軌跡貼路」跑出來的結果。
    * 這裡只讀不算 —— 貼路要打第三方 API，只在按下按鈕時才做。
    * 沒貼過的日子會 404，安靜略過就好。
    */
-  const needMatched = showMatched || animateOn === 'matched';
   useEffect(() => {
-    if (!needMatched) { setMatchedTracks([]); setMatchedDays(0); return; }
-
     let cancelled = false;
     (async () => {
       setMatchedLoading(true);
       try {
-        const dayKeys = rawDayKeys ? rawDayKeys.split(',') : [];
-        // 跟原始軌跡同一套邊界：貼路的結果是整天的，日期範圍卻可以切在半天
+        // GPS 軌跡的日子，加上有 Google 時間軸的日子（貼過才讀得到，沒貼就 404）。
+        // 手機還沒開始記軌跡的那些年，地圖上的線就是靠後者來的
+        const dayKeys = [
+          ...(rawDayKeys ? rawDayKeys.split(',') : []),
+          ...(timelineDayKeys ? timelineDayKeys.split(',').map(d => TIMELINE_DAY_PREFIX + d) : []),
+        ];
+        // 貼路的結果是整天的，日期範圍卻可以切在半天，所以逐點還要再濾一次
         const tMin = trackFrom ? Date.parse(trackFrom) : -Infinity;
         const tMax = trackTo ? Date.parse(trackTo) : Infinity;
         const out: TrackPoint[] = [];
         let days = 0;
+        // 讀不到結果的日子。自動貼路就靠這份清單決定要處理誰 ——
+        // 這裡本來就要逐天問一次 R2，順手記下來，不必再多打一輪
+        const missing: string[] = [];
 
         for (const dayKey of dayKeys) {
           const data = await fetchTrackMatched(dayKey);
           if (cancelled) return;
-          if (!data?.segments?.length) continue;
+          if (!data?.segments?.length) { missing.push(dayKey); continue; }
 
           let kept = 0;
           for (const s of data.segments) {
@@ -607,7 +543,8 @@ export default function MapPage() {
             for (const [lng, lat, t] of s.points) {
               if (!(t >= tMin && t <= tMax)) continue;
               out.push({
-                // 負數 id，同 rawTracks：這些點不在 D1 裡，不可編輯
+                // 負數 id：這些點不在 D1 裡，給個一看就知道不是真列的值，
+                // 免得哪天不小心被當成可編輯的點送進 editTrackPoints
                 id: -(out.length + 1),
                 day_key: dayKey,
                 t_utc: new Date(t).toISOString(),
@@ -625,13 +562,14 @@ export default function MapPage() {
         if (cancelled) return;
         setMatchedTracks(out);
         setMatchedDays(days);
+        setUnmatchedKeys(missing);
       } finally {
         if (!cancelled) setMatchedLoading(false);
       }
     })();
 
     return () => { cancelled = true; };
-  }, [needMatched, rawDayKeys, trackFrom, trackTo, matchedVersion]);
+  }, [rawDayKeys, timelineDayKeys, trackFrom, trackTo, matchedVersion]);
 
   /**
    * 同步足跡的本體：列出 Drive 上的 GPX、只抓 md5 有變的，在瀏覽器裡解析與抽稀，
@@ -753,7 +691,7 @@ export default function MapPage() {
    * - 送進去之前先剔尖峰、再依速度切成「一趟一趟的移動」。整天原封不動送過去
    *   的話，在家、在室內那幾個小時的定位雜訊會被 matcher 當成路徑，
    *   在原地繞出一團看不懂的線 —— 而那才是貼路結果難看的主因。
-   * - 一趟一個請求，costing 依那一趟自己的速度決定（手動指定優先）。
+   * - 一趟一個請求，costing 依那一趟自己的速度決定。
    *   火車、飛機、船直接跳過 —— 它們走的不是道路網，硬貼會把航線扭成公路。
    * - 每秒只送一個請求。FOSSGIS 是志工用捐款養的單一伺服器，條款寫明的上限。
    * - 來源 md5 沒變的日子整天跳過。每一趟都是一次別人家的請求，不重打。
@@ -803,10 +741,9 @@ export default function MapPage() {
 
       for (let i = 0; i < trips.length; i++) {
         const trip = trips[i];
-        // 手動指定過的交通工具優先；否則用這一趟自己的速度猜。
-        // 不用整段 trkseg 的平均 —— 那被中間的停留稀釋過，出門一趟會被猜成走路
-        const manual = manualVehicles.get(`${dayKey}#${trip.points[0].seg}`);
-        const vehicle = manual ?? vehicleFromSpeed(trip.speedKmh);
+        // 用這一趟自己的速度猜，不用整段 trkseg 的平均 ——
+        // 那被中間的停留稀釋過，出門一趟會被猜成走路
+        const vehicle = vehicleFromSpeed(trip.speedKmh);
         const costing = costingFor(vehicle);
         const label = `${dayKey} 第 ${i + 1} 趟`;
         if (!costing) {
@@ -859,39 +796,199 @@ export default function MapPage() {
     log.push(`貼路結束，共送出 ${requests} 個請求。`);
     setMatchLog([...log]);
     setMatching(false);
-    // 跑完直接把圖層打開，不然要自己去勾才看得到結果
-    setShowMatched(true);
     setMatchedVersion(v => v + 1);
     return requests;
-  }, [manualVehicles]);
+  }, []);
 
-  /** 「軌跡貼路」按鈕：把畫面上這段日期範圍裡有原始檔的日子整批送去貼 */
-  const matchTracks = async () => {
-    const dayKeys = Array.from(new Set(tracks.map(p => p.day_key))).sort();
+  /*
+   * Google 時間軸貼路。
+   *
+   * 為什麼要有這條路：手機開始常駐記軌跡是很後來的事，在那之前的行程只剩
+   * Google 時間軸這一份。那一層原本是唯讀的紀念層，畫出來是一條在建築物之間
+   * 亂穿的直線 —— 把它送去貼路之後，那些年的行程也能有一條貼著路走的線。
+   *
+   * 跟 runMatch 共用同一套處理（切趟 → 依速度挑 costing → 逐趟送 Valhalla →
+   * 存 R2），只有三個地方不同：
+   * - 資料來源是 R2 的月檔而不是 GPX 原始檔，所以自己組出 GpxPoint[]。
+   * - 時間軸的取樣是分鐘級而且會斷（沒開 app、沒訊號、飛機上），所以先照
+   *   時間間隔與隱含速度切 seg。不切的話 extractTrips 會把中斷兩端接成一條
+   *   假的移動，然後 matcher 會很認真地幫那條假移動找一條公路出來。
+   * - day_key 加前綴（見 TIMELINE_DAY_PREFIX），跟 GPS 那批分開存。
+   *
+   * 這一步不回寫任何東西進 D1，時間軸仍然是唯讀層；產出的只是 R2 上的一份
+   * 貼路結果，看不順眼隨時可以刪掉重跑。
+   *
+   * @param days 要貼的當地日（'YYYY-MM-DD'），由呼叫端先篩好。這裡不問、不擋 ——
+   *             它是自動流程的一環，不是按鈕。
+   */
+  const runTimelineMatch = useCallback(async (days: string[]) => {
+    if (days.length === 0) return 0;
+
+    setMatching(true);
+    const log: string[] = [`Google 時間軸：${days.length} 天，開始貼路…`];
+    setMatchLog([...log]);
+
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+    let requests = 0;
+
+    for (const day of days) {
+      const month = day.slice(0, 7);
+      let monthData = timelineCache.current.get(month);
+      if (!monthData) {
+        monthData = (await fetchTimelineMonth(month)) ?? {};
+        timelineCache.current.set(month, monthData);
+        setTimelineCacheVersion(v => v + 1);
+      }
+      const tuples = monthData[day] as TrackTuple[] | undefined;
+      if (!tuples?.length) continue;
+
+      const dayKey = TIMELINE_DAY_PREFIX + day;
+      const sorted = tuples.slice().sort((a, b) => a[0] - b[0]);
+      // 月檔是不可變的，但重新匯入會換掉整個月。用點數與頭尾時戳當版本記號，
+      // 內容沒變就沿用上次結果，不重打別人家的 API
+      const stamp = `tl:${sorted.length}:${sorted[0][0]}:${sorted[sorted.length - 1][0]}`;
+
+      const existing = await fetchTrackMatched(dayKey);
+      if (existing?.sourceMd5 === stamp) {
+        log.push(`${day}：來源未變，沿用上次結果（${existing.segments.length} 趟）`);
+        setMatchLog([...log]);
+        continue;
+      }
+
+      // 切 seg：間隔超過 15 分鐘，或兩點之間的隱含速度超過 200 km/h（＝飛機，
+      // 或匯出資料本身的跳點）就斷開，兩端不可以連成一段移動
+      const segs = segmentIndices(sorted, { maxGapSec: 900 });
+      const gpxPoints: GpxPoint[] = sorted.map(([sec, lat, lng], i) => ({
+        t: new Date(sec * 1000).toISOString(),
+        lat, lng, src: 'timeline', hdop: null, seg: segs[i], staySec: null,
+      }));
+
+      // minPoints 放寬到 5：時間軸是分鐘級取樣，一趟二十分鐘的車程也才十來點，
+      // 用 GPX 那邊的 8 會把短程整批濾掉
+      const trips = extractTrips(rejectSpikes(gpxPoints), { minPoints: 5 });
+      if (trips.length === 0) {
+        await deleteTrackMatched(dayKey);
+        log.push(`${day}：${sorted.length} 點裡沒有一趟真正的移動，略過`);
+        setMatchLog([...log]);
+        continue;
+      }
+
+      log.push(`${day}：${sorted.length} 點 → ${trips.length} 趟移動`);
+      setMatchLog([...log]);
+
+      const segments: MatchedTrack['segments'] = [];
+      let dayPoints = 0;
+
+      for (let i = 0; i < trips.length; i++) {
+        const trip = trips[i];
+        const vehicle = vehicleFromSpeed(trip.speedKmh);
+        const costing = costingFor(vehicle);
+        const label = `${day} 第 ${i + 1} 趟`;
+        if (!costing) {
+          log.push(`${label}：${vehicleLabel(vehicle)}不走道路，跳過`);
+          setMatchLog([...log]);
+          continue;
+        }
+
+        const input = subsampleForMatch(
+          trip.points.map(p => ({ lat: p.lat, lng: p.lng, t: Date.parse(p.t) } as MatchInput)),
+          1000,
+        );
+        if (requests > 0) await sleep(1100);
+        requests++;
+        const resp = await matchTrackShape(input.map(p => ({ lat: p.lat, lon: p.lng })), costing);
+        const matched = resp ? buildMatchedTrack(input, resp) : null;
+        if (!matched) {
+          log.push(`${label}：貼路失敗${resp?.error ? `（${resp.error}）` : ''}`);
+          setMatchLog([...log]);
+          continue;
+        }
+
+        segments.push({
+          seg: i,
+          costing,
+          vehicle,
+          points: matched.map(m => [m.lng, m.lat, Math.round(m.t)] as [number, number, number]),
+        });
+        dayPoints += matched.length;
+      }
+
+      if (segments.length === 0) {
+        await deleteTrackMatched(dayKey);
+        log.push(`${day}：沒有貼出任何一趟`);
+      } else {
+        const ok = await saveTrackMatched(dayKey, {
+          dayKey, builtAt: new Date().toISOString(), sourceMd5: stamp, segments,
+        });
+        log.push(
+          `${day}：${segments.length}/${trips.length} 趟貼路完成，${dayPoints} 點`
+          + (ok ? '' : '（存檔失敗）')
+        );
+      }
+      setMatchLog([...log]);
+    }
+
+    log.push(`時間軸貼路結束，共送出 ${requests} 個請求。`);
+    setMatchLog([...log]);
+    setMatching(false);
+    setMatchedVersion(v => v + 1);
+    return requests;
+  }, []);
+
+  /*
+   * 自動貼路：選好日期就自己把這段範圍補齊，不再有按鈕。
+   *
+   * 來源優先序在 timelineDaysInRange 那邊就決定好了 —— 有 GPSLogger 軌跡的日子
+   * 只走 GPS，沒有的才輪到 Google 時間軸，同一天不會兩邊都貼。
+   *
+   * 三道閂，缺一不可：
+   * - 只補 unmatchedKeys（R2 上真的沒有結果的日子）。有結果就不重打。
+   * - attemptedMatch：同一天這次進頁只試一次。貼不出來的日子（整天沒移動、
+   *   對方掛掉）不會在「重讀→還是沒有→再貼」之間無限打轉。
+   * - 等 matchedLoading 結束、且沒有別的貼路在跑。自動同步那條路也會呼叫
+   *   runMatch，兩邊同時跑會把每秒一請求的自律破功。
+   */
+  useEffect(() => {
+    if (!isAdmin || matching || matchedLoading || unmatchedKeys.length === 0) return;
+
+    const todo = unmatchedKeys.filter(k => !attemptedMatch.current.has(k));
+    if (todo.length === 0) return;
+
     const dayByKey = new Map(trackDays.map(d => [d.day_key, d]));
-    // 沒有原始檔的日子（舊的同步、Google 時間軸匯入的）根本沒得貼
-    const targets: MatchTarget[] = dayKeys
-      .filter(k => dayByKey.get(k)?.has_raw)
-      .map(k => ({ dayKey: k, md5: dayByKey.get(k)?.md5 ?? null }));
-
-    if (dayKeys.length === 0) {
-      alert('目前畫面上沒有軌跡可以貼路。先選一段有軌跡的日期範圍。');
-      return;
+    const timelineDays: string[] = [];
+    const gpsTargets: MatchTarget[] = [];
+    // 這一輪真的做出判斷的 key。查不到 TrackDay 的先不標記 —— 那多半只是
+    // 軌跡點先回來、日清單還在路上，標下去就等於這一天這次進頁再也不會貼
+    const decided: string[] = [];
+    for (const key of todo) {
+      if (key.startsWith(TIMELINE_DAY_PREFIX)) {
+        timelineDays.push(key.slice(TIMELINE_DAY_PREFIX.length));
+        decided.push(key);
+        continue;
+      }
+      const d = dayByKey.get(key);
+      if (!d) continue;
+      decided.push(key);
+      // 沒留原始 GPX 的日子沒得貼（濃縮過的點會貼出你沒走過的路），
+      // 但仍然算「判斷過」，不必每次重讀都再挑出來看一遍
+      if (d.has_raw) gpsTargets.push({ dayKey: key, md5: d.md5 ?? null });
     }
-    if (targets.length === 0) {
-      alert(`這 ${dayKeys.length} 天都沒有留原始 GPX，無法貼路。\n\n貼路需要原始密度的點，濃縮過的點會貼出你沒走過的路。`);
-      return;
-    }
-    if (!confirm(
-      `把 ${targets.length} 天的軌跡送去貼路？`
-      + (targets.length < dayKeys.length ? `（另外 ${dayKeys.length - targets.length} 天沒有原始檔，會略過）` : '')
-      + '\n\n座標會送到 FOSSGIS（OpenStreetMap 德國分會）的 Valhalla 服務，'
-      + '經由自家 Worker 轉手，所以對方看不到你的 IP。\n'
-      + '每秒只能送一次請求，趟數多的話會跑一段時間。'
-    )) return;
+    // 先標記再送出：中途失敗、或使用者切走日期，都不該讓這幾天再排隊一次
+    for (const k of decided) attemptedMatch.current.add(k);
+    if (gpsTargets.length === 0 && timelineDays.length === 0) return;
 
-    await runMatch(targets);
-  };
+    (async () => {
+      const total = gpsTargets.length + timelineDays.length;
+      setAutoStatus(`貼路中…（${total} 天）`);
+      let requests = 0;
+      if (gpsTargets.length > 0) requests += await runMatch(gpsTargets, { quiet: true });
+      if (timelineDays.length > 0) requests += await runTimelineMatch(timelineDays);
+      setAutoStatus(requests > 0 ? `已貼路 ${total} 天，送出 ${requests} 個請求` : null);
+    })();
+    // trackDays 只是拿來查 has_raw/md5，它變動時 rawDayKeys 也會跟著變並重讀一輪，
+    // 不需要它自己觸發這個 effect
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin, matching, matchedLoading, unmatchedKeys, runMatch, runTimelineMatch]);
 
   /*
    * 開頁自動同步。取代 cron 的作法（見 runSync 的註解為什麼不做 cron）。
@@ -927,22 +1024,7 @@ export default function MapPage() {
     })();
   }, [isAdmin, runSync, runMatch]);
 
-  const runTool = async (name: string, fn: () => Promise<number>) => {
-    setBusy(name);
-    const n = await fn();
-    setBusy(null);
-    alert(`${name}：更新了 ${n} 張照片`);
-    load();
-  };
-
   const currentAlbum = albums.find(a => a.id === albumId);
-
-  // 有手機軌跡就以軌跡為準；沒有軌跡的日子（GPSLogger 開始跑之前的舊照片）
-  // 才退回照片連線，否則地圖上會完全沒有路線。使用者手動切過就以他的選擇為準。
-  //
-  // skipTracks 時不預設連線：那是「沒去撈軌跡」而不是「這段時間沒有軌跡」，
-  // 尤其全部相簿會把跨越好幾年的照片串成一團橫跨地圖的線。
-  const connectPhotosEffective = connectPhotos ?? (!skipTracks && tracks.length === 0);
 
   /*
    * 只看一天時，鏡頭要停的那個點：那天最早的一筆位置。
@@ -950,8 +1032,8 @@ export default function MapPage() {
    * 只在 from === to 時才給值 —— 選了一段範圍就還是「全部框進來」，
    * 停在第一天的起點會看不出這段範圍到底涵蓋了哪裡。
    *
-   * 優先序是使用者的原話「當天 GPS 的第一個點」：先看三份 GPS 軌跡（濃縮／貼路／
-   * 原始，都是同一趟的不同精度，取最早的那筆），沒有才退到 Google 足跡 ——
+   * 優先序是使用者的原話「當天 GPS 的第一個點」：先看兩份 GPS 軌跡（濃縮與貼路，
+   * 同一趟的不同精度，取最早的那筆），沒有才退到 Google 足跡 ——
    * 2014 年那些早於 GPSLogger 的日子只有這一層，不退過去的話等於沒定位。
    * 最後才是照片，它連「有沒有在移動」都不表示。
    */
@@ -963,7 +1045,7 @@ export default function MapPage() {
     if (loading) return null;
 
     let best: TrackPoint | null = null;
-    for (const list of [tracks, matchedTracks, rawTracks]) {
+    for (const list of [tracks, matchedTracks]) {
       for (const p of list) if (best === null || p.t_utc < best.t_utc) best = p;
     }
     if (best) return [best.lng, best.lat];
@@ -980,7 +1062,7 @@ export default function MapPage() {
     // 全都沒有 taken_at（排不進時間軸）時退到後端給的順序，總比不定位好
     const photo = firstPhoto ?? points[0];
     return photo ? [photo.lng, photo.lat] : null;
-  }, [from, to, loading, tracks, matchedTracks, rawTracks, timelineLines, points]);
+  }, [from, to, loading, tracks, matchedTracks, timelineLines, points]);
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 16px 60px' }}>
@@ -1030,76 +1112,19 @@ export default function MapPage() {
             清除篩選
           </button>
         )}
-        {/* 原始軌跡只有管理者讀得到（會暴露完整行蹤）。
-            非管理者不給這個選單，就吃預設的貼路軌跡 —— 那本來就是要給人看的那一份 */}
-        {isAdmin && tracks.length > 0 && (
-          <label style={{ fontSize: 13 }}>
-            <div style={{ marginBottom: 4, color: '#475569' }}>動畫依據</div>
-            <select
-              value={animateOn}
-              onChange={(e) => setAnimateOn(e.target.value as 'track' | 'raw' | 'matched')}
-              style={{ padding: '7px 10px', borderRadius: 7, border: '1px solid #cbd5e1' }}
-              title="選了就會自動去取對應的資料，不需要先勾上面的顯示開關。選到的那份沒資料時會退回 GPS 軌跡。"
-            >
-              <option value="matched">貼路軌跡</option>
-              <option value="track">GPS 軌跡（濃縮後）</option>
-              <option value="raw">原始軌跡（完整）</option>
-            </select>
-          </label>
-        )}
-
-        {/* 跟「動畫依據」是兩回事：這個是額外把照片的點也串進動畫路徑，可以疊加 */}
+        {/* 照片開關。預設開 —— 這一頁的主角本來就是照片。
+            關掉是為了看清楚底下的線：同一個景點常常疊著幾十張縮圖，
+            把整條路徑蓋得看不出貼路貼準了沒 */}
         <label style={{ fontSize: 13, display: 'flex', gap: 7, alignItems: 'center', cursor: 'pointer' }}>
           <input
             type="checkbox"
-            checked={connectPhotosEffective}
-            onChange={(e) => setConnectPhotos(e.target.checked)}
+            checked={showPhotos}
+            onChange={(e) => setShowPhotos(e.target.checked)}
           />
-          <span title="關閉時動畫只沿著上面選的那份軌跡跑。照片之間直接連線是推測出來的路徑，不是實際走過的路。">
-            連接照片位置
+          <span title="地圖上的照片圓點、聚合數字與縮圖。關掉只是不畫，照片資料本身不受影響（縮圖也不會再去下載）。">
+            顯示照片
           </span>
         </label>
-
-        {/* 只有管理者能開：讀原始檔的路由本來就只給管理者（會暴露完整行蹤） */}
-        {isAdmin && tracks.length > 0 && (
-          <label style={{ fontSize: 13, display: 'flex', gap: 7, alignItems: 'center', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={showRaw}
-              onChange={(e) => setShowRaw(e.target.checked)}
-            />
-            <span title="從 R2 取回原始 GPX 直接畫成橘色虛線，未經停留濃縮與抽稀。純檢視，不會寫進資料庫。">
-              顯示原始軌跡
-            </span>
-          </label>
-        )}
-
-        {tracks.length > 0 && (
-          <label style={{ fontSize: 13, display: 'flex', gap: 7, alignItems: 'center', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={showMatched}
-              onChange={(e) => setShowMatched(e.target.checked)}
-            />
-            <span title="貼著道路走的紫色線，地圖上平常看的就是這條。要先在管理工具按過「軌跡貼路」才有東西。">
-              顯示貼路軌跡
-            </span>
-          </label>
-        )}
-
-        {tracks.length > 0 && (
-          <label style={{ fontSize: 13, display: 'flex', gap: 7, alignItems: 'center', cursor: 'pointer' }}>
-            <input
-              type="checkbox"
-              checked={showTrack}
-              onChange={(e) => setShowTrack(e.target.checked)}
-            />
-            <span title="貼路之前的原料：D1 裡濃縮抽稀過的綠色軌跡線與停留圈。要對照貼路貼得準不準時才打開。">
-              顯示濃縮軌跡
-            </span>
-          </label>
-        )}
-
         {/* 只有管理者：這一層是十二年不間斷的完整移動史，沒有公開的合理預設 */}
         {isAdmin && (
           <label style={{ fontSize: 13, display: 'flex', gap: 7, alignItems: 'center', cursor: 'pointer' }}>
@@ -1122,7 +1147,7 @@ export default function MapPage() {
           {autoStatus && (
             <div
               style={{ fontSize: 12, color: '#0891b2', marginTop: 2 }}
-              title="開啟這一頁時會自動去 Drive 看有沒有新的軌跡檔（每小時最多一次），有的話同步進來並接著貼路。"
+              title="開啟這一頁時會自動去 Drive 看有沒有新的軌跡檔（每小時最多一次）；另外選定日期後，這段範圍裡還沒貼過路的日子會自動補上 —— 有 GPS 軌跡的用軌跡，沒有的用 Google 時間軸。"
             >
               {autoStatus}
             </div>
@@ -1131,18 +1156,6 @@ export default function MapPage() {
             <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 2 }}>
               {new Date(photoSpan.first).toLocaleDateString()} ～ {new Date(photoSpan.last).toLocaleDateString()}
               {albumId === '' && !from && !to && '（未載入軌跡）'}
-            </div>
-          )}
-          {needRaw && (
-            <div style={{ fontSize: 12, color: '#ea580c', marginTop: 2 }}>
-              {rawLoading ? '讀取原始軌跡…' : rawStats && (
-                <>
-                  原始 {rawStats.points} 點 → 現存 {tracks.length} 點
-                  {rawStats.points > 0 &&
-                    `（濃縮抽稀掉 ${Math.round((1 - tracks.length / rawStats.points) * 100)}%）`}
-                  {rawStats.missing > 0 && ` ・ ${rawStats.missing} 天無原始檔`}
-                </>
-              )}
             </div>
           )}
           {showTimeline && (
@@ -1155,82 +1168,75 @@ export default function MapPage() {
                     : '這段範圍沒有 Google 足跡'}
             </div>
           )}
-          {needMatched && (
-            <div style={{ fontSize: 12, color: '#7c3aed', marginTop: 2 }}>
-              {/* 「還沒貼過路」只有在真的有 GPS 軌跡可貼時才成立。沒有軌跡的日子
-                  （2014 年那些只有 Google 足跡的舊日期）照樣叫人去按貼路按鈕，
-                  只會讓人按了一個什麼都不會發生的按鈕 */}
-              {matchedLoading ? '讀取貼路軌跡…'
+          <div style={{ fontSize: 12, color: '#7c3aed', marginTop: 2 }}>
+            {/* 貼路已經是自動的，所以這裡不再叫人去按什麼。剩下的只有兩種情況：
+                正在補（matching）、或這段範圍根本沒有來源可以貼 */}
+            {matchedLoading ? '讀取貼路軌跡…'
+              : matching ? '貼路中…'
                 : matchedTracks.length > 0
                   ? `貼路 ${matchedTracks.length} 點 / ${matchedDays} 天`
                   : skipTracks
                     ? ''
-                    : tracks.length === 0
-                      ? '這段範圍沒有 GPS 軌跡可以貼路'
-                      : '這段範圍還沒貼過路（管理工具裡有按鈕）'}
-            </div>
-          )}
+                    : tracks.length === 0 && timelineDaysInRange.length === 0
+                      ? '這段範圍沒有可以貼路的軌跡'
+                      : '這段範圍貼不出路徑（來源太疏或整天沒移動）'}
+          </div>
         </div>
       </div>
 
       <FootprintMap
         points={points}
+        showPhotos={showPhotos}
+        albums={albums}
         tracks={tracks}
-        connectPhotos={connectPhotosEffective}
         editable={isAdmin}
         onEditPoints={handleEditPoints}
         onMovePhoto={handleMovePhoto}
-        rawTracks={rawTracks}
-        showRawLine={showRaw}
+        showRawLine={SHOW_RAW_LINE}
         matchedTracks={matchedTracks}
-        showMatchedLine={showMatched}
-        showTrackLine={showTrack}
-        animateOn={animateOn}
+        showMatchedLine={SHOW_MATCHED_LINE}
+        showTrackLine={SHOW_TRACK_LINE}
+        animateOn={ANIMATE_ON}
         timelineLines={showTimeline ? timelineLines : undefined}
         focusPoint={focusPoint}
       />
 
+      {/* 圖例只剩線。照片的點不再依座標來源分色（見 FootprintMap 的 photo-points 圖層）——
+          一張照片的位置是量到的還是推出來的，是點開它才需要知道的事，
+          不值得在每次看地圖時都佔一整排圖例 */}
       <div style={{ marginTop: 10, fontSize: 12.5, color: '#64748b', display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-        <span style={{ color: '#2563eb' }}>● 照片自帶 GPS</span>
-        <span style={{ color: '#0891b2' }}>● Google 時間軸</span>
-        <span style={{ color: '#f59e0b' }}>◍ 打卡地點</span>
-        {showMatched && <span style={{ color: '#7c3aed' }}>— 貼路軌跡（OSM 路網）</span>}
-        {showRaw && <span style={{ color: '#f97316' }}>┈ 原始軌跡（未濃縮抽稀）</span>}
-        {showTrack && <span style={{ color: '#16a34a' }}>— GPS 軌跡</span>}
-        {showTrack && <span style={{ color: '#16a34a' }}>◎ 停留（圈越大待越久）</span>}
+        {showPhotos && <span style={{ color: '#2563eb' }}>● 照片</span>}
+        <span style={{ color: '#7c3aed' }}>— 貼路軌跡（OSM 路網）</span>
         {showTimeline && <span style={{ color: '#db2777' }}>— Google 足跡（唯讀）</span>}
-        <span>◍ 由前後照片推估</span>
-        <span>○ 手動指定</span>
       </div>
 
       {isAdmin && (
         <div style={{ marginTop: 30 }}>
-          <h2 style={{ fontSize: 18, marginBottom: 12 }}>管理工具</h2>
+          {/* 整區收合。平常來這一頁是要看地圖的，貼路與同步也都自動化了，
+              工具區留在展開狀態只是把地圖往上擠 */}
+          <button
+            onClick={() => setShowAdminTools(v => !v)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 8, padding: 0,
+              border: 'none', background: 'none', cursor: 'pointer',
+              fontSize: 18, fontWeight: 600, color: '#0f172a', marginBottom: 12,
+            }}
+          >
+            <span style={{ fontSize: 13, color: '#94a3b8' }}>{showAdminTools ? '▾' : '▸'}</span>
+            管理工具
+          </button>
 
+          {showAdminTools && (
+          <>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 20 }}>
             <button
-              disabled={!!busy}
-              onClick={() => runTool('套用行程段', () => applyTripSegments(albumId === '' ? undefined : albumId))}
-              style={toolBtn}
-            >
-              {busy === '套用行程段' ? '處理中…' : '套用行程段到未定位照片'}
-            </button>
-            <button
-              disabled={!!busy}
-              onClick={() => runTool('內插補點', () => interpolateGeo(albumId === '' ? undefined : albumId))}
-              style={toolBtn}
-            >
-              {busy === '內插補點' ? '處理中…' : '對有 GPS 的照片之間內插補點'}
-            </button>
-            <button
-              disabled={!!busy}
               onClick={() => setShowTimelineImport(true)}
               style={{ ...toolBtn, borderColor: '#0891b2', color: '#0891b2' }}
             >
               📍 從 Google 時間軸匯入
             </button>
             <button
-              disabled={syncing || !!busy}
+              disabled={syncing}
               onClick={syncTracks}
               style={{ ...toolBtn, borderColor: '#16a34a', color: '#16a34a' }}
             >
@@ -1245,14 +1251,9 @@ export default function MapPage() {
                 強制重新匯入
               </span>
             </label>
-            <button
-              disabled={matching || syncing || !!busy || tracks.length === 0}
-              onClick={matchTracks}
-              style={{ ...toolBtn, borderColor: '#7c3aed', color: '#7c3aed' }}
-              title="把畫面上這幾天的軌跡送去 OpenStreetMap 的路網上比對，讓線貼著實際道路走。結果存 R2，不進資料庫。"
-            >
-              {matching ? '貼路中…' : '🛣️ 軌跡貼路'}
-            </button>
+            {/* 貼路沒有按鈕：選定日期就自動補齊（見上面那個自動貼路的 effect）。
+                有 GPSLogger 軌跡的日子用實測軌跡，沒有的才用 Google 時間軸。
+                進度在畫面右上角那行狀態字，細節在底下的 log */}
           </div>
 
           {matchLog.length > 0 && (
@@ -1273,10 +1274,14 @@ export default function MapPage() {
                   收起
                 </button>
               )}
-              {/* OSM 的資料授權要求標註來源，貼路的幾何整條都來自那裡 */}
-              <div style={{ marginTop: 8, fontSize: 11.5, color: '#7c3aed', opacity: 0.8 }}>
-                路網比對由 FOSSGIS e.V. 提供的 Valhalla 服務完成，道路資料 © OpenStreetMap contributors
-              </div>
+              {/* OSM 的資料授權要求標註來源，貼路的幾何整條都來自那裡。
+                  收折起來但不刪掉 —— 授權要求的是「有標註」，不是「一直攤在眼前」 */}
+              <details style={{ marginTop: 8, fontSize: 11.5, color: '#7c3aed', opacity: 0.8 }}>
+                <summary style={{ cursor: 'pointer' }}>資料來源與授權</summary>
+                <div style={{ marginTop: 4 }}>
+                  路網比對由 FOSSGIS e.V. 提供的 Valhalla 服務完成，道路資料 © OpenStreetMap contributors
+                </div>
+              </details>
             </div>
           )}
 
@@ -1325,101 +1330,6 @@ export default function MapPage() {
             </div>
           )}
 
-          <h3 style={{ fontSize: 15, marginBottom: 8 }}>已同步的軌跡日（{trackDays.length}）</h3>
-          {trackDays.length === 0 ? (
-            <p style={{ fontSize: 13.5, color: '#64748b', marginBottom: 24 }}>
-              還沒有同步過任何軌跡。按上面的「立即同步足跡」從 Google Drive 匯入。
-            </p>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 24 }}>
-              {trackDays.map(d => (
-                <div key={d.day_key} style={{
-                  display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px',
-                  border: '1px solid #e2e8f0', borderRadius: 9, fontSize: 13.5, flexWrap: 'wrap',
-                }}>
-                  <strong style={{ minWidth: 150 }}>{d.day_key}</strong>
-                  <span style={{ color: '#64748b' }}>{d.point_count} 點</span>
-                  {d.ingest_source === 'manual' && (
-                    <span style={{ color: '#d97706', fontSize: 12 }}>已手動編修</span>
-                  )}
-                  {d.ingest_source === 'timeline' && (
-                    <span style={{ color: '#0891b2', fontSize: 12 }}>Google 時間軸</span>
-                  )}
-                  {/* 沒有原始檔的日子（時間軸匯入、或這功能上線前同步的）不給按鈕，
-                      不然按下去只會拿到一個讀不到檔案的錯誤 */}
-                  {d.has_raw ? (
-                    <button
-                      disabled={restoring !== null}
-                      onClick={() => restoreDay(d)}
-                      style={{
-                        marginLeft: 'auto', padding: '5px 12px', borderRadius: 6,
-                        border: '1px solid #cbd5e1', background: '#fff', color: '#475569',
-                        cursor: restoring ? 'default' : 'pointer', fontSize: 12.5,
-                      }}
-                    >
-                      {restoring === d.day_key ? '還原中…' : '↺ 恢復原始軌跡'}
-                    </button>
-                  ) : (
-                    <span
-                      style={{ marginLeft: 'auto', color: '#94a3b8', fontSize: 12 }}
-                      title="這一天是在「留存原始 GPX」之前同步的，或本來就沒有 GPX 檔。重新同步一次就會留下原始檔。"
-                    >
-                      無原始檔
-                    </span>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-
-          <h3 style={{ fontSize: 15, marginBottom: 8 }}>軌跡段交通工具（{segInfos.length}）</h3>
-          {segInfos.length === 0 ? (
-            <p style={{ fontSize: 13.5, color: '#64748b', marginBottom: 24 }}>
-              目前的篩選範圍內沒有 GPS 軌跡。
-            </p>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 24 }}>
-              {segInfos.map(s => (
-                <div key={s.key} style={{
-                  display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px',
-                  border: '1px solid #e2e8f0', borderRadius: 9, fontSize: 13.5, flexWrap: 'wrap',
-                }}>
-                  {/* 圖示不再區分交通工具（見 vehicles.ts）。這裡的交通工具是給貼路用的，
-                      實際選了什麼看右邊的選單，不用圖示重複表達一次 */}
-                  <span style={{ fontSize: 20, width: 26, textAlign: 'center' }}>{MOVER_EMOJI}</span>
-                  <span style={{ color: '#64748b', minWidth: 210 }}>
-                    {new Date(s.from).toLocaleString()} ~ {new Date(s.to).toLocaleTimeString()}
-                  </span>
-                  <span style={{ color: '#94a3b8', fontSize: 12 }}>
-                    {s.points.length} 點 ・ 約 {Math.round(s.speedKmh)} km/h
-                  </span>
-                  <select
-                    value={s.manual ?? ''}
-                    onChange={async (e) => {
-                      const v = e.target.value === '' ? null : (e.target.value as Vehicle);
-                      // 先反映在畫面上，失敗再回滾 —— 這是一個一眼就看得出結果的操作
-                      setManualVehicles(prev => { const next = new Map(prev); next.set(s.key, v); return next; });
-                      if (!(await setSegmentVehicle(s.dayKey, s.seg, v))) {
-                        alert('儲存失敗');
-                        loadVehicles();
-                      }
-                    }}
-                    style={{
-                      marginLeft: 'auto', padding: '5px 8px', borderRadius: 6,
-                      border: '1px solid #cbd5e1', fontSize: 13,
-                    }}
-                  >
-                    {/* 沒指定就依速度猜，選單裡直接寫出猜的結果，才知道自己在覆蓋什麼 */}
-                    <option value="">自動（{vehicleLabel(s.guess)}）</option>
-                    {VEHICLES.map(v => (
-                      <option key={v.id} value={v.id}>{v.label}</option>
-                    ))}
-                  </select>
-                </div>
-              ))}
-            </div>
-          )}
-
           <h3 style={{ fontSize: 15, marginBottom: 8 }}>行程段（{segments.length}）</h3>
           {segments.length === 0 ? (
             <p style={{ fontSize: 13.5, color: '#64748b' }}>
@@ -1455,6 +1365,8 @@ export default function MapPage() {
                 </div>
               ))}
             </div>
+          )}
+          </>
           )}
         </div>
       )}

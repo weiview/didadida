@@ -1,0 +1,21 @@
+-- 照片座標的預設從「私密」翻成「公開」，改由相簿層級的 map_private 當唯一的閘門。
+--
+-- 為什麼要改：使用者定的規則是「相簿公開就連同（照片與）軌跡公開，相簿不公開就
+-- 只有登入管理員看得到」。但 geo_private 原本預設 1，而 applyGeoPrivacy 是
+-- map_private = 0 AND geo_private = 0 才輸出座標 —— 兩個條件是 AND，所以把相簿
+-- 設成公開之後，地圖上仍然一個座標都不會出現。那個預設值等於讓公開開關失效。
+--
+-- geo_private 這一欄不刪：它現在的角色是「這一張特別不要」，
+-- 從『預設全部隱藏，逐張開放』翻成『預設跟著相簿走，逐張排除』。
+--
+-- SQLite 不能改既有欄位的 DEFAULT，只能重建整張表 —— 為了一個預設值搬動整個
+-- Photo（含索引與外鍵）不划算。所以這裡只把既有資料補成 0，
+-- 新欄位預設值的修正寫在 schema.sql，之後重建的資料庫就會是對的。
+-- 兩邊不一致是刻意的，理由就是上面這段。
+--
+-- 三個地方都要套：
+--   npx wrangler d1 execute didadida-db --local  --file=../../database/migrate_geo_private_default.sql
+--   npx wrangler d1 execute didadida-db-dev --remote --file=...
+--   npx wrangler d1 execute didadida-db     --remote --file=...
+
+UPDATE Photo SET geo_private = 0 WHERE geo_private <> 0;

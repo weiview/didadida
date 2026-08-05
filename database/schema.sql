@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS Photo (
   -- 權威由高而低：'manual' | 'exif' | 'track' | 'timeline' | 'segment' | 'interpolated'
   geo_source TEXT,
   place_name TEXT,
-  geo_private INTEGER NOT NULL DEFAULT 1,
+  -- 「這一張特別不要出現在地圖上」。預設 0 ＝ 跟著相簿的 map_private 走，
+  -- 相簿層級才是公開與否的閘門（見 migrate_geo_private_default.sql）
+  geo_private INTEGER NOT NULL DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   url TEXT,
   thumb_url TEXT,
@@ -92,7 +94,9 @@ CREATE TABLE IF NOT EXISTS TrackDay (
   raw_key TEXT,
   point_count INTEGER NOT NULL DEFAULT 0,
   tz_offset_minutes INTEGER,
-  -- 軌跡自成一組隱私旗標，不繼承相簿的 map_private
+  -- 「就算沒有任何公開相簿，這一天也要公開」。預設 1 ＝ 不主動公開，
+  -- 但只要有公開相簿的行程時間窗蓋到，那一段軌跡仍然看得到
+  -- （見後端的 publicTripWindows）
   is_private INTEGER NOT NULL DEFAULT 1,
   synced_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );

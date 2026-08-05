@@ -9,6 +9,8 @@ node_modules
 # next.js
 .next/
 out/
+# tsc --noEmit 的增量快取，純本機產物
+*.tsbuildinfo
 
 # production
 /build

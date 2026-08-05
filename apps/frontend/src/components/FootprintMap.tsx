@@ -6,7 +6,7 @@ import {
   type GeoJSONSource, type MapLayerMouseEvent,
 } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import type { FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
+import type { Album, FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 
 // OpenFreeMap：免費、免 API key、無流量上限的向量圖磚。
@@ -15,6 +15,23 @@ const DEFAULT_STYLE = 'https://tiles.openfreemap.org/styles/positron';
 
 interface Props {
   points: FootprintPoint[];
+  /**
+   * 要不要在地圖上畫照片（圓點、聚合、縮圖）。
+   *
+   * 關掉時是把 photos 這個 source 餵空，而不是只切圖層可見性 ——
+   * 縮圖採「畫到才載」（見 styleimagemissing），source 空了就不會有人來要圖，
+   * 也就順便省掉那一整批 R2 讀取與頻寬。
+   *
+   * points 仍然照傳：關掉只是不畫，鏡頭框景與播放列的統計都還算它們。
+   */
+  showPhotos?: boolean;
+  /**
+   * 相簿清單。只為了一件事：整叢照片都屬於同一本相簿時，用那本的封面照當代表。
+   *
+   * 沒傳、或那本沒設封面，就退回「從這本相簿的照片裡隨機挑一張」——
+   * 所以這個 prop 是加分項，缺了地圖照樣完整。
+   */
+  albums?: Album[];
   /** GPS 軌跡點。有軌跡時，動畫就是沿著它跑 */
   tracks?: TrackPoint[];
   /**
@@ -120,10 +137,69 @@ const STAY_SNAP_M = 120;
 // 地圖上最多同時保留幾張縮圖。超過就退回圓點 ——
 // 每張都是一塊要留在 GPU 上的貼圖，不設上限的話大相簿會把記憶體吃光。
 const MAX_THUMBS = 200;
-// 貼圖用 2 倍解析度畫、再以 pixelRatio 2 交給 maplibre，等於 CSS 上的 64px。
-// 直接畫 64px 的話放大到 icon-size 1.5 會糊掉。
-const THUMB_PX = 128;
-const THUMB_PIXEL_RATIO = 2;
+
+// 照片在地圖上畫成「對話框泡泡」：圓角白框裝著照片，底下一根尾巴指著座標。
+// 下面全是 CSS px，實際貼圖以 BUBBLE_PR 倍解析度畫，再靠 pixelRatio 交還給 maplibre
+// （直接畫成 CSS 尺寸的話，放大到 icon-size 1.5 會糊掉）。
+const BUBBLE_PR = 2;
+const BUBBLE_W = 84;
+const BUBBLE_H = 84;
+/** 尾巴高度。泡泡本體離座標多遠就是靠它 */
+const BUBBLE_TAIL = 14;
+/** 四周留白，純粹是給陰影用的；畫圖時要扣掉，錨點也要補回來（見 icon-offset） */
+const BUBBLE_PAD = 8;
+/** 白框粗細與圓角。圓角刻意放很大 —— 泡泡「可愛」的主要來源就是這個 */
+const BUBBLE_BORDER = 5;
+const BUBBLE_RADIUS = 24;
+
+// 泡泡外圈的糖果色。依 id 取模挑一個，讓一整片泡泡看起來熱鬧而不是一片白。
+// 不帶任何語意（不代表座標來源、不代表相簿），純裝飾
+const BUBBLE_RINGS = ['#f472b6', '#fbbf24', '#34d399', '#60a5fa', '#a78bfa', '#fb7185'];
+
+/**
+ * 代表照的挑法：把「這次載入抽的亂數」放高位、照片 id 放低位打包成一個數字，
+ * 交給 maplibre 的 clusterProperties 用 max 累加 —— 累加完的最大值，
+ * 就等於這一叢裡隨機抽中的那一張。
+ *
+ * 拿 max 而不是別的：clusterProperties 只吃 min/max/sum 這類可結合的累加器，
+ * 沒有「隨便給我一個」可用。低位留 1e9 給 id，高位亂數上限 1e5，
+ * 乘起來 1e14 還在 double 的精確整數範圍（2^53）內。
+ */
+const REP_ID_MOD = 1e9;
+const REP_RAND_MAX = 1e5;
+
+/**
+ * 「一坨」的判定半徑。同一本相簿、彼此在這個距離內的照片會被釘到同一個點上，
+ * 攤成撲克牌那樣的扇形。
+ *
+ * 為什麼不是整本相簿取平均：一本相簿常常是一整趟旅行，橫跨好幾公里，
+ * 取平均會把所有照片釘在一片什麼都沒有的空地上。要的是「同一個地方」而不是「同一本」。
+ *
+ * 40m 是照著泡泡的實際大小回推的 —— z19 時 1px ≈ 0.3m，泡泡約 126px 寬 ≈ 38m，
+ * 也就是「在這個距離內就一定會疊在一起」的門檻。
+ */
+const PILE_RADIUS_M = 40;
+/** 一坨最多攤開幾張。剩下的不畫，張數由徽章交代 */
+const PILE_MAX_CARDS = 5;
+/**
+ * 扇形的總張角（度）。泡泡以尾巴尖端為旋轉中心（icon-rotate 是繞著 icon-anchor 轉的），
+ * 所以這個角度直接就是牌面攤開的幅度：泡泡本體的中心約在支點上方 56px，
+ * ±32° 換算過去大約是半個泡泡寬的間距，看得出是五張不同的照片又還疊著。
+ */
+const PILE_FAN_DEG = 64;
+
+/** 每張照片畫在哪、怎麼擺。由 usePiles 算出來，只給 photos 這個 source 用 */
+interface PileSlot {
+  /** 釘住的座標（同一坨共用；單張就是它自己） */
+  lng: number;
+  lat: number;
+  /** 這一坨總共幾張 */
+  pile: number;
+  /** 扇形裡的第幾張（0 起算）。-1 = 這張不畫 */
+  fan: number;
+  /** 旋轉角度（度） */
+  angle: number;
+}
 
 // 跳到某一天的起點時用的縮放。街廓看得清楚，又不至於窄到看不出接下來往哪走。
 // 固定值而不是「保留使用者目前的縮放」—— 從全球視野點進某一天，
@@ -164,48 +240,94 @@ function roundedRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w:
 }
 
 /**
- * 把照片畫成地圖用的圓角小縮圖。
+ * 對話框泡泡的外框路徑：圓角矩形 + 底部朝下的尾巴，一條路徑走完。
+ *
+ * 尾巴不另外畫一個三角形疊上去 —— 分開畫的話白框的接縫會露出來，
+ * 而且外圈那條糖果色描邊會從尾巴根部橫切過去。
+ * 尾巴尖端固定在正中央：錨點就是靠它對準座標的。
+ */
+function bubblePath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number, tail: number) {
+  const cx = x + w / 2;
+  const half = tail * 0.62; // 尾巴根部的半寬
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(cx + half, y + h);
+  ctx.lineTo(cx, y + h + tail);
+  ctx.lineTo(cx - half, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+
+/**
+ * 把照片畫成地圖用的對話框泡泡。
  *
  * 走 canvas 是因為 map.addImage 要的是像素資料，不是 <img>。
  * 這需要圖片是 CORS-clean，/api/photos/view/ 有回 Access-Control-Allow-Origin: *，
  * 所以 crossOrigin='anonymous' 成立；少了它 canvas 會被污染，getImageData 會直接丟例外。
+ *
+ * ring 是外圈描邊的顏色，由呼叫端依 id 挑（見 BUBBLE_RINGS）。
  */
-function loadThumb(url: string): Promise<ImageData> {
+function loadBubble(url: string, ring: string): Promise<ImageData> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onerror = () => reject(new Error('圖片載入失敗'));
     img.onload = () => {
+      const wPx = (BUBBLE_W + BUBBLE_PAD * 2) * BUBBLE_PR;
+      const hPx = (BUBBLE_H + BUBBLE_TAIL + BUBBLE_PAD * 2) * BUBBLE_PR;
       const canvas = document.createElement('canvas');
-      canvas.width = THUMB_PX;
-      canvas.height = THUMB_PX;
+      canvas.width = wPx;
+      canvas.height = hPx;
       const ctx = canvas.getContext('2d');
       if (!ctx) { reject(new Error('取不到 canvas context')); return; }
+      // 之後的座標一律用 CSS px 思考，解析度只是倍率
+      ctx.scale(BUBBLE_PR, BUBBLE_PR);
 
-      // 白框 + 圓角，跟原本的圓點標記是同一套視覺語言。
-      // 邊框與圓角跟著 THUMB_PX 等比例縮放，換解析度時視覺比例才不會跑掉。
-      const border = Math.round(THUMB_PX * 0.055);
-      const radius = Math.round(THUMB_PX * 0.16);
+      const x = BUBBLE_PAD;
+      const y = BUBBLE_PAD;
 
-      roundedRectPath(ctx, 1, 1, THUMB_PX - 2, THUMB_PX - 2, radius);
+      // 白框本體。順手投一層淡影，泡泡才會像是浮在底圖上而不是印在上面
+      ctx.save();
+      ctx.shadowColor = 'rgba(15, 23, 42, 0.35)';
+      ctx.shadowBlur = 6;
+      ctx.shadowOffsetY = 3;
+      bubblePath(ctx, x, y, BUBBLE_W, BUBBLE_H, BUBBLE_RADIUS, BUBBLE_TAIL);
       ctx.fillStyle = '#ffffff';
       ctx.fill();
+      ctx.restore();
 
+      // 照片：置中裁切（cover），不要把照片壓扁
       ctx.save();
-      const inner = THUMB_PX - border * 2;
-      roundedRectPath(ctx, border, border, inner, inner, Math.max(radius - border, 2));
+      const ix = x + BUBBLE_BORDER;
+      const iy = y + BUBBLE_BORDER;
+      const iw = BUBBLE_W - BUBBLE_BORDER * 2;
+      const ih = BUBBLE_H - BUBBLE_BORDER * 2;
+      roundedRectPath(ctx, ix, iy, iw, ih, Math.max(BUBBLE_RADIUS - BUBBLE_BORDER, 2));
       ctx.clip();
-      // 置中裁切（cover），不要把照片壓扁
       const side = Math.min(img.width, img.height);
       ctx.drawImage(
         img,
         (img.width - side) / 2, (img.height - side) / 2, side, side,
-        border, border, inner, inner,
+        ix, iy, iw, ih,
       );
       ctx.restore();
 
+      // 外圈糖果色描邊。畫在最後，才不會被照片蓋掉，也不會沾到上面那層陰影
+      bubblePath(ctx, x, y, BUBBLE_W, BUBBLE_H, BUBBLE_RADIUS, BUBBLE_TAIL);
+      ctx.lineWidth = 2.5;
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = ring;
+      ctx.stroke();
+
       try {
-        resolve(ctx.getImageData(0, 0, THUMB_PX, THUMB_PX));
+        resolve(ctx.getImageData(0, 0, wPx, hPx));
       } catch (err) {
         reject(err as Error);
       }
@@ -243,6 +365,64 @@ function humanDuration(sec: number): string {
 }
 
 /**
+ * 把擠在同一個地方的照片收成一坨，決定每張畫在哪、擺成什麼角度。
+ *
+ * 分組是貪婪的「領頭者」法：照時間掃過去，落在某一坨的質心 PILE_RADIUS_M 內
+ * 且同一本相簿就併進去，質心跟著更新，否則自己開一坨。O(n × 坨數)，
+ * 幾百張照片綽綽有餘，不值得為它拉一套空間索引進來。
+ *
+ * 一坨最多攤開 PILE_MAX_CARDS 張，而且是**照時間均勻取樣**而不是取前幾張 ——
+ * 五張攤開來要能代表這個地方待的那一整段，不是只看到剛到的頭五分鐘。
+ *
+ * 沒被選中的那幾張仍然留在資料裡（fan = -1，圖層自己濾掉）：
+ * 它們得繼續參與 maplibre 的聚合，否則縮小時徽章上的張數會少算。
+ */
+function buildPiles(sorted: FootprintPoint[], pileUp: boolean): Map<number, PileSlot> {
+  const out = new Map<number, PileSlot>();
+
+  // 編輯模式不併坨：位置要能對得上真實座標，不然「把這張搬到這裡」會從錯的地方搬起
+  if (!pileUp) {
+    for (const p of sorted) {
+      out.set(p.id, { lng: p.lng, lat: p.lat, pile: 1, fan: 0, angle: (p.id % 11) - 5 });
+    }
+    return out;
+  }
+
+  const groups: { albumId: number; lng: number; lat: number; members: FootprintPoint[] }[] = [];
+  for (const p of sorted) {
+    const g = groups.find(
+      (q) => q.albumId === p.album_id && metersBetween(q.lat, q.lng, p.lat, p.lng) <= PILE_RADIUS_M,
+    );
+    if (!g) {
+      groups.push({ albumId: p.album_id, lng: p.lng, lat: p.lat, members: [p] });
+      continue;
+    }
+    g.members.push(p);
+    g.lng += (p.lng - g.lng) / g.members.length;
+    g.lat += (p.lat - g.lat) / g.members.length;
+  }
+
+  for (const g of groups) {
+    const n = g.members.length;
+    const k = Math.min(n, PILE_MAX_CARDS);
+    const picked = new Set<number>();
+    for (let i = 0; i < k; i++) picked.add(k === 1 ? 0 : Math.round((i * (n - 1)) / (k - 1)));
+
+    const step = k > 1 ? PILE_FAN_DEG / (k - 1) : 0;
+    let fanIdx = 0;
+    for (let i = 0; i < n; i++) {
+      const m = g.members[i];
+      const show = picked.has(i);
+      const fan = show ? fanIdx++ : -1;
+      // 單張沒得攤，給一點固定的小歪斜就好；一整排全擺正會像證件照
+      const angle = n === 1 ? (m.id % 11) - 5 : -PILE_FAN_DEG / 2 + Math.max(fan, 0) * step;
+      out.set(m.id, { lng: g.lng, lat: g.lat, pile: n, fan, angle: show ? angle : 0 });
+    }
+  }
+  return out;
+}
+
+/**
  * 把軌跡點按「哪一天的第幾段」切成一條條折線。
  * 跨段不可以連線 —— 中間是關機或收不到訊號，接起來會憑空畫出一條沒走過的直線。
  * 資料本來就按時間遞增，這裡只做分組。
@@ -259,7 +439,7 @@ function groupLines(points: TrackPoint[] | undefined): [number, number][][] {
 }
 
 export default function FootprintMap({
-  points, tracks, connectPhotos = false, height = 520, styleUrl, onSelectPhoto,
+  points, showPhotos = true, albums, tracks, connectPhotos = false, height = 520, styleUrl, onSelectPhoto,
   editable = false, onEditPoints, onMovePhoto,
   rawTracks, showRawLine = false,
   matchedTracks, showMatchedLine = false,
@@ -274,6 +454,7 @@ export default function FootprintMap({
   // 地圖只建立一次，事件處理器會鎖住當時的 props。用 ref 讓它讀得到最新的資料
   const pathRef = useRef<PathNode[]>([]);
   const sortedRef = useRef<FootprintPoint[]>([]);
+  const albumsRef = useRef<Album[]>([]);
   // 已經加進地圖的縮圖，以及正在下載中的。避免同一張重複抓，也用來擋住上限
   const thumbLoaded = useRef<Set<string>>(new Set());
   const thumbPending = useRef<Set<string>>(new Set());
@@ -302,6 +483,9 @@ export default function FootprintMap({
     [points],
   );
   const coords = useMemo(() => sorted.map((p) => [p.lng, p.lat] as [number, number]), [sorted]);
+
+  // 只影響 photos 這個 source 怎麼畫。動畫路徑、鏡頭框景、點擊後的資料一律走真實座標
+  const piles = useMemo(() => buildPiles(sorted, !editing), [sorted, editing]);
 
   const trackLines = useMemo(() => groupLines(tracks), [tracks]);
 
@@ -436,6 +620,7 @@ export default function FootprintMap({
 
   useEffect(() => { pathRef.current = path; }, [path]);
   useEffect(() => { sortedRef.current = sorted; }, [sorted]);
+  useEffect(() => { albumsRef.current = albums || []; }, [albums]);
   useEffect(() => { tracksRef.current = tracks || []; }, [tracks]);
   useEffect(() => { editingRef.current = editing; }, [editing]);
 
@@ -582,11 +767,49 @@ export default function FootprintMap({
         type: 'geojson',
         data: { type: 'FeatureCollection', features: [] },
         cluster: true,
-        clusterRadius: 45,
-        clusterMaxZoom: 15,
+        // 泡泡比原本的圓點大得多，聚合半徑跟著放大，否則縮小時會擠成一片疊圖
+        clusterRadius: 70,
+        // 一路聚到 z17 才散開，散開之後由 buildPiles 的扇形接手。
+        // 停在 z15 的話 z16~17 這一段既沒有叢集、又還沒近到分得開，會糊成一團
+        clusterMaxZoom: 17,
+        clusterProperties: {
+          // 整叢是不是同一本相簿：min === max 就是。
+          // 沒有「集合」型的累加器可用，只好靠兩端夾出來
+          aMin: ['min', ['get', 'album_id']],
+          aMax: ['max', ['get', 'album_id']],
+          // 這一叢的代表照（見 REP_ID_MOD）
+          rep: ['max', ['get', 'rep']],
+        },
       });
 
-      // 同一景點常常拍幾十張，不聚合會疊成一坨
+      // 泡泡的大小與傾角，單張與整叢共用同一組，兩層看起來才是同一種東西。
+      // interpolate 在頭尾停靠點之外會夾住，這就是「不能大過頭」的上下限
+      const bubbleSize: any = [
+        'interpolate', ['linear'], ['zoom'],
+        9, 0.62,
+        13, 0.95,
+        16, 1.25,
+        18, 1.5,
+      ];
+      // 每個泡泡歪一點點，角度由 rep 決定（單張與叢集都有這個屬性）。
+      // 全部擺正會像一排證件照，歪一點才活
+      const bubbleTilt: any = ['-', ['%', ['get', 'rep'], 11], 5];
+      const bubbleLayout = {
+        'icon-size': bubbleSize,
+        // 尾巴尖端要落在座標上：圖的底部往下推一個 BUBBLE_PAD（陰影留白）補回來。
+        // icon-offset 會跟著 icon-size 一起縮放，所以放大時也對得準
+        'icon-anchor': 'bottom' as const,
+        'icon-offset': [0, BUBBLE_PAD] as [number, number],
+        'icon-rotate': bubbleTilt,
+        // 傾角是畫面上的裝飾，不該跟著地圖轉
+        'icon-rotation-alignment': 'viewport' as const,
+        // 照片本來就常常擠在一起，讓它們互相遮擋比整片消失好
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+      };
+
+      // 同一景點常常拍幾十張，不聚合會疊成一坨。
+      // 這個圓點只是泡泡還沒載到時的底 —— 數量改由右上角的徽章顯示
       map.addLayer({
         id: 'photo-clusters',
         type: 'circle',
@@ -594,85 +817,129 @@ export default function FootprintMap({
         filter: ['has', 'point_count'],
         paint: {
           'circle-color': '#2563eb',
-          'circle-opacity': 0.85,
-          'circle-radius': ['step', ['get', 'point_count'], 16, 10, 22, 50, 30],
+          'circle-opacity': 0.9,
+          'circle-radius': ['step', ['get', 'point_count'], 8, 10, 10, 50, 12],
           'circle-stroke-width': 2,
           'circle-stroke-color': '#ffffff',
         },
       });
-      map.addLayer({
-        id: 'photo-cluster-count',
-        type: 'symbol',
-        source: 'photos',
-        filter: ['has', 'point_count'],
-        // 必須指定 OpenFreeMap 實際提供的字型；用 maplibre 預設的
-        // "Open Sans Regular,Arial Unicode MS Regular" 會 404 而退化成本地字型
-        layout: {
-          'text-field': ['get', 'point_count_abbreviated'],
-          'text-font': ['Noto Sans Bold'],
-          'text-size': 12,
-        },
-        paint: { 'text-color': '#ffffff' },
-      });
 
-      // 單點樣式依座標來源區分，讓人一眼看出哪些足跡是推論出來的：
-      //   manual=空心（使用者親手指定）、exif/timeline=實心不透明、
-      //   segment/interpolated=半透明（規則或內插推估，不是量到的位置）
+      // 單點一律同一個樣子。以前依 geo_source 分成五種顏色與透明度，拿掉了：
+      // 那需要一整排圖例才看得懂，而多數點上面本來就疊著縮圖，顏色根本露不出來。
+      // 「這張照片的位置是量到的還是推出來的」點開它就會說（見底下的播放列）。
       map.addLayer({
         id: 'photo-points',
         type: 'circle',
         source: 'photos',
-        filter: ['!', ['has', 'point_count']],
+        // fan < 0 是被同一坨蓋掉、不畫的那幾張。它們跟同坨的其他人同座標，
+        // 畫出來只是把同一個圓點重疊描好幾次
+        filter: ['all', ['!', ['has', 'point_count']], ['>=', ['get', 'fan'], 0]],
         paint: {
           'circle-radius': 7,
-          'circle-color': [
-            'match', ['get', 'geo_source'],
-            'exif', '#2563eb',
-            'timeline', '#0891b2',
-            'segment', '#f59e0b',
-            'interpolated', '#2563eb',
-            'manual', '#ffffff',
-            '#94a3b8',
-          ],
-          'circle-opacity': [
-            'match', ['get', 'geo_source'],
-            'exif', 1,
-            'timeline', 1,
-            'segment', 0.55,
-            'interpolated', 0.45,
-            'manual', 1,
-            0.6,
-          ],
+          'circle-color': '#2563eb',
+          'circle-opacity': 1,
           'circle-stroke-width': 2,
-          'circle-stroke-color': [
-            'match', ['get', 'geo_source'],
-            'manual', '#2563eb',
-            '#ffffff',
-          ],
+          'circle-stroke-color': '#ffffff',
         },
       });
 
-      // 縮圖疊在圓點之上。圓點那一層留著當底 —— 圖還沒載到（或載失敗）時
-      // 至少還看得到位置，不會整個標記消失
+      // 泡泡疊在圓點之上。圓點那兩層留著當底 —— 圖還沒載到（或載失敗）時
+      // 至少還看得到位置，不會整個標記消失。
+      //
+      // 單張與叢集分兩層而不是靠 icon-image 一條 case 判完，是為了點擊：
+      // 點單張要開燈箱、點叢集要展開，兩件事得掛在不同的 layer 上
       map.addLayer({
         id: 'photo-thumbs',
         type: 'symbol',
         source: 'photos',
-        filter: ['!', ['has', 'point_count']],
+        filter: ['all', ['!', ['has', 'point_count']], ['>=', ['get', 'fan'], 0]],
         layout: {
+          ...bubbleLayout,
           'icon-image': ['concat', 'photo-', ['to-string', ['get', 'id']]],
-          // 跟著縮放走：拉近看得清楚，拉遠不會整片糊成一團。
-          // interpolate 在頭尾兩個停靠點之外會夾住，這就是「不能大過頭」的上下限 ——
-          // 貼圖是 64 CSS px，所以實際尺寸落在 38px（z≤10）到 96px（z≥17）之間。
-          'icon-size': [
-            'interpolate', ['linear'], ['zoom'],
-            10, 0.6,
-            14, 1.0,
-            17, 1.5,
+          // 擠在一起的那幾張已經被釘在同一個點上，角度由 buildPiles 排成扇形。
+          // 旋轉中心就是 icon-anchor（尾巴尖端），所以攤開來自然是握著一手牌的樣子
+          'icon-rotate': ['get', 'angle'],
+          // 牌面由左到右依序疊上去，不然每次重繪的前後關係都可能不一樣
+          'symbol-sort-key': ['get', 'fan'],
+        },
+      });
+
+      // 整叢的代表照：全部同一本相簿就用那本的封面（album-<id>，載不到封面時
+      // 由 styleimagemissing 那邊退回隨機一張），否則用這一區隨機抽中的那張照片
+      map.addLayer({
+        id: 'photo-cluster-thumbs',
+        type: 'symbol',
+        source: 'photos',
+        filter: ['has', 'point_count'],
+        layout: {
+          ...bubbleLayout,
+          'icon-image': [
+            'case',
+            ['==', ['get', 'aMin'], ['get', 'aMax']],
+            ['concat', 'album-', ['to-string', ['get', 'aMin']]],
+            ['concat', 'photo-', ['to-string', ['%', ['get', 'rep'], REP_ID_MOD]]],
           ],
-          // 照片本來就常常擠在一起，讓它們互相遮擋比整片消失好
-          'icon-allow-overlap': true,
-          'icon-ignore-placement': true,
+        },
+      });
+
+      // 張數徽章，貼在泡泡的右上角。
+      //
+      // 不能畫進貼圖裡：同一張代表照會出現在張數不同的叢集上，貼圖是共用的。
+      // 位置只好用 translate 手算 —— 泡泡以尾巴尖端為錨，本體頂緣在
+      // -(BUBBLE_H + BUBBLE_TAIL) × icon-size，右緣在 BUBBLE_W/2 × icon-size，
+      // 下面每個縮放停靠點就是把這兩個數字乘出來的（跟 bubbleSize 同一組 zoom）
+      const badgeShift: any = [
+        'interpolate', ['linear'], ['zoom'],
+        9, [22, -57],
+        13, [34, -87],
+        16, [45, -115],
+        18, [54, -138],
+      ];
+      // 徽章要蓋兩種情況：maplibre 聚出來的叢集，以及放大之後攤成扇形的那一坨。
+      // 一坨只掛在第一張牌上，否則五張牌會冒出五個一模一樣的徽章
+      const badgeFilter: any = [
+        'any',
+        ['has', 'point_count'],
+        ['all', ['==', ['get', 'fan'], 0], ['>', ['get', 'pile'], 1]],
+      ];
+      const badgeText: any = [
+        'case',
+        ['has', 'point_count'], ['get', 'point_count_abbreviated'],
+        ['to-string', ['get', 'pile']],
+      ];
+      map.addLayer({
+        id: 'photo-count-badge',
+        type: 'circle',
+        source: 'photos',
+        filter: badgeFilter,
+        paint: {
+          'circle-color': '#f43f5e',
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 9, 9, 13, 12, 16, 15, 18, 17],
+          'circle-stroke-width': 2.5,
+          'circle-stroke-color': '#ffffff',
+          'circle-translate': badgeShift,
+          // 泡泡是畫面對齊的，徽章要跟著它，不能跟著地圖轉
+          'circle-translate-anchor': 'viewport',
+        },
+      });
+      map.addLayer({
+        id: 'photo-count-label',
+        type: 'symbol',
+        source: 'photos',
+        filter: badgeFilter,
+        // 必須指定 OpenFreeMap 實際提供的字型；用 maplibre 預設的
+        // "Open Sans Regular,Arial Unicode MS Regular" 會 404 而退化成本地字型
+        layout: {
+          'text-field': badgeText,
+          'text-font': ['Noto Sans Bold'],
+          'text-size': ['interpolate', ['linear'], ['zoom'], 9, 10, 13, 12, 16, 14, 18, 16],
+          'text-allow-overlap': true,
+          'text-ignore-placement': true,
+        },
+        paint: {
+          'text-color': '#ffffff',
+          'text-translate': badgeShift,
+          'text-translate-anchor': 'viewport',
         },
       });
 
@@ -779,37 +1046,64 @@ export default function FootprintMap({
       map.on('mouseenter', 'track-point-dots', () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', 'track-point-dots', () => { map.getCanvas().style.cursor = ''; });
 
+      /**
+       * icon-image 的名字 → 要拿哪張圖來畫。
+       *
+       * photo-<id>：那張照片本身。
+       * album-<id>：那本相簿的封面；沒設封面就從這本相簿在地圖上的照片裡隨機挑一張。
+       *   挑完就進了 maplibre 的圖庫、整個 session 不會再抽，所以不會一直跳。
+       */
+      const bubbleSourceFor = (imageId: string): string | null => {
+        if (imageId.startsWith('photo-')) {
+          const photoId = Number(imageId.slice('photo-'.length));
+          return sortedRef.current.find((p) => p.id === photoId)?.url ?? null;
+        }
+        const albumId = Number(imageId.slice('album-'.length));
+        const cover = albumsRef.current.find((a) => a.id === albumId)?.cover_photo_url;
+        if (cover) return cover;
+        const pool = sortedRef.current.filter((p) => p.album_id === albumId);
+        if (pool.length === 0) return null;
+        return pool[Math.floor(Math.random() * pool.length)].url;
+      };
+
       // 縮圖採「用到才載」：maplibre 找不到 icon-image 就會發這個事件。
-      // 一次把整個相簿的縮圖抓下來是白費頻寬 —— 聚合起來的照片根本不會畫出縮圖。
+      // 一次把整個相簿的縮圖抓下來是白費頻寬 —— 聚合起來的照片只會畫出一張代表。
       map.on('styleimagemissing', (e: { id: string }) => {
         const id = e.id;
-        if (!id.startsWith('photo-')) return;
+        if (!id.startsWith('photo-') && !id.startsWith('album-')) return;
         if (thumbPending.current.has(id) || thumbLoaded.current.size >= MAX_THUMBS) return;
-        const photoId = Number(id.slice('photo-'.length));
-        const photo = sortedRef.current.find((p) => p.id === photoId);
-        if (!photo) return;
+        const url = bubbleSourceFor(id);
+        if (!url) return;
+
+        // 外圈顏色只求穩定與分散，用 id 的數字部分取模就夠
+        const ring = BUBBLE_RINGS[Math.abs(Number(id.slice(id.indexOf('-') + 1)) || 0) % BUBBLE_RINGS.length];
 
         thumbPending.current.add(id);
-        loadThumb(photo.url)
+        loadBubble(url, ring)
           .then((data) => {
             // 這中間地圖可能已經被 remove，或別的路徑已經加過同一張
             if (!mapRef.current || mapRef.current.hasImage(id)) return;
-            mapRef.current.addImage(id, data, { pixelRatio: THUMB_PIXEL_RATIO });
+            mapRef.current.addImage(id, data, { pixelRatio: BUBBLE_PR });
             thumbLoaded.current.add(id);
           })
           .catch(() => { /* 載不到就維持圓點，不需要打擾使用者 */ })
           .finally(() => { thumbPending.current.delete(id); });
       });
 
-      map.on('click', 'photo-clusters', (e: MapLayerMouseEvent) => {
-        const f = map.queryRenderedFeatures(e.point, { layers: ['photo-clusters'] })[0];
+      // 點叢集就展開。泡泡那一層畫得比底下的圓點大，只掛圓點的話點到泡泡不會有反應
+      const onClusterClick = (e: MapLayerMouseEvent) => {
+        const f = map.queryRenderedFeatures(e.point, {
+          layers: ['photo-clusters', 'photo-cluster-thumbs'],
+        })[0];
         const clusterId = f?.properties?.cluster_id;
         const src = map.getSource('photos') as GeoJSONSource;
         if (clusterId == null || !src) return;
         src.getClusterExpansionZoom(clusterId).then((zoom: number) => {
           map.easeTo({ center: (f.geometry as any).coordinates, zoom });
         }).catch(() => { /* 叢集已不存在，忽略 */ });
-      });
+      };
+      map.on('click', 'photo-clusters', onClusterClick);
+      map.on('click', 'photo-cluster-thumbs', onClusterClick);
 
       const onPhotoClick = (e: MapLayerMouseEvent) => {
         const f = e.features?.[0];
@@ -843,11 +1137,11 @@ export default function FootprintMap({
           onSelectPhoto?.(point);
         }
       };
-      // 縮圖比底下的圓點大，只掛在圓點上的話點到縮圖邊緣會沒有反應
+      // 泡泡比底下的圓點大，只掛在圓點上的話點到泡泡邊緣會沒有反應
       map.on('click', 'photo-points', onPhotoClick);
       map.on('click', 'photo-thumbs', onPhotoClick);
 
-      for (const layer of ['photo-points', 'photo-thumbs', 'photo-clusters']) {
+      for (const layer of ['photo-points', 'photo-thumbs', 'photo-clusters', 'photo-cluster-thumbs']) {
         map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
         map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
       }
@@ -874,14 +1168,36 @@ export default function FootprintMap({
     const src = map.getSource('photos') as GeoJSONSource | undefined;
     src?.setData({
       type: 'FeatureCollection',
-      features: sorted.map((p) => ({
-        type: 'Feature',
-        properties: { id: p.id, geo_source: p.geo_source, title: p.title },
-        geometry: { type: 'Point', coordinates: [p.lng, p.lat] },
-      })),
+      features: (showPhotos ? sorted : []).map((p) => {
+        // 落單的照片（理論上不會有，piles 是照 sorted 建的）就照原座標畫
+        const slot = piles.get(p.id) ?? { lng: p.lng, lat: p.lat, pile: 1, fan: 0, angle: 0 };
+        return {
+          type: 'Feature' as const,
+          properties: {
+            id: p.id,
+            geo_source: p.geo_source,
+            title: p.title,
+            album_id: p.album_id,
+            // 每次資料換掉就重抽一次代表照（也順便換一輪叢集泡泡的傾角）。
+            // id 超過 REP_ID_MOD 的話低位會溢位、代表照就抽錯 —— 現實中差了好幾個數量級
+            rep: Math.floor(Math.random() * REP_RAND_MAX) * REP_ID_MOD + (p.id % REP_ID_MOD),
+            pile: slot.pile,
+            fan: slot.fan,
+            angle: slot.angle,
+          },
+          // 同一坨的照片一律釘在該坨的質心上，不是各自的真實座標
+          geometry: { type: 'Point' as const, coordinates: [slot.lng, slot.lat] },
+        };
+      }),
     });
 
-  }, [sorted, coords, ready]);
+  }, [sorted, coords, piles, showPhotos, ready]);
+
+  // 關掉照片時把照片的選取一起放掉。留著的話編輯面板會說「已選 3 張」，
+  // 但畫面上一張都看不到，也點不到任何一張來取消
+  useEffect(() => {
+    if (!showPhotos) setSelectedPhotoIds(new Set());
+  }, [showPhotos]);
 
   // 路徑換了就把播放頭移到終點，維持「預設看到完整路線」的樣子
   useEffect(() => {

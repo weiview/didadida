@@ -204,3 +204,28 @@ export function toLineStrings(points: TrackTuple[]): [number, number][][] {
   if (cur.length >= 2) out.push(cur);
   return out;
 }
+
+/**
+ * 每個點屬於第幾段連續移動。斷點的判準與 toLineStrings 完全一樣，只是回傳
+ * 編號而不是幾何 —— 給貼路用：要先切成「確定是連續移動」的段，matcher 才不會
+ * 很認真地幫一段中斷（沒開 app、飛機上）編出一條它其實沒走過的公路。
+ *
+ * 貼路那邊用的門檻比畫線嚴（斷線只是不宣稱連續，貼路是真的會生出一條路徑），
+ * 所以 maxGapSec 開放覆寫；速度上限沿用同一個值。
+ */
+export function segmentIndices(
+  points: TrackTuple[],
+  { maxGapSec = MAX_GAP_SEC, maxKmh = MAX_KMH }: { maxGapSec?: number; maxKmh?: number } = {},
+): number[] {
+  const out: number[] = [];
+  let seg = 0;
+  for (let i = 0; i < points.length; i++) {
+    if (i > 0) {
+      const dt = points[i][0] - points[i - 1][0];
+      const kmh = dt > 0 ? (metersBetween(points[i - 1], points[i]) / dt) * 3.6 : Infinity;
+      if (dt > maxGapSec || kmh > maxKmh) seg++;
+    }
+    out.push(seg);
+  }
+  return out;
+}

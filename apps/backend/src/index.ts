@@ -77,6 +77,8 @@ async function isAuthorized(request: Request, env: Env): Promise<boolean> {
  * 注意：所有 GET 路由都是公開的（只有 POST/PUT/DELETE 需要驗證），所以座標必須在
  * 後端就拿掉 —— 只在前端不繪製地圖是無效的，按 F12 就能從 JSON 看到經緯度。
  * 相簿層級 (map_private) 或照片層級 (geo_private) 任一為私密，就不輸出座標。
+ * 實務上閘門是相簿：geo_private 預設 0（見 migrate_geo_private_default.sql），
+ * 只有被單獨標成私密的那幾張才會在公開相簿裡被扣住。
  *
  * 傳入的 row 需含 map_private 欄位（由 JOIN Album 帶入），輸出時會移除該欄位。
  */
@@ -155,6 +157,87 @@ function sanitizePhotoIds(raw: unknown, max = 2000): number[] {
 
 /** SQLite 日期修飾字串。-90 -> '-90 minutes'、90 -> '+90 minutes' */
 const minutesModifier = (n: number) => `${n >= 0 ? '+' : ''}${n} minutes`;
+
+/**
+ * 公開相簿各自涵蓋的 UTC 時間窗，前後各留 6 小時。
+ *
+ * 用途：把「這本相簿公開」翻譯成「這段時間的軌跡也公開」。使用者的規則是
+ * 相簿公開就連同軌跡公開、相簿不公開就只有登入時看得到 —— 所以軌跡的
+ * is_private 不再是唯一的閘門，它現在的意思是「就算沒有任何公開相簿也要公開」。
+ *
+ * 為什麼用時間窗而不是整個 day_key：一天裡可能只有下午那趟屬於這次旅行，
+ * 早上還在家。用相簿照片的時間範圍去交集，公開出去的就只有那一趟。
+ * 前後 6 小時是去程與回程 —— 沒有它，公開的軌跡會從抵達目的地才開始。
+ * 跟前端地圖頁推算軌跡範圍用的是同一個數字，兩邊看到的東西才會一致。
+ *
+ * taken_at 與 t_utc 都是 'YYYY-MM-DDTHH:MM:SS.sssZ'，可以直接字串比大小。
+ */
+const TRIP_PAD_MS = 6 * 60 * 60 * 1000;
+async function publicTripWindows(env: Env): Promise<{ from: string; to: string }[]> {
+  const { results } = await env.DB.prepare(`
+    SELECT MIN(p.taken_at) AS lo, MAX(p.taken_at) AS hi
+    FROM Photo p JOIN Album a ON a.id = p.album_id
+    WHERE a.map_private = 0 AND p.taken_at IS NOT NULL
+    GROUP BY a.id
+  `).all();
+
+  const out: { from: string; to: string }[] = [];
+  for (const r of results as any[]) {
+    const lo = Date.parse(r.lo);
+    const hi = Date.parse(r.hi);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi)) continue;
+    out.push({
+      from: new Date(lo - TRIP_PAD_MS).toISOString(),
+      to: new Date(hi + TRIP_PAD_MS).toISOString(),
+    });
+  }
+  return out;
+}
+
+/** 這一段時間（ISO 字串）有沒有跟任何一個公開行程的時間窗重疊 */
+function overlapsTripWindows(from: string, to: string, windows: { from: string; to: string }[]): boolean {
+  return windows.some(w => from <= w.to && to >= w.from);
+}
+
+/**
+ * Google 時間軸貼路結果的 day_key 前綴（前端的 TIMELINE_DAY_PREFIX，兩邊要一致）。
+ * 這些日子在 TrackDay 裡沒有列 —— 時間軸是唯讀紀念層，刻意不進 D1。
+ */
+const TIMELINE_DAY_PREFIX = 'timeline:';
+
+/**
+ * 整個 day_key 對外可不可見。給那些「只能整份給或整份不給」的東西用
+ * （貼路結果是 R2 上的一顆檔案，沒辦法只給其中一段）。
+ *
+ * 條件同 /api/tracks：明確公開，或這一天有任何一點落在公開相簿的行程時間窗裡。
+ * 注意這比 /api/tracks 寬鬆 —— 只要有一點對上就整天給出去。會這樣是因為
+ * 檔案本身不可分割，而它終究是從那些點推出來的，不含更多資訊。
+ */
+async function isTrackDayPublic(env: Env, dayKey: string): Promise<boolean> {
+  // Google 時間軸的日子在 TrackDay / TrackPoint 裡都沒有列，沒有點可以查，
+  // 只能拿 key 裡那個日期去比。整天當一段（UTC 00:00～23:59），窗本身
+  // 前後已經各留了 6 小時，時區差那幾小時吃得下
+  if (dayKey.startsWith(TIMELINE_DAY_PREFIX)) {
+    const day = dayKey.slice(TIMELINE_DAY_PREFIX.length);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+    const windows = await publicTripWindows(env);
+    return overlapsTripWindows(`${day}T00:00:00.000Z`, `${day}T23:59:59.999Z`, windows);
+  }
+
+  const day = await env.DB.prepare(
+    "SELECT is_private FROM TrackDay WHERE day_key = ?"
+  ).bind(dayKey).first<{ is_private: number }>();
+  if (day && Number(day.is_private) === 0) return true;
+
+  const windows = await publicTripWindows(env);
+  if (windows.length === 0) return false;
+  const ors = windows.map(() => "(t_utc >= ? AND t_utc <= ?)").join(" OR ");
+  const binds = windows.flatMap(w => [w.from, w.to]);
+  const hit = await env.DB.prepare(
+    `SELECT 1 AS ok FROM TrackPoint WHERE day_key = ? AND (${ors}) LIMIT 1`
+  ).bind(dayKey, ...binds).first();
+  return !!hit;
+}
 
 // Rate Limiting (In-memory)
 interface LoginAttempt {
@@ -1189,59 +1272,83 @@ function hammingDistance(hex1: string, hex2: string): number {
         return new Response(JSON.stringify({ success: true, updated: stmts.length }), { headers });
       }
 
-      // 路由：以時間對無座標照片做線性內插
-      // 用途：手機拍的有 GPS、相機拍的沒有，混拍時可自動補上中間那些。
-      // 只在前後兩個 exif 錨點的時間差夠近時才內插，否則推論沒有意義。
-      if (method === "POST" && pathname === "/api/photos/geo/interpolate") {
-        const body: any = await request.json().catch(() => ({}));
-        const albumId = Number.isFinite(body?.albumId) ? body.albumId : null;
-        const maxGapHours = Number.isFinite(body?.maxGapHours) ? body.maxGapHours : 24;
-
-        const { results: rows } = albumId !== null
-          ? await env.DB.prepare(`
-              SELECT p.id, p.lat, p.lng, p.geo_source, ${LOCAL_TIME_EXPR} AS local_time
-              FROM Photo p WHERE p.album_id = ? ORDER BY local_time ASC
-            `).bind(albumId).all()
-          : await env.DB.prepare(`
-              SELECT p.id, p.lat, p.lng, p.geo_source, ${LOCAL_TIME_EXPR} AS local_time
-              FROM Photo p ORDER BY local_time ASC
-            `).all();
-
-        const list = (rows as any[]).filter(r => r.local_time);
-        const msOf = (s: string) => {
-          const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
-          return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : NaN;
-        };
-
-        const anchors = list
-          .map((r, i) => ({ ...r, idx: i, ms: msOf(r.local_time) }))
-          .filter(r => r.geo_source === 'exif' && r.lat !== null && Number.isFinite(r.ms));
-
-        const stmts: D1PreparedStatement[] = [];
-        for (let a = 0; a < anchors.length - 1; a++) {
-          const left = anchors[a];
-          const right = anchors[a + 1];
-          const spanMs = right.ms - left.ms;
-          if (spanMs <= 0 || spanMs > maxGapHours * 3600_000) continue;
-
-          for (let i = left.idx + 1; i < right.idx; i++) {
-            const p = list[i];
-            if (p.lat !== null) continue; // 已有座標（含手動指定）就不覆蓋
-            const ms = msOf(p.local_time);
-            if (!Number.isFinite(ms)) continue;
-            const t = (ms - left.ms) / spanMs;
-            // 註：跨換日線的經度內插會繞遠路，屬已知限制，實務上極少遇到
-            const lat = left.lat + (right.lat - left.lat) * t;
-            const lng = left.lng + (right.lng - left.lng) * t;
-            stmts.push(env.DB.prepare(
-              `UPDATE Photo SET lat = ?, lng = ?, geo_source = 'interpolated'
-               WHERE id = ?${geoOverwriteGuard('interpolated')}`
-            ).bind(lat, lng, p.id));
-          }
+      /*
+       * 路由：只補地名，座標一個字都不動。
+       *
+       * 存在的理由：相機自帶 GPS 的照片座標已經是最準的一份，缺的只有「這是哪裡」。
+       * 走 /api/photos/geo/batch 會把 lat/lng 換成地名中心點、geo_source 蓋成
+       * 'manual'，等於為了一個名字把精確座標降級成一個大概的位置。
+       *
+       * 所以這裡刻意不碰 lat/lng/geo_source —— 語意是「幫這個座標取個名字」，
+       * 而不是「把這張照片移到那裡」。
+       */
+      if (method === "POST" && pathname === "/api/photos/geo/place-name") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
-        if (stmts.length > 0) await env.DB.batch(stmts);
+        const body: any = await request.json().catch(() => ({}));
+        const raw = Array.isArray(body?.items) ? body.items : [];
+        const items = raw
+          .filter((it: any) => Number.isInteger(it?.photoId) && it.photoId > 0
+            && typeof it?.placeName === 'string' && it.placeName.trim())
+          .slice(0, 2000)
+          .map((it: any) => ({ photoId: it.photoId as number, placeName: (it.placeName as string).trim() }));
 
-        return new Response(JSON.stringify({ success: true, updated: stmts.length, anchors: anchors.length }), { headers });
+        if (items.length === 0) {
+          return new Response(JSON.stringify({ error: "items is required" }), { status: 400, headers });
+        }
+
+        await env.DB.batch(items.map((it: { photoId: number; placeName: string }) =>
+          env.DB.prepare("UPDATE Photo SET place_name = ? WHERE id = ?").bind(it.placeName, it.photoId)
+        ));
+        return new Response(JSON.stringify({ success: true, updated: items.length }), { headers });
+      }
+
+      /*
+       * 路由：地名查詢（正向與反向），轉手給 Photon（komoot 的 OSM 地理編碼）。
+       *
+       * 為什麼要經過 Worker 而不是讓瀏覽器直接打：反向查詢送出去的是照片的實際
+       * 座標。瀏覽器直連等於把「這台裝置在什麼時候查了哪些位置」交給第三方，
+       * 而那正是這整個專案在防的事。理由跟 /api/tracks/match 轉手 Valhalla 一樣。
+       * 正向查詢（打字搜地名）本來沒這個問題，一起收進來只是為了兩邊同一條路。
+       *
+       * 只給管理者：這兩條都只在管理工具裡用得到，開放出去就是一個免費的
+       * 地理編碼代理，會被拿去打爆別人家的志工伺服器。
+       */
+      if (method === "GET" && (pathname === "/api/geo/search" || pathname === "/api/geo/reverse")) {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+
+        let upstream: string;
+        if (pathname === "/api/geo/search") {
+          const q = (url.searchParams.get("q") || "").trim();
+          if (!q) return new Response(JSON.stringify({ features: [] }), { headers });
+          upstream = `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=6`;
+        } else {
+          const lat = Number(url.searchParams.get("lat"));
+          const lng = Number(url.searchParams.get("lng"));
+          if (!isValidLatLng(lat, lng)) {
+            return new Response(JSON.stringify({ error: "Invalid lat/lng" }), { status: 400, headers });
+          }
+          // 取 5 筆而不是 1 筆：最近的那個常常是一條路或一棟房子，
+          // 我們要的是「清水寺」這種地標。挑哪一筆由前端決定（見 geo.ts 的 pickPlaceName）
+          upstream = `https://photon.komoot.io/reverse?lat=${lat}&lon=${lng}&limit=5`;
+        }
+
+        try {
+          const res = await fetch(upstream, {
+            headers: { "User-Agent": "didadida-photo-map (self-hosted, low volume)" },
+          });
+          if (!res.ok) {
+            return new Response(JSON.stringify({ error: `Photon ${res.status}` }), { status: 502, headers });
+          }
+          return new Response(await res.text(), {
+            headers: { ...headers, "Content-Type": "application/json" },
+          });
+        } catch (e: any) {
+          return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 502, headers });
+        }
       }
 
       // 路由：寫入由 Google 時間軸比對出來的位置
@@ -1712,13 +1819,8 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
         // 隱私比照 /api/tracks 而不是 /api/tracks/raw：這是從已存的軌跡點
         // 推出來的，沒有比那些點更敏感。私密的日子還是要擋
-        if (!(await isAuthorized(request, env))) {
-          const day = await env.DB.prepare(
-            "SELECT is_private FROM TrackDay WHERE day_key = ?"
-          ).bind(dayKey).first<{ is_private: number }>();
-          if (!day || day.is_private) {
-            return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers });
-          }
+        if (!(await isAuthorized(request, env)) && !(await isTrackDayPublic(env, dayKey))) {
+          return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers });
         }
         const object = await env.BUCKET.get(matchedKey(dayKey));
         if (!object) {
@@ -1828,15 +1930,28 @@ function hammingDistance(hex1: string, hex2: string): number {
       }
 
       // 路由：取得軌跡點供地圖繪製
-      // 軌跡是獨立的隱私旗標，不繼承相簿的 map_private ——
-      // 它記錄的是人的整日移動（含住家），比單張照片的位置敏感得多。
-      // 所有 GET 路由都是公開的，所以過濾必須發生在 SQL 裡。
+      //
+      // 對外可見的條件有兩條，任一成立即可：
+      //   1. 這一天被明確標成公開（TrackDay.is_private = 0）
+      //   2. 這個瞬間落在某本公開相簿的行程時間窗裡（見 publicTripWindows）
+      //
+      // 第二條是使用者定的規則「相簿公開就連同軌跡公開」。刻意做在點的層級而不是
+      // 整個 day_key：一天裡不屬於那趟行程的時段（例如出發前還在家）不會跟著曝光。
+      // 所有 GET 路由都是公開的，所以過濾必須發生在 SQL 裡 —— 只在前端不畫是無效的。
       if (method === "GET" && pathname === "/api/tracks") {
         const isAdmin = await isAuthorized(request, env);
         const conds: string[] = [];
         const binds: any[] = [];
 
-        if (!isAdmin) conds.push("d.is_private = 0");
+        if (!isAdmin) {
+          const windows = await publicTripWindows(env);
+          const ors = ["d.is_private = 0"];
+          for (const w of windows) {
+            ors.push("(p.t_utc >= ? AND p.t_utc <= ?)");
+            binds.push(w.from, w.to);
+          }
+          conds.push(`(${ors.join(" OR ")})`);
+        }
 
         const qFrom = url.searchParams.get("from");
         if (qFrom) { conds.push("p.t_utc >= ?"); binds.push(qFrom); }
@@ -1926,53 +2041,6 @@ function hammingDistance(hex1: string, hex2: string): number {
         return new Response(JSON.stringify({
           success: true, dayKey, deleted: deleteIds.length, inserted: insert.length,
         }), { headers });
-      }
-
-      // 路由：每段軌跡的交通工具
-      //
-      // 這裡只回「使用者指定過的那些段」，不做任何統計。段的點數、時間範圍、
-      // 平均速度都能從 /api/tracks 已經回傳的點自己算出來，
-      // 再讓 D1 為了 GROUP BY 掃一次 TrackPoint 是白花讀取額度。
-      if (method === "GET" && pathname === "/api/tracks/segments") {
-        const isAdmin = await isAuthorized(request, env);
-        // 跟 /api/tracks 同一套隱私規則：看不到那天的軌跡就不該看到它的交通工具
-        const where = isAdmin ? "" : "WHERE d.is_private = 0";
-        const { results } = await env.DB.prepare(`
-          SELECT s.day_key, s.seg, s.vehicle
-          FROM TrackSegment s
-          JOIN TrackDay d ON d.day_key = s.day_key
-          ${where}
-        `).all();
-        return new Response(JSON.stringify(results), { headers });
-      }
-
-      if (method === "PUT" && pathname === "/api/tracks/segments") {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
-        const body: any = await request.json().catch(() => ({}));
-        const dayKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
-        const seg = Number.isFinite(body?.seg) ? Math.trunc(body.seg) : NaN;
-        if (!dayKey || !Number.isFinite(seg)) {
-          return new Response(JSON.stringify({ error: "dayKey 與 seg 為必填" }), { status: 400, headers });
-        }
-        // 白名單。這個值會直接對到前端的圖示表，放任意字串進來只會變成沒有圖示
-        const ALLOWED = ['walk', 'bike', 'motorbike', 'car', 'bus', 'train', 'plane', 'boat'];
-        const raw = typeof body?.vehicle === 'string' ? body.vehicle : null;
-        if (raw !== null && !ALLOWED.includes(raw)) {
-          return new Response(JSON.stringify({ error: `vehicle 必須是 ${ALLOWED.join('/')} 之一` }), { status: 400, headers });
-        }
-
-        // vehicle 傳 null 代表「取消指定」，回到依速度自動判斷
-        if (raw === null) {
-          await env.DB.prepare("DELETE FROM TrackSegment WHERE day_key = ? AND seg = ?").bind(dayKey, seg).run();
-        } else {
-          await env.DB.prepare(
-            `INSERT INTO TrackSegment (day_key, seg, vehicle) VALUES (?, ?, ?)
-             ON CONFLICT(day_key, seg) DO UPDATE SET vehicle = excluded.vehicle`
-          ).bind(dayKey, seg, raw).run();
-        }
-        return new Response(JSON.stringify({ success: true, dayKey, seg, vehicle: raw }), { headers });
       }
 
       /*
