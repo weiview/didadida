@@ -98,8 +98,18 @@ export function parseOffsetTime(raw: unknown): number | null {
  * EXIF 此欄位不帶時區，讀出來的就是拍攝當下的牆上時間。
  * 也接受 'YYYY-MM-DD HH:MM:SS'，因此可直接餵 DB 裡的 taken_at_local。
  *
- * 也接受 Date 物件（exifr 預設會 revive），但那已被 exifr 以執行環境時區解讀過，
- * 這裡以 UTC getter 取回原始數字才不會二次位移。
+ * 也接受 Date 物件（exifr 預設會 revive），以 UTC getter 取值。
+ * **但這條路只有在 UTC 執行環境（Cloudflare Worker）才正確**：exifr 不看
+ * OffsetTimeOriginal，一律用「解析當下的執行環境時區」把 EXIF 時間 revive 成
+ * Date，同一張照片在 Worker 得 16:11Z、在台北的瀏覽器得 08:11Z。UTC 環境下
+ * 那個 Date 的 UTC 欄位剛好就是原始牆上時間；非 UTC 環境則會少掉一個時區。
+ * 因此瀏覽器端請先用 `exifr.parse(file, { reviveValues: false })` 取回原始
+ * 字串再餵進來（見 imageUtils.ts），不要直接丟 revive 過的 Date。
+ *
+ * **帶時區標記的字串一律回 null**（'...Z'、'...+08:00'）—— 那是一個「瞬間」而不是
+ * 牆上時間，兩者長得很像但差一整個時區。舊資料的 exif.DateTimeOriginal 正是這種
+ * 形狀（exifr 還原成 Date 之後被 JSON.stringify 序列化過），硬讀數字的話台灣的
+ * 照片會整整少 8 小時。要從瞬間得到牆上時間請用 wallClockFromInstant。
  */
 export function parseExifDateTime(raw: unknown): WallClock | null {
   if (raw instanceof Date) {
@@ -110,7 +120,11 @@ export function parseExifDateTime(raw: unknown): WallClock | null {
     };
   }
   if (typeof raw !== 'string') return null;
-  const m = raw.replace(/\0/g, '').trim()
+  const s = raw.replace(/\0/g, '').trim();
+  // EXIF 原生格式（'2026:06:18 16:11:00'）與 taken_at_local（'2026-06-18 16:11:00'）
+  // 都不帶時區，只有瞬間字串會有這個尾巴
+  if (/(?:Z|[+-]\d{2}:?\d{2})$/i.test(s)) return null;
+  const m = s
     .match(/^(\d{4})[:\-](\d{2})[:\-](\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
   if (!m) return null;
   const wc: WallClock = {
@@ -177,6 +191,22 @@ const pad = (n: number, len = 2) => String(Math.abs(n)).padStart(len, '0');
 /** 格式化為 'YYYY-MM-DD HH:MM:SS'（與 TripSegment.start_local/end_local 同格式才能直接字串比對） */
 export function formatWallClock(wc: WallClock): string {
   return `${pad(wc.y, 4)}-${pad(wc.mo)}-${pad(wc.d)} ${pad(wc.h)}:${pad(wc.mi)}:${pad(wc.s)}`;
+}
+
+/**
+ * 從「瞬間」算出牆上時間。接受 ISO-8601 字串（帶 Z 或 ±HH:MM）與毫秒數。
+ *
+ * 這是 parseExifDateTime 的另一半：那個只認不帶時區的牆上時間，這個只認瞬間。
+ * 分成兩個函式而不是一個聰明的自動判斷，是因為「這個字串是哪一種」必須由呼叫端
+ * 決定 —— 猜錯的代價是無聲地差一整個時區。
+ */
+export function wallClockFromInstant(raw: unknown, offsetMinutes: number): WallClock | null {
+  const ms = typeof raw === 'number' ? raw
+    : typeof raw === 'string' ? Date.parse(raw.trim())
+    : raw instanceof Date ? raw.getTime()
+    : NaN;
+  if (!Number.isFinite(ms)) return null;
+  return wallClockFromUtc(ms, offsetMinutes);
 }
 
 /** 由 UTC 毫秒數與偏移算出牆上時間 */

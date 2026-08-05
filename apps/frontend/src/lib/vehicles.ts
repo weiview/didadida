@@ -1,28 +1,32 @@
-// 交通工具的圖示、標籤與速度推測。
+// 交通工具的標籤與速度推測。
 //
-// 圖示用 emoji 而不是自畫的 SVG：地圖上的圖示是靠 canvas 畫成點陣圖再
-// map.addImage 進去的，走的是作業系統的 emoji 字型，不是底圖樣式的 SDF 字型
-// （OpenFreeMap 的 Noto Sans 沒有 emoji 字符，直接寫進 text-field 只會變豆腐）。
-// 這樣一個字元就換到一個圖示，不用維護八張向量圖。
+// 這裡的交通工具**不是拿來畫圖示的**，是拿來決定貼路要用哪個 Valhalla costing
+// （見 mapmatch.ts 的 costingFor）—— 走路的軌跡套汽車路網會被吸到馬路上。
+// 地圖上一律只畫一個飛碟（MOVER_EMOJI）：依速度猜出來的交通工具本來就常常猜錯
+// （機車與汽車在速度上根本分不開），畫成一堆真實的車輛圖示等於把猜測當事實展示。
+// 飛碟不宣稱任何事，就只是「這個東西正在移動」。
+//
+// 用 emoji 而不是自畫的 SVG：地圖上的圖示是靠 canvas 畫成點陣圖再 map.addImage
+// 進去的，走的是作業系統的 emoji 字型，不是底圖樣式的 SDF 字型（OpenFreeMap 的
+// Noto Sans 沒有 emoji 字符，直接寫進 text-field 只會變豆腐）。
 
 import type { TrackPoint, Vehicle } from './api';
 
-export const VEHICLES: { id: Vehicle; label: string; emoji: string }[] = [
-  { id: 'walk', label: '走路', emoji: '🚶' },
-  { id: 'bike', label: '腳踏車', emoji: '🚲' },
-  { id: 'motorbike', label: '機車', emoji: '🏍️' },
-  { id: 'car', label: '汽車', emoji: '🚗' },
-  { id: 'bus', label: '公車', emoji: '🚌' },
-  { id: 'train', label: '火車', emoji: '🚆' },
-  { id: 'plane', label: '飛機', emoji: '✈️' },
-  { id: 'boat', label: '船', emoji: '⛴️' },
+/** 地圖上唯一的移動圖示。動畫的頭端與播放列都用它 */
+export const MOVER_EMOJI = '🛸';
+
+export const VEHICLES: { id: Vehicle; label: string }[] = [
+  { id: 'walk', label: '走路' },
+  { id: 'bike', label: '腳踏車' },
+  { id: 'motorbike', label: '機車' },
+  { id: 'car', label: '汽車' },
+  { id: 'bus', label: '公車' },
+  { id: 'train', label: '火車' },
+  { id: 'plane', label: '飛機' },
+  { id: 'boat', label: '船' },
 ];
 
 const BY_ID = new Map(VEHICLES.map((v) => [v.id, v]));
-
-export function vehicleEmoji(v: Vehicle): string {
-  return BY_ID.get(v)?.emoji ?? '📍';
-}
 
 export function vehicleLabel(v: Vehicle): string {
   return BY_ID.get(v)?.label ?? v;

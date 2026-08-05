@@ -175,9 +175,16 @@ export async function fetchPhotos(albumId: string | number): Promise<Photo[]> {
   }
 }
 
+/**
+ * 全站照片。帶上 token —— 這條路由本身是公開的，但沒帶驗證的話後端會套用
+ * applyGeoPrivacy，私密相簿的照片一律回傳 lat = null。時間軸匯入視窗就是靠
+ * 「lat 是不是 null」判斷哪些照片還沒有座標，看不到自己的私密照片座標的話，
+ * 那些照片會永遠被當成「還沒定位」，寫完也不會從待處理清單裡消失。
+ * 未登入時 token 是空字串，後端驗不過，行為與原本的匿名請求相同。
+ */
 export async function fetchAllPhotos(): Promise<Photo[]> {
   try {
-    const res = await fetch(`${API_BASE_URL}/all-photos`);
+    const res = await fetch(`${API_BASE_URL}/all-photos`, { headers: getAuthHeaders() });
     if (!res.ok) throw new Error('Failed to fetch all photos');
     return res.json();
   } catch (error) {
@@ -943,6 +950,15 @@ export interface TrackDay {
   synced_at: string | null;
   is_private: number;
   has_raw: number;
+  /**
+   * 這天的軌跡點實際落在哪一天（當地牆上日，'YYYY-MM-DD'）。
+   *
+   * day_key 是 Drive 檔名，解析不出日期（見上面的說明），要知道「哪幾天有足跡」
+   * 只能用這兩欄。一份 GPX 幾乎都只涵蓋一天，跨夜時兩個值才會不一樣。
+   * 沒有任何軌跡點的日子是 null。
+   */
+  first_local_day: string | null;
+  last_local_day: string | null;
 }
 
 export async function fetchTrackDays(): Promise<TrackDay[]> {
@@ -1067,9 +1083,18 @@ export interface MatchedTrack {
   dayKey: string;
   /** 產生時間，之後要判斷新舊時用得到 */
   builtAt: string;
+  /**
+   * 產生這份結果時，來源 GPX 的 md5（TrackDay.md5）。
+   * 下次貼路時比對，一樣就整天跳過 —— 每一趟都是一次第三方請求，
+   * 沒必要為了沒變的資料重打。舊的結果沒有這欄，會被當成「要重跑」。
+   */
+  sourceMd5?: string;
   segments: {
+    /** 這一天的第幾趟。趟與趟之間不連線，所以每趟都要有自己的編號 */
     seg: number;
     costing: string;
+    /** 決定 costing 的交通工具，畫動畫圖示時用得到 */
+    vehicle?: Vehicle;
     /** [lng, lat, 毫秒 epoch]，壓成陣列是為了讓檔案小一點 */
     points: [number, number, number][];
   }[];
@@ -1144,6 +1169,80 @@ export async function setSegmentVehicle(
       method: 'PUT',
       headers: getAuthHeaders(),
       body: JSON.stringify({ dayKey, seg, vehicle }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+/* ---- Google 時間軸紀念層 ----
+ *
+ * 存在 R2 的月檔，完全不進 D1。所有讀取都需要登入 ——
+ * 這是十二年不間斷的完整移動史，沒有把它公開的合理預設。
+ */
+
+/** 索引裡的一個月。前端據此決定要抓哪幾個月檔 */
+export interface TimelineMonthMeta {
+  monthKey: string;
+  points: number;
+  days: number;
+}
+
+export interface TimelineIndex {
+  months: TimelineMonthMeta[];
+  updatedAt?: string;
+}
+
+export async function fetchTimelineIndex(): Promise<TimelineIndex | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/timeline/index`, { headers: getAuthHeaders() });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+export async function saveTimelineIndex(months: TimelineMonthMeta[]): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/timeline/index`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ months }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+/** 一個月的內容：當地日 → [UTC 秒, 緯度, 經度, 時區偏移分鐘][] */
+export type TimelineMonthData = Record<string, [number, number, number, number][]>;
+
+/** 沒有這個月（404）回 null，不是錯誤 —— 索引與月檔可能不同步 */
+export async function fetchTimelineMonth(monthKey: string): Promise<TimelineMonthData | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/timeline/month/${monthKey}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+export async function saveTimelineMonth(monthKey: string, data: TimelineMonthData): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/timeline/month/${monthKey}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(data),
     });
     return res.ok;
   } catch (err) {

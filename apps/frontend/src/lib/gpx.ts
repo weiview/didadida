@@ -151,12 +151,7 @@ function distanceM(a: GpxPoint, b: GpxPoint): number {
 export function collapseStays(points: GpxPoint[], radiusM = 60, minSeconds = 300): GpxPoint[] {
   if (points.length < 2) return points;
 
-  const bySeg = new Map<number, GpxPoint[]>();
-  for (const p of points) {
-    const list = bySeg.get(p.seg);
-    if (list) list.push(p);
-    else bySeg.set(p.seg, [p]);
-  }
+  const bySeg = groupBySeg(points);
 
   const out: GpxPoint[] = [];
   for (const seg of Array.from(bySeg.keys()).sort((a, b) => a - b)) {
@@ -189,6 +184,193 @@ export function collapseStays(points: GpxPoint[], radiusM = 60, minSeconds = 300
 
   out.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : a.seg - b.seg));
   return out;
+}
+
+/**
+ * 剔除折返尖峰。
+ *
+ * 定位偶爾會噴出一個離譜的點，下一點又跳回來，在圖上留下一根刺。
+ * 判準是幾何的：A→B→C 三點，前後兩段都夠長（> minLegM），
+ * 但頭尾直線距離 |AC| 卻遠小於折線長 |AB|+|BC| —— 這只有「跑出去又跑回來」
+ * 才會發生，正常行進的三點 |AC| 會接近 |AB|+|BC|。
+ *
+ * 只看幾何，不看 hdop 也不看 src：實測過那兩個欄位跟位置誤差沒有相關性，
+ * hdop=500 的點位置正常，而在家的 network 點比 gps 還準。
+ *
+ * 為什麼一定要在 extractTrips 之前跑：一根 200m 的刺配上 30 秒的間隔
+ * 就是 24km/h，足以讓整段靜止的室內雜訊被誤判成一趟行程。
+ *
+ * 連續兩個尖峰不會一起砍（`drop.has(i - 1)` 那行）—— 前一點已經被判定為
+ * 雜訊時，用它當 A 去量下一點沒有意義。
+ *
+ * @param minLegM 前後兩段各自至少要多長才值得檢查。太小會誤砍原地抖動
+ * @param ratio   |AC| / (|AB|+|BC|) 低於多少算折返。0.35 約等於夾角小於 40°
+ * @param maxGapS 三點之間任一段超過這個秒數就跳過 —— 中間可能真的移動過
+ */
+export function rejectSpikes(
+  points: GpxPoint[],
+  { minLegM = 40, ratio = 0.35, maxGapS = 300 }: { minLegM?: number; ratio?: number; maxGapS?: number } = {},
+): GpxPoint[] {
+  if (points.length < 3) return points;
+
+  const bySeg = groupBySeg(points);
+  const drop = new Set<GpxPoint>();
+  const maxGapMs = maxGapS * 1000;
+
+  for (const pts of Array.from(bySeg.values())) {
+    for (let i = 1; i < pts.length - 1; i++) {
+      const a = pts[i - 1];
+      const b = pts[i];
+      const c = pts[i + 1];
+      if (drop.has(a)) continue;
+      const tA = Date.parse(a.t);
+      const tB = Date.parse(b.t);
+      const tC = Date.parse(c.t);
+      if (tB - tA > maxGapMs || tC - tB > maxGapMs) continue;
+      const ab = distanceM(a, b);
+      const bc = distanceM(b, c);
+      if (ab <= minLegM || bc <= minLegM) continue;
+      if (distanceM(a, c) < (ab + bc) * ratio) drop.add(b);
+    }
+  }
+
+  return drop.size === 0 ? points : points.filter((p) => !drop.has(p));
+}
+
+/** 一趟移動。points 是原始密度的點，沒有抽稀 —— 貼路要密才貼得準 */
+export interface Trip {
+  points: GpxPoint[];
+  /** 累積路程（公尺） */
+  distanceM: number;
+  /** 代表速度，取瞬時速度的 85 百分位。用來猜交通工具，避開起步與塞車的極端值 */
+  speedKmh: number;
+}
+
+/**
+ * 依速度切出「有在移動」的區段。
+ *
+ * 為什麼不用半徑式的停留偵測來切：停留半徑要多大，取決於當下是在家、在室內
+ * 賣場、還是在騎樓下，同一個數字擺哪裡都不對。而「有沒有在移動」用速度判斷
+ * 沒有這個問題 —— 靜止時的雜訊速度跟真的在走路差了一個數量級。
+ *
+ * 要連續 runLength 個點都超過 minKmh 才算開始移動，單點的假速度騙不過去；
+ * 實測整夜在家的 603 點與室內 21 分鐘的 77 點都是 0 段，
+ * 而門檻取 5 / 8 / 12 km/h 切出來的行程幾乎一樣，代表這個判準不敏感。
+ *
+ * 兩趟之間靜止不到 mergeGapMin 分鐘就併成同一趟（等紅燈、路邊停車），
+ * 免得一段路被切成十幾個碎片、每個碎片各發一次貼路請求。
+ *
+ * @param minKmh        超過多少算在移動
+ * @param runLength     要連續幾個點都超過門檻
+ * @param mergeGapMin   兩段之間靜止幾分鐘以內就併回同一趟
+ * @param minDistanceM  一趟至少要走多遠才留著
+ * @param minPoints     一趟至少要有幾個點（Valhalla 太短的輸入貼不出東西）
+ * @param maxTrips      一天最多幾趟。每一趟都是一次貼路請求，所以是硬上限：
+ *                      先把 mergeGapMin 加倍重試，還是超過就只留最長的幾趟
+ */
+export function extractTrips(
+  points: GpxPoint[],
+  {
+    minKmh = 8,
+    runLength = 3,
+    mergeGapMin = 5,
+    minDistanceM = 300,
+    minPoints = 8,
+    maxTrips = 12,
+  }: {
+    minKmh?: number; runLength?: number; mergeGapMin?: number;
+    minDistanceM?: number; minPoints?: number; maxTrips?: number;
+  } = {},
+): Trip[] {
+  if (points.length < minPoints) return [];
+
+  const bySeg = groupBySeg(points);
+  let gapMin = mergeGapMin;
+  let trips: Trip[] = [];
+
+  // 最多放寬 4 次（5 → 40 分鐘），沿用 simplifyTrack 的作法。
+  // 再放寬下去整天就會併成一趟，那條線會橫跨所有停留，反而更難看
+  for (let attempt = 0; attempt < 4; attempt++) {
+    trips = [];
+    for (const seg of Array.from(bySeg.keys()).sort((a, b) => a - b)) {
+      trips.push(...tripsInSegment(bySeg.get(seg)!, { minKmh, runLength, gapMin, minDistanceM, minPoints }));
+    }
+    if (trips.length <= maxTrips) break;
+    gapMin *= 2;
+  }
+
+  // 放寬只能併「時間相鄰」的段落，跨 trkseg 或隔了好幾小時的併不起來。
+  // 所以最後補一刀硬砍：留最長的幾趟。短的那些本來也貼不出好看的線
+  if (trips.length > maxTrips) {
+    trips.sort((a, b) => b.distanceM - a.distanceM);
+    trips = trips.slice(0, maxTrips);
+  }
+
+  trips.sort((a, b) => (a.points[0].t < b.points[0].t ? -1 : 1));
+  return trips;
+}
+
+function tripsInSegment(
+  pts: GpxPoint[],
+  opts: { minKmh: number; runLength: number; gapMin: number; minDistanceM: number; minPoints: number },
+): Trip[] {
+  const { minKmh, runLength, gapMin, minDistanceM, minPoints } = opts;
+  if (pts.length < minPoints) return [];
+
+  const ms = pts.map((p) => Date.parse(p.t));
+  // 每點的瞬時速度（相對於前一點）。第 0 點沒有前一點，補 0
+  const kmh = pts.map((p, i) => {
+    if (i === 0) return 0;
+    const dt = (ms[i] - ms[i - 1]) / 1000;
+    return dt > 0 ? (distanceM(pts[i - 1], p) / dt) * 3.6 : 0;
+  });
+
+  const moving = new Array<boolean>(pts.length).fill(false);
+  for (let i = 0; i + runLength <= pts.length; i++) {
+    let ok = true;
+    for (let k = i; k < i + runLength; k++) if (kmh[k] <= minKmh) { ok = false; break; }
+    // 連上 i-1：kmh[i] 描述的是 i-1 → i 這一段，所以出發點是 i-1
+    if (ok) for (let k = Math.max(0, i - 1); k < i + runLength; k++) moving[k] = true;
+  }
+
+  const spans: [number, number][] = [];
+  let start = -1;
+  for (let i = 0; i < pts.length; i++) {
+    if (moving[i] && start < 0) start = i;
+    else if (!moving[i] && start >= 0) { spans.push([start, i - 1]); start = -1; }
+  }
+  if (start >= 0) spans.push([start, pts.length - 1]);
+
+  const merged: [number, number][] = [];
+  for (const span of spans) {
+    const last = merged[merged.length - 1];
+    if (last && ms[span[0]] - ms[last[1]] <= gapMin * 60 * 1000) last[1] = span[1];
+    else merged.push([span[0], span[1]]);
+  }
+
+  const out: Trip[] = [];
+  for (const [a, b] of merged) {
+    const slice = pts.slice(a, b + 1);
+    if (slice.length < minPoints) continue;
+    let total = 0;
+    for (let i = 1; i < slice.length; i++) total += distanceM(slice[i - 1], slice[i]);
+    if (total < minDistanceM) continue;
+    // 代表速度取 85 百分位，跟 vehicles.ts 的 segmentSpeedKmh 同一套規則
+    const inside = kmh.slice(a + 1, b + 1).filter((v) => Number.isFinite(v)).sort((x, y) => x - y);
+    const speedKmh = inside.length ? inside[Math.min(inside.length - 1, Math.floor(inside.length * 0.85))] : 0;
+    out.push({ points: slice, distanceM: total, speedKmh });
+  }
+  return out;
+}
+
+function groupBySeg(points: GpxPoint[]): Map<number, GpxPoint[]> {
+  const bySeg = new Map<number, GpxPoint[]>();
+  for (const p of points) {
+    const list = bySeg.get(p.seg);
+    if (list) list.push(p);
+    else bySeg.set(p.seg, [p]);
+  }
+  return bySeg;
 }
 
 /**
@@ -262,12 +444,7 @@ function simplifySegment(seg: GpxPoint[], toleranceM: number): GpxPoint[] {
 export function simplifyTrack(points: GpxPoint[], toleranceM = 5, maxPoints = 8000): GpxPoint[] {
   if (points.length <= 2) return points;
 
-  const bySeg = new Map<number, GpxPoint[]>();
-  for (const p of points) {
-    const list = bySeg.get(p.seg);
-    if (list) list.push(p);
-    else bySeg.set(p.seg, [p]);
-  }
+  const bySeg = groupBySeg(points);
 
   let tolerance = toleranceM;
   let out: GpxPoint[] = [];

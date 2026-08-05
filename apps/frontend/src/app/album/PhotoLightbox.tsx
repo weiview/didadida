@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import styles from "./lightbox.module.css";
 import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag } from "@/lib/api";
-import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime } from "@/lib/geo";
+import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
 
 // 只有顯示用的中文說明，值域本身定義在 geo.ts
@@ -104,7 +104,23 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   // 拍攝時間一律顯示照片自己的牆上時間加上時區標籤。
   // 不用 new Date(taken_at).toLocaleString() —— 那會換算成「看照片的人所在的時區」，
   // 在日本拍的照片用台灣的瀏覽器打開會少三小時，看起來像資料壞了。
-  const exifWall = parseExifDateTime(parsedExif?.DateTimeOriginal);
+  //
+  // 沒有 taken_at_local 的舊資料要走退路，三層由可信到最不可信：
+  //   1. exif.DateTimeOriginal 是不帶時區的牆上時間（'2026:06:18 16:11:00'）→ 直接用
+  //   2. taken_at 是真正的 UTC 瞬間，配上這張照片自己的時區 → 換算得到牆上時間
+  //   3. 舊 exif blob 裡序列化過的 '2026-06-18T08:11:00.000Z' → 最後手段
+  //
+  // 第 3 層要擺最後，是因為那個字串其實不是可靠的瞬間：exifr 會用「解析當下的
+  // 執行環境時區」把 EXIF 時間 revive 成 Date（同一張照片在瀏覽器得 08:11Z、
+  // 在 Worker 得 16:11Z），JSON.stringify 之後就把那個時區烤了進去。要還原只能
+  // 賭當初上傳的瀏覽器時區，所以只有在 taken_at 也沒有時才用它。
+  // 硬把它當第 1 層那種字串讀的話，台灣的照片會顯示成早上 8 點（少 8 小時）。
+  // 時區未知時退回站台預設值，但 displayDate 不會為此加上時區標籤 —— 那是猜的。
+  const tzForFallback = photo.tz_offset_minutes ?? DEFAULT_TZ_OFFSET_MINUTES;
+  const exifWall =
+    parseExifDateTime(parsedExif?.DateTimeOriginal)
+    ?? wallClockFromInstant(photo.taken_at, tzForFallback)
+    ?? wallClockFromInstant(parsedExif?.DateTimeOriginal, tzForFallback);
   const wallClock = photo.taken_at_local || (exifWall ? formatWallClock(exifWall) : null);
   const displayDate = wallClock
     ? (photo.tz_offset_minutes != null
