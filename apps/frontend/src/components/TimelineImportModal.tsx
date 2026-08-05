@@ -42,7 +42,15 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
   const [error, setError] = useState('');
 
   const [photos, setPhotos] = useState<Photo[]>([]);
-  const [tolerance, setTolerance] = useState(30);
+  /*
+   * 比對容差預設 5 分鐘。
+   *
+   * 本來是 30 —— 那代表一筆差了 28 分鐘的命中，跟差 1 分鐘的命中在寫入時
+   * 權重完全一樣，足以把使用者親手圈的行程段靜默改寫成「那天早上的另一個地點」。
+   * 5 分鐘之內的位置通常還在同一個地點，超過就是移動中的猜測。
+   * 要放寬還是可以自己拉滑桿，而且超過 10 分鐘的命中後端會自動降級（見 api.ts）。
+   */
+  const [tolerance, setTolerance] = useState(5);
   const [fallbackOffset, setFallbackOffset] = useState(480); // 台灣 UTC+8
   const [onlyMissing, setOnlyMissing] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -154,7 +162,11 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
     setSubmitting(true);
     const res = await applyTimelineMatches(matches);
     if (res) {
-      setResult(`已為 ${res.updated} 張照片寫入位置` + (res.skipped > 0 ? `，${res.skipped} 張因已有 GPS 而跳過` : ''));
+      setResult(
+        `已為 ${res.updated} 張照片寫入位置`
+        + (res.skipped > 0 ? `，${res.skipped} 張因已有更可信的位置而跳過` : '')
+        + (res.loose ? `（其中 ${res.loose} 筆差距超過 10 分鐘，只補了原本沒有座標的照片）` : ''),
+      );
       onDone(res.updated);
       // 寫完一定要重抓：candidates／matches 都是從這份 photos 算出來的，
       // 不重抓的話面板會停在寫入前的快照 —— 綠色訊息說「已寫入 27 張」，

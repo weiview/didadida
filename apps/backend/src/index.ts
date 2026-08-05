@@ -72,13 +72,15 @@ async function isAuthorized(request: Request, env: Env): Promise<boolean> {
 }
 
 /**
- * 移除不該對外曝光的座標。
+ * 移除不該對外曝光的座標 —— 也就是「打卡點」這一層。
  *
- * 注意：所有 GET 路由都是公開的（只有 POST/PUT/DELETE 需要驗證），所以座標必須在
- * 後端就拿掉 —— 只在前端不繪製地圖是無效的，按 F12 就能從 JSON 看到經緯度。
+ * 注意：照片相關的 GET 路由都是公開的（軌跡那幾支已經改成一律要登入），所以座標
+ * 必須在後端就拿掉 —— 只在前端不繪製地圖是無效的，按 F12 就能從 JSON 看到經緯度。
  * 相簿層級 (map_private) 或照片層級 (geo_private) 任一為私密，就不輸出座標。
- * 實務上閘門是相簿：geo_private 預設 0（見 migrate_geo_private_default.sql），
- * 只有被單獨標成私密的那幾張才會在公開相簿裡被扣住。
+ * 實務上閘門是相簿，而且 **map_private 預設 1（不公開）**：要讓一本相簿的打卡點
+ * 對訪客現身，只能由管理者明確勾選。geo_private 預設 0
+ * （見 migrate_geo_private_default.sql），只有被單獨標成私密的那幾張才會在
+ * 已公開的相簿裡再被扣住。
  *
  * 傳入的 row 需含 map_private 欄位（由 JOIN Album 帶入），輸出時會移除該欄位。
  */
@@ -131,6 +133,17 @@ const TIMELINE_MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 /** 單月上限。最密的一個月約 280KB，12MB 已經是兩位數的餘裕 */
 const TIMELINE_MONTH_MAX_BYTES = 12 * 1024 * 1024;
 
+/**
+ * 時間軸比對的可信門檻（分鐘）。照片時間與最近取樣點差距超過這個值，
+ * 寫入時就降級（見 /api/photos/geo/from-timeline）。
+ *
+ * 10 分鐘的來由：前端把命中分成 ≤2 分（exact）、≤10 分（near）、其餘（loose）
+ * 三桶，這裡切在 near 與 loose 的交界上，跟畫面顯示的分類一致。
+ * 它跟前端那個「容差」滑桿是兩回事 —— 容差決定「要不要算命中」，
+ * 這個決定「命中之後有多少權威」。
+ */
+const TIMELINE_LOOSE_GAP_MIN = 10;
+
 /** 座標合法性檢查 —— 手動輸入與 API 傳入都要過這關 */
 function isValidLatLng(lat: unknown, lng: unknown): boolean {
   return (
@@ -158,86 +171,20 @@ function sanitizePhotoIds(raw: unknown, max = 2000): number[] {
 /** SQLite 日期修飾字串。-90 -> '-90 minutes'、90 -> '+90 minutes' */
 const minutesModifier = (n: number) => `${n >= 0 ? '+' : ''}${n} minutes`;
 
-/**
- * 公開相簿各自涵蓋的 UTC 時間窗，前後各留 6 小時。
+/*
+ * 對外可見的範圍，只有兩層，沒有第三層：
  *
- * 用途：把「這本相簿公開」翻譯成「這段時間的軌跡也公開」。使用者的規則是
- * 相簿公開就連同軌跡公開、相簿不公開就只有登入時看得到 —— 所以軌跡的
- * is_private 不再是唯一的閘門，它現在的意思是「就算沒有任何公開相簿也要公開」。
+ *   1. 軌跡（TrackPoint、貼路結果、Google 時間軸）—— **一律要登入**。
+ *      訪客拿不到任何一個點，不管那天有沒有公開相簿。
+ *   2. 照片打卡點（Photo.lat/lng/place_name）—— 相簿的 map_private = 0 才給，
+ *      預設 1（不公開）。個別照片還能再用 geo_private 單獨扣住。見 applyGeoPrivacy。
  *
- * 為什麼用時間窗而不是整個 day_key：一天裡可能只有下午那趟屬於這次旅行，
- * 早上還在家。用相簿照片的時間範圍去交集，公開出去的就只有那一趟。
- * 前後 6 小時是去程與回程 —— 沒有它，公開的軌跡會從抵達目的地才開始。
- * 跟前端地圖頁推算軌跡範圍用的是同一個數字，兩邊看到的東西才會一致。
- *
- * taken_at 與 t_utc 都是 'YYYY-MM-DDTHH:MM:SS.sssZ'，可以直接字串比大小。
+ * 之前這裡有一整套「公開相簿的時間窗 → 那段軌跡也公開」的機制
+ * （publicTripWindows / overlapsTripWindows / isTrackDayPublic），已整個移除。
+ * 移除的原因：一本相簿的時間窗是「最早那張到最晚那張」，跨年度的精選相簿
+ * 會把整整一年的日常軌跡撐開成公開範圍，而使用者不會有任何感覺。
+ * 現在的規則不必猜、不必調門檻 —— 軌跡就是不給訪客。
  */
-const TRIP_PAD_MS = 6 * 60 * 60 * 1000;
-async function publicTripWindows(env: Env): Promise<{ from: string; to: string }[]> {
-  const { results } = await env.DB.prepare(`
-    SELECT MIN(p.taken_at) AS lo, MAX(p.taken_at) AS hi
-    FROM Photo p JOIN Album a ON a.id = p.album_id
-    WHERE a.map_private = 0 AND p.taken_at IS NOT NULL
-    GROUP BY a.id
-  `).all();
-
-  const out: { from: string; to: string }[] = [];
-  for (const r of results as any[]) {
-    const lo = Date.parse(r.lo);
-    const hi = Date.parse(r.hi);
-    if (!Number.isFinite(lo) || !Number.isFinite(hi)) continue;
-    out.push({
-      from: new Date(lo - TRIP_PAD_MS).toISOString(),
-      to: new Date(hi + TRIP_PAD_MS).toISOString(),
-    });
-  }
-  return out;
-}
-
-/** 這一段時間（ISO 字串）有沒有跟任何一個公開行程的時間窗重疊 */
-function overlapsTripWindows(from: string, to: string, windows: { from: string; to: string }[]): boolean {
-  return windows.some(w => from <= w.to && to >= w.from);
-}
-
-/**
- * Google 時間軸貼路結果的 day_key 前綴（前端的 TIMELINE_DAY_PREFIX，兩邊要一致）。
- * 這些日子在 TrackDay 裡沒有列 —— 時間軸是唯讀紀念層，刻意不進 D1。
- */
-const TIMELINE_DAY_PREFIX = 'timeline:';
-
-/**
- * 整個 day_key 對外可不可見。給那些「只能整份給或整份不給」的東西用
- * （貼路結果是 R2 上的一顆檔案，沒辦法只給其中一段）。
- *
- * 條件同 /api/tracks：明確公開，或這一天有任何一點落在公開相簿的行程時間窗裡。
- * 注意這比 /api/tracks 寬鬆 —— 只要有一點對上就整天給出去。會這樣是因為
- * 檔案本身不可分割，而它終究是從那些點推出來的，不含更多資訊。
- */
-async function isTrackDayPublic(env: Env, dayKey: string): Promise<boolean> {
-  // Google 時間軸的日子在 TrackDay / TrackPoint 裡都沒有列，沒有點可以查，
-  // 只能拿 key 裡那個日期去比。整天當一段（UTC 00:00～23:59），窗本身
-  // 前後已經各留了 6 小時，時區差那幾小時吃得下
-  if (dayKey.startsWith(TIMELINE_DAY_PREFIX)) {
-    const day = dayKey.slice(TIMELINE_DAY_PREFIX.length);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
-    const windows = await publicTripWindows(env);
-    return overlapsTripWindows(`${day}T00:00:00.000Z`, `${day}T23:59:59.999Z`, windows);
-  }
-
-  const day = await env.DB.prepare(
-    "SELECT is_private FROM TrackDay WHERE day_key = ?"
-  ).bind(dayKey).first<{ is_private: number }>();
-  if (day && Number(day.is_private) === 0) return true;
-
-  const windows = await publicTripWindows(env);
-  if (windows.length === 0) return false;
-  const ors = windows.map(() => "(t_utc >= ? AND t_utc <= ?)").join(" OR ");
-  const binds = windows.flatMap(w => [w.from, w.to]);
-  const hit = await env.DB.prepare(
-    `SELECT 1 AS ok FROM TrackPoint WHERE day_key = ? AND (${ors}) LIMIT 1`
-  ).bind(dayKey, ...binds).first();
-  return !!hit;
-}
 
 // Rate Limiting (In-memory)
 interface LoginAttempt {
@@ -1362,19 +1309,38 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
 
         const overwriteExif = body?.overwriteExif === true;
-        // overwriteExif 只放行 'exif' 這一層；'manual' 是使用者親手指定的，
-        // 任何自動流程都不得覆蓋，所以它不在放行範圍內。
-        const guard = overwriteExif
-          ? " AND geo_source IS NOT 'manual'"
-          : geoOverwriteGuard('timeline');
 
         const stmts: D1PreparedStatement[] = [];
         let invalid = 0;
+        let loose = 0;
         for (const m of matches) {
           const id = Number(m?.photoId);
           if (!Number.isFinite(id) || !isValidLatLng(m?.lat, m?.lng)) { invalid++; continue; }
           const place = typeof m.placeName === 'string' ? m.placeName : null;
           const tz = Number.isFinite(m?.tzOffsetMinutes) ? m.tzOffsetMinutes : null;
+
+          /*
+           * 時間軸的權威隨「照片時間離最近取樣點多遠」浮動。
+           *
+           * gap 一分鐘的命中是「Google 剛好記到你在那裡」，比城市級的行程段準；
+           * gap 二十分鐘的命中只是「那陣子你在那附近」，比不上使用者親手圈的行程段。
+           * 兩者用同一個 GEO_RANK 等級寫入的話，後者會靜默蓋掉前者定好的地點。
+           *
+           * 所以超過門檻就降級到 interpolated 那一層：只填得了還沒有座標的照片，
+           * 蓋不掉 segment。geo_source 一律還是寫 'timeline' —— 那是它真正的出處，
+           * 降級改的是「能覆蓋誰」，不是「它從哪來」。
+           *
+           * gapMinutes 沒送（舊版前端）就當作可信，維持原本的行為。
+           */
+          const gap = Number(m?.gapMinutes);
+          const rank = Number.isFinite(gap) && gap > TIMELINE_LOOSE_GAP_MIN ? 'interpolated' : 'timeline';
+          if (rank === 'interpolated') loose++;
+          // overwriteExif 只放行 'exif' 這一層，而且只對可信的命中放行；'manual' 是
+          // 使用者親手指定的，任何自動流程都不得覆蓋，所以它不在放行範圍內。
+          const guard = overwriteExif && rank === 'timeline'
+            ? " AND geo_source IS NOT 'manual'"
+            : geoOverwriteGuard(rank);
+
           stmts.push(env.DB.prepare(
             `UPDATE Photo
                SET lat = ?, lng = ?, place_name = COALESCE(?, place_name),
@@ -1395,6 +1361,7 @@ function hammingDistance(hex1: string, hex2: string): number {
           success: true,
           updated,
           invalid,
+          loose,
           skipped: stmts.length - updated,
         }), { headers });
       }
@@ -1817,9 +1784,8 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
         }
-        // 隱私比照 /api/tracks 而不是 /api/tracks/raw：這是從已存的軌跡點
-        // 推出來的，沒有比那些點更敏感。私密的日子還是要擋
-        if (!(await isAuthorized(request, env)) && !(await isTrackDayPublic(env, dayKey))) {
+        // 軌跡一律要登入，貼路結果也是 —— 它就是從那些點推出來的
+        if (!(await isAuthorized(request, env))) {
           return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers });
         }
         const object = await env.BUCKET.get(matchedKey(dayKey));
@@ -1931,27 +1897,15 @@ function hammingDistance(hex1: string, hex2: string): number {
 
       // 路由：取得軌跡點供地圖繪製
       //
-      // 對外可見的條件有兩條，任一成立即可：
-      //   1. 這一天被明確標成公開（TrackDay.is_private = 0）
-      //   2. 這個瞬間落在某本公開相簿的行程時間窗裡（見 publicTripWindows）
-      //
-      // 第二條是使用者定的規則「相簿公開就連同軌跡公開」。刻意做在點的層級而不是
-      // 整個 day_key：一天裡不屬於那趟行程的時段（例如出發前還在家）不會跟著曝光。
-      // 所有 GET 路由都是公開的，所以過濾必須發生在 SQL 裡 —— 只在前端不畫是無效的。
+      // **一律要登入。** 軌跡是「我每天幾點在哪裡」的連續紀錄，訪客一個點都拿不到。
+      // TrackDay.is_private 因此不再影響對外可見性（欄位留著，只當管理端的標記）。
+      // 擋在這裡而不是前端不畫 —— 後者按 F12 就能從 JSON 看到經緯度。
       if (method === "GET" && pathname === "/api/tracks") {
-        const isAdmin = await isAuthorized(request, env);
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
         const conds: string[] = [];
         const binds: any[] = [];
-
-        if (!isAdmin) {
-          const windows = await publicTripWindows(env);
-          const ors = ["d.is_private = 0"];
-          for (const w of windows) {
-            ors.push("(p.t_utc >= ? AND p.t_utc <= ?)");
-            binds.push(w.from, w.to);
-          }
-          conds.push(`(${ors.join(" OR ")})`);
-        }
 
         const qFrom = url.searchParams.get("from");
         if (qFrom) { conds.push("p.t_utc >= ?"); binds.push(qFrom); }

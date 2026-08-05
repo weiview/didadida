@@ -872,11 +872,18 @@ export async function setPlaceNames(
 /**
  * 寫入由 Google 時間軸比對出來的位置。
  * 只送出比對結果，原始的 Timeline.json 不會離開瀏覽器。
+ *
+ * `gapMinutes` 要一起送：後端拿它決定這一筆的權威高低 —— 差太多分鐘的命中
+ * 只填得了還沒有座標的照片，蓋不掉使用者親手圈的行程段。
+ * 回傳的 `loose` 就是被這樣降級的筆數。
  */
 export async function applyTimelineMatches(
-  matches: { photoId: number; lat: number; lng: number; placeName?: string; tzOffsetMinutes?: number }[],
+  matches: {
+    photoId: number; lat: number; lng: number;
+    placeName?: string; tzOffsetMinutes?: number; gapMinutes?: number;
+  }[],
   overwriteExif = false,
-): Promise<{ updated: number; invalid: number; skipped: number } | null> {
+): Promise<{ updated: number; invalid: number; loose?: number; skipped: number } | null> {
   try {
     const res = await fetch(`${API_BASE_URL}/photos/geo/from-timeline`, {
       method: 'POST',
