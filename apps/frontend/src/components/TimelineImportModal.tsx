@@ -5,12 +5,18 @@ import {
   parseTimeline, matchPhotosToTimeline,
   type TimelineSample, type MatchResult,
 } from '@/lib/googleTimeline';
-import { fetchAllPhotos, applyTimelineMatches, type Photo } from '@/lib/api';
+import { extractTrackMonths, type ExtractResult } from '@/lib/timelineTrack';
+import {
+  fetchAllPhotos, applyTimelineMatches, saveTimelineMonth, saveTimelineIndex,
+  type Photo,
+} from '@/lib/api';
 
 interface Props {
   isOpen: boolean;
   onClose: () => void;
   onDone: (updated: number) => void;
+  /** 足跡圖層上傳完成。頁面據此重載索引，不用整頁刷新 */
+  onTrackUploaded?: () => void;
 }
 
 /** ISO → 牆上時間字串；舊照片沒有 taken_at_local 時用它退化 */
@@ -27,7 +33,7 @@ const fmtRange = (samples: TimelineSample[]) => {
   return `${a} ~ ${b}`;
 };
 
-export default function TimelineImportModal({ isOpen, onClose, onDone }: Props) {
+export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUploaded }: Props) {
   const [parsing, setParsing] = useState(false);
   const [samples, setSamples] = useState<TimelineSample[]>([]);
   const [format, setFormat] = useState<string>('');
@@ -42,13 +48,25 @@ export default function TimelineImportModal({ isOpen, onClose, onDone }: Props) 
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<string>('');
 
+  // 足跡圖層（紀念層）。跟上面的照片比對共用同一次選檔，但兩件事完全獨立：
+  // 可以只做其中一件，做完一件也不影響另一件
+  const [track, setTrack] = useState<ExtractResult | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState('');
+  const [trackResult, setTrackResult] = useState('');
+
   const handleFile = useCallback(async (file: File) => {
-    setParsing(true); setError(''); setResult('');
+    setParsing(true); setError(''); setResult(''); setTrackResult('');
     setFileName(file.name);
     try {
       const text = await file.text();
       const json = JSON.parse(text);
       const parsed = parseTimeline(json);
+      // 足跡圖層走另一條解析路徑（只取移動取樣，不碰停留地點與行程起訖），
+      // 趁 json 還在手上一起算完 —— 100MB 的檔案不想留在記憶體裡等第二次
+      const extracted = extractTrackMonths(json);
+      setTrack(extracted.points > 0 ? extracted : null);
+
       if (parsed.samples.length === 0) {
         setError('這個檔案裡找不到任何位置資料。請確認匯出的是 Timeline.json（手機版）或舊版的 Records.json。');
         setSamples([]);
@@ -61,10 +79,50 @@ export default function TimelineImportModal({ isOpen, onClose, onDone }: Props) 
     } catch (e: any) {
       setError(`解析失敗：${e?.message || e}`);
       setSamples([]);
+      setTrack(null);
     } finally {
       setParsing(false);
     }
   }, [photos.length]);
+
+  /*
+   * 逐月上傳，最後才寫索引。
+   *
+   * 索引放最後是刻意的：前端只讀索引裡有的月份，所以中途失敗的話
+   * 舊索引還在，地圖看到的是上一次完整的資料，而不是半套。
+   *
+   * 不做增量比對 —— Google 每次匯出都是 2014 年到今天的全量 dump，
+   * 找差異的成本比整包重寫還高，而重寫也才 144 個檔。
+   */
+  const handleUploadTrack = useCallback(async () => {
+    if (!track) return;
+    setUploading(true); setTrackResult(''); setError('');
+    const failed: string[] = [];
+    for (let i = 0; i < track.months.length; i++) {
+      const m = track.months[i];
+      setUploadProgress(`${m.monthKey}（${i + 1}/${track.months.length}）`);
+      const ok = await saveTimelineMonth(m.monthKey, m.days);
+      if (!ok) failed.push(m.monthKey);
+    }
+    setUploadProgress('寫入索引…');
+    const indexOk = await saveTimelineIndex(
+      track.months
+        .filter((m) => !failed.includes(m.monthKey))
+        .map((m) => ({ monthKey: m.monthKey, points: m.points, days: Object.keys(m.days).length })),
+    );
+    setUploading(false); setUploadProgress('');
+
+    if (failed.length > 0) {
+      setError(`有 ${failed.length} 個月份上傳失敗（${failed.slice(0, 3).join('、')}${failed.length > 3 ? '…' : ''}），索引只收錄了成功的部分。請確認仍在登入狀態後重試。`);
+      return;
+    }
+    if (!indexOk) {
+      setError('月份都上傳完了，但索引寫入失敗 —— 地圖上還看不到。請確認仍在登入狀態後重試。');
+      return;
+    }
+    setTrackResult(`已上傳 ${track.months.length} 個月、${track.points.toLocaleString()} 個位置點`);
+    onTrackUploaded?.();
+  }, [track, onTrackUploaded]);
 
   // 候選照片與比對結果都是純計算，參數一改就即時重算
   const candidates = useMemo(() => {
@@ -95,14 +153,26 @@ export default function TimelineImportModal({ isOpen, onClose, onDone }: Props) 
   const handleApply = useCallback(async () => {
     setSubmitting(true);
     const res = await applyTimelineMatches(matches);
-    setSubmitting(false);
     if (res) {
       setResult(`已為 ${res.updated} 張照片寫入位置` + (res.skipped > 0 ? `，${res.skipped} 張因已有 GPS 而跳過` : ''));
       onDone(res.updated);
+      // 寫完一定要重抓：candidates／matches 都是從這份 photos 算出來的，
+      // 不重抓的話面板會停在寫入前的快照 —— 綠色訊息說「已寫入 27 張」，
+      // 上面卻還寫著「候選 30 張」、按鈕還邀請你再寫一次同樣的 30 張。
+      // 回傳空陣列代表這次重抓失敗（剛寫完不可能真的一張都沒有），
+      // 那就寧可留著舊快照，也不要顯示「0 張」這種假的歸零。
+      const fresh = await fetchAllPhotos();
+      if (fresh.length > 0) setPhotos(fresh);
     } else {
       setError('寫入失敗，請確認仍在登入狀態。');
     }
+    setSubmitting(false);
   }, [matches, onDone]);
+
+  // 照片位置這半段已經做完，而且沒有剩下可寫的了。
+  // 此時主要動作從「寫入」換成「關閉」；但取消勾選「只處理還沒有座標的照片」
+  // 之後又會有東西可寫，這個值就自己變回 false，兩顆按鈕的主次跟著換回來。
+  const photoWorkDone = result !== '' && matches.length === 0;
 
   if (!isOpen) return null;
 
@@ -121,11 +191,14 @@ export default function TimelineImportModal({ isOpen, onClose, onDone }: Props) 
           maxHeight: '88vh', overflowY: 'auto', padding: 22, color: '#0f172a',
         }}
       >
-        <h3 style={{ margin: '0 0 6px', fontSize: 18 }}>從 Google 時間軸匯入位置</h3>
+        <h3 style={{ margin: '0 0 6px', fontSize: 18 }}>從 Google 時間軸匯入</h3>
         <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 16px', lineHeight: 1.7 }}>
           手機的 Google Maps → 你的時間軸 → 設定 → 匯出時間軸資料，會得到 Timeline.json。
-          <strong style={{ color: '#0f172a' }}>檔案只在你的瀏覽器裡解析，不會上傳</strong>，
-          只有比對出來的座標會寫進資料庫。
+          選一次檔可以做兩件獨立的事：<strong style={{ color: '#0f172a' }}>補照片位置</strong>，
+          以及<strong style={{ color: '#0f172a' }}>上傳足跡圖層</strong>。
+          <br />
+          <strong style={{ color: '#0f172a' }}>原始檔永遠不會上傳</strong>，只在你的瀏覽器裡解析；
+          送出去的只有座標與時間，地點名稱、住家／公司標記、WiFi 掃描一概不讀。
         </p>
 
         <label style={{
@@ -154,8 +227,52 @@ export default function TimelineImportModal({ isOpen, onClose, onDone }: Props) 
           </div>
         )}
 
+        {track && (
+          <div style={{
+            border: '1px solid #e2e8f0', borderRadius: 10, padding: '13px 15px', marginBottom: 16,
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>足跡圖層（紀念層）</div>
+            <p style={{ fontSize: 12.5, color: '#64748b', margin: '0 0 10px', lineHeight: 1.7 }}>
+              十二年的移動軌跡畫成地圖上最底層的一條淡線。
+              <strong style={{ color: '#0f172a' }}>唯讀</strong> —— 不修正、不貼路、也不會拿來推算照片位置。
+              重新上傳是整包覆蓋，不用擔心重複。
+            </p>
+            <div style={{ fontSize: 13, lineHeight: 1.9, marginBottom: 10 }}>
+              <div>
+                <strong>{track.points.toLocaleString()}</strong> 個位置點，
+                散在 <strong>{track.days.toLocaleString()}</strong> 天、
+                <strong>{track.months.length}</strong> 個月
+              </div>
+              <div style={{ color: '#475569', fontSize: 12.5 }}>{track.firstDay} ~ {track.lastDay}</div>
+              {track.notes.map((n, i) => (
+                <div key={i} style={{ color: '#64748b', fontSize: 12.5 }}>· {n}</div>
+              ))}
+            </div>
+            <button
+              onClick={handleUploadTrack}
+              disabled={uploading}
+              style={{
+                padding: '8px 16px', borderRadius: 8, border: '1px solid #cbd5e1',
+                background: uploading ? '#f1f5f9' : '#fff',
+                cursor: uploading ? 'wait' : 'pointer', fontSize: 13.5,
+              }}
+            >
+              {uploading ? `上傳中… ${uploadProgress}` : '上傳足跡圖層'}
+            </button>
+            {trackResult && (
+              <div style={{
+                marginTop: 10, background: '#f0fdf4', border: '1px solid #bbf7d0',
+                borderRadius: 9, padding: '9px 12px', fontSize: 13, color: '#166534',
+              }}>
+                {trackResult}
+              </div>
+            )}
+          </div>
+        )}
+
         {samples.length > 0 && (
           <>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>補照片位置</div>
             <div style={{
               background: '#f8fafc', borderRadius: 10, padding: '12px 14px',
               fontSize: 13.5, lineHeight: 1.8, marginBottom: 14,
@@ -246,25 +363,35 @@ export default function TimelineImportModal({ isOpen, onClose, onDone }: Props) 
         )}
 
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-          <button
-            onClick={onClose}
-            style={{
-              padding: '9px 18px', borderRadius: 8, border: '1px solid #cbd5e1',
-              background: '#fff', cursor: 'pointer', fontSize: 14,
-            }}
-          >
-            關閉
-          </button>
+          {/* 做完之後兩顆按鈕左右對調：主要動作永遠在最右邊 */}
           <button
             onClick={handleApply}
             disabled={matches.length === 0 || submitting}
             style={{
+              order: photoWorkDone ? 0 : 1,
               padding: '9px 18px', borderRadius: 8, border: 'none',
               background: matches.length > 0 ? '#2563eb' : '#cbd5e1', color: '#fff',
               cursor: matches.length > 0 && !submitting ? 'pointer' : 'not-allowed', fontSize: 14,
             }}
           >
-            {submitting ? '寫入中…' : `寫入 ${matches.length} 張照片的位置`}
+            {/* 還沒選檔時不能說「沒有要寫入的照片」—— 那時候是還沒算，不是算完是零 */}
+            {submitting ? '寫入中…'
+              : samples.length === 0 ? '寫入照片位置'
+              : matches.length === 0 ? '沒有要寫入的照片'
+              : `寫入 ${matches.length} 張照片的位置`}
+          </button>
+          <button
+            onClick={onClose}
+            style={{
+              order: photoWorkDone ? 1 : 0,
+              padding: '9px 18px', borderRadius: 8,
+              border: photoWorkDone ? 'none' : '1px solid #cbd5e1',
+              background: photoWorkDone ? '#2563eb' : '#fff',
+              color: photoWorkDone ? '#fff' : 'inherit',
+              cursor: 'pointer', fontSize: 14,
+            }}
+          >
+            關閉
           </button>
         </div>
       </div>

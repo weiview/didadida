@@ -6,8 +6,8 @@ import {
   type GeoJSONSource, type MapLayerMouseEvent,
 } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import type { FootprintPoint, TrackPoint, TrackPointEdit, Vehicle } from '@/lib/api';
-import { VEHICLES, vehicleEmoji, metersBetween, segmentKey } from '@/lib/vehicles';
+import type { FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
+import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 
 // OpenFreeMap：免費、免 API key、無流量上限的向量圖磚。
 // 不用 Google Maps 是因為它強制要求綁定信用卡的帳單帳戶。
@@ -23,8 +23,6 @@ interface Props {
    * 沒有軌跡的舊相簿才需要打開它。
    */
   connectPhotos?: boolean;
-  /** 每段軌跡（key 為 'day_key#seg'）要用哪個交通工具圖示 */
-  vehicleByKey?: Map<string, Vehicle>;
   height?: number | string;
   styleUrl?: string;
   onSelectPhoto?: (point: FootprintPoint) => void;
@@ -62,8 +60,31 @@ interface Props {
   matchedTracks?: TrackPoint[];
   /** 要不要把貼路軌跡畫成紫色實線 */
   showMatchedLine?: boolean;
+  /**
+   * 要不要畫 D1 濃縮軌跡（綠線）與停留圈。
+   *
+   * 平常看的是貼路軌跡，這一層只是它的原料 —— 兩條疊在一起反而看不出貼路
+   * 有沒有貼準。關掉只影響「畫不畫」，編輯模式的軌跡點另有一層，不受影響。
+   */
+  showTrackLine?: boolean;
   /** 動畫沿著哪一份軌跡跑。選到的那份沒資料時自動退回 'track' */
   animateOn?: 'track' | 'raw' | 'matched';
+  /**
+   * Google 時間軸的紀念層，已經切好可以連的線段（[lng, lat][][]）。
+   *
+   * 傳的是線而不是點，因為這一層跟其他三層的本質不同：它唯讀 —— 不編輯、
+   * 不貼路、不跑動畫、不參與照片位置推論。頁面那邊算完就定案，
+   * 這裡只負責畫。跟著傳點進來只會讓人以為它能做跟 tracks 一樣的事。
+   */
+  timelineLines?: [number, number][][];
+  /**
+   * 鏡頭要直接停在這個點（[lng, lat]），而不是把所有東西框進畫面。
+   *
+   * 只看一天的時候用：框住一整天的範圍會把鏡頭拉到看不出細節的高度，
+   * 而人在看某一天時想從那天的起點看起（通常接著就按播放）。
+   * 給 null 就恢復成「全部框進來」。
+   */
+  focusPoint?: [number, number] | null;
 }
 
 /** 動畫路徑上的一個節點 */
@@ -103,6 +124,11 @@ const MAX_THUMBS = 200;
 // 直接畫 64px 的話放大到 icon-size 1.5 會糊掉。
 const THUMB_PX = 128;
 const THUMB_PIXEL_RATIO = 2;
+
+// 跳到某一天的起點時用的縮放。街廓看得清楚，又不至於窄到看不出接下來往哪走。
+// 固定值而不是「保留使用者目前的縮放」—— 從全球視野點進某一天，
+// 沿用當下的縮放等於停在一片什麼都看不到的地方。
+const FOCUS_ZOOM = 14;
 
 /** 'YYYY-MM-DD HH:MM:SS' → 顯示用的短字串 */
 function shortTime(local: string): string {
@@ -233,16 +259,18 @@ function groupLines(points: TrackPoint[] | undefined): [number, number][][] {
 }
 
 export default function FootprintMap({
-  points, tracks, connectPhotos = false, vehicleByKey, height = 520, styleUrl, onSelectPhoto,
+  points, tracks, connectPhotos = false, height = 520, styleUrl, onSelectPhoto,
   editable = false, onEditPoints, onMovePhoto,
   rawTracks, showRawLine = false,
   matchedTracks, showMatchedLine = false,
+  showTrackLine = true,
   animateOn = 'track',
+  timelineLines,
+  focusPoint,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const rafRef = useRef<number | null>(null);
-  const lastCameraIndex = useRef<number>(-1);
   // 地圖只建立一次，事件處理器會鎖住當時的 props。用 ref 讓它讀得到最新的資料
   const pathRef = useRef<PathNode[]>([]);
   const sortedRef = useRef<FootprintPoint[]>([]);
@@ -394,9 +422,6 @@ export default function FootprintMap({
     ? Math.min(Math.max(Math.floor(head), 0), maxIndex)
     : 0;
   const headTime = path[headIndex]?.t ?? null;
-  // 播放頭所在那一段的交通工具。純照片路徑沒有段別，退回汽車
-  const headSegKey = path[headIndex]?.segKey ?? null;
-  const headVehicle: Vehicle = (headSegKey && vehicleByKey?.get(headSegKey)) || 'car';
 
   // 動畫走到哪個時間，就顯示那個時間之前最後拍的那張
   const current = useMemo(() => {
@@ -430,6 +455,25 @@ export default function FootprintMap({
     map.on('error', (e: any) => console.error('[FootprintMap] 地圖錯誤:', e?.error?.message || e));
 
     map.on('load', () => {
+      // Google 時間軸的紀念層。第一個加，所以墊在所有東西的最底下 ——
+      // 它是背景中的背景：十二年的足跡疊起來，常走的路自然變濃，
+      // 但今天要看的是上面那幾層
+      map.addSource('timeline-track', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      });
+      map.addLayer({
+        id: 'timeline-track-line',
+        type: 'line',
+        source: 'timeline-track',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        // 桃紅。原本是灰藍 #64748b，跟 OpenFreeMap 底圖的道路與行政區界幾乎同色，
+        // 十二年的足跡疊上去看起來只是底圖髒了。桃紅在這張底圖上沒有任何東西在用，
+        // 也跟另外三層（綠／橘／紫）分得開。
+        // 仍然刻意細而淡：單獨一條不搶戲，重疊多的地方自己會浮出來
+        paint: { 'line-color': '#db2777', 'line-width': 1.1, 'line-opacity': 0.45 },
+      });
+
       // 原始軌跡的對照底線，排在 gps-track 之前才會墊在它下面 ——
       // 要看的是「濃縮後的線偏離原始路徑多少」，濃縮後那條必須疊在上面
       map.addSource('raw-track', {
@@ -632,23 +676,21 @@ export default function FootprintMap({
         },
       });
 
-      // 交通工具圖示。畫在最上層，它是動畫的主角
-      for (const v of VEHICLES) {
-        const img = emojiImage(v.emoji);
-        if (img && !map.hasImage(`vehicle-${v.id}`)) map.addImage(`vehicle-${v.id}`, img);
-      }
+      // 移動圖示。畫在最上層，它是動畫的主角。
+      // 只有一個圖示，不隨交通工具改變 —— 理由見 vehicles.ts 開頭
+      const moverImg = emojiImage(MOVER_EMOJI);
+      if (moverImg && !map.hasImage('mover')) map.addImage('mover', moverImg);
       map.addSource('vehicle', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
       map.addLayer({
         id: 'vehicle-marker',
         type: 'symbol',
         source: 'vehicle',
         layout: {
-          'icon-image': ['concat', 'vehicle-', ['get', 'vehicle']],
+          'icon-image': 'mover',
           'icon-size': 0.72,
           'icon-allow-overlap': true,
           'icon-ignore-placement': true,
-          // 刻意不隨行進方向旋轉：emoji 的朝向每個字型都不一樣（🚗 向左、✈️ 向右上、
-          // 🚶 側身），統一套一個角度一定會有幾個變成頭下腳上。維持直立最保險。
+          // 刻意不隨行進方向旋轉：飛碟沒有明確的頭尾，轉了只是抖動
           'icon-rotation-alignment': 'viewport',
         },
       });
@@ -828,7 +870,6 @@ export default function FootprintMap({
     if (!map || !ready) return;
 
     setPlaying(false);
-    lastCameraIndex.current = -1;
 
     const src = map.getSource('photos') as GeoJSONSource | undefined;
     src?.setData({
@@ -846,7 +887,6 @@ export default function FootprintMap({
   useEffect(() => {
     setHead(path.length > 0 ? path.length - 1 : 0);
     setPlaying(false);
-    lastCameraIndex.current = -1;
   }, [path]);
 
   // --- 軌跡 ---
@@ -856,13 +896,29 @@ export default function FootprintMap({
     const src = map.getSource('gps-track') as GeoJSONSource | undefined;
     src?.setData({
       type: 'FeatureCollection',
-      features: trackLines.map((line) => ({
+      features: (showTrackLine ? trackLines : []).map((line) => ({
         type: 'Feature',
         properties: {},
         geometry: { type: 'LineString', coordinates: line },
       })),
     });
-  }, [trackLines, ready]);
+  }, [trackLines, showTrackLine, ready]);
+
+  // --- Google 時間軸紀念層 ---
+  // 線已經在頁面那邊切好了，這裡不做任何判斷 —— 沒傳就是不畫
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource('timeline-track') as GeoJSONSource | undefined;
+    src?.setData({
+      type: 'FeatureCollection',
+      features: (timelineLines ?? []).map((line) => ({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates: line },
+      })),
+    });
+  }, [timelineLines, ready]);
 
   // --- 原始軌跡對照底線 ---
   useEffect(() => {
@@ -901,13 +957,15 @@ export default function FootprintMap({
     const src = map.getSource('stays') as GeoJSONSource | undefined;
     src?.setData({
       type: 'FeatureCollection',
-      features: stays.map((s) => ({
+      // 停留圈是綠線的註解（「這裡的線頓住是因為待了三小時」），
+      // 綠線關掉時單獨留著只會變成一堆沒有來由的圈
+      features: (showTrackLine ? stays : []).map((s) => ({
         type: 'Feature',
         properties: { sec: s.sec, label: humanDuration(s.sec) },
         geometry: { type: 'Point', coordinates: [s.lng, s.lat] },
       })),
     });
-  }, [stays, ready]);
+  }, [stays, showTrackLine, ready]);
 
   // --- 編輯模式的軌跡點 ---
   useEffect(() => {
@@ -950,11 +1008,33 @@ export default function FootprintMap({
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !ready) return;
-    const all = [...coords, ...trackLines.flat()];
-    if (all.length === 0) return;
-    const bounds = all.reduce((b, c) => b.extend(c), new LngLatBounds(all[0], all[0]));
+
+    // 只看一天：直接停在起點，不框全部。理由見 focusPoint 的說明
+    if (focusPoint) {
+      map.easeTo({ center: focusPoint, zoom: FOCUS_ZOOM, duration: 600 });
+      return;
+    }
+
+    // 只框看得到的線。綠線關掉、只留貼路時還照 trackLines 框的話，
+    // 鏡頭會停在一個畫面上什麼都沒有的範圍
+    const lines = showTrackLine ? trackLines : showMatchedLine ? matchedLines : trackLines;
+
+    // Google 足跡也要框進來。以前漏掉它，結果只有那一層有資料的年份（2014 年那些
+    // 早於 GPS 軌跡的日子）畫得出線，鏡頭卻不會過去 —— 線確實畫了，只是在畫面外。
+    // timelineLines 沒開的時候頁面傳 undefined，跟上面「只框看得到的」一致。
+    //
+    // 不用 flat()：不篩日期時這一層是十二年、幾十萬個點，攤平只是白配一個大陣列
+    let bounds: LngLatBounds | null = null;
+    const extend = (c: [number, number]) => {
+      bounds = bounds === null ? new LngLatBounds(c, c) : bounds.extend(c);
+    };
+    for (const c of coords) extend(c);
+    for (const line of lines) for (const c of line) extend(c);
+    for (const line of timelineLines ?? []) for (const c of line) extend(c);
+    if (bounds === null) return;
+
     map.fitBounds(bounds, { padding: 60, maxZoom: 13, duration: 600 });
-  }, [coords, trackLines, ready]);
+  }, [coords, trackLines, matchedLines, timelineLines, showTrackLine, showMatchedLine, focusPoint, ready]);
 
   // --- 路線隨 head 生長 ---
   useEffect(() => {
@@ -993,29 +1073,32 @@ export default function FootprintMap({
         .map((l) => ({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: l } })),
     });
 
-    // 交通工具停在路線頭端，跟線一起前進
+    // 飛碟停在路線頭端，跟線一起前進
     const vehicleSrc = map.getSource('vehicle') as GeoJSONSource | undefined;
     const headPos = cur.length > 0 ? cur[cur.length - 1] : null;
     if (vehicleSrc) {
-      const seg = a?.segKey ?? null;
-      // 沒有指定也猜不出來（例如純照片路徑）就用汽車，總比沒有圖示好
-      const vehicle = (seg && vehicleByKey?.get(seg)) || 'car';
       vehicleSrc.setData({
         type: 'FeatureCollection',
         features: headPos ? [{
           type: 'Feature',
-          properties: { vehicle },
+          properties: {},
           geometry: { type: 'Point', coordinates: headPos },
         }] : [],
       });
     }
 
-    // 相機只在抵達新的節點時才移動；每幀都移會很暈
-    if (playing && whole !== lastCameraIndex.current && a) {
-      lastCameraIndex.current = whole;
-      map.easeTo({ center: [a.lng, a.lat], duration: 600, essential: true });
+    /*
+     * 跟拍：每一幀都把鏡頭對到飛碟目前的位置，讓它固定在畫面正中央。
+     *
+     * 用 setCenter 而不是 easeTo —— easeTo 是「用 N 毫秒滑過去」，每幀都下一次
+     * 新的 easeTo 會不斷打斷上一次的補間，鏡頭永遠追在飛碟後面，飛碟就會飄到
+     * 畫面邊緣（原本每 600ms 才對準一次節點，正是這個症狀）。head 本身已經是
+     * 連續內插出來的，直接設中心就已經是平滑的移動。
+     */
+    if (playing && headPos) {
+      map.setCenter(headPos as [number, number]);
     }
-  }, [head, path, ready, playing, vehicleByKey]);
+  }, [head, path, ready, playing]);
 
   // --- 播放迴圈 ---
   useEffect(() => {
@@ -1051,7 +1134,6 @@ export default function FootprintMap({
   }, [playing, speed, path.length]);
 
   const replay = useCallback(() => {
-    lastCameraIndex.current = -1;
     setHead(0);
     setPlaying(true);
   }, []);
@@ -1221,16 +1303,12 @@ export default function FootprintMap({
     <div style={{ position: 'relative', width: '100%' }}>
       <div ref={containerRef} style={{ width: '100%', height, borderRadius: 12, overflow: 'hidden' }} />
 
-      {sorted.length === 0 && trackLines.length === 0 && (
-        <div style={{
-          position: 'absolute', inset: 0, display: 'flex', alignItems: 'center',
-          justifyContent: 'center', background: 'rgba(255,255,255,.75)', borderRadius: 12,
-          textAlign: 'center', padding: 24, fontSize: 14, color: '#475569',
-        }}>
-          這個範圍內還沒有帶座標的照片。<br />
-          可以先用批次指定地點，或對有 GPS 的照片執行內插補點。
-        </div>
-      )}
+      {/*
+        這裡曾經有一塊「這個範圍內還沒有帶座標的照片」的半透明遮罩。拿掉了：
+        它的判斷只看照片與 GPS 軌跡，Google 足跡那層畫得好好的也照樣蓋上去，
+        等於用一段建議把使用者真正想看的東西擋住。地圖沒東西看不看得出來，
+        本來就不需要一層蓋在上面的東西來說明 —— 右上角的狀態列已經在講點數了。
+      */}
 
       {canEdit && !editing && (
         <button
@@ -1411,8 +1489,8 @@ export default function FootprintMap({
           )}
 
           <div style={{ fontSize: 12, color: '#64748b', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
-            <span style={{ fontSize: 16 }} title="這一段的交通工具，可在下方逐段指定">
-              {vehicleEmoji(headVehicle)}
+            <span style={{ fontSize: 16 }} title="播放中的位置">
+              {MOVER_EMOJI}
             </span>
             {headIndex + 1} / {path.length}
           </div>

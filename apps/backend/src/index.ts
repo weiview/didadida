@@ -92,18 +92,42 @@ function applyGeoPrivacy(rows: any[], isAdmin: boolean): any[] {
 
 /**
  * 取得照片的「當地牆上時間」，統一成 'YYYY-MM-DD HH:MM:SS'。
- * 新資料直接用 taken_at_local；舊資料沒有這欄，就把 taken_at 的 ISO 格式
- * ('2026-03-01T09:30:00.000Z') 截到秒並把 T 換成空白，才能跟行程段做字串比對。
+ * 新資料直接用 taken_at_local；舊資料沒有這欄，就由 taken_at 加上時區推回來。
+ *
+ * 退路**不能**只把 ISO 截到秒（'2026-06-18T08:11:00.000Z' → '2026-06-18 08:11:00'）——
+ * taken_at 是 UTC 瞬間而不是牆上時間，那樣讀台灣的照片會整整少 8 小時，
+ * 行程段比對與時間軸定位會全部對到八小時前的位置。時區未知時用站台預設值，
+ * 跟 geo.ts 的 normalizeGeo 同一個假設。
+ *
  * 使用此常數的 SQL 必須把 Photo 表別名為 p。
  */
 const LOCAL_TIME_EXPR =
-  "COALESCE(p.taken_at_local, REPLACE(SUBSTR(p.taken_at, 1, 19), 'T', ' '))";
+  "COALESCE(p.taken_at_local, strftime('%Y-%m-%d %H:%M:%S', p.taken_at, "
+  + `COALESCE(p.tz_offset_minutes, ${DEFAULT_TZ_OFFSET_MINUTES}) || ' minutes'))`;
 
 /**
  * 貼路軌跡在 R2 的 key。跟原始 GPX 同一套規則用 encodeURIComponent 包起來：
  * day_key 就是 Drive 檔名，不保證不含斜線之類會在 R2 裡長出假目錄的字元。
  */
 const matchedKey = (dayKey: string) => `tracks/${encodeURIComponent(dayKey)}.matched.json`;
+
+/*
+ * Google 時間軸的「紀念層」在 R2 的位置。
+ *
+ * 這一層刻意完全不進 D1：它不修正、不貼路、也不拿來推照片位置，
+ * 所以沒有任何需要「查詢」的理由 —— 而那是 D1 唯一的價值。
+ * 十二年份約 25 萬點，寫進 TrackPoint 要吃掉兩整天的免費寫入額度；
+ * 存成 R2 月檔則是 145 次 Class A、約 10MB，佔免費額度千分之一。
+ *
+ * 順帶避開了 TrackDay.day_key 是單一主鍵的問題 —— 同一天要能同時
+ * 有 GPSLogger 軌跡與時間軸軌跡，塞進同一張表就得改主鍵。
+ */
+const TIMELINE_INDEX_KEY = 'timeline/index.json';
+const timelineMonthKey = (month: string) => `timeline/${month}.json`;
+/** 嚴格比對而不是 encodeURIComponent：只放行 'YYYY-MM'，路徑穿越就無從談起 */
+const TIMELINE_MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+/** 單月上限。最密的一個月約 280KB，12MB 已經是兩位數的餘裕 */
+const TIMELINE_MONTH_MAX_BYTES = 12 * 1024 * 1024;
 
 /** 座標合法性檢查 —— 手動輸入與 API 傳入都要過這關 */
 function isValidLatLng(lat: unknown, lng: unknown): boolean {
@@ -428,8 +452,11 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：處理 R2 照片上傳
       if (method === "POST" && pathname === "/api/upload") {
         const formData = await request.formData();
-        const file = formData.get('file') as File;
-        const thumb = formData.get('thumb') as File | null;
+        // 走 unknown：這個專案同時吃 workers-types 與 @types/node，FormData.get 的
+        // 回傳型別會解析到不含 File 的那一份，直接 as File 會被 TS 擋下來。
+        // 實際 runtime 是 Workers，取到的就是 File；下面仍有 !file 的檢查。
+        const file = formData.get('file') as unknown as File | null;
+        const thumb = formData.get('thumb') as unknown as File | null;
         const albumId = formData.get('album_id') as string;
         const exifData = formData.get('exif') as string || null;
         const takenAt = formData.get('taken_at') as string || null;
@@ -782,7 +809,9 @@ function hammingDistance(hex1: string, hex2: string): number {
         let finalTakenAt = creationTime;
         try {
           // 在後端直接解析 EXIF
-          const rawExif = await exifr.parse(arrayBuffer, { tiff: true, ifd0: true, exif: true, gps: true });
+          // 不寫 ifd0：exifr 的 ifd0 本來就無法關閉（型別上也只收物件不收 boolean），
+          // 開著 tiff 就一定會解析到，寫 `ifd0: true` 只是個沒有作用的型別錯誤
+          const rawExif = await exifr.parse(arrayBuffer, { tiff: true, exif: true, gps: true });
           if (rawExif) {
             parsedExif = {
               Make: rawExif.Make || (exif ? exif.Make : undefined),
@@ -957,7 +986,7 @@ function hammingDistance(hex1: string, hex2: string): number {
 
       // 路由：取得足跡點位
       // 時間篩選一律用當地牆上時間 —— 使用者說「3/1 我在京都」指的是當地時間。
-      // 舊資料若無 taken_at_local，就把 taken_at 的 ISO 格式轉成同樣格式再比對。
+      // 舊資料若無 taken_at_local，由 LOCAL_TIME_EXPR 從 taken_at 加時區推回來再比對。
       if (method === "GET" && pathname === "/api/footprint") {
         const isAdmin = await isAuthorized(request, env);
         const conds = ["p.lat IS NOT NULL", "p.lng IS NOT NULL"];
@@ -1515,12 +1544,27 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
         // drive_file_id / md5 也一起給：還原是走 ingest，而 ingest 會把這兩欄
         // 整個覆蓋掉，前端得原封不動送回來，否則下次同步會誤判成「檔案有變」
+        // first_local_day / last_local_day：這批軌跡點實際落在哪一天（當地）。
+        // day_key 是 Drive 檔名，不保證是日期（見上面的註解），前端的月曆要標
+        // 「這天有沒有足跡」只能靠這兩欄，不能去解析檔名。
+        //
+        // 用相關子查詢而不是 GROUP BY 掃全表：idx_trackpoint_day 是
+        // (day_key, t_utc)，day_key 給定之後 MIN/MAX 就是索引的頭尾兩次 seek，
+        // 每天各兩筆。GROUP BY 會把整個 TrackPoint 掃過一遍，天數一多就是白花讀取額度。
         const { results } = await env.DB.prepare(`
-          SELECT day_key, ingest_source, drive_file_id, md5, point_count,
-                 tz_offset_minutes, synced_at, is_private,
-                 raw_key IS NOT NULL AS has_raw
-          FROM TrackDay
-          ORDER BY day_key DESC
+          SELECT d.day_key, d.ingest_source, d.drive_file_id, d.md5, d.point_count,
+                 d.tz_offset_minutes, d.synced_at, d.is_private,
+                 d.raw_key IS NOT NULL AS has_raw,
+                 strftime('%Y-%m-%d',
+                   (SELECT MIN(p.t_utc) FROM TrackPoint p WHERE p.day_key = d.day_key),
+                   COALESCE(d.tz_offset_minutes, ${DEFAULT_TZ_OFFSET_MINUTES}) || ' minutes'
+                 ) AS first_local_day,
+                 strftime('%Y-%m-%d',
+                   (SELECT MAX(p.t_utc) FROM TrackPoint p WHERE p.day_key = d.day_key),
+                   COALESCE(d.tz_offset_minutes, ${DEFAULT_TZ_OFFSET_MINUTES}) || ' minutes'
+                 ) AS last_local_day
+          FROM TrackDay d
+          ORDER BY d.day_key DESC
         `).all();
         return new Response(JSON.stringify(results), { headers });
       }
@@ -1929,6 +1973,107 @@ function hammingDistance(hex1: string, hex2: string): number {
           ).bind(dayKey, seg, raw).run();
         }
         return new Response(JSON.stringify({ success: true, dayKey, seg, vehicle: raw }), { headers });
+      }
+
+      /*
+       * ---- Google 時間軸紀念層 ----
+       *
+       * 一律要登入才讀得到，連 GET 也是。/api/tracks 那套 is_private 逐日旗標
+       * 在這裡沒有對應物（資料不在 D1，沒有地方掛旗標），而這一層是十二年
+       * 不間斷的完整移動史 —— 沒有把它公開的合理預設。
+       *
+       * 原始的匯出檔本身永遠不會上傳：瀏覽器只送解析後的座標，
+       * placeId、semanticType（含 INFERRED_HOME/WORK）、WiFi 掃描都不讀。
+       */
+      if (method === "GET" && pathname === "/api/timeline/index") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const object = await env.BUCKET.get(TIMELINE_INDEX_KEY);
+        // 還沒匯入過不是錯誤，回空索引讓前端不用區分這兩種情況
+        if (!object) {
+          return new Response(JSON.stringify({ months: [] }), { headers });
+        }
+        return new Response(object.body, {
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
+
+      if (method === "PUT" && pathname === "/api/timeline/index") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const body: any = await request.json().catch(() => null);
+        if (!body || !Array.isArray(body.months)) {
+          return new Response(JSON.stringify({ error: "months 必須是陣列" }), { status: 400, headers });
+        }
+        // 只留認得的欄位再存回去，索引才不會變成什麼都能塞的垃圾桶
+        const months = body.months
+          .filter((m: any) => typeof m?.monthKey === 'string' && TIMELINE_MONTH_RE.test(m.monthKey))
+          .map((m: any) => ({
+            monthKey: m.monthKey,
+            points: Number.isFinite(m?.points) ? Math.trunc(m.points) : 0,
+            days: Number.isFinite(m?.days) ? Math.trunc(m.days) : 0,
+          }))
+          .sort((a: any, b: any) => a.monthKey.localeCompare(b.monthKey));
+
+        await env.BUCKET.put(TIMELINE_INDEX_KEY, JSON.stringify({
+          months, updatedAt: new Date().toISOString(),
+        }), { httpMetadata: { contentType: "application/json" } });
+        return new Response(JSON.stringify({ success: true, months: months.length }), { headers });
+      }
+
+      if (method === "GET" && pathname.startsWith("/api/timeline/month/")) {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const month = pathname.slice("/api/timeline/month/".length);
+        if (!TIMELINE_MONTH_RE.test(month)) {
+          return new Response(JSON.stringify({ error: "月份格式必須是 YYYY-MM" }), { status: 400, headers });
+        }
+        const object = await env.BUCKET.get(timelineMonthKey(month));
+        if (!object) {
+          return new Response(JSON.stringify({ error: "這個月份還沒有資料" }), { status: 404, headers });
+        }
+        return new Response(object.body, {
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
+
+      /*
+       * 匯入是「整包覆蓋」而不是增量：Google 每次匯出的都是 2014 年到今天的
+       * 全量 dump，不是新增的部分。所以這裡不做 md5 比對、不找差異，
+       * 重上傳就是同一個 key 再 put 一次。
+       */
+      if (method === "PUT" && pathname.startsWith("/api/timeline/month/")) {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const month = pathname.slice("/api/timeline/month/".length);
+        if (!TIMELINE_MONTH_RE.test(month)) {
+          return new Response(JSON.stringify({ error: "月份格式必須是 YYYY-MM" }), { status: 400, headers });
+        }
+        const json = await request.text();
+        if (json.length > TIMELINE_MONTH_MAX_BYTES) {
+          return new Response(JSON.stringify({ error: "單月資料過大" }), { status: 413, headers });
+        }
+        // 存進去之前先確認它真的是 JSON —— R2 不會幫忙驗，
+        // 壞掉的內容要等到幾個月後有人打開地圖才會發現
+        let parsed: any;
+        try {
+          parsed = JSON.parse(json);
+        } catch {
+          return new Response(JSON.stringify({ error: "內容不是合法的 JSON" }), { status: 400, headers });
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return new Response(JSON.stringify({ error: "內容必須是 { 日期: 點陣列 } 的物件" }), { status: 400, headers });
+        }
+        await env.BUCKET.put(timelineMonthKey(month), json, {
+          httpMetadata: { contentType: "application/json" },
+        });
+        return new Response(JSON.stringify({
+          success: true, month, days: Object.keys(parsed).length,
+        }), { headers });
       }
 
       return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });

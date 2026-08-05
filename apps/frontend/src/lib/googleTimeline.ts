@@ -17,7 +17,10 @@ export interface TimelineSample {
   offsetMin: number | null;
   lat: number;
   lng: number;
-  /** 停留地點的名稱（若有） */
+  /**
+   * 停留地點的名稱（若有）。只有舊版語意月檔（格式 C）會有 ——
+   * 手機版匯出那邊沒有真正的名稱可用，見 parseTimeline 裡的說明。
+   */
   label?: string;
 }
 
@@ -115,12 +118,18 @@ export function parseTimeline(json: any): ParseResult {
     for (const seg of segments) {
       const segOffset = seg?.startTimeTimezoneUtcOffsetMinutes;
 
-      // 停留地點：整段時間都在同一個座標
+      // 停留地點：整段時間都在同一個座標。
+      //
+      // 刻意不帶 label —— 手機版這裡唯一能當名字的欄位是 topCandidate.semanticType，
+      // 而它不是地點名稱，是 Google 的分類代號：INFERRED_HOME、INFERRED_WORK、
+      // UNKNOWN、SEARCHED_ADDRESS。寫進 place_name 的話，多數照片的地點會變成
+      // 「UNKNOWN」這種噪音，家裡拍的則會變成「INFERRED_HOME」—— 而 place_name
+      // 在公開相簿裡是訪客看得到的（applyGeoPrivacy 只在標私密時才清掉）。
+      // 舊版語意月檔（格式 C）的 location.name 是真的地點名，那邊照舊採用。
       const visitLoc = seg?.visit?.topCandidate?.placeLocation;
       if (visitLoc) {
-        const label = seg?.visit?.topCandidate?.semanticType || undefined;
-        pushSample(samples, visitLoc.latLng ?? visitLoc, seg.startTime, segOffset, label);
-        if (seg.endTime) pushSample(samples, visitLoc.latLng ?? visitLoc, seg.endTime, seg?.endTimeTimezoneUtcOffsetMinutes ?? segOffset, label);
+        pushSample(samples, visitLoc.latLng ?? visitLoc, seg.startTime, segOffset);
+        if (seg.endTime) pushSample(samples, visitLoc.latLng ?? visitLoc, seg.endTime, seg?.endTimeTimezoneUtcOffsetMinutes ?? segOffset);
       }
 
       // 移動路徑：逐點的座標與時間
