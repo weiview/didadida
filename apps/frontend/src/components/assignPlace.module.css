@@ -1,0 +1,76 @@
+/* 指定地點的視窗外殼。這裡用 CSS module 而不是行內樣式，是因為要吃 media query
+   —— 手機上整個佔滿螢幕，桌機上留一點邊。 */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.card {
+  background: #fff;
+  color: #0f172a;
+  border-radius: 14px;
+  width: 100%;
+  max-width: 960px;
+  /* 高度吃滿 overlay（position:fixed 的那層），不用 100vh —— 手機瀏覽器的
+     網址列會伸縮，100vh 會讓底部按鈕被吃掉 */
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 標題與底部按鈕不捲動，中間才捲。地圖佔掉大半個畫面，
+   「套用地點」如果跟著捲走，手機上會找不到 */
+.head {
+  flex: none;
+  padding: 16px 22px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 18px 22px;
+}
+
+.foot {
+  flex: none;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  padding: 14px 22px;
+  border-top: 1px solid #e2e8f0;
+}
+
+/* 地圖高度跟著畫面走：小螢幕不要壓縮到只剩一條，大螢幕也不要吃掉整頁 */
+.map {
+  height: clamp(260px, 42vh, 520px);
+}
+
+@media (max-width: 768px) {
+  .overlay {
+    padding: 0;
+  }
+  .card {
+    border-radius: 0;
+    max-width: none;
+  }
+  .head,
+  .body,
+  .foot {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+  /* 避開 iPhone 底部那條 home indicator */
+  .foot {
+    padding-bottom: calc(14px + env(safe-area-inset-bottom));
+  }
+}

@@ -18,8 +18,6 @@ export interface Album {
   cover_photo_url?: string;
   cover_text?: string;
   preview_photos?: string[];
-  /** 這本相簿的照片總數（含沒有座標的）。足跡地圖的張數徽章用它 */
-  photo_count?: number;
   /** 1 = 足跡地圖不對外公開（預設） */
   map_private?: number;
 }
@@ -169,9 +167,18 @@ export async function fetchAlbums(): Promise<Album[]> {
   }
 }
 
+/**
+ * 相簿裡的照片。**一定要帶 token**（跟 fetchAllPhotos 同理）：
+ * 這條路由本身公開，但後端的 applyGeoPrivacy 對沒登入的請求會把 lat/lng/place_name
+ * 抹成 null，而 map_private **預設就是 1**。不帶 token 的話管理者在自己的相簿頁
+ * 看到的每張照片都是「沒有位置」，指定完地點也不會變 —— 資料其實寫進去了，
+ * 只是這支 API 不肯把它交出來。
+ */
 export async function fetchPhotos(albumId: string | number): Promise<Photo[]> {
   try {
-    const res = await fetch(`${API_BASE_URL}/albums/${albumId}/photos`);
+    const res = await fetch(`${API_BASE_URL}/albums/${albumId}/photos`, {
+      headers: getAuthHeaders(),
+    });
     if (!res.ok) throw new Error('Failed to fetch photos');
     return res.json();
   } catch (error) {
@@ -627,18 +634,32 @@ export async function assignGeoBatch(params: {
   albumId?: number;
   tzOffsetMinutes?: number;
   overwriteExif?: boolean;
-}): Promise<{ success: boolean; updated: number; skippedExif: number; segmentId: number | null } | null> {
+}): Promise<
+  | { success: true; updated: number; skippedExif: number; segmentId: number | null }
+  | { success: false; error: string }
+> {
+  // 這條不照其他 API「失敗就回 null」的慣例：套用地點是使用者按下去等結果的動作，
+  // 失敗卻什麼都不說的話，畫面看起來就只是「沒反應」，連是不是登入過期都不知道
   try {
     const res = await fetch(`${API_BASE_URL}/photos/geo/batch`, {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify(params),
     });
-    if (!res.ok) return null;
-    return await res.json();
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      return {
+        success: false,
+        error: res.status === 401
+          ? '登入已過期，請重新登入後再試'
+          : `伺服器回應 ${res.status}${body ? `：${body.slice(0, 200)}` : ''}`,
+      };
+    }
+    const data = await res.json();
+    return { success: true, updated: data.updated ?? 0, skippedExif: data.skippedExif ?? 0, segmentId: data.segmentId ?? null };
   } catch (err) {
     console.error(err);
-    return null;
+    return { success: false, error: '連線失敗，請確認網路與後端服務是否正常' };
   }
 }
 

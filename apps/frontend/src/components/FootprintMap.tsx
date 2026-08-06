@@ -408,31 +408,21 @@ function buildPiles(sorted: FootprintPoint[], pileUp: boolean): Map<number, Pile
 }
 
 /**
- * 張數徽章上的數字。
+ * 張數徽章上的數字：**永遠是這顆泡泡自己底下有幾張**。
  *
- * 整叢都是同一本相簿時，泡泡畫的是**那本相簿的封面**（見 photo-cluster-thumbs），
- * 這時候徽章報「這一叢有幾張」會跟圖對不起來 —— 同一本相簿在地圖上散成好幾個
- * 一模一樣的封面，數字卻各不相同，看起來就是「跟相簿裡的張數不符」。
- * 所以封面泡泡的徽章一律報那本相簿的**照片總數**（含沒有座標、地圖上根本畫不出來的）。
+ * 一路縮放下來就是同一件事在細分：整片聚成一顆時報總數，放大拆成幾叢後
+ * 各報各的，拆到 clusterMaxZoom 以上叢集解散，換成 buildPiles 的那一坨報 pile。
+ * 三段的數字加起來守恆，所以數字變小＝真的分開了，不是換了一套算法。
  *
- * 其餘兩種情況的圖畫的是照片本身，數字就維持「這裡有幾張」：
- *   - 跨相簿的叢集：沒有哪一本能代表它
- *   - 放大後攤成扇形的一坨：圖是那幾張照片，不是封面
+ * 別把它換成「相簿總張數」：那會讓同一本相簿的每顆泡泡都印同一個數字，
+ * 加起來爆掉，也看不出哪裡拍得多。
  */
-function badgeTextFor(albums: Album[]): any {
-  // ['match', 輸入, 標籤1, 值1, …, 預設值]。一組都沒有的話 match 本身不合法
-  const byAlbum: any[] = ['match', ['get', 'aMin']];
-  for (const a of albums) {
-    if (typeof a.photo_count === 'number') byAlbum.push(a.id, String(a.photo_count));
-  }
-  byAlbum.push(['get', 'point_count_abbreviated']);
-  const clusterText: any =
-    byAlbum.length > 3
-      ? ['case', ['==', ['get', 'aMin'], ['get', 'aMax']], byAlbum, ['get', 'point_count_abbreviated']]
-      : ['get', 'point_count_abbreviated'];
-
-  return ['case', ['has', 'point_count'], clusterText, ['to-string', ['get', 'pile']]];
-}
+const BADGE_TEXT: any = [
+  'case',
+  ['has', 'point_count'],
+  ['get', 'point_count_abbreviated'],
+  ['to-string', ['get', 'pile']],
+];
 
 /**
  * 把軌跡點按「哪一天的第幾段」切成一條條折線。
@@ -687,13 +677,6 @@ export default function FootprintMap({
   useEffect(() => { pathRef.current = path; }, [path]);
   useEffect(() => { sortedRef.current = sorted; }, [sorted]);
   useEffect(() => { albumsRef.current = albums || []; }, [albums]);
-  // 徽章的數字要查相簿張數，但圖層只建立一次、那時候 albums 常常還沒回來。
-  // 相簿一到（或改了）就把 text-field 整條換掉
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !ready || !map.getLayer('photo-count-label')) return;
-    map.setLayoutProperty('photo-count-label', 'text-field', badgeTextFor(albums || []));
-  }, [albums, ready]);
   useEffect(() => { tracksRef.current = tracks || []; }, [tracks]);
   useEffect(() => { editingRef.current = editing; }, [editing]);
   useEffect(() => {
@@ -1007,8 +990,7 @@ export default function FootprintMap({
         // 必須指定 OpenFreeMap 實際提供的字型；用 maplibre 預設的
         // "Open Sans Regular,Arial Unicode MS Regular" 會 404 而退化成本地字型
         layout: {
-          // 相簿還沒載到時先用叢集自己的張數；albums 一到就由底下的 effect 換掉
-          'text-field': badgeTextFor(albumsRef.current),
+          'text-field': BADGE_TEXT,
           'text-font': ['Noto Sans Bold'],
           'text-size': ['interpolate', ['linear'], ['zoom'], 9, 10, 13, 12, 16, 14, 18, 16],
           'text-allow-overlap': true,
