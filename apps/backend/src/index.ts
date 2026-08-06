@@ -285,9 +285,18 @@ if (method === "POST" && pathname === "/api/verify-password") {
           ) WHERE rn <= 10
         `).all();
         
+        // 每本相簿的照片總數。preview_photos 只取前 10 張，數不出總數，
+        // 而足跡地圖的張數徽章要報的就是「這本相簿一共幾張」
+        const { results: photoCounts } = await env.DB.prepare(
+          "SELECT album_id, COUNT(*) AS n FROM Photo GROUP BY album_id"
+        ).all();
+        const countByAlbum = new Map<number, number>(
+          photoCounts.map((r: any) => [Number(r.album_id), Number(r.n)])
+        );
+
         const albumsWithPhotos = albums.map((album: any) => {
           const albumPhotos = allPhotos.filter((p: any) => p.album_id === album.id).map((p: any) => p.url);
-          return { ...album, preview_photos: albumPhotos };
+          return { ...album, preview_photos: albumPhotos, photo_count: countByAlbum.get(album.id) ?? 0 };
         });
 
         return new Response(JSON.stringify(albumsWithPhotos), { headers });

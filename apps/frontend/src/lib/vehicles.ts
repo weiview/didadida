@@ -6,9 +6,8 @@
 // （機車與汽車在速度上根本分不開），畫成一堆真實的車輛圖示等於把猜測當事實展示。
 // 飛碟不宣稱任何事，就只是「這個東西正在移動」。
 //
-// 用 emoji 而不是自畫的 SVG：地圖上的圖示是靠 canvas 畫成點陣圖再 map.addImage
-// 進去的，走的是作業系統的 emoji 字型，不是底圖樣式的 SDF 字型（OpenFreeMap 的
-// Noto Sans 沒有 emoji 字符，直接寫進 text-field 只會變豆腐）。
+// 這裡的 emoji 只給 HTML（播放列）用。地圖上那台是 ufo.ts 自己畫的動畫圖示 ——
+// emoji 每台電腦長得不一樣而且不會動，當不了動畫的主角。
 
 import type { Vehicle } from './api';
 

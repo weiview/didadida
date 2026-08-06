@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import ScrollOptimizer from "@/components/ScrollOptimizer";
+import ScrollToTopButton from "@/components/ScrollToTopButton";
 
 export const metadata: Metadata = {
   title: "DidaDida | 滴答生活",
@@ -24,6 +25,7 @@ export default function RootLayout({
       <body>
         <ScrollOptimizer />
         <main>{children}</main>
+        <ScrollToTopButton />
       </body>
     </html>
   );
