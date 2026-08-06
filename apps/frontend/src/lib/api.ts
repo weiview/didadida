@@ -18,6 +18,8 @@ export interface Album {
   cover_photo_url?: string;
   cover_text?: string;
   preview_photos?: string[];
+  /** 這本相簿的照片總數（含沒有座標的）。足跡地圖的張數徽章用它 */
+  photo_count?: number;
   /** 1 = 足跡地圖不對外公開（預設） */
   map_private?: number;
 }

@@ -8,6 +8,7 @@ import {
 import 'maplibre-gl/dist/maplibre-gl.css';
 import type { Album, FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
+import { createUfoImage, UFO_PIXEL_RATIO } from '@/lib/ufo';
 
 // OpenFreeMap：免費、免 API key、無流量上限的向量圖磚。
 // 不用 Google Maps 是因為它強制要求綁定信用卡的帳單帳戶。
@@ -133,6 +134,10 @@ const MAX_GAP_MS = 24 * 60 * 60 * 1000;
 // 照片離停留質心多近才算「在同一個地方」。停留半徑是 60m，這裡放寬到兩倍，
 // 因為照片本身的 EXIF 座標也有誤差，而且大樓的另一側仍然是同一棟樓。
 const STAY_SNAP_M = 120;
+
+// 1x 播完整條路徑要幾秒。長度差幾百倍的日子都套同一個總時長，
+// 使用者才不用為了看完一趟長途旅行等上好幾分鐘
+const PLAY_SECONDS = 25;
 
 // 地圖上最多同時保留幾張縮圖。超過就退回圓點 ——
 // 每張都是一塊要留在 GPU 上的貼圖，不設上限的話大相簿會把記憶體吃光。
@@ -336,26 +341,6 @@ function loadBubble(url: string, ring: string): Promise<ImageData> {
   });
 }
 
-/**
- * 把 emoji 畫成點陣圖。
- *
- * 不能直接寫進 symbol 的 text-field：地圖文字走的是底圖樣式提供的 SDF 字型，
- * OpenFreeMap 的 Noto Sans 沒有 emoji 字符，畫出來會是豆腐。
- * canvas 用的是作業系統字型，emoji 才有得畫。
- */
-function emojiImage(emoji: string, size = 40): ImageData | null {
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return null;
-  ctx.font = `${Math.round(size * 0.72)}px "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(emoji, size / 2, size / 2 + size * 0.04);
-  return ctx.getImageData(0, 0, size, size);
-}
-
 /** 秒數 → '3 小時 20 分' 這種給人看的長度 */
 function humanDuration(sec: number): string {
   const h = Math.floor(sec / 3600);
@@ -423,6 +408,33 @@ function buildPiles(sorted: FootprintPoint[], pileUp: boolean): Map<number, Pile
 }
 
 /**
+ * 張數徽章上的數字。
+ *
+ * 整叢都是同一本相簿時，泡泡畫的是**那本相簿的封面**（見 photo-cluster-thumbs），
+ * 這時候徽章報「這一叢有幾張」會跟圖對不起來 —— 同一本相簿在地圖上散成好幾個
+ * 一模一樣的封面，數字卻各不相同，看起來就是「跟相簿裡的張數不符」。
+ * 所以封面泡泡的徽章一律報那本相簿的**照片總數**（含沒有座標、地圖上根本畫不出來的）。
+ *
+ * 其餘兩種情況的圖畫的是照片本身，數字就維持「這裡有幾張」：
+ *   - 跨相簿的叢集：沒有哪一本能代表它
+ *   - 放大後攤成扇形的一坨：圖是那幾張照片，不是封面
+ */
+function badgeTextFor(albums: Album[]): any {
+  // ['match', 輸入, 標籤1, 值1, …, 預設值]。一組都沒有的話 match 本身不合法
+  const byAlbum: any[] = ['match', ['get', 'aMin']];
+  for (const a of albums) {
+    if (typeof a.photo_count === 'number') byAlbum.push(a.id, String(a.photo_count));
+  }
+  byAlbum.push(['get', 'point_count_abbreviated']);
+  const clusterText: any =
+    byAlbum.length > 3
+      ? ['case', ['==', ['get', 'aMin'], ['get', 'aMax']], byAlbum, ['get', 'point_count_abbreviated']]
+      : ['get', 'point_count_abbreviated'];
+
+  return ['case', ['has', 'point_count'], clusterText, ['to-string', ['get', 'pile']]];
+}
+
+/**
  * 把軌跡點按「哪一天的第幾段」切成一條條折線。
  * 跨段不可以連線 —— 中間是關機或收不到訊號，接起來會憑空畫出一條沒走過的直線。
  * 資料本來就按時間遞增，這裡只做分組。
@@ -463,6 +475,8 @@ export default function FootprintMap({
   const editingRef = useRef(false);
   // shift 連選的起點（tracks 陣列裡的索引）
   const anchorIdxRef = useRef<number | null>(null);
+  // 飛碟自己的動畫迴圈讀這個決定要不要繼續要下一幀。地圖只建立一次，讀不到 state
+  const playingRef = useRef(false);
 
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(false);
@@ -600,6 +614,58 @@ export default function FootprintMap({
   }, [animTracks, sorted, connectPhotos, stays]);
 
   const maxIndex = Math.max(path.length - 1, 0);
+
+  /*
+   * 路徑的累積長度（公尺）。動畫靠它跑出「一致的速度」。
+   *
+   * head 直接依節點數前進的話，速度是「每秒幾個節點」而不是「每秒幾公尺」——
+   * GPS 是按時間取樣的，塞車時一分鐘擠十幾個點、高速公路上一分鐘拉開一公里，
+   * 同樣的節點速率畫出來就是走路慢吞吞、開車用瞬移的。改成沿著弧長前進，
+   * 不管當時在幹嘛，飛碟在畫面上都是同一個速度。
+   *
+   * 斷點那一段長度算 0：那段路根本沒走過（換軌跡段或錄製中斷），
+   * 不該分到任何播放時間，飛碟會直接接到下一段的起點。
+   */
+  const arc = useMemo(() => {
+    const cum = new Float64Array(path.length);
+    for (let i = 1; i < path.length; i++) {
+      const a = path[i - 1];
+      const b = path[i];
+      cum[i] = cum[i - 1] + (b.breakBefore ? 0 : metersBetween(a.lat, a.lng, b.lat, b.lng));
+    }
+    return cum;
+  }, [path]);
+  const totalDist = arc.length > 0 ? arc[arc.length - 1] : 0;
+
+  /** head（浮點索引）→ 已經走了幾公尺 */
+  const distFromHead = useCallback((h: number) => {
+    if (arc.length === 0) return 0;
+    const i = Math.min(Math.max(Math.floor(h), 0), arc.length - 1);
+    const frac = Math.min(Math.max(h - i, 0), 1);
+    const next = i + 1 < arc.length ? arc[i + 1] : arc[i];
+    return arc[i] + (next - arc[i]) * frac;
+  }, [arc]);
+
+  /**
+   * 走了幾公尺 → head。
+   *
+   * 二分找「最後一個累積長度 <= d 的節點」。取最後一個是刻意的：
+   * 停留點與斷點的長度是 0，會有一串累積長度相同的節點，取最後一個才不會卡在原地。
+   */
+  const headFromDist = useCallback((d: number) => {
+    const n = arc.length;
+    if (n === 0) return 0;
+    if (d <= 0) return 0;
+    if (d >= arc[n - 1]) return n - 1;
+    let lo = 0;
+    let hi = n - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (arc[mid] <= d) lo = mid; else hi = mid - 1;
+    }
+    const span = lo + 1 < n ? arc[lo + 1] - arc[lo] : 0;
+    return span > 0 ? lo + (d - arc[lo]) / span : lo;
+  }, [arc]);
   // head 是動畫算出來的浮點數，會被拿來當陣列索引，所以夾在合法範圍內再用。
   // 少了下界的話，播放起頭那一瞬間的負值會變成 path[-1]
   const headIndex = Number.isFinite(head)
@@ -621,8 +687,20 @@ export default function FootprintMap({
   useEffect(() => { pathRef.current = path; }, [path]);
   useEffect(() => { sortedRef.current = sorted; }, [sorted]);
   useEffect(() => { albumsRef.current = albums || []; }, [albums]);
+  // 徽章的數字要查相簿張數，但圖層只建立一次、那時候 albums 常常還沒回來。
+  // 相簿一到（或改了）就把 text-field 整條換掉
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready || !map.getLayer('photo-count-label')) return;
+    map.setLayoutProperty('photo-count-label', 'text-field', badgeTextFor(albums || []));
+  }, [albums, ready]);
   useEffect(() => { tracksRef.current = tracks || []; }, [tracks]);
   useEffect(() => { editingRef.current = editing; }, [editing]);
+  useEffect(() => {
+    playingRef.current = playing;
+    // 停的時候 render() 就不再要求下一幀，所以要重新起跑得自己踢一下
+    if (playing) mapRef.current?.triggerRepaint();
+  }, [playing]);
 
   // --- 建立地圖 ---
   useEffect(() => {
@@ -888,12 +966,16 @@ export default function FootprintMap({
       // 位置只好用 translate 手算 —— 泡泡以尾巴尖端為錨，本體頂緣在
       // -(BUBBLE_H + BUBBLE_TAIL) × icon-size，右緣在 BUBBLE_W/2 × icon-size，
       // 下面每個縮放停靠點就是把這兩個數字乘出來的（跟 bubbleSize 同一組 zoom）
+      //
+      // 每個停靠點的 [x, y] 一定要包成 ['literal', [...]]：expression 裡裸露的陣列
+      // 會被當成「函式呼叫」去解析，第一個元素是數字就直接判定整條式子非法，
+      // 這兩層會被 maplibre 整個拒收（徽章就完全不會出現）
       const badgeShift: any = [
         'interpolate', ['linear'], ['zoom'],
-        9, [22, -57],
-        13, [34, -87],
-        16, [45, -115],
-        18, [54, -138],
+        9, ['literal', [22, -57]],
+        13, ['literal', [34, -87]],
+        16, ['literal', [45, -115]],
+        18, ['literal', [54, -138]],
       ];
       // 徽章要蓋兩種情況：maplibre 聚出來的叢集，以及放大之後攤成扇形的那一坨。
       // 一坨只掛在第一張牌上，否則五張牌會冒出五個一模一樣的徽章
@@ -901,11 +983,6 @@ export default function FootprintMap({
         'any',
         ['has', 'point_count'],
         ['all', ['==', ['get', 'fan'], 0], ['>', ['get', 'pile'], 1]],
-      ];
-      const badgeText: any = [
-        'case',
-        ['has', 'point_count'], ['get', 'point_count_abbreviated'],
-        ['to-string', ['get', 'pile']],
       ];
       map.addLayer({
         id: 'photo-count-badge',
@@ -930,7 +1007,8 @@ export default function FootprintMap({
         // 必須指定 OpenFreeMap 實際提供的字型；用 maplibre 預設的
         // "Open Sans Regular,Arial Unicode MS Regular" 會 404 而退化成本地字型
         layout: {
-          'text-field': badgeText,
+          // 相簿還沒載到時先用叢集自己的張數；albums 一到就由底下的 effect 換掉
+          'text-field': badgeTextFor(albumsRef.current),
           'text-font': ['Noto Sans Bold'],
           'text-size': ['interpolate', ['linear'], ['zoom'], 9, 10, 13, 12, 16, 14, 18, 16],
           'text-allow-overlap': true,
@@ -945,8 +1023,14 @@ export default function FootprintMap({
 
       // 移動圖示。畫在最上層，它是動畫的主角。
       // 只有一個圖示，不隨交通工具改變 —— 理由見 vehicles.ts 開頭
-      const moverImg = emojiImage(MOVER_EMOJI);
-      if (moverImg && !map.hasImage('mover')) map.addImage('mover', moverImg);
+      if (!map.hasImage('mover')) {
+        map.addImage(
+          'mover',
+          // 只有播放中才要求下一幀：暫停時地圖不該一直重畫
+          createUfoImage(() => map.triggerRepaint(), () => playingRef.current) as any,
+          { pixelRatio: UFO_PIXEL_RATIO },
+        );
+      }
       map.addSource('vehicle', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
       map.addLayer({
         id: 'vehicle-marker',
@@ -954,9 +1038,11 @@ export default function FootprintMap({
         source: 'vehicle',
         layout: {
           'icon-image': 'mover',
-          'icon-size': 0.72,
+          'icon-size': 1,
           'icon-allow-overlap': true,
           'icon-ignore-placement': true,
+          // 圖的底部中央是光束落地點，錨在那裡才會「碟身浮在上面、光束打在軌跡上」
+          'icon-anchor': 'bottom',
           // 刻意不隨行進方向旋轉：飛碟沒有明確的頭尾，轉了只是抖動
           'icon-rotation-alignment': 'viewport',
         },
@@ -1423,9 +1509,12 @@ export default function FootprintMap({
       rafRef.current = null;
       return;
     }
-    // 節點數會從幾張照片到幾千個軌跡點都有，用固定的「每秒幾個節點」會讓
-    // 軌跡慢到看不完。改成不管幾個點，1x 都大約 25 秒跑完整條。
-    const nodesPerSec = Math.max(1, path.length / 25) * speed;
+    // 不管一天走了 300 公尺還是 300 公里，1x 都大約 25 秒跑完 ——
+    // 換算成公尺／秒之後全程等速（見 arc 的註解）。
+    const metersPerSec = (totalDist / PLAY_SECONDS) * speed;
+    // 整條路徑長度是 0（照片全擠在同一點之類）時退回舊的節點速率，
+    // 否則 metersPerSec 是 0，播放鍵按下去什麼事都不會發生
+    const nodesPerSec = Math.max(1, path.length / PLAY_SECONDS) * speed;
     let last = performance.now();
     const tick = (now: number) => {
       // requestAnimationFrame 給的是「這一幀開始」的時間，可能早於上面那個
@@ -1433,7 +1522,11 @@ export default function FootprintMap({
       const dt = Math.max(0, (now - last) / 1000);
       last = now;
       setHead((h) => {
-        const next = h + dt * nodesPerSec;
+        // 每一幀都從 head 換算回距離再往前推，而不是自己存一份距離：
+        // 拖時間軸改的是 head，這樣寫拖完就能無縫接著播
+        const next = metersPerSec > 0
+          ? headFromDist(distFromHead(h) + dt * metersPerSec)
+          : h + dt * nodesPerSec;
         if (next >= path.length - 1) {
           setPlaying(false);
           return Math.max(path.length - 1, 0);
@@ -1447,7 +1540,7 @@ export default function FootprintMap({
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [playing, speed, path.length]);
+  }, [playing, speed, path.length, totalDist, headFromDist, distFromHead]);
 
   const replay = useCallback(() => {
     setHead(0);
@@ -1758,13 +1851,22 @@ export default function FootprintMap({
             {head >= maxIndex ? '重播' : playing ? '暫停' : '播放'}
           </button>
 
+          {/*
+            拉桿走的是距離而不是節點序號 —— 播放本身已經是等速前進，
+            兩邊用同一把尺，拉桿的位置才會跟畫面上的進度對得起來。
+            整條長度是 0 時退回節點序號，否則拉桿的 max 會是 0 而動不了
+          */}
           <input
             type="range"
             min={0}
-            max={maxIndex}
+            max={totalDist > 0 ? totalDist : maxIndex}
             step="any"
-            value={head}
-            onChange={(e) => { setPlaying(false); setHead(Number(e.target.value)); }}
+            value={totalDist > 0 ? distFromHead(head) : head}
+            onChange={(e) => {
+              setPlaying(false);
+              const v = Number(e.target.value);
+              setHead(totalDist > 0 ? headFromDist(v) : v);
+            }}
             style={{ flex: '1 1 180px', minWidth: 140 }}
             aria-label="時間軸"
           />

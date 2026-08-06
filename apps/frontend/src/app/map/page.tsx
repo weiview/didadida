@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
 import {
   fetchFootprint, fetchAlbums, fetchTripSegments, deleteTripSegment,
@@ -88,6 +89,7 @@ export default function MapPage() {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [segments, setSegments] = useState<TripSegment[]>([]);
   const { isAdmin } = useAdmin();
+  const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [showTimelineImport, setShowTimelineImport] = useState(false);
   // 管理工具整區收合。預設收起來 —— 平常來這一頁是要看地圖的，
@@ -1142,6 +1144,9 @@ export default function MapPage() {
         animateOn={ANIMATE_ON}
         timelineLines={showTimeline ? timelineLines : undefined}
         focusPoint={focusPoint}
+        // 點縮圖就跳去那本相簿。地圖上看到一張照片時，下一個想做的事
+        // 幾乎都是「看那天其他張」—— 編輯模式下點擊是選取，FootprintMap 自己擋掉了
+        onSelectPhoto={(p) => router.push(`/album?id=${p.album_id}`)}
       />
 
       {/* 圖例只剩線。照片的點不再依座標來源分色（見 FootprintMap 的 photo-points 圖層）——
