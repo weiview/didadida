@@ -11,7 +11,8 @@ interface Props {
   onClose: () => void;
   /** 挑好照片後交回相簿頁，由既有的 AssignPlaceModal 接手 */
   onAssignPlace: (photoIds: number[]) => void;
-  onRefresh: () => Promise<void> | void;
+  /** 重抓相簿資料。回傳值這裡用不到，宣告成 unknown 讓呼叫端可以直接丟 loadData 進來 */
+  onRefresh: () => Promise<unknown> | unknown;
 }
 
 const hasGeo = (p: Photo) => typeof p.lat === 'number' && typeof p.lng === 'number';

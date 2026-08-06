@@ -168,6 +168,25 @@ function sanitizePhotoIds(raw: unknown, max = 2000): number[] {
   return [...new Set(ids)].slice(0, max);
 }
 
+/**
+ * 把 id 陣列切成一塊一塊，因為 **D1 一句 SQL 最多只能綁 100 個參數**。
+ * 超過就是 `D1_ERROR: too many SQL variables`，而且是在執行期才炸 —— 開發時
+ * 選個三五張都好好的，使用者一次全選一百多張才踩到。
+ *
+ * `reserve` 是那句 SQL 除了 id 以外還要綁幾個（lat、lng、place_name 之類），
+ * 從額度裡先扣掉。切出來的每塊各自 prepare，用 `env.DB.batch()` 一次送出去：
+ * 一個 round trip，而且 batch 本身就是一筆交易，不會做到一半只更新了前 80 張。
+ */
+function chunkIds(ids: number[], reserve = 0, limit = 100): number[][] {
+  const size = Math.max(1, limit - reserve);
+  const out: number[][] = [];
+  for (let i = 0; i < ids.length; i += size) out.push(ids.slice(i, i + size));
+  return out;
+}
+
+/** 給 chunkIds 切出來的每一塊產生 `?,?,?` */
+const placeholdersFor = (chunk: unknown[]) => chunk.map(() => "?").join(",");
+
 /** SQLite 日期修飾字串。-90 -> '-90 minutes'、90 -> '+90 minutes' */
 const minutesModifier = (n: number) => `${n >= 0 ? '+' : ''}${n} minutes`;
 
@@ -285,18 +304,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
           ) WHERE rn <= 10
         `).all();
         
-        // 每本相簿的照片總數。preview_photos 只取前 10 張，數不出總數，
-        // 而足跡地圖的張數徽章要報的就是「這本相簿一共幾張」
-        const { results: photoCounts } = await env.DB.prepare(
-          "SELECT album_id, COUNT(*) AS n FROM Photo GROUP BY album_id"
-        ).all();
-        const countByAlbum = new Map<number, number>(
-          photoCounts.map((r: any) => [Number(r.album_id), Number(r.n)])
-        );
-
         const albumsWithPhotos = albums.map((album: any) => {
           const albumPhotos = allPhotos.filter((p: any) => p.album_id === album.id).map((p: any) => p.url);
-          return { ...album, preview_photos: albumPhotos, photo_count: countByAlbum.get(album.id) ?? 0 };
+          return { ...album, preview_photos: albumPhotos };
         });
 
         return new Response(JSON.stringify(albumsWithPhotos), { headers });
@@ -988,8 +998,11 @@ function hammingDistance(hex1: string, hex2: string): number {
             }
             if (filesToDelete.length > 0) {
               await env.BUCKET.delete(filesToDelete);
-              const placeholders = validIds.map(() => '?').join(',');
-              await env.DB.prepare(`DELETE FROM Photo WHERE id IN (${placeholders})`).bind(...validIds).run();
+              await env.DB.batch(
+                chunkIds(validIds).map((c) => env.DB.prepare(
+                  `DELETE FROM Photo WHERE id IN (${placeholdersFor(c)})`
+                ).bind(...c)),
+              );
             }
           }
           // 新增新檔案
@@ -1082,11 +1095,13 @@ function hammingDistance(hex1: string, hex2: string): number {
           return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
         }
 
-        const ph = ids.map(() => "?").join(",");
-        const { results: sel } = await env.DB.prepare(`
-          SELECT p.id, p.album_id, p.geo_source, ${LOCAL_TIME_EXPR} AS local_time
-          FROM Photo p WHERE p.id IN (${ph})
-        `).bind(...ids).all();
+        const selChunks = await env.DB.batch(
+          chunkIds(ids).map((c) => env.DB.prepare(`
+            SELECT p.id, p.album_id, p.geo_source, ${LOCAL_TIME_EXPR} AS local_time
+            FROM Photo p WHERE p.id IN (${placeholdersFor(c)})
+          `).bind(...c)),
+        );
+        const sel = selChunks.flatMap((r) => (r.results ?? []) as any[]);
 
         const times = (sel as any[]).map(r => r.local_time).filter(Boolean).sort();
         const startLocal = times[0] ?? null;
@@ -1098,15 +1113,19 @@ function hammingDistance(hex1: string, hex2: string): number {
         let alsoInRange: any[] = [];
         if (startLocal && endLocal && albumIds.length > 0) {
           const aph = albumIds.map(() => "?").join(",");
+          // 「排除已選取的那些」改在 JS 做，不寫成 NOT IN (?,?,…)：
+          // 那串會把 id 全部塞進綁定參數，破 D1 的 100 個上限。這裡也切不了塊 ——
+          // NOT IN 要一次排除全部，拆開跑每塊都會把別塊的 id 當成漏網之魚撈回來。
+          // 相簿內、落在時間範圍內的照片本來就沒幾張，撈回來過濾很便宜。
           const { results } = await env.DB.prepare(`
             SELECT p.id, p.title, COALESCE(p.thumb_url, p.url) AS url, ${LOCAL_TIME_EXPR} AS local_time
             FROM Photo p
             WHERE p.album_id IN (${aph})
-              AND p.id NOT IN (${ph})
               AND ${LOCAL_TIME_EXPR} BETWEEN ? AND ?
             ORDER BY local_time ASC
-          `).bind(...albumIds, ...ids, startLocal, endLocal).all();
-          alsoInRange = results as any[];
+          `).bind(...albumIds, startLocal, endLocal).all();
+          const selected = new Set(ids);
+          alsoInRange = (results as any[]).filter((r) => !selected.has(r.id));
         }
 
         return new Response(JSON.stringify({
@@ -1137,20 +1156,26 @@ function hammingDistance(hex1: string, hex2: string): number {
         const placeName = typeof body.placeName === 'string' ? body.placeName : null;
         const overwriteExif = body.overwriteExif === true;
 
-        const ph = ids.map(() => "?").join(",");
         // 這是使用者親手指定，權威最高，唯一預設不動的是照片自帶的 GPS。
         // 用 IS NOT 而非 != ：後者遇到 geo_source IS NULL 會得到 NULL，
         // 反而把最需要寫入的「還沒定位」那些照片排除掉。
         const guard = overwriteExif ? "" : " AND geo_source IS NOT 'exif'";
-        const upd = await env.DB.prepare(`
-          UPDATE Photo SET lat = ?, lng = ?, place_name = ?, geo_source = 'manual'
-          WHERE id IN (${ph})${guard}
-        `).bind(lat, lng, placeName, ...ids).run();
+        // lat、lng、place_name 三個綁定要先從 100 的額度裡扣掉
+        const updChunks = await env.DB.batch(
+          chunkIds(ids, 3).map((c) => env.DB.prepare(`
+            UPDATE Photo SET lat = ?, lng = ?, place_name = ?, geo_source = 'manual'
+            WHERE id IN (${placeholdersFor(c)})${guard}
+          `).bind(lat, lng, placeName, ...c)),
+        );
+        const changed = updChunks.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
 
         // 推導時間區段
-        const { results: sel } = await env.DB.prepare(`
-          SELECT ${LOCAL_TIME_EXPR} AS local_time FROM Photo p WHERE p.id IN (${ph})
-        `).bind(...ids).all();
+        const selChunks = await env.DB.batch(
+          chunkIds(ids).map((c) => env.DB.prepare(`
+            SELECT ${LOCAL_TIME_EXPR} AS local_time FROM Photo p WHERE p.id IN (${placeholdersFor(c)})
+          `).bind(...c)),
+        );
+        const sel = selChunks.flatMap((r) => (r.results ?? []) as any[]);
         const times = (sel as any[]).map(r => r.local_time).filter(Boolean).sort();
         const startLocal = times[0] ?? null;
         const endLocal = times[times.length - 1] ?? null;
@@ -1169,8 +1194,8 @@ function hammingDistance(hex1: string, hex2: string): number {
 
         return new Response(JSON.stringify({
           success: true,
-          updated: (upd.meta as any)?.changes ?? 0,
-          skippedExif: ids.length - ((upd.meta as any)?.changes ?? 0),
+          updated: changed,
+          skippedExif: ids.length - changed,
           startLocal,
           endLocal,
           segmentId,
@@ -1383,11 +1408,13 @@ function hammingDistance(hex1: string, hex2: string): number {
           return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
         }
         const value = body?.geoPrivate === 0 || body?.geoPrivate === false ? 0 : 1;
-        const ph = ids.map(() => "?").join(",");
-        const res = await env.DB.prepare(
-          `UPDATE Photo SET geo_private = ? WHERE id IN (${ph})`
-        ).bind(value, ...ids).run();
-        return new Response(JSON.stringify({ success: true, updated: (res.meta as any)?.changes ?? 0 }), { headers });
+        const res = await env.DB.batch(
+          chunkIds(ids, 1).map((c) => env.DB.prepare(
+            `UPDATE Photo SET geo_private = ? WHERE id IN (${placeholdersFor(c)})`
+          ).bind(value, ...c)),
+        );
+        const updated = res.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
+        return new Response(JSON.stringify({ success: true, updated }), { headers });
       }
 
       // 路由：切換相簿層級的地圖隱私
@@ -1503,18 +1530,19 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
 
         const mod = minutesModifier(minutes);
-        const ph = ids.map(() => "?").join(",");
         // 一句 UPDATE 做完，不逐張讀回來在 JS 算：D1 免費額度是按寫入列數計費的，
         // 這樣整批只花 ids.length 列。同一句 UPDATE 裡右側取到的都是舊值。
-        const res = await env.DB.prepare(`
-          UPDATE Photo SET
-            taken_at = strftime('%Y-%m-%dT%H:%M:%fZ', taken_at, ?),
-            taken_at_local = strftime('%Y-%m-%d %H:%M:%S', taken_at_local, ?),
-            time_source = 'manual'
-          WHERE id IN (${ph}) AND taken_at IS NOT NULL
-        `).bind(mod, mod, ...ids).run();
+        const res = await env.DB.batch(
+          chunkIds(ids, 2).map((c) => env.DB.prepare(`
+            UPDATE Photo SET
+              taken_at = strftime('%Y-%m-%dT%H:%M:%fZ', taken_at, ?),
+              taken_at_local = strftime('%Y-%m-%d %H:%M:%S', taken_at_local, ?),
+              time_source = 'manual'
+            WHERE id IN (${placeholdersFor(c)}) AND taken_at IS NOT NULL
+          `).bind(mod, mod, ...c)),
+        );
 
-        const updated = (res.meta as any)?.changes ?? 0;
+        const updated = res.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
         return new Response(JSON.stringify({
           success: true,
           updated,
@@ -1537,15 +1565,16 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
 
         const tz = body.tzOffsetMinutes;
-        const ph = ids.map(() => "?").join(",");
-        const res = await env.DB.prepare(`
-          UPDATE Photo SET
-            tz_offset_minutes = ?,
-            taken_at_local = strftime('%Y-%m-%d %H:%M:%S', taken_at, ?)
-          WHERE id IN (${ph}) AND taken_at IS NOT NULL
-        `).bind(tz, minutesModifier(tz), ...ids).run();
+        const res = await env.DB.batch(
+          chunkIds(ids, 2).map((c) => env.DB.prepare(`
+            UPDATE Photo SET
+              tz_offset_minutes = ?,
+              taken_at_local = strftime('%Y-%m-%d %H:%M:%S', taken_at, ?)
+            WHERE id IN (${placeholdersFor(c)}) AND taken_at IS NOT NULL
+          `).bind(tz, minutesModifier(tz), ...c)),
+        );
 
-        const updated = (res.meta as any)?.changes ?? 0;
+        const updated = res.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
         return new Response(JSON.stringify({
           success: true,
           updated,
@@ -1978,11 +2007,13 @@ function hammingDistance(hex1: string, hex2: string): number {
 
         const stmts: D1PreparedStatement[] = [];
         if (deleteIds.length > 0) {
-          // 一定要同時比對 day_key：否則帶著別天的 id 進來就能刪掉任意軌跡點
-          const holes = deleteIds.map(() => '?').join(',');
-          stmts.push(env.DB.prepare(
-            `DELETE FROM TrackPoint WHERE day_key = ? AND id IN (${holes})`
-          ).bind(dayKey, ...deleteIds));
+          // 一定要同時比對 day_key：否則帶著別天的 id 進來就能刪掉任意軌跡點。
+          // 上限是 5000 點，遠超過 D1 一句 100 個綁定參數的限制，一定要切塊
+          for (const c of chunkIds(deleteIds, 1)) {
+            stmts.push(env.DB.prepare(
+              `DELETE FROM TrackPoint WHERE day_key = ? AND id IN (${placeholdersFor(c)})`
+            ).bind(dayKey, ...c));
+          }
         }
         for (const p of insert) {
           stmts.push(env.DB.prepare(

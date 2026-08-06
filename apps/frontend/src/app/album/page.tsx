@@ -162,10 +162,11 @@ function AlbumContent() {
 
   const [currentCoverPhotoUrl, setCurrentCoverPhotoUrl] = useState<string | null>(null);
 
-  const loadData = async () => {
-    if (!id) return;
+  /** 回傳重抓到的照片，讓呼叫端不必等 state 生效就能依最新資料做決定 */
+  const loadData = async (): Promise<Photo[]> => {
+    if (!id) return [];
     setLoading(true);
-    
+
     const [allAlbums, photoData, tags] = await Promise.all([
       fetchAlbums(),
       fetchPhotos(id),
@@ -178,10 +179,12 @@ function AlbumContent() {
       setCurrentCoverPhotoUrl(current.cover_photo_url || null);
     }
     
-    setPhotos(photoData || []);
+    const fresh = photoData || [];
+    setPhotos(fresh);
     setAvailableTags(tags);
-    
+
     setLoading(false);
+    return fresh;
   };
 
   useEffect(() => {
@@ -1328,15 +1331,34 @@ function AlbumContent() {
         albumId={id ? Number(id) : undefined}
         onClose={() => {
           setShowAssignPlace(false);
-          // 從打卡畫面來的就回去，讓使用者接著處理下一批
+          // 取消：原路退回，什麼都沒改，不用重抓
           if (returnToCheckin) { setReturnToCheckin(false); setShowPlaceCheckin(true); }
         }}
-        onDone={({ updated, skippedExif }) => {
+        onDone={async ({ updated, skippedExif }) => {
+          setShowAssignPlace(false);
           setSelectedPhotos([]);
           lastSelectedIndexRef.current = null;
-          loadData();
+          // 一定要等重抓完才決定下一步：不等的話跳回打卡畫面看到的是舊資料，
+          // 剛指定好的那批還會掛在「沒有位置」底下
+          const fresh = await loadData();
           const skipped = skippedExif > 0 ? `，${skippedExif} 張已有 GPS 未覆蓋` : '';
-          alert(`已為 ${updated} 張照片指定地點${skipped}`);
+
+          if (!returnToCheckin) {
+            alert(`已為 ${updated} 張照片指定地點${skipped}`);
+            return;
+          }
+
+          setReturnToCheckin(false);
+          // 打卡畫面上還有事可做嗎？缺座標、或有座標但沒地名，都算還沒完
+          const left = fresh.filter(
+            (p) => p.lat == null || p.lng == null || !p.place_name?.trim(),
+          ).length;
+          if (left > 0) {
+            alert(`已為 ${updated} 張照片指定地點${skipped}，還有 ${left} 張要處理`);
+            setShowPlaceCheckin(true);
+          } else {
+            alert(`已為 ${updated} 張照片指定地點${skipped}。這本相簿都有位置與地名了 🎉`);
+          }
         }}
       />
 
