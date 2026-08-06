@@ -9,6 +9,13 @@
   --shadow-color: rgba(0, 0, 0, 0.05);
   --accent-color: #d1bfae; /* 柔和的奶茶色/大地色系作為點綴 */
   --transition-speed: 0.3s;
+
+  /* 浮動控制項那片玻璃的色溫（見下方 .glass-control）。放在 :root 是因為
+     編輯模式的動作列在 page.module.css 裡，也要引用同一組值 —— 兩邊各寫一次
+     遲早會走鐘。格式是裸的 R, G, B，好讓 rgba() 就地套上各自的 alpha */
+  --glass-tint-accent: 209, 191, 174;
+  /* 刪除鈕專用。比 #e57373 深，因為玻璃是半透明的，底色一淡白字就讀不出來 */
+  --glass-tint-danger: 183, 62, 62;
 }
 
 * {
@@ -54,4 +61,105 @@ h1, h2, h3, h4, h5, h6 {
 /* 效能優化：滾動時停用滑鼠事件，避免觸發大量 hover 重繪 */
 body.is-scrolling * {
   pointer-events: none !important;
+}
+
+/* 但浮動控制項要例外。慣性捲動會一路發 scroll 事件，is-scrolling 又要等最後一次
+   之後 150ms 才拔掉 —— 手指離開螢幕就去按「回到頂端」正好落在這個空窗，
+   點下去毫無反應。這些鈕本來就浮在最上層，不會觸發格線的 hover 重繪。
+   只有真的能按的時候才掛這個 class（見 ScrollToTopButton / FabMenu），
+   藏起來時仍然要讓 pointer-events: none 生效，免得擋住底下的東西。 */
+body.is-scrolling .floating-control,
+body.is-scrolling .floating-control * {
+  pointer-events: auto !important;
+}
+
+/* ── 右下角浮動控制項的共用材質 ────────────────────────────────────────
+ *
+ * 四層疊出「一片有厚度的玻璃」：
+ *   1. backdrop-filter 把背後的照片糊掉並拉高飽和度，糊成一片色而不是一片灰
+ *   2. 半透明底色壓一層暖調，讓它屬於這個網站而不是浮在上面的系統元件
+ *   3. 兩道 inset ——上緣白線是打在邊緣的高光，下緣暗線是自身的厚度
+ *   4. 兩道外陰影 ——近的做接觸感，遠的做懸浮感；只有一道會像貼紙
+ *
+ * alpha 不能再往下調。背後是整面照片牆，透明度越高對比就越不可控，
+ * 字壓在亮色照片上會直接讀不出來（Liquid Glass 最常被抱怨的就是這點）。
+ * 邊框也是必要的：全透明的控制項會失去「這是一顆可以按的東西」的形狀。
+ */
+.glass-control {
+  --glass-tint: 255, 253, 250;
+  --glass-alpha: 0.72;
+  /* 位移／旋轉由各自的狀態決定，按下去的縮放要疊在它上面，所以拆成變數 */
+  --glass-transform: none;
+
+  background: rgba(var(--glass-tint), var(--glass-alpha));
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  color: #4a4036;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.75),
+    inset 0 -1px 0 rgba(120, 100, 84, 0.10),
+    0 8px 24px -6px rgba(87, 72, 58, 0.30),
+    0 2px 6px -2px rgba(87, 72, 58, 0.20);
+  transform: var(--glass-transform);
+  transition:
+    transform 0.2s cubic-bezier(0.34, 1.4, 0.64, 1),
+    box-shadow 0.2s ease,
+    opacity 0.2s ease,
+    background-color 0.2s ease;
+}
+
+.glass-control:hover:not(:disabled) {
+  background: rgba(var(--glass-tint), calc(var(--glass-alpha) + 0.1));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    inset 0 -1px 0 rgba(120, 100, 84, 0.10),
+    0 12px 30px -6px rgba(87, 72, 58, 0.36),
+    0 3px 8px -2px rgba(87, 72, 58, 0.22);
+}
+
+/* 按下去縮一點：觸控沒有 hover，這是手機上唯一的回饋 */
+.glass-control:active:not(:disabled) {
+  transform: var(--glass-transform) scale(0.93);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.6),
+    0 3px 10px -4px rgba(87, 72, 58, 0.3);
+  transition-duration: 0.08s;
+}
+
+.glass-control:focus-visible {
+  outline: 2px solid rgba(122, 102, 84, 0.75);
+  outline-offset: 2px;
+}
+
+/* 動作那一家（FAB 與展開的藥丸）走主題色，導覽用的回到頂端鈕留暖白，
+   兩者材質相同、只差色溫 —— 同一片玻璃，不同的份量 */
+.glass-accent {
+  --glass-tint: var(--glass-tint-accent);
+  --glass-alpha: 0.8;
+}
+
+/* 瀏覽器沒有 backdrop-filter 就沒有「糊掉背景」這回事，
+   半透明只會變成照片直接透出來壓在字上。補足不透明度 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass-control {
+    --glass-alpha: 0.96;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass-control {
+    --glass-alpha: 0.97;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .glass-control {
+    transition-duration: 0.01ms;
+  }
+  .glass-control:active:not(:disabled) {
+    transform: var(--glass-transform);
+  }
 }
