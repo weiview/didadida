@@ -72,25 +72,6 @@
   color: var(--text-color);
 }
 
-.uploadButton {
-  background-color: var(--accent-color);
-  color: #fff;
-  border: none;
-  padding: 0.75rem 1.5rem;
-  border-radius: 30px;
-  font-size: 1rem;
-  cursor: pointer;
-  transition: opacity var(--transition-speed) ease, transform 0.2s ease;
-  font-weight: 400;
-  letter-spacing: 0.05em;
-  box-shadow: 0 4px 15px rgba(209, 191, 174, 0.4);
-}
-
-.uploadButton:hover {
-  opacity: 0.9;
-  transform: translateY(-2px);
-}
-
 .photoGrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -201,12 +182,6 @@
   padding: 2px 8px;
   border-radius: 12px;
   font-size: 0.75rem;
-}
-
-.uploadButton:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  transform: none;
 }
 
 .loading, .emptyState {
@@ -373,28 +348,51 @@
 }
   
 @keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }  
-.dropdownMenu { animation: fadeIn 0.2s ease-out forwards; } 
 
 /* 時間軸滾動條樣式 (類似 Google 相片滾動軸) */
 .timelineTrack {
   position: fixed;
   right: 6px;
-  top: 50%;
-  transform: translateY(-50%);
+  /*
+   * 上下用固定邊界圈出一條帶，而不是 top:50% 垂直置中。
+   *
+   * 置中時整條的高度會隨月份數量長（marks 原本可以吃到 65vh），長到一定程度
+   * 就會伸進右下角，蓋掉「回到頂端」鈕和 FAB —— 時間軸 z-index 2000，那兩個
+   * 才 900／950，重疊到就是按不到。管理員的情況更早發生：FAB 把回到頂端鈕
+   * 往上墊了 68px，正好墊進這條的行進路線。
+   *
+   * 下緣直接讓開 corner stack（跟回到頂端鈕讀同一個變數，再加它自己的高度
+   * 與間距），兩邊從此在幾何上不可能相碰，不必再靠 z-index 猜輸贏。
+   */
+  top: 88px;
+  bottom: calc(var(--corner-stack-bottom, max(16px, env(safe-area-inset-bottom))) + 56px);
   z-index: 2000;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
+  /* 高度改由上下邊界決定，內容自己在帶子裡置中 */
+  justify-content: center;
   gap: 10px;
   opacity: 0;
+  /*
+   * visibility 而不是 pointer-events 來控制「看不見時不吃點擊」：
+   * hidden 會連同所有子孫一起退出 hit-test，就算子孫自己寫了 pointer-events: auto
+   * 也一樣 —— 這正是先前那顆隱形 bubble 攔到點擊的破口。
+   * 放進 transition 之後，淡出的 0.3s 內它仍然是 visible，淡完才真的消失。
+   */
+  visibility: hidden;
+  /* 帶子本身永遠不吃點擊：它現在有 500px 以上的高度，中間大半是空的，
+     整塊變成點擊目標會把右緣的照片全擋掉。只有刻度那一塊需要可按 */
   pointer-events: none;
-  transition: opacity 0.3s ease, transform 0.3s ease;
+  transition: opacity 0.3s ease, visibility 0.3s ease;
 }
 
+/* 滑鼠停在刻度上時 :hover 會一路往上匹配到 track（父層自己 pointer-events: none
+   不影響這件事），所以捲動停了之後只要游標還在上面就不會收掉 */
 .timelineTrack:hover,
 .timelineActive {
   opacity: 1;
-  pointer-events: auto;
+  visibility: visible;
 }
 
 .timelineBubble {
@@ -408,7 +406,15 @@
   margin-bottom: 8px;
   white-space: nowrap;
   animation: fadeIn 0.2s ease;
-  pointer-events: auto;
+  /*
+   * 這只是一顆日期標籤，永遠不該是點擊目標。
+   *
+   * 它原本寫死 pointer-events: auto，蓋過父層 track 隱藏時的 none —— 結果整條
+   * 淡出成 opacity: 0 之後，這塊 95x34 的透明區還在 z-index 2000 上吃點擊，
+   * 而且滑鼠碰到它就觸發 .timelineTrack:hover，把整條看不見的軌道連同它的
+   * pointer-events 一起復活。使用者看到的是「這裡明明空的，按下去卻沒反應」。
+   */
+  pointer-events: none;
 }
 
 .timelineMarks {
@@ -421,8 +427,13 @@
   padding: 14px 10px;
   border-radius: 24px;
   border: 1px solid rgba(255, 255, 255, 0.15);
-  max-height: 65vh;
+  /* 上限交給父層那條帶（見 .timelineTrack）。min-height: 0 是 flex 子項要能
+     真的溢出捲動的前提，少了它 overflow-y 不會生效 */
+  max-height: 100%;
+  min-height: 0;
   overflow-y: auto;
+  /* 整條 track 裡唯一可按的區塊。看不見時由 track 的 visibility: hidden 一併關掉 */
+  pointer-events: auto;
   scrollbar-width: none; /* Firefox */
   box-shadow: 0 8px 32px rgba(0,0,0,0.3);
 }

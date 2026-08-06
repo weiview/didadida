@@ -17,6 +17,8 @@ import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
 import FilterBottomSheet from "@/components/FilterBottomSheet";
+import FabMenu, { type FabAction } from "@/components/FabMenu";
+import BottomActionBar from "@/components/BottomActionBar";
 
 function AlbumContent() {
   const searchParams = useSearchParams();
@@ -48,22 +50,6 @@ function AlbumContent() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isBatchDeleting, setIsBatchDeleting] = useState(false);
   const [isEditingPhotos, setIsEditingPhotos] = useState(false);
-  const [showUploadMenu, setShowUploadMenu] = useState(false);
-  const uploadMenuRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (uploadMenuRef.current && !uploadMenuRef.current.contains(event.target as Node)) {
-        setShowUploadMenu(false);
-      }
-    };
-    if (showUploadMenu) {
-      document.addEventListener("mousedown", handleClickOutside);
-    }
-    return () => {
-      document.removeEventListener("mousedown", handleClickOutside);
-    };
-  }, [showUploadMenu]);
 
   // Google Sync State
   const [syncingGoogle, setSyncingGoogle] = useState(false);
@@ -343,6 +329,63 @@ function AlbumContent() {
 
   const handleUploadClick = () => {
     fileInputRef.current?.click();
+  };
+
+  /**
+   * 右下角浮動鈕展開後的那串動作。`actions[0]` 貼著 FAB，所以最常用的「上傳照片」擺第一。
+   * 原本「上傳照片」是一顆點了會再展開下拉選單的按鈕，收進 FabMenu 之後直接攤平成兩項。
+   */
+  const buildFabActions = (): FabAction[] => {
+    if (uploading || syncingGoogle) {
+      // 上傳／匯入中：進度另有整條進度列，這裡只是別讓人以為按鈕不見了
+      return [{
+        key: 'busy',
+        disabled: true,
+        label: syncingGoogle
+          ? (syncProgress ? `匯入中... (${syncProgress.current}/${syncProgress.total})` : "準備 Google 相簿...")
+          : (uploadProgress ? `上傳中... (${uploadProgress.current}/${uploadProgress.total})` : "上傳中..."),
+      }];
+    }
+
+    return [
+      {
+        key: 'upload',
+        label: '上傳照片',
+        // 兩種來源收成一扇門。展開四顆藥丸時「上傳照片」跟「從 Google 相簿匯入」
+        // 並排，看起來像兩件不相干的事，其實只是同一件事的兩個來源
+        children: [
+          {
+            key: 'local',
+            label: '本機上傳',
+            // 排在最貼近 FAB 的位置：Picker 會把 GPS 洗掉，本機上傳才留得住 EXIF，
+            // 是預設該走的路
+            title: '從這台裝置選檔案。EXIF（含 GPS）會完整保留',
+            onClick: handleUploadClick,
+          },
+          {
+            key: 'google',
+            label: hasGoogleToken ? '從 Google 相簿匯入' : '連結 Google 相簿',
+            title: 'Google Picker 不會給位置資訊，匯入後要自己補地點',
+            onClick: () => {
+              let popup: Window | null = null;
+              if (hasGoogleToken) {
+                // 絕對同步開啟空視窗取得權限，突破任何阻擋器
+                popup = window.open("", "GooglePicker", "width=1000,height=800,menubar=no,toolbar=no,location=no,status=no");
+                if (popup) popup.document.write("<html><body style='font-family:sans-serif;text-align:center;margin-top:20%;'>載入 Google 相簿中...</body></html>");
+              }
+              handleGoogleSync(null, popup);
+            },
+          },
+        ],
+      },
+      {
+        key: 'place',
+        label: '地點',
+        title: '整本相簿攤開，照日期看哪些照片還缺位置或地名',
+        onClick: () => setShowPlaceCheckin(true),
+      },
+      { key: 'edit', label: '編輯照片', onClick: () => setIsEditingPhotos(true) },
+    ];
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -967,118 +1010,16 @@ function AlbumContent() {
               </div>
             </div>
           </FilterBottomSheet>
+          {/* 管理用的按鈕都收進右下角的 FabMenu，頁首只留搜尋與篩選 */}
           {isAdmin && (
-            <div style={{ display: 'flex', gap: '10px' }}>
-              <button
-                className={`${styles.uploadButton} ${isEditingPhotos ? styles.primary : ''}`}
-                onClick={() => {
-                  if (isEditingPhotos) {
-                    setIsEditingPhotos(false);
-                    setSelectedPhotos([]);
-                  } else {
-                    setIsEditingPhotos(true);
-                  }
-                }}
-              >
-                {isEditingPhotos ? '完成' : '編輯'}
-              </button>
-
-              {!isEditingPhotos && (
-                <button
-                  className={styles.uploadButton}
-                  onClick={() => setShowPlaceCheckin(true)}
-                  title="整本相簿攤開，照日期看哪些照片還缺位置或地名"
-                >
-                  📍 地點
-                </button>
-              )}
-
-              {!isEditingPhotos && (
-                <div style={{ position: 'relative' }}>
-                  <input 
-                    type="file" 
-                    ref={fileInputRef} 
-                    style={{ display: 'none' }} 
-                    accept="image/jpeg, image/png, image/webp, image/heic, image/heif"
-                    multiple
-                    onChange={handleFileChange}
-                  />
-                  
-                  {syncingGoogle || uploading ? (
-                    <button 
-                      className={pageStyles.createButton || styles.uploadButton} 
-                      disabled
-                    >
-                      {syncingGoogle 
-                        ? (syncProgress ? `匯入中... (${syncProgress.current}/${syncProgress.total})` : "準備 Google 相簿...") 
-                        : (uploadProgress ? `上傳中... (${uploadProgress.current}/${uploadProgress.total})` : "上傳中...")}
-                    </button>
-                  ) : (
-                    <>
-                        <button 
-                          className={pageStyles.createButton || styles.uploadButton} 
-                          onClick={() => setShowUploadMenu(!showUploadMenu)}
-                        >
-                          上傳照片
-                        </button>
-
-                      {showUploadMenu && (
-                        <div 
-                          ref={uploadMenuRef}
-                          className={styles.dropdownMenu}
-                          style={{
-                            position: 'absolute',
-                            top: 'calc(100% + 5px)',
-                            right: 0,
-                            background: 'var(--card-bg)',
-                            border: '1px solid var(--border-color)',
-                            borderRadius: '10px',
-                            boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
-                            backdropFilter: 'blur(10px)',
-                            overflow: 'hidden',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            zIndex: 100,
-                            minWidth: '180px'
-                          }}>
-                          <button 
-                            style={{ padding: '12px 16px', border: 'none', background: 'transparent', color: 'var(--text-color)', cursor: 'pointer', textAlign: 'left', fontSize: '0.95rem', whiteSpace: 'nowrap' }}
-                            onClick={() => { setShowUploadMenu(false); fileInputRef.current?.click(); }}
-                            onMouseOver={(e) => e.currentTarget.style.background = 'var(--bg-color)'}
-                            onMouseOut={(e) => e.currentTarget.style.background = 'transparent'}
-                          >
-                            選擇本地照片
-                          </button>
-                          <div style={{ height: '1px', background: 'var(--border-color)' }}></div>
-                          <button 
-                            style={{ 
-                              padding: '12px 16px', border: 'none', background: 'transparent', 
-                              color: 'var(--text-color)', cursor: 'pointer', 
-                              textAlign: 'left', fontSize: '0.95rem', whiteSpace: 'nowrap' 
-                            }}
-                            onClick={() => { 
-                              setShowUploadMenu(false); 
-                              
-                              let popup: Window | null = null;
-                              if (hasGoogleToken) {
-                                // 絕對同步開啟空視窗取得權限，突破任何阻擋器
-                                popup = window.open("", "GooglePicker", "width=1000,height=800,menubar=no,toolbar=no,location=no,status=no");
-                                if (popup) popup.document.write("<html><body style='font-family:sans-serif;text-align:center;margin-top:20%;'>載入 Google 相簿中...</body></html>");
-                              }
-                              handleGoogleSync(null, popup);
-                            }}
-                            onMouseOver={(e) => { e.currentTarget.style.background = 'var(--bg-color)'; }}
-                            onMouseOut={(e) => { e.currentTarget.style.background = 'transparent'; }}
-                          >
-                            {!hasGoogleToken ? "連結 Google 相簿" : "從 Google 相簿匯入"}
-                          </button>
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
+            <input
+              type="file"
+              ref={fileInputRef}
+              style={{ display: 'none' }}
+              accept="image/jpeg, image/png, image/webp, image/heic, image/heif"
+              multiple
+              onChange={handleFileChange}
+            />
           )}
         </div>
       </div>
@@ -1239,9 +1180,14 @@ function AlbumContent() {
         />
       )}
 
+      {/* 右下角浮動操作鈕。編輯模式下交棒給底部動作列，所以這裡給空陣列 */}
+      <FabMenu
+        actions={!isAdmin || isEditingPhotos ? [] : buildFabActions()}
+      />
+
       {/* 底部動作列 (編輯模式) */}
       {isEditingPhotos && (
-        <div className={pageStyles.actionBar}>
+        <BottomActionBar className={pageStyles.actionBar}>
           <button
             className={pageStyles.actionButton}
             onClick={() => {
@@ -1281,7 +1227,18 @@ function AlbumContent() {
           >
             {isBatchDeleting ? '刪除中...' : `刪除 ${selectedPhotos.length} 個項目`}
           </button>
-        </div>
+
+          {/* 「編輯／完成」的切換鈕原本在頁首，編輯模式下 FAB 收起，出口就放在這排的尾端 */}
+          <button
+            className={`${pageStyles.actionButton} ${pageStyles.primary}`}
+            onClick={() => {
+              setIsEditingPhotos(false);
+              setSelectedPhotos([]);
+            }}
+          >
+            完成
+          </button>
+        </BottomActionBar>
       )}
 
       {/* Slide Confirm Modal */}

@@ -181,24 +181,6 @@
   text-align: left;
 }
 
-.createButton {
-  background: var(--accent-color);
-  color: white;
-  border: none;
-  padding: 0.75rem 1.5rem;
-  border-radius: 2rem;
-  font-size: 1rem;
-  cursor: pointer;
-  transition: all var(--transition-speed) ease;
-  box-shadow: 0 4px 15px rgba(209, 191, 174, 0.3);
-}
-
-.createButton:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(209, 191, 174, 0.5);
-  background: #c3b0a0;
-}
-
 .loading, .emptyState {
   text-align: center;
   color: var(--text-light);
@@ -320,12 +302,48 @@
 }
 
 .actionBar { position: fixed; bottom: 2rem; right: 2rem; display: flex; gap: 1rem; z-index: 100; align-items: center; }
-.actionButton { background: var(--card-bg); color: var(--text-color); border: 1px solid var(--border-color); padding: 0.75rem 1.5rem; border-radius: 2rem; font-size: 1rem; cursor: pointer; transition: all var(--transition-speed) ease; box-shadow: 0 4px 15px rgba(209, 191, 174, 0.3); }
-.actionButton:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(209, 191, 174, 0.5); }
-.actionButton.danger { color: white; background: #e57373; border: none; }
-.actionButton.danger:hover { background: #d32f2f; }
-.actionButton.primary { background: var(--accent-color); color: white; border: none; }
-.actionButton.primary:hover { background: #c3b0a0; }
+
+/*
+ * 編輯模式的動作列。跟右下角的 FAB／回到頂端鈕同一片玻璃 —— 它們佔的是同一個
+ * 角落，只是輪流上場（進編輯模式 FAB 收起、這排接手），材質不同會看起來像
+ * 兩個不同時期做的東西。
+ *
+ * 底色、邊框、陰影、按壓縮放全部來自 globals.css 的 .glass-control；這裡只留
+ * 版面與字級，還有各自的色溫。**不要在這裡重寫 .glass-control 已經有的屬性** ——
+ * 兩邊特異性都是 (0,1,0)，誰贏取決於 CSS module 與 globals 的載入順序，
+ * 那個順序不歸我們管。要覆蓋就用複合選擇器（像下面的 .danger）把特異性拉高。
+ */
+.actionButton {
+  composes: glass-control from global;
+  padding: 0.75rem 1.5rem;
+  border-radius: 2rem;
+  font-size: 1rem;
+  cursor: pointer;
+}
+/* 原本的 translateY(-2px) 改寫進變數：直接寫 transform 會把 :active 的縮放蓋掉 */
+.actionButton:hover:not(:disabled) { --glass-transform: translateY(-2px); }
+
+/* 刪除：整排唯一的破壞性動作，紅色是它的識別，不能跟其他鈕同一個色溫。
+   白字要讀得出來，所以 alpha 比別人高一些 */
+.actionButton.danger { --glass-tint: var(--glass-tint-danger); --glass-alpha: 0.88; color: #fff; }
+/* 主要動作（完成）：跟 FAB 同一個奶茶色。字仍然是深褐色 —— 白字壓在這個亮度
+   的底色上只有 1.9:1，等於看不見 */
+.actionButton.primary { --glass-tint: var(--glass-tint-accent); --glass-alpha: 0.82; }
+
+/* 手機上這排放不下（相簿頁有 5 顆）：讓它靠左界收邊、換行往上長，
+   高度變化由 BottomActionBar 量測後回報給右下角的堆疊。
+   要放在 .actionButton 之後 —— 特異性一樣，@media 不加權，寫在前面會被蓋掉 */
+@media (max-width: 768px) {
+  .actionBar {
+    left: 1rem;
+    right: 1rem;
+    bottom: max(1rem, env(safe-area-inset-bottom));
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 0.5rem;
+  }
+  .actionButton { padding: 0.6rem 1.1rem; font-size: 0.9rem; }
+}
 
 .desktopOnly {
   display: flex;

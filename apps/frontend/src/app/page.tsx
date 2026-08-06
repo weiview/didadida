@@ -10,6 +10,8 @@ import SlideConfirmModal from "@/components/SlideConfirmModal";
 import PhotoLightbox from "./album/PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
 import FilterBottomSheet from "@/components/FilterBottomSheet";
+import FabMenu from "@/components/FabMenu";
+import BottomActionBar from "@/components/BottomActionBar";
 
 function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPressIndex, sortBy, index, handlePointerDown, handlePointerUpOrLeave, handleDragStart, handleDragEnter, handleDragEnd, isSelected, onSelectToggle }: any) {
   const [hovered, setHovered] = useState(false);
@@ -754,41 +756,7 @@ export default function Home() {
               </div>
             </FilterBottomSheet>
           </div>
-          {!isCheckingAuth && (
-            isAdmin ? (
-              <div style={{ display: 'flex', gap: '10px' }}>
-                <button
-                  className={`${styles.createButton} ${isEditingAlbums ? styles.primary : ''}`}
-                  onClick={() => {
-                    if (isEditingAlbums) {
-                      setIsEditingAlbums(false);
-                      setSelectedAlbums([]);
-                    } else {
-                      setIsEditingAlbums(true);
-                    }
-                  }}
-                >
-                  {isEditingAlbums ? '完成' : '編輯'}
-                </button>
-
-                {!isEditingAlbums && (
-                  <button 
-                    className={styles.createButton}
-                    onClick={() => setShowModal(true)}
-                  >
-                    + 建立相簿
-                  </button>
-                )}
-              </div>
-            ) : (
-              <button 
-                className={styles.createButton}
-                onClick={() => setShowLoginModal(true)}
-              >
-                管理員登入
-              </button>
-            )
-          )}
+          {/* 管理／登入的按鈕都收進右下角的 FabMenu，頁首只留搜尋與篩選 */}
         </div>
       </header>
 
@@ -963,9 +931,25 @@ export default function Home() {
         />
       )}
 
+      {/* 右下角浮動操作鈕。編輯模式下交棒給底部動作列，所以這裡給空陣列 */}
+      <FabMenu
+        actions={
+          isCheckingAuth || isEditingAlbums
+            ? []
+            : isAdmin
+              ? [
+                  { key: 'create', label: '建立相簿', icon: '＋', onClick: () => setShowModal(true) },
+                  { key: 'edit', label: '編輯相簿', icon: '✎', onClick: () => setIsEditingAlbums(true) },
+                ]
+              : [
+                  { key: 'login', label: '管理員登入', icon: '🔑', onClick: () => setShowLoginModal(true) },
+                ]
+        }
+      />
+
       {/* 底部動作列 (編輯模式) */}
       {isEditingAlbums && (
-        <div className={styles.actionBar}>
+        <BottomActionBar className={styles.actionBar}>
           <button
             className={styles.actionButton}
             onClick={() => {
@@ -978,7 +962,7 @@ export default function Home() {
           >
             {selectedAlbums.length === displayAlbums.length ? '取消全選' : '全選'}
           </button>
-          
+
           <button
             className={`${styles.actionButton} ${selectedAlbums.length > 0 ? styles.danger : ''}`}
             onClick={() => setShowDeleteConfirm(true)}
@@ -987,7 +971,18 @@ export default function Home() {
           >
             {isBatchDeleting ? '刪除中...' : `刪除 ${selectedAlbums.length} 個項目`}
           </button>
-        </div>
+
+          {/* 「編輯／完成」的切換鈕原本在頁首，編輯模式下 FAB 收起，出口就放在這排的尾端 */}
+          <button
+            className={`${styles.actionButton} ${styles.primary}`}
+            onClick={() => {
+              setIsEditingAlbums(false);
+              setSelectedAlbums([]);
+            }}
+          >
+            完成
+          </button>
+        </BottomActionBar>
       )}
 
       {/* 建立相簿 Modal */}

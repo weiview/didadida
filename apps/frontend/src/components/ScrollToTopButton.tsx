@@ -31,34 +31,41 @@ export default function ScrollToTopButton() {
       type="button"
       aria-label="回到頁面最上方"
       title="回到最上方"
+      // floating-control：捲動中 globals.css 會把全站的 pointer-events 關掉，這是豁免票。
+      //   只在按鈕真的看得到時才掛，藏起來時照樣不吃點擊。
+      // glass-control：跟 FabMenu 同一片玻璃。這裡不加 glass-accent —— 留暖白，
+      //   它是導覽而不是動作，不該跟正上方的 FAB 搶同一份注意力。
+      className={`glass-control${show ? " floating-control" : ""}`}
       onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
       style={{
         position: "fixed",
         // 右下角。左下角在手機上會撞到系統的返回手勢區
         right: "max(16px, env(safe-area-inset-right))",
-        bottom: "max(16px, env(safe-area-inset-bottom))",
+        // 同一個角落還會有浮動操作鈕／編輯模式動作列，它們會把 --corner-stack-bottom
+        // 墊高（見 lib/cornerStack.ts）；沒人佔用時就回到角落本身
+        bottom: "var(--corner-stack-bottom, max(16px, env(safe-area-inset-bottom)))",
         width: 44,
         height: 44,
         borderRadius: "50%",
-        border: "1px solid rgba(148, 163, 184, 0.4)",
-        background: "rgba(255, 255, 255, 0.88)",
-        backdropFilter: "blur(8px)",
-        WebkitBackdropFilter: "blur(8px)",
-        boxShadow: "0 4px 14px rgba(15, 23, 42, 0.18)",
-        color: "#334155",
-        fontSize: 18,
-        lineHeight: 1,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
         cursor: "pointer",
         zIndex: 900,
         // 淡入淡出而不是直接 unmount：突然出現／消失的按鈕會讓人以為誤觸了什麼。
         // 藏起來時一併關掉 pointer-events，否則會擋住底下右下角的東西
         opacity: show ? 1 : 0,
-        transform: show ? "translateY(0)" : "translateY(8px)",
+        ["--glass-transform" as string]: show ? "translateY(0)" : "translateY(8px) scale(0.9)",
         pointerEvents: show ? "auto" : "none",
-        transition: "opacity 0.18s ease, transform 0.18s ease",
-      }}
+        // bottom 會隨 corner stack 變動（FAB／動作列出現時），跟著補一段過場
+        transitionProperty: "transform, box-shadow, opacity, background-color, bottom",
+      } as React.CSSProperties}
     >
-      ↑
+      {/* 用線條圖示取代 ↑ 字元：字型的箭頭在不同平台粗細差很多，也對不準圓心 */}
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+        <line x1="12" y1="19" x2="12" y2="6" />
+        <polyline points="6 12 12 6 18 12" />
+      </svg>
     </button>
   );
 }
