@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbums, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, type UploadedPhoto } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, type UploadedPhoto } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
@@ -153,13 +153,12 @@ function AlbumContent() {
     if (!id) return [];
     setLoading(true);
 
-    const [allAlbums, photoData, tags] = await Promise.all([
-      fetchAlbums(),
+    const [current, photoData, tags] = await Promise.all([
+      fetchAlbum(id),
       fetchPhotos(id),
       fetchTags()
     ]);
-    
-    const current = allAlbums.find(a => String(a.id) === id);
+
     if (current) {
       setAlbumName(current.name);
       setCurrentCoverPhotoUrl(current.cover_photo_url || null);
