@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useMemo, useCallback } from "react";
 import styles from "./page.module.css";
 import albumStyles from "./album/album.module.css";
 import Link from "next/link";
-import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag } from "@/lib/api";
+import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import PhotoLightbox from "./album/PhotoLightbox";
@@ -830,9 +830,9 @@ export default function Home() {
                     className={albumStyles.photoCard}
                     onClick={() => setSelectedPhotoIndex(index)}
                   >
-                    <img 
-                      src={photo.thumb_url || photo.url} 
-                      alt={photo.title} 
+                    <img
+                      src={photoThumbSrc(photo, 'md')}
+                      alt={photo.title}
                       className={albumStyles.photoImage} 
                       loading="lazy" 
                       decoding="async" 

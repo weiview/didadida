@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import type { Photo } from '@/lib/api';
+import { photoThumbSrc, type Photo } from '@/lib/api';
 
 interface Props {
   isOpen: boolean;
@@ -116,7 +116,7 @@ export default function PostUploadReviewModal({
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src={p.thumb_url || p.url}
+                  src={photoThumbSrc(p, 'sm')}
                   alt={p.title}
                   style={{
                     width: '100%', height: '100%', objectFit: 'cover',

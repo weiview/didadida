@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { applyTripSegments, reverseGeocode, setPlaceNames, type Photo } from '@/lib/api';
+import { applyTripSegments, reverseGeocode, setPlaceNames, photoThumbSrc, type Photo } from '@/lib/api';
 
 interface Props {
   isOpen: boolean;
@@ -298,7 +298,7 @@ export default function PlaceCheckinModal({
                       >
                         {/* eslint-disable-next-line @next/next/no-img-element */}
                         <img
-                          src={p.thumb_url || p.url}
+                          src={photoThumbSrc(p, 'sm')}
                           alt={p.title}
                           loading="lazy"
                           style={{
