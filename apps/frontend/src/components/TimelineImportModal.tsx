@@ -1,13 +1,13 @@
 'use client';
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   parseTimeline, matchPhotosToTimeline,
   type TimelineSample, type MatchResult,
 } from '@/lib/googleTimeline';
 import { extractTrackMonths, type ExtractResult } from '@/lib/timelineTrack';
 import {
-  fetchAllPhotos, applyTimelineMatches, saveTimelineMonth, saveTimelineIndex,
+  fetchGeoPendingPhotos, applyTimelineMatches, saveTimelineMonth, saveTimelineIndex,
   type Photo,
 } from '@/lib/api';
 
@@ -63,6 +63,44 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
   const [uploadProgress, setUploadProgress] = useState('');
   const [trackResult, setTrackResult] = useState('');
 
+  /*
+   * 「只處理還沒有座標的照片」現在由後端過濾，所以這個開關一動就得重抓。
+   *
+   * 以前是一次把全站照片抓回來、在瀏覽器裡 filter，切換開關是零成本的；但那份
+   * 請求會讓後端掃過整張 Photo 表並回傳每一個欄位。改成後端過濾之後，勾著的
+   * 時候（預設）通常只剩幾百張要載。
+   *
+   * photosScope 記住手上這份是哪一種，免得每次 render 都以為要重抓。
+   */
+  const [photosScope, setPhotosScope] = useState<'missing' | 'all' | null>(null);
+  const [loadingPhotos, setLoadingPhotos] = useState(false);
+  // 慢的請求先回、快的後回時，setPhotos 會被舊資料蓋掉。記住最後一次的序號，
+  // 只讓最新那次的結果寫進 state。
+  const loadSeq = useRef(0);
+
+  const loadPhotos = useCallback(async (onlyMissingNow: boolean) => {
+    const seq = ++loadSeq.current;
+    setLoadingPhotos(true);
+    const fresh = await fetchGeoPendingPhotos(onlyMissingNow);
+    if (seq !== loadSeq.current) return;
+    setLoadingPhotos(false);
+    // null 是「抓失敗」，空陣列才是「真的沒有待處理的照片」。抓失敗時留著舊快照
+    // 並說清楚，不要讓畫面靜靜地變成一個假的「已完成」。
+    if (fresh === null) {
+      setError('讀取照片清單失敗，畫面上的數字可能不是最新的。請確認仍在登入狀態。');
+      return;
+    }
+    setPhotos(fresh);
+    setPhotosScope(onlyMissingNow ? 'missing' : 'all');
+  }, []);
+
+  // 已經載過一次之後才跟著開關重抓 —— 還沒選檔前抓了也沒有東西可以比對
+  useEffect(() => {
+    if (photosScope === null) return;
+    const want = onlyMissing ? 'missing' : 'all';
+    if (photosScope !== want) loadPhotos(onlyMissing);
+  }, [onlyMissing, photosScope, loadPhotos]);
+
   const handleFile = useCallback(async (file: File) => {
     setParsing(true); setError(''); setResult(''); setTrackResult('');
     setFileName(file.name);
@@ -82,7 +120,7 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
         setSamples(parsed.samples);
         setFormat(parsed.format);
         setSkipped(parsed.skipped);
-        if (photos.length === 0) setPhotos(await fetchAllPhotos());
+        if (photosScope === null) await loadPhotos(onlyMissing);
       }
     } catch (e: any) {
       setError(`解析失敗：${e?.message || e}`);
@@ -91,7 +129,7 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
     } finally {
       setParsing(false);
     }
-  }, [photos.length]);
+  }, [photosScope, onlyMissing, loadPhotos]);
 
   /*
    * 逐月上傳，最後才寫索引。
@@ -171,15 +209,12 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
       // 寫完一定要重抓：candidates／matches 都是從這份 photos 算出來的，
       // 不重抓的話面板會停在寫入前的快照 —— 綠色訊息說「已寫入 27 張」，
       // 上面卻還寫著「候選 30 張」、按鈕還邀請你再寫一次同樣的 30 張。
-      // 回傳空陣列代表這次重抓失敗（剛寫完不可能真的一張都沒有），
-      // 那就寧可留著舊快照，也不要顯示「0 張」這種假的歸零。
-      const fresh = await fetchAllPhotos();
-      if (fresh.length > 0) setPhotos(fresh);
+      await loadPhotos(onlyMissing);
     } else {
       setError('寫入失敗，請確認仍在登入狀態。');
     }
     setSubmitting(false);
-  }, [matches, onDone]);
+  }, [matches, onDone, loadPhotos, onlyMissing]);
 
   // 照片位置這半段已經做完，而且沒有剩下可寫的了。
   // 此時主要動作從「寫入」換成「關閉」；但取消勾選「只處理還沒有座標的照片」
@@ -350,7 +385,12 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
               border: `1px solid ${matches.length > 0 ? '#bfdbfe' : '#fcd34d'}`,
               borderRadius: 10, padding: '12px 14px', fontSize: 13.5, lineHeight: 1.8, marginBottom: 16,
             }}>
-              <div>候選照片 <strong>{candidates.length}</strong> 張，比對成功 <strong>{matches.length}</strong> 張</div>
+              <div>
+                {loadingPhotos
+                  // 切換上面那個勾選會回後端重撈，數字在那期間是上一次的，要講清楚
+                  ? '正在讀取照片清單…'
+                  : <>候選照片 <strong>{candidates.length}</strong> 張，比對成功 <strong>{matches.length}</strong> 張</>}
+              </div>
               {matches.length > 0 && (
                 <div style={{ color: '#475569', fontSize: 12.5 }}>
                   時間差 2 分鐘內：{buckets.exact} ／ 10 分鐘內：{buckets.near} ／ 更久：{buckets.loose}

@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
 import {
-  fetchFootprint, fetchAlbums, fetchTripSegments, deleteTripSegment,
+  fetchFootprint, fetchAllAlbums, fetchTripSegments, deleteTripSegment,
   setAlbumMapPrivacy,
   fetchDriveGpxFiles, fetchDriveGpxText, ingestTrack, fetchTracks,
   editTrackPoints,
@@ -265,7 +265,7 @@ export default function MapPage() {
   }, [isAdmin, trackFrom, trackTo, skipTracks]);
 
   useEffect(() => {
-    fetchAlbums().then(setAlbums);
+    fetchAllAlbums().then(setAlbums);
   }, []);
 
   // 只有管理者讀得到（會暴露出門的日期）
@@ -1291,7 +1291,7 @@ export default function MapPage() {
                       if (!ok) { setAlbums(prev => [...prev]); return; }
                     }
                     const ok = await setAlbumMapPrivacy(currentAlbum.id, !turningPublic);
-                    if (ok) fetchAlbums().then(setAlbums);
+                    if (ok) fetchAllAlbums().then(setAlbums);
                   }}
                   style={{ marginTop: 3 }}
                 />

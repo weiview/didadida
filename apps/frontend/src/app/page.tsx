@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useState, useRef, useMemo } from "react";
+import { useEffect, useState, useRef, useMemo, useCallback } from "react";
 import styles from "./page.module.css";
 import albumStyles from "./album/album.module.css";
 import Link from "next/link";
-import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, fetchAllPhotos, Photo, fetchTags, Tag } from "@/lib/api";
+import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import PhotoLightbox from "./album/PhotoLightbox";
@@ -16,18 +16,37 @@ import BottomActionBar from "@/components/BottomActionBar";
 function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPressIndex, sortBy, index, handlePointerDown, handlePointerUpOrLeave, handleDragStart, handleDragEnter, handleDragEnd, isSelected, onSelectToggle }: any) {
   const [hovered, setHovered] = useState(false);
   const [photoIndex, setPhotoIndex] = useState(0);
+  const previews: string[] = album.preview_photos ?? [];
 
   useEffect(() => {
     let interval: NodeJS.Timeout;
-    if (hovered && album.preview_photos && album.preview_photos.length > 0) {
+    if (hovered && previews.length > 0) {
       interval = setInterval(() => {
-        setPhotoIndex(prev => (prev + 1) % album.preview_photos.length);
+        setPhotoIndex(prev => (prev + 1) % previews.length);
       }, 4000);
     } else {
       setPhotoIndex(0);
     }
     return () => clearInterval(interval);
-  }, [hovered, album]);
+  }, [hovered, previews.length]);
+
+  /*
+   * 輪播圖是「用到才掛上 DOM」的。
+   *
+   * 以前是把每一張預覽圖都渲染成 <div style={{backgroundImage, opacity: 0}}>，
+   * 靠 opacity 藏起來。但瀏覽器只有 display: none 才會延後抓圖，opacity: 0 一律
+   * 照抓，而且 loading="lazy" 對 CSS 背景圖完全無效 —— 結果是進首頁不 hover
+   * 也會下載「相簿數 × 預覽張數」張縮圖，每一張都是一次 Workers 請求。
+   *
+   * 掛到「下一張」而不是只掛現在這張：下一張得先以 opacity 0 存在於 DOM 裡，
+   * 交叉淡入才有起始畫格，否則會變成硬切。mountedCount 只增不減，滑鼠移開再
+   * 移回來不會把已經載好的圖從 DOM 拔掉又重掛。
+   */
+  const [mountedCount, setMountedCount] = useState(0);
+  useEffect(() => {
+    if (!hovered) return;
+    setMountedCount((c) => Math.max(c, Math.min(previews.length, photoIndex + 2)));
+  }, [hovered, photoIndex, previews.length]);
 
   const coverText = album.name;
 
@@ -65,11 +84,11 @@ function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPres
         onDragOver={(e) => isAdmin && sortBy === "custom" && e.preventDefault()}
       >
         <div className={styles.coverPlaceholder}>
-          {/* Carousel images */}
-          {album.preview_photos?.map((photoUrl: string, i: number) => (
-            <div 
-              key={photoUrl} 
-              className={styles.coverImage} 
+          {/* Carousel images（只掛已經輪到的，見上面 mountedCount 的說明） */}
+          {previews.slice(0, mountedCount).map((photoUrl: string, i: number) => (
+            <div
+              key={photoUrl}
+              className={styles.coverImage}
               style={{
                 backgroundImage: `url(${photoUrl})`,
                 opacity: (hovered && photoIndex === i) ? 1 : 0
@@ -78,21 +97,21 @@ function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPres
           ))}
           {/* Static cover photo */}
           {album.cover_photo_url && (
-            <div 
-              className={styles.coverImage} 
+            <div
+              className={styles.coverImage}
               style={{
                 backgroundImage: `url(${album.cover_photo_url})`,
-                opacity: (hovered && album.preview_photos && album.preview_photos.length > 0) ? 0 : 1
+                opacity: (hovered && previews.length > 0) ? 0 : 1
               }}
             />
           )}
-          
+
           {/* Static cover text (if no cover photo is set) */}
           {!album.cover_photo_url && (
-            <span style={{ 
-              position: 'relative', 
+            <span style={{
+              position: 'relative',
               zIndex: 2,
-              opacity: (hovered && album.preview_photos && album.preview_photos.length > 0) ? 0 : 1,
+              opacity: (hovered && previews.length > 0) ? 0 : 1,
               transition: 'opacity 3s ease-in-out'
             }}>
               {coverText}
@@ -203,7 +222,7 @@ export default function Home() {
   }, [gridColumns]);
 
   // 照片全站搜尋與大圖檢視 State
-  const [allPhotos, setAllPhotos] = useState<Photo[]>([]);
+  const [displayPhotos, setDisplayPhotos] = useState<Photo[]>([]);
   const [selectedPhotoIndex, setSelectedPhotoIndex] = useState<number | null>(null);
 
   // 時間軸滾動條 State
@@ -212,45 +231,95 @@ export default function Home() {
   const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const photoCardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
-  const loadData = async () => {
-    setLoading(true);
-    const [albumsData, photosData, tagsData] = await Promise.all([
-      fetchAlbums(),
-      fetchAllPhotos(),
-      fetchTags()
-    ]);
-    setAlbums(albumsData || []);
-    setAllPhotos(photosData || []);
-    setAvailableTags(tagsData || []);
-    setLoading(false);
-  };
+  /*
+   * 篩選與分頁全部改由後端負責。
+   *
+   * 以前是進站就把全站每一張照片抓回來，再用 includes() 在瀏覽器裡過濾。沒打
+   * 關鍵字時那份資料根本沒被用到，卻每次都讓後端掃過整張 Photo 表 —— 照片一多，
+   * D1 的每日讀取列數會比任何其他額度更早見底。
+   *
+   * 相簿也一樣改成一頁一頁要。既然手上永遠只有一部分，篩選和排序就不能再留在
+   * 前端做：那只會把「已經載到的那幾本」排好，還沒載的仍然是錯的。
+   */
+  const ALBUM_PAGE_SIZE = 20;
+  const PHOTO_PAGE_SIZE = 60;
+  const [hasMoreAlbums, setHasMoreAlbums] = useState(false);
+  const [loadingMoreAlbums, setLoadingMoreAlbums] = useState(false);
+  const isFiltering = searchQuery.trim() !== "" || selectedTags.length > 0;
 
-  // 管理員狀態由 useAdmin 負責（會去問後端 token 還有沒有效）
+  // 慢的查詢先送、快的後送時，晚回來的舊結果會蓋掉新的。只讓最後一次發出的查詢
+  // 寫進 state。
+  const querySeq = useRef(0);
+
+  const runQuery = useCallback(async () => {
+    const seq = ++querySeq.current;
+    setLoading(true);
+    const q = searchQuery.trim();
+    const filtering = q !== "" || selectedTags.length > 0;
+
+    const [albumPage, photoPage] = await Promise.all([
+      fetchAlbums({ q, tagIds: selectedTags, limit: ALBUM_PAGE_SIZE, sort: sortBy }),
+      // 沒有任何篩選條件時首頁只顯示相簿，照片區塊是空的 —— 這時候完全不必問後端
+      filtering
+        ? searchPhotos({ q, tagIds: selectedTags, limit: PHOTO_PAGE_SIZE })
+        : Promise.resolve({ photos: [] as Photo[], hasMore: false }),
+    ]);
+    if (seq !== querySeq.current) return;
+
+    setAlbums(albumPage.albums);
+    setHasMoreAlbums(albumPage.hasMore);
+    setDisplayPhotos(photoPage.photos);
+    setLoading(false);
+  }, [searchQuery, selectedTags, sortBy]);
+
+  // 對外仍叫 loadData：新增／刪除／排序失敗之後要用它把畫面拉回真實狀態
+  const loadData = runQuery;
+
+  // 標籤清單幾乎不變，進站載一次就好，不必跟著每次打字重抓
   useEffect(() => {
-    loadData();
+    fetchTags().then((t) => setAvailableTags(t || []));
   }, []);
 
-  // 計算符合條件的全站照片 (搜尋關鍵字或選取標籤)
-  const displayPhotos = useMemo(() => {
-    if (!searchQuery.trim() && selectedTags.length === 0) return [];
-    
-    return allPhotos.filter(photo => {
-      // 標籤選單過濾 (照片需包含選取的任一標籤)
-      if (selectedTags.length > 0) {
-        if (!photo.tags?.some(t => selectedTags.includes(t.id))) return false;
-      }
+  // 打字時 debounce，不要每一個字都送一次查詢；改標籤或排序則立即生效
+  useEffect(() => {
+    const delay = searchQuery.trim() ? 250 : 0;
+    const handle = setTimeout(() => { runQuery(); }, delay);
+    return () => clearTimeout(handle);
+  }, [runQuery, searchQuery]);
 
-      // 搜尋關鍵字過濾
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase().trim();
-        const matchTitle = photo.title?.toLowerCase().includes(q);
-        const matchDesc = photo.description?.toLowerCase().includes(q);
-        if (!matchTitle && !matchDesc) return false;
-      }
+  /*
+   * 相簿無限捲動。哨兵進入畫面就要下一頁。
+   *
+   * offset 用 albums.length 而不是頁碼：中途刪掉一本相簿時頁碼會算錯，
+   * 直接用「目前已經有幾本」永遠對得上。
+   */
+  const albumSentinelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const node = albumSentinelRef.current;
+    if (!node || !hasMoreAlbums || loading) return;
 
-      return true;
-    });
-  }, [allPhotos, searchQuery, selectedTags]);
+    const observer = new IntersectionObserver(async (entries) => {
+      if (!entries[0].isIntersecting || loadingMoreAlbums) return;
+      setLoadingMoreAlbums(true);
+      const seq = querySeq.current;
+      const page = await fetchAlbums({
+        q: searchQuery.trim(), tagIds: selectedTags,
+        offset: albums.length, limit: ALBUM_PAGE_SIZE, sort: sortBy,
+      });
+      // 等這一頁的期間使用者又改了搜尋條件的話，這批資料已經不屬於畫面上那個清單了
+      if (seq !== querySeq.current) return;
+      setAlbums((prev) => {
+        // 兩次請求之間如果有相簿被新增，offset 會讓某幾本重複出現，用 id 去重
+        const seen = new Set(prev.map((a) => a.id));
+        return [...prev, ...page.albums.filter((a) => !seen.has(a.id))];
+      });
+      setHasMoreAlbums(page.hasMore);
+      setLoadingMoreAlbums(false);
+    }, { rootMargin: "400px" });
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [hasMoreAlbums, loading, loadingMoreAlbums, albums.length, searchQuery, selectedTags, sortBy]);
 
   // 時間軸標籤點 (照片模式)
   const timelineGroup = useMemo(() => {
@@ -331,46 +400,11 @@ export default function Home() {
     }
   };
 
-  // 計算經過篩選與排序的相簿 (包含：相簿名稱、相簿描述、或是底下照片包含 Story/標題 的相簿，若有選取標籤則過濾包含該標籤照片的相簿)
-  const displayAlbums = useMemo(() => {
-    let filtered = [...albums];
-
-    // 如果選取了標籤選單
-    if (selectedTags.length > 0) {
-      const taggedAlbumIds = new Set(
-        allPhotos
-          .filter(photo => photo.tags?.some(t => selectedTags.includes(t.id)))
-          .map(photo => photo.album_id)
-      );
-      filtered = filtered.filter(album => taggedAlbumIds.has(album.id));
-    }
-
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase().trim();
-      const matchedAlbumIdsFromPhotos = new Set(
-        allPhotos
-          .filter(photo => {
-            const matchTitle = photo.title?.toLowerCase().includes(q);
-            const matchDesc = photo.description?.toLowerCase().includes(q);
-            return matchTitle || matchDesc;
-          })
-          .map(photo => photo.album_id)
-      );
-
-      filtered = filtered.filter(album => {
-        const matchAlbumName = album.name.toLowerCase().includes(q);
-        const matchAlbumDesc = album.description?.toLowerCase().includes(q);
-        const matchChildPhotos = matchedAlbumIdsFromPhotos.has(album.id);
-        return matchAlbumName || matchAlbumDesc || matchChildPhotos;
-      });
-    }
-
-    return filtered.sort((a, b) => {
-      if (sortBy === "custom") return a.sort_order - b.sort_order;
-      if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-      return 0;
-    });
-  }, [albums, allPhotos, searchQuery, selectedTags, sortBy]);
+  /*
+   * 篩選（相簿名／描述／底下照片命中）與排序都已經在後端做完，`albums` 拿到的
+   * 就是要顯示的東西。這裡保留這個名字只是為了不用改動下面一整片 JSX。
+   */
+  const displayAlbums = albums;
 
   const handleLogin = async () => {
     setIsSubmitting(true);
@@ -424,7 +458,8 @@ export default function Home() {
 
   // Drag and Drop handlers
   const handlePointerDown = (index: number) => {
-    if (!isAdmin) return;
+    // 篩選中畫面上只是子集合，拖曳算出來的 sort_order 會是錯的（見 handleDragEnd）
+    if (!isAdmin || isFiltering) return;
     timerRef.current = setTimeout(() => {
       setLongPressIndex(index);
     }, 1000);
@@ -459,7 +494,14 @@ export default function Home() {
 
   const handleDragEnd = async () => {
     if (dragItem.current !== null) {
-      // 呼叫 API 儲存新的排序順序
+      /*
+       * sort_order 直接用「這本在畫面上的第幾個」。
+       *
+       * 成立的前提是畫面上這串相簿是完整順序的前綴 —— 無限捲動一定從 offset 0
+       * 開始往後接，所以沒問題；但有搜尋或標籤篩選時畫面上是挑過的子集合，
+       * 第 3 個實際上可能是全站的第 87 本，照這樣寫回去會把其他相簿的順序全部
+       * 打亂。所以篩選中不讓拖曳生效（下面的 draggable 也一併關掉）。
+       */
       const updates = albums.map((album, index) => ({
         id: album.id,
         sort_order: index,
@@ -886,9 +928,20 @@ export default function Home() {
               }}
             />
           ))}
-          {displayAlbums.length === 0 && (
+          {displayAlbums.length === 0 && !loading && (
             <div className={styles.emptyState}>找不到相簿</div>
           )}
+        </div>
+      )}
+
+      {/*
+        無限捲動的哨兵。放在網格外面而不是當成格子的一員 —— 塞進 grid 裡會佔掉
+        一格，最後一列就會空一個洞。rootMargin 讓它在還差 400px 進畫面時就先要
+        下一頁，捲到底時通常已經接上了。
+      */}
+      {hasMoreAlbums && (
+        <div ref={albumSentinelRef} style={{ padding: '24px 0', textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
+          {loadingMoreAlbums ? '載入中…' : ''}
         </div>
       )}
 

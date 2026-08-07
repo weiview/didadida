@@ -4,6 +4,7 @@ import {
   parseExifDateTime, geoOverwriteGuard, DEFAULT_TZ_OFFSET_MINUTES,
 } from './geo';
 import { listGpxFiles, fetchGpxBytes } from './drive';
+import { syncFtsForPhotos, deleteFtsForPhotos, ftsMatchExpr } from './fts';
 
 export interface Env {
   DB: D1Database;
@@ -191,6 +192,68 @@ const placeholdersFor = (chunk: unknown[]) => chunk.map(() => "?").join(",");
 const minutesModifier = (n: number) => `${n >= 0 ? '+' : ''}${n} minutes`;
 
 /*
+ * 三層快取。三層擋掉的是不同的東西，少任何一層都補不回來：
+ *
+ *   L1 瀏覽器（Cache-Control max-age）
+ *       唯一能省下 **Workers 請求數**（免費 100K/天）的一層 —— L2 命中時 Worker
+ *       其實已經跑起來了，那次請求照樣計費。
+ *   L2 邊緣（caches.default）
+ *       省的是 **D1 讀取列數與 R2 Class B 次數**。同一分鐘內全家人開首頁只有第一
+ *       個人真的查資料庫。
+ *   L3 R2 物件本身
+ *       檔名帶時間戳、內容永遠不變，所以縮圖給一年的 immutable。
+ *
+ * ⚠️ 管理員一律跳過 L2（不讀也不寫）。照片查詢會跑 applyGeoPrivacy()，管理員拿到
+ *    的是完整座標而訪客拿到的是 null；只要管理員的回應曾經進過共用的邊緣快取，
+ *    家人就會拿到私密相簿的經緯度。在 cache key 裡加身分也做得到，但那種寫法漏
+ *    一個地方就洩漏，直接跳過則不可能寫錯。
+ */
+async function withEdgeCache(
+  request: Request,
+  ctx: ExecutionContext,
+  opts: {
+    /** 瀏覽器可以放心用舊資料的秒數 */
+    browserMaxAge: number;
+    /** 邊緣保留的秒數，通常可以比瀏覽器久 */
+    edgeMaxAge: number;
+    /** true 就完全不碰快取。管理員請求務必給 true */
+    skip: boolean;
+  },
+  produce: () => Promise<Response>,
+): Promise<Response> {
+  if (opts.skip) return produce();
+
+  /*
+   * cache key 把 Origin 併進 URL。回應帶的是逐一比對過的
+   * Access-Control-Allow-Origin，prod、dev 與 localhost 三個前端各不相同，
+   * 只用 URL 當 key 會把 prod 的 ACAO 餵給 dev 的頁面，瀏覽器直接擋掉。
+   * 正規做法是 `Vary: Origin`，但 Cloudflare 的快取只認 Accept-Encoding 的 Vary，
+   * 靠不住 —— 併進 key 才是這裡真的會生效的寫法。
+   */
+  const keyUrl = new URL(request.url);
+  keyUrl.searchParams.set("__origin", request.headers.get("Origin") || "-");
+  const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
+
+  const cache = caches.default;
+  const hit = await cache.match(cacheKey);
+  if (hit) return hit;
+
+  const response = await produce();
+  if (response.status === 200) {
+    const cached = new Response(response.body, response);
+    cached.headers.set(
+      "Cache-Control",
+      `public, max-age=${opts.browserMaxAge}, s-maxage=${opts.edgeMaxAge}`,
+    );
+    // 回應要用兩次（一次進快取、一次給使用者），body 只能讀一次，所以先 clone。
+    // 寫入放 waitUntil：使用者不必等快取寫完才拿到資料。
+    ctx.waitUntil(cache.put(cacheKey, cached.clone()));
+    return cached;
+  }
+  return response;
+}
+
+/*
  * 對外可見的範圍，只有兩層，沒有第三層：
  *
  *   1. 軌跡（TrackPoint、貼路結果、Google 時間軸）—— **一律要登入**。
@@ -291,52 +354,173 @@ if (method === "POST" && pathname === "/api/verify-password") {
         return new Response(JSON.stringify({ admin: true }), { headers });
       }
 
-      // 路由：取得所有相簿
+      /*
+       * 路由：取得相簿（分頁）
+       *
+       * 舊版用 ROW_NUMBER() OVER(PARTITION BY album_id) 一次撈出每本相簿的前 10 張
+       * 預覽圖。那個窗口函式必須把整張 Photo 掃過一遍才算得出 rn，所以首頁每開一次
+       * 就讀一次全部照片 —— 15 萬張時是 15 萬列，D1 一天 5M 列等於只夠開 33 次首頁。
+       *
+       * 改成每本相簿各送索引 seek，成本從「總照片數」變成「這一頁的相簿數 × 5」，
+       * 不再隨照片數量成長。
+       */
       if (method === "GET" && pathname === "/api/albums") {
-        const { results: albums } = await env.DB.prepare("SELECT * FROM Album ORDER BY sort_order ASC, created_at DESC").all();
-        
-        // Fetch preview photos for the carousel using a window function to limit to 10 per album
-        const { results: allPhotos } = await env.DB.prepare(`
-          SELECT album_id, COALESCE(thumb_url, url) as url FROM (
-            SELECT album_id, url, thumb_url, 
-                   ROW_NUMBER() OVER(PARTITION BY album_id ORDER BY sort_order ASC, created_at DESC) as rn
-            FROM Photo
-          ) WHERE rn <= 10
-        `).all();
-        
-        const albumsWithPhotos = albums.map((album: any) => {
-          const albumPhotos = allPhotos.filter((p: any) => p.album_id === album.id).map((p: any) => p.url);
-          return { ...album, preview_photos: albumPhotos };
+       // 快取 60 秒，剛好對齊下面預覽圖的分鐘種子 —— 種子換人時快取也正好過期，
+       // 不會出現「快取裡的舊種子」與「新算出來的種子」互相打架的空窗
+       return withEdgeCache(request, ctx,
+         { browserMaxAge: 60, edgeMaxAge: 60, skip: await isAuthorized(request, env) },
+         async () => {
+        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 20) || 20, 1), 60);
+        const offset = Math.max(Number(url.searchParams.get("offset") ?? 0) || 0, 0);
+        const rawQuery = (url.searchParams.get("q") ?? "").trim();
+        const tagIds = (url.searchParams.get("tags") ?? "")
+          .split(",").map(Number).filter((n) => Number.isInteger(n) && n > 0).slice(0, 50);
+
+        /*
+         * 篩選條件跟 /api/search 一樣，但比對的是「這本相簿本身」或「裡面有沒有
+         * 符合的照片」。相簿名不進 PhotoFts（見 migration 0004），改用 LIKE 直接
+         * 比對 Album 表 —— 那張表頂多幾百列，掃完的成本可以忽略，而且完全不必同步。
+         */
+        const where: string[] = [];
+        const binds: any[] = [];
+        if (rawQuery) {
+          const matchExpr = ftsMatchExpr(rawQuery);
+          const like = `%${rawQuery.replace(/[\\%_]/g, "\\$&")}%`;
+          const clauses = [
+            `a.name LIKE ? ESCAPE '\\'`,
+            `IFNULL(a.description, '') LIKE ? ESCAPE '\\'`,
+          ];
+          binds.push(like, like);
+          if (matchExpr) {
+            clauses.push(`a.id IN (SELECT p.album_id FROM Photo p
+                                    WHERE p.id IN (SELECT rowid FROM PhotoFts WHERE PhotoFts MATCH ?))`);
+            binds.push(matchExpr);
+          }
+          where.push(`(${clauses.join(" OR ")})`);
+        }
+        if (tagIds.length > 0) {
+          where.push(`a.id IN (SELECT p.album_id FROM Photo p
+                                WHERE p.id IN (SELECT photo_id FROM PhotoTag WHERE tag_id IN (${placeholdersFor(tagIds)})))`);
+          binds.push(...tagIds);
+        }
+
+        /*
+         * 排序也得由後端決定 —— 清單既然是分頁的，前端手上永遠只有一部分，
+         * 在瀏覽器裡排序只會把「這一頁」排好，跨頁的順序還是錯的。
+         * 白名單比對而不是把參數拼進 SQL：這段是字串串接，不是繫結參數。
+         */
+        const orderBy = url.searchParams.get("sort") === "upload_date"
+          ? "a.created_at DESC"
+          : "a.sort_order ASC, a.created_at DESC";
+
+        const { results: albums } = await env.DB.prepare(`
+          SELECT a.* FROM Album a
+          ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+          ORDER BY ${orderBy}
+          LIMIT ? OFFSET ?
+        `).bind(...binds, limit, offset).all();
+
+        if (albums.length === 0) {
+          return new Response(JSON.stringify({ albums: [], has_more: false }), { headers });
+        }
+
+        /*
+         * 預覽圖的隨機起點。
+         *
+         * 種子跟著分鐘走而不是每次請求重擲：這條路由要能被邊緣快取，每次都給不同
+         * 答案等於快取失效，而且同一分鐘內家人各自看到不同內容也沒有意義。
+         * 每分鐘換一次，長期下來整本相簿都輪得到。
+         * 再乘上 album_id 打散，否則所有相簿會同時跳到各自序列的同一個相對位置。
+         */
+        const minuteBucket = Math.floor(Date.now() / 60000);
+        const seedFor = (albumId: number) =>
+          Math.abs(Math.imul(minuteBucket + albumId * 7919, 2654435761)) % 2147483647;
+
+        /*
+         * 每本相簿送兩條：從隨機起點往後拿 5 張，再從序列開頭補 5 張。
+         * 起點落在尾端時第一條會不足 5 筆，第二條負責繞回開頭補齊。
+         * 兩條都走 idx_photo_album_shuffle 的 covering index，各自最多讀 5 列。
+         */
+        const previewSelect = (op: string) =>
+          `SELECT COALESCE(thumb_sm_url, thumb_url, url) AS url
+             FROM Photo WHERE album_id = ? AND shuffle_key ${op} ?
+            ORDER BY shuffle_key LIMIT 5`;
+        const statements = (albums as any[]).flatMap((a) => {
+          const seed = seedFor(Number(a.id));
+          return [
+            env.DB.prepare(previewSelect(">=")).bind(a.id, seed),
+            env.DB.prepare(previewSelect("<")).bind(a.id, seed),
+          ];
+        });
+        const batched = await env.DB.batch<any>(statements);
+
+        const albumsWithPhotos = (albums as any[]).map((album, i) => {
+          // 同一張照片不可能同時滿足 >= 與 <，直接串接不會重複
+          const rows = [...batched[i * 2].results, ...batched[i * 2 + 1].results];
+          return { ...album, preview_photos: rows.slice(0, 5).map((p: any) => p.url) };
         });
 
-        return new Response(JSON.stringify(albumsWithPhotos), { headers });
+        return new Response(JSON.stringify({
+          albums: albumsWithPhotos,
+          // 剛好等於 limit 時無法分辨是不是最後一頁，寧可讓前端多問一次空頁
+          has_more: albums.length === limit,
+        }), { headers });
+         });
       }
 
 
 
       // 路由：查看 R2 照片
+      //
+      // 檔名帶上傳時間戳、內容不會被就地覆寫，所以可以給 immutable 的一年。
+      // 這裡不分管理員：R2 物件本身沒有依身分變化的內容，沒有 applyGeoPrivacy
+      // 那種洩漏問題。邊緣快取省下的是 R2 Class B 次數（免費 10M/月）。
       if (method === "GET" && pathname.startsWith("/api/photos/view/")) {
-        const fileName = decodeURIComponent(pathname.split("/")[4]);
-        const object = await env.BUCKET.get(fileName);
+        return withEdgeCache(request, ctx,
+          { browserMaxAge: 31536000, edgeMaxAge: 31536000, skip: false },
+          async () => {
+            const fileName = decodeURIComponent(pathname.split("/")[4]);
+            const object = await env.BUCKET.get(fileName);
 
-        if (object === null) {
-          return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+            if (object === null) {
+              return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+            }
+
+            const photoHeaders = new Headers();
+            object.writeHttpMetadata(photoHeaders);
+            photoHeaders.set("etag", object.httpEtag);
+            photoHeaders.set("Access-Control-Allow-Origin", "*");
+            // Cache-Control 由 withEdgeCache 統一覆寫，這裡不必再設
+
+            return new Response(object.body, { headers: photoHeaders });
+          });
+      }
+
+      /*
+       * 路由：單一相簿。
+       *
+       * 相簿頁本來是抓整份相簿清單再 find() 出這一本 —— 相簿清單改成分頁之後那招
+       * 就壞了（要的那本可能在第 5 頁），而且本來也不該為了一本相簿把全部都抓來。
+       */
+      if (method === "GET" && pathname.startsWith("/api/albums/") && pathname.split("/").length === 4) {
+        const albumId = pathname.split("/")[3];
+        const album = await env.DB.prepare("SELECT * FROM Album WHERE id = ?").bind(albumId).first();
+        if (!album) {
+          return new Response(JSON.stringify({ error: "Album not found" }), { status: 404, headers });
         }
-
-        const photoHeaders = new Headers();
-        object.writeHttpMetadata(photoHeaders);
-        photoHeaders.set("etag", object.httpEtag);
-        photoHeaders.set("Access-Control-Allow-Origin", "*");
-        photoHeaders.set("Cache-Control", "public, max-age=31536000");
-
-        return new Response(object.body, { headers: photoHeaders });
+        return new Response(JSON.stringify(album), { headers });
       }
 
       // 路由：取得特定相簿的照片 (含 Tags)
       if (method === "GET" && pathname.startsWith("/api/albums/") && pathname.endsWith("/photos")) {
+        // 同樣有座標差異，管理員跳過快取
+        const albumIsAdmin = await isAuthorized(request, env);
+        return withEdgeCache(request, ctx,
+          { browserMaxAge: 30, edgeMaxAge: 300, skip: albumIsAdmin },
+          async () => {
         const parts = pathname.split("/");
         const albumId = parts[3];
-        
+
         const { results: rawPhotos } = await env.DB.prepare(`
           SELECT p.*, a.map_private
           FROM Photo p
@@ -344,68 +528,208 @@ if (method === "POST" && pathname === "/api/verify-password") {
           WHERE p.album_id = ?
           ORDER BY p.sort_order ASC, p.created_at DESC
         `).bind(albumId).all();
-        const photos = applyGeoPrivacy(rawPhotos as any[], await isAuthorized(request, env));
+        const photos = applyGeoPrivacy(rawPhotos as any[], albumIsAdmin);
 
         // 取得這些照片的標籤
         if (photos.length > 0) {
           const tagsQuery = `
-            SELECT pt.photo_id, t.id, t.name 
-            FROM PhotoTag pt 
-            JOIN Tag t ON pt.tag_id = t.id 
+            SELECT pt.photo_id, t.id, t.name
+            FROM PhotoTag pt
+            JOIN Tag t ON pt.tag_id = t.id
             JOIN Photo p ON pt.photo_id = p.id
             WHERE p.album_id = ?
           `;
-          
+
           const { results: tags } = await env.DB.prepare(tagsQuery).bind(albumId).all();
-          
-          // 將 tag 附加到 photo 上
-          for (let photo of photos) {
-            (photo as any).tags = tags.filter(t => t.photo_id === photo.id).map(t => ({ id: t.id, name: t.name }));
+
+          // 先建 Map 再逐張取，不要每張照片都去 filter 一次整份標籤 ——
+          // 那是 O(照片數 × 標籤關聯數)，5000 張的相簿會直接超過單次 10ms CPU 上限
+          const byPhoto = new Map<number, { id: number; name: string }[]>();
+          for (const t of tags as any[]) {
+            const list = byPhoto.get(Number(t.photo_id)) ?? [];
+            list.push({ id: t.id, name: t.name });
+            byPhoto.set(Number(t.photo_id), list);
+          }
+          for (const photo of photos) {
+            (photo as any).tags = byPhoto.get(Number((photo as any).id)) ?? [];
           }
         }
-        
+
         return new Response(JSON.stringify(photos), { headers });
+          });
       }
 
       // 路由：取得所有正在使用的標籤
+      //
+      // 這條的 DISTINCT + JOIN 要掃過整張 PhotoTag（沒有辦法只靠索引就知道哪些
+      // 標籤「有人用」），是少數會隨照片數成長的查詢。標籤清單幾乎不變，交給
+      // 快取扛：五分鐘內只有第一個人真的掃。
       if (method === "GET" && pathname === "/api/tags") {
-        const { results } = await env.DB.prepare(`
-          SELECT DISTINCT t.* 
-          FROM Tag t 
-          INNER JOIN PhotoTag pt ON t.id = pt.tag_id 
-          ORDER BY t.name ASC
-        `).all();
-        return new Response(JSON.stringify(results), { headers });
+        return withEdgeCache(request, ctx,
+          { browserMaxAge: 300, edgeMaxAge: 300, skip: await isAuthorized(request, env) },
+          async () => {
+            const { results } = await env.DB.prepare(`
+              SELECT DISTINCT t.*
+              FROM Tag t
+              INNER JOIN PhotoTag pt ON t.id = pt.tag_id
+              ORDER BY t.name ASC
+            `).all();
+            return new Response(JSON.stringify(results), { headers });
+          });
       }
 
-      // 路由：取得全站所有照片 (含 Tags 與 所屬相簿名稱)
-      if (method === "GET" && pathname === "/api/all-photos") {
-        const { results: rawAllPhotos } = await env.DB.prepare(`
-          SELECT p.*, a.name as album_name, a.map_private
+      /*
+       * 路由：搜尋照片（取代舊的 /api/all-photos）
+       *
+       * 舊版一次回傳全站每一張照片，讓前端在瀏覽器裡用 includes() 過濾。首頁沒打
+       * 關鍵字時那份資料根本沒被用到，卻每次都掃完整張 Photo 表，還在 Worker 裡跑
+       * 一個 photos × tags 的雙層迴圈 —— 15 萬張時光那個迴圈就遠超單次 10ms CPU。
+       *
+       * 現在關鍵字交給 PhotoFts（見 fts.ts），標籤交給 idx_phototag_tag，兩者都是
+       * 索引查詢，讀到的列數跟「命中幾張」成正比，而不是跟「總共有幾張」成正比。
+       */
+      if (method === "GET" && pathname === "/api/search") {
+       // 搜尋結果會跑 applyGeoPrivacy，管理員與訪客拿到的座標不同 —— 管理員一律
+       // 跳過邊緣快取，否則家人會從共用快取裡撈到私密相簿的經緯度
+       const searchIsAdmin = await isAuthorized(request, env);
+       return withEdgeCache(request, ctx,
+         { browserMaxAge: 30, edgeMaxAge: 300, skip: searchIsAdmin },
+         async () => {
+        const rawQuery = (url.searchParams.get("q") ?? "").trim();
+        const tagIds = (url.searchParams.get("tags") ?? "")
+          .split(",").map(Number).filter((n) => Number.isInteger(n) && n > 0).slice(0, 50);
+        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 60) || 60, 1), 200);
+        const offset = Math.max(Number(url.searchParams.get("offset") ?? 0) || 0, 0);
+
+        const matchExpr = rawQuery ? ftsMatchExpr(rawQuery) : null;
+        // 有關鍵字但切不出任何 token（例如只打了標點）就是查無結果，
+        // 不能當成「沒有條件」而把全站照片倒出來
+        const impossible = rawQuery !== "" && matchExpr === null;
+        if (impossible || (!matchExpr && tagIds.length === 0)) {
+          return new Response(JSON.stringify({ photos: [], has_more: false }), { headers });
+        }
+
+        // 兩個條件都是子查詢而非 JOIN：JOIN 會因為一張照片命中多個標籤而重複列，
+        // 得再補 DISTINCT，而 DISTINCT 會讓 SQLite 為了去重把結果集整個具體化。
+        const where: string[] = [];
+        const binds: any[] = [];
+        if (matchExpr) {
+          where.push(`p.id IN (SELECT rowid FROM PhotoFts WHERE PhotoFts MATCH ?)`);
+          binds.push(matchExpr);
+        }
+        if (tagIds.length > 0) {
+          where.push(`p.id IN (SELECT photo_id FROM PhotoTag WHERE tag_id IN (${placeholdersFor(tagIds)}))`);
+          binds.push(...tagIds);
+        }
+
+        const { results: rawPhotos } = await env.DB.prepare(`
+          SELECT p.*, a.name AS album_name, a.map_private
           FROM Photo p
-          LEFT JOIN Album a ON p.album_id = a.id
+          LEFT JOIN Album a ON a.id = p.album_id
+          WHERE ${where.join(" AND ")}
           ORDER BY p.taken_at DESC, p.created_at DESC
-        `).all();
-        const photos = applyGeoPrivacy(rawAllPhotos as any[], await isAuthorized(request, env));
+          LIMIT ? OFFSET ?
+        `).bind(...binds, limit, offset).all();
 
+        const photos = applyGeoPrivacy(rawPhotos as any[], searchIsAdmin);
+
+        // 標籤只補這一頁的（最多 limit 張），而且用 Map 對應而不是每張照片 filter
+        // 一次整份標籤 —— 那正是舊版的 O(n×m)。
         if (photos.length > 0) {
-          const { results: tags } = await env.DB.prepare(`
-            SELECT pt.photo_id, t.id, t.name 
-            FROM PhotoTag pt 
-            JOIN Tag t ON pt.tag_id = t.id
-          `).all();
-
-          for (let photo of photos) {
-            (photo as any).tags = tags.filter(t => String(t.photo_id) === String((photo as any).id)).map(t => ({ id: t.id, name: t.name }));
+          const ids = photos.map((p: any) => Number(p.id));
+          const tagResults = await env.DB.batch<any>(
+            chunkIds(ids).map((c) => env.DB.prepare(
+              `SELECT pt.photo_id, t.id, t.name FROM PhotoTag pt
+                 JOIN Tag t ON t.id = pt.tag_id
+                WHERE pt.photo_id IN (${placeholdersFor(c)})`
+            ).bind(...c)),
+          );
+          const byPhoto = new Map<number, { id: number; name: string }[]>();
+          for (const part of tagResults) {
+            for (const row of part.results) {
+              const list = byPhoto.get(Number(row.photo_id)) ?? [];
+              list.push({ id: row.id, name: row.name });
+              byPhoto.set(Number(row.photo_id), list);
+            }
+          }
+          for (const photo of photos) {
+            (photo as any).tags = byPhoto.get(Number((photo as any).id)) ?? [];
           }
         }
-        return new Response(JSON.stringify(photos), { headers });
+
+        return new Response(JSON.stringify({
+          photos,
+          has_more: photos.length === limit,
+        }), { headers });
+         });
+      }
+
+      /*
+       * 路由：Google 時間軸比對用的照片清單。
+       *
+       * 這是唯一還會走完整張 Photo 表的讀取路徑，因為「哪張照片對得上哪個時間點」
+       * 本來就得看過每一張。差別在於它只有管理員按下匯入時才跑一次，而不是每個
+       * 訪客開首頁都跑；而且只取比對真正需要的四個欄位、用 id 當游標分批，
+       * 單次呼叫的記憶體與 CPU 都是固定的。
+       *
+       * only_missing=1 時只回還沒有座標的照片。這一段沒有索引可用（idx_photo_geo_nn
+       * 是 NOT NULL 的部分索引，剛好相反），還是得掃，但至少回傳量小很多。
+       */
+      if (method === "GET" && pathname === "/api/photos/geo-pending") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const cursor = Number(url.searchParams.get("cursor") ?? 0) || 0;
+        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 1000) || 1000, 1), 2000);
+        const onlyMissing = url.searchParams.get("only_missing") === "1";
+
+        const { results: photos } = await env.DB.prepare(`
+          SELECT id, lat, taken_at, taken_at_local
+            FROM Photo
+           WHERE id > ? ${onlyMissing ? "AND lat IS NULL" : ""}
+           ORDER BY id LIMIT ?
+        `).bind(cursor, limit).all();
+
+        return new Response(JSON.stringify({
+          photos,
+          next_cursor: photos.length > 0 ? Number((photos[photos.length - 1] as any).id) : cursor,
+          done: photos.length < limit,
+        }), { headers });
       }
 
       // 以下路由需要驗證
       const requiresAuth = ["POST", "PUT", "DELETE"].includes(method);
       if (requiresAuth && !(await isAuthorized(request, env))) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+      }
+
+      // 路由：重建全文檢索索引（分批）
+      //
+      // PhotoFts 的斷詞在 JS 裡做（見 fts.ts），沒辦法用 SQL trigger 補，所以
+      // backfill 得走這裡。設計成帶 cursor 分批而不是一次跑完，有兩個理由：
+      //   1. D1 每天只能寫 100K 列，一張照片約 5 列，一次灌完會直接撞額度
+      //   2. Workers 單次呼叫的 CPU 只有 10ms，照片一多必定超時
+      // 呼叫端拿到 next_cursor 就再打一次，拿到 done: true 才算完成。
+      if (method === "POST" && pathname === "/api/admin/rebuild-fts") {
+        const cursor = Number(url.searchParams.get("cursor") ?? 0) || 0;
+        const limit = Math.min(Number(url.searchParams.get("limit") ?? 100) || 100, 200);
+
+        const { results: photos } = await env.DB.prepare(
+          `SELECT id FROM Photo WHERE id > ? ORDER BY id LIMIT ?`
+        ).bind(cursor, limit).all();
+
+        if (photos.length === 0) {
+          return new Response(JSON.stringify({ processed: 0, done: true }), { headers });
+        }
+
+        await syncFtsForPhotos(env.DB, (photos as any[]).map((p) => Number(p.id)));
+
+        const nextCursor = Number((photos as any[])[photos.length - 1].id);
+        return new Response(JSON.stringify({
+          processed: photos.length,
+          next_cursor: nextCursor,
+          done: photos.length < limit,
+        }), { headers });
       }
 
       // 路由：重新排序相簿
@@ -473,10 +797,13 @@ if (method === "POST" && pathname === "/api/verify-password") {
         
         // 4. 刪除這些照片紀錄
         await env.DB.prepare("DELETE FROM Photo WHERE album_id = ?").bind(albumId).run();
-        
+
         // 5. 刪除相簿本身
         await env.DB.prepare("DELETE FROM Album WHERE id = ?").bind(albumId).run();
-        
+
+        // 6. PhotoFts 是虛擬表，沒有 FK，不會跟著 Photo 一起被刪掉
+        await deleteFtsForPhotos(env.DB, photos.map((p: any) => Number(p.id)));
+
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
@@ -556,16 +883,22 @@ function hammingDistance(hex1: string, hex2: string): number {
           geo.timeSource ?? (uploadTakenAt ? 'file_time' : null);
 
         const inserted = await env.DB.prepare(
+          // shuffle_key 由 SQL 直接產生：ALTER TABLE 不接受非常數的 DEFAULT，
+          // 而漏填的照片 shuffle_key 是 NULL，會被 /api/albums 的預覽查詢整個跳過。
+          // random() & 0x7FFFFFFF 保證落在 JS 安全整數內，後端才算得出同樣的種子。
           `INSERT INTO Photo
              (title, file_name, album_id, url, thumb_url, exif, taken_at, file_hash, phash,
-              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, shuffle_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
           file.name, fileName, albumId, fileUrl, thumbUrl, exifData,
           uploadTakenAt, fileHash, clientPhash,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
           uploadTimeSource,
         ).run();
+
+        const newPhotoId = Number(inserted.meta?.last_row_id ?? 0);
+        if (newPhotoId) await syncFtsForPhotos(env.DB, [newPhotoId]);
 
         // 回傳 id 與座標，前端才有辦法在上傳結束後認出「這一批」是哪幾張、
         // 以及其中哪幾張沒有 EXIF 位置需要補。
@@ -600,6 +933,7 @@ function hammingDistance(hex1: string, hex2: string): number {
           body.taken_at || null, body.taken_at || null, body.taken_at || null,
           photoId,
         ).run();
+        await syncFtsForPhotos(env.DB, [Number(photoId)]);
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
@@ -614,6 +948,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         // 如果該照片是某個相簿的封面，則清除該相簿的封面
         await env.DB.prepare("UPDATE Album SET cover_photo_url = NULL WHERE cover_photo_url = ?").bind(photo.url).run();
         await env.DB.prepare("DELETE FROM Photo WHERE id = ?").bind(photoId).run();
+        await deleteFtsForPhotos(env.DB, [Number(photoId)]);
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
@@ -627,6 +962,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         const tag = await env.DB.prepare("SELECT id FROM Tag WHERE name = ?").bind(tagName).first();
         if (tag) {
           await env.DB.prepare("INSERT OR IGNORE INTO PhotoTag (photo_id, tag_id) VALUES (?, ?)").bind(photoId, tag.id).run();
+          await syncFtsForPhotos(env.DB, [Number(photoId)]);
         }
         return new Response(JSON.stringify({ success: true, tag: { id: tag?.id, name: tagName } }), { headers });
       }
@@ -639,6 +975,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         await env.DB.prepare("DELETE FROM PhotoTag WHERE photo_id = ? AND tag_id = ?").bind(photoId, tagId).run();
         // 清理完全沒有任何照片使用的孤立標籤
         await env.DB.prepare("DELETE FROM Tag WHERE id NOT IN (SELECT DISTINCT tag_id FROM PhotoTag)").run();
+        await syncFtsForPhotos(env.DB, [Number(photoId)]);
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
@@ -950,17 +1287,21 @@ function hammingDistance(hex1: string, hex2: string): number {
           return new Response(JSON.stringify({ conflict: true, existingPhotos, tempPhoto }), { headers });
         }
 
-        await env.DB.prepare(
+        const syncInserted = await env.DB.prepare(
+          // shuffle_key 見 /api/upload 的說明：漏填會讓照片永遠不出現在相簿預覽
           `INSERT INTO Photo
              (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
-              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, shuffle_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
           tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
           tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash, tempPhoto.phash,
           tempPhoto.lat, tempPhoto.lng, tempPhoto.geo_source,
           tempPhoto.taken_at_local, tempPhoto.tz_offset_minutes, tempPhoto.time_source,
         ).run();
+
+        const syncedId = Number(syncInserted.meta?.last_row_id ?? 0);
+        if (syncedId) await syncFtsForPhotos(env.DB, [syncedId]);
 
         return new Response(JSON.stringify({ success: true, url: fileUrl }), { headers });
       }
@@ -980,6 +1321,10 @@ function hammingDistance(hex1: string, hex2: string): number {
         // 同理，同步流程不可能產生 'manual'，只放行 normalizeGeo 真的會回傳的值
         const tpTimeSource = ['offset_tag', 'gps_utc', 'file_time', 'assumed']
           .includes(tempPhoto?.time_source) ? tempPhoto.time_source : null;
+
+        // replace 與 keep_both 都會插入一張新照片，兩邊共用同一個變數，
+        // 收尾時再一次同步 FTS。skip 不會插入，維持 null。
+        let replacedInsert: D1Result | null = null;
 
         if (decision === "skip") {
           // 刪除暫存在 R2 的新檔案
@@ -1003,14 +1348,16 @@ function hammingDistance(hex1: string, hex2: string): number {
                   `DELETE FROM Photo WHERE id IN (${placeholdersFor(c)})`
                 ).bind(...c)),
               );
+              await deleteFtsForPhotos(env.DB, validIds);
             }
           }
           // 新增新檔案
-          await env.DB.prepare(
+          replacedInsert = await env.DB.prepare(
+            // shuffle_key 見 /api/upload 的說明
             `INSERT INTO Photo
                (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
-                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, shuffle_key)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
           ).bind(
             tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
             tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash || null, tempPhoto.phash || null,
@@ -1020,17 +1367,22 @@ function hammingDistance(hex1: string, hex2: string): number {
           // 修改標題避免混淆
           const count = existingPhotos ? existingPhotos.length : 1;
           const newTitle = tempPhoto.title.replace(/(\.[^.]+)$/, `_new_${count}$1`);
-          await env.DB.prepare(
+          replacedInsert = await env.DB.prepare(
+            // shuffle_key 見 /api/upload 的說明
             `INSERT INTO Photo
                (title, file_name, album_id, url, taken_at, exif,
-                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, shuffle_key)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
           ).bind(
             newTitle, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
             tempPhoto.taken_at, tempPhoto.exif,
             tpLat, tpLng, tpGeoSource, tpLocal, tpTz, tpTimeSource,
           ).run();
         }
+
+        const resolvedId = Number(replacedInsert?.meta?.last_row_id ?? 0);
+        if (resolvedId) await syncFtsForPhotos(env.DB, [resolvedId]);
+
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
@@ -1041,6 +1393,11 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 舊資料若無 taken_at_local，由 LOCAL_TIME_EXPR 從 taken_at 加時區推回來再比對。
       if (method === "GET" && pathname === "/api/footprint") {
         const isAdmin = await isAuthorized(request, env);
+        // 這條的隱私過濾是寫在 SQL 的 WHERE 裡（不是 applyGeoPrivacy），但結果同樣
+        // 依身分而異，一樣不能讓管理員的版本落進共用的邊緣快取
+        return withEdgeCache(request, ctx,
+          { browserMaxAge: 30, edgeMaxAge: 300, skip: isAdmin },
+          async () => {
         const conds = ["p.lat IS NOT NULL", "p.lng IS NOT NULL"];
         const binds: any[] = [];
 
@@ -1069,6 +1426,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         `).bind(...binds).all();
 
         return new Response(JSON.stringify(results), { headers });
+          });
       }
 
       // 路由：列出行程段（會直接暴露地點，僅管理者可讀）
@@ -1282,6 +1640,8 @@ function hammingDistance(hex1: string, hex2: string): number {
         await env.DB.batch(items.map((it: { photoId: number; placeName: string }) =>
           env.DB.prepare("UPDATE Photo SET place_name = ? WHERE id = ?").bind(it.placeName, it.photoId)
         ));
+        // place_name 是 FTS 的四個欄位之一，改了要跟著同步，否則搜地名會搜不到
+        await syncFtsForPhotos(env.DB, items.map((it: { photoId: number }) => it.photoId));
         return new Response(JSON.stringify({ success: true, updated: items.length }), { headers });
       }
 

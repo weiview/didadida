@@ -156,19 +156,84 @@ export async function checkAuth(): Promise<boolean> {
   }
 }
 
-export async function fetchAlbums(): Promise<Album[]> {
+/** 分頁查詢的共用參數。q 與 tags 交給後端做，前端不再自己過濾 */
+export interface QueryOptions {
+  q?: string;
+  tagIds?: number[];
+  offset?: number;
+  limit?: number;
+  /** 只有相簿清單看得懂；照片一律照拍攝時間新到舊 */
+  sort?: 'custom' | 'upload_date';
+}
+
+function queryString(opts: QueryOptions): string {
+  const sp = new URLSearchParams();
+  if (opts.q?.trim()) sp.set('q', opts.q.trim());
+  if (opts.tagIds?.length) sp.set('tags', opts.tagIds.join(','));
+  if (opts.offset) sp.set('offset', String(opts.offset));
+  if (opts.limit) sp.set('limit', String(opts.limit));
+  if (opts.sort) sp.set('sort', opts.sort);
+  const s = sp.toString();
+  return s ? `?${s}` : '';
+}
+
+/**
+ * 相簿清單，一次一頁。
+ *
+ * 以前是一次回傳全部相簿、連同每本的 10 張預覽圖，而那 10 張是後端用窗口函式
+ * 掃過整張 Photo 表算出來的。現在改成分頁 + 每本 5 張隨機預覽（後端走
+ * shuffle_key 索引），`has_more` 為 true 就再要下一頁。
+ *
+ * q / tagIds 也一起送給後端 —— 相簿既然是分頁的，就不可能再靠前端過濾，
+ * 手上根本沒有還沒載入的那幾頁。
+ */
+export async function fetchAlbums(
+  opts: QueryOptions = {},
+): Promise<{ albums: Album[]; hasMore: boolean }> {
   try {
-    const res = await fetch(`${API_BASE_URL}/albums`);
+    const res = await fetch(`${API_BASE_URL}/albums${queryString(opts)}`);
     if (!res.ok) throw new Error('Failed to fetch albums');
-    return res.json();
+    const data = await res.json();
+    return { albums: data.albums ?? [], hasMore: !!data.has_more };
   } catch (error) {
     console.error(error);
-    return [];
+    return { albums: [], hasMore: false };
   }
 }
 
 /**
- * 相簿裡的照片。**一定要帶 token**（跟 fetchAllPhotos 同理）：
+ * 整份相簿清單（自動翻頁）。只給真的需要「全部」的地方用 —— 目前是地圖頁的
+ * 相簿下拉選單與隱私開關。每頁 60 本是後端 limit 上限，300 本相簿約 5 次請求；
+ * 一般列表請改用分頁版 fetchAlbums()，不要為了方便就把整份抓下來。
+ */
+export async function fetchAllAlbums(): Promise<Album[]> {
+  const all: Album[] = [];
+  // 上限當保險絲：後端若哪天 has_more 恆為 true，也不會變成無窮迴圈
+  for (let page = 0; page < 50; page++) {
+    const { albums, hasMore } = await fetchAlbums({ limit: 60, offset: all.length });
+    all.push(...albums);
+    if (!hasMore || albums.length === 0) break;
+  }
+  return all;
+}
+
+/**
+ * 單一相簿。相簿頁只需要這一本的名稱與封面，不該為此把整份清單抓下來
+ * —— 清單分頁之後那招也不再成立，要的那本可能根本不在第一頁。
+ */
+export async function fetchAlbum(albumId: string | number): Promise<Album | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/albums/${albumId}`);
+    if (!res.ok) throw new Error('Failed to fetch album');
+    return res.json();
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+/**
+ * 相簿裡的照片。**一定要帶 token**（跟 searchPhotos 同理）：
  * 這條路由本身公開，但後端的 applyGeoPrivacy 對沒登入的請求會把 lat/lng/place_name
  * 抹成 null，而 map_private **預設就是 1**。不帶 token 的話管理者在自己的相簿頁
  * 看到的每張照片都是「沒有位置」，指定完地點也不會變 —— 資料其實寫進去了，
@@ -188,20 +253,71 @@ export async function fetchPhotos(albumId: string | number): Promise<Photo[]> {
 }
 
 /**
- * 全站照片。帶上 token —— 這條路由本身是公開的，但沒帶驗證的話後端會套用
- * applyGeoPrivacy，私密相簿的照片一律回傳 lat = null。時間軸匯入視窗就是靠
- * 「lat 是不是 null」判斷哪些照片還沒有座標，看不到自己的私密照片座標的話，
- * 那些照片會永遠被當成「還沒定位」，寫完也不會從待處理清單裡消失。
- * 未登入時 token 是空字串，後端驗不過，行為與原本的匿名請求相同。
+ * 全站照片搜尋（取代舊的 fetchAllPhotos）。
+ *
+ * 以前是把全站每一張照片抓回瀏覽器再用 includes() 過濾。首頁沒打關鍵字時那份
+ * 資料根本沒用到，卻每次進站都掃完整張 Photo 表。現在關鍵字與標籤都由後端的
+ * PhotoFts / idx_phototag_tag 處理，只回傳真正命中的那一頁。
+ *
+ * 一樣帶 token：這條路由公開，但沒帶驗證時後端會套 applyGeoPrivacy，而
+ * map_private **預設就是 1**，管理者會看到自己每張照片都「沒有位置」。
+ * 未登入時 token 是空字串，後端驗不過，行為與匿名請求相同。
  */
-export async function fetchAllPhotos(): Promise<Photo[]> {
+export async function searchPhotos(
+  opts: QueryOptions = {},
+): Promise<{ photos: Photo[]; hasMore: boolean }> {
   try {
-    const res = await fetch(`${API_BASE_URL}/all-photos`, { headers: getAuthHeaders() });
-    if (!res.ok) throw new Error('Failed to fetch all photos');
-    return res.json();
+    const res = await fetch(`${API_BASE_URL}/search${queryString(opts)}`, {
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) throw new Error('Failed to search photos');
+    const data = await res.json();
+    return { photos: data.photos ?? [], hasMore: !!data.has_more };
   } catch (error) {
     console.error(error);
-    return [];
+    return { photos: [], hasMore: false };
+  }
+}
+
+/**
+ * 時間軸比對用的照片清單（僅管理者）。
+ *
+ * 這是唯一還需要「全部照片」的地方 —— 要知道哪張照片對得上哪個時間點，本來就
+ * 得看過每一張。差別在於只取比對真正用得到的四個欄位，而且用 id 當游標分批抓，
+ * 不會有單一個超大回應把 Worker 的記憶體或 CPU 撐爆。
+ *
+ * onlyMissing 交給後端過濾，能少載回幾萬張已經有座標的照片。
+ */
+export async function fetchGeoPendingPhotos(onlyMissing: boolean): Promise<Photo[] | null> {
+  const out: Photo[] = [];
+  let cursor = 0;
+  try {
+    // 上限純粹是保險絲：正常情況下 done 會先為 true。沒有它的話，後端若因為
+    // 某個 bug 一直回同一個 cursor，這裡會變成無窮迴圈把瀏覽器鎖死。
+    for (let page = 0; page < 200; page++) {
+      const res = await fetch(
+        `${API_BASE_URL}/photos/geo-pending?cursor=${cursor}&limit=1000`
+          + (onlyMissing ? '&only_missing=1' : ''),
+        { headers: getAuthHeaders() },
+      );
+      if (!res.ok) throw new Error('Failed to fetch geo-pending photos');
+      const data = await res.json();
+      out.push(...(data.photos ?? []));
+      if (data.done || !data.photos?.length) break;
+      cursor = data.next_cursor;
+    }
+    return out;
+  } catch (error) {
+    console.error(error);
+    /*
+     * 失敗回 null 而不是空陣列。
+     *
+     * 空陣列在這裡是個合法且有意義的答案（「全部都有座標了」），呼叫端會拿它
+     * 去顯示「沒有待處理的照片」。把失敗也講成空陣列，使用者看到的就是一個
+     * 假的完成畫面。回傳已經抓到的半套資料同樣不行 —— 那會讓比對只跑一部分
+     * 照片，卻表現得像跑完了。
+     */
+    return null;
   }
 }
 
