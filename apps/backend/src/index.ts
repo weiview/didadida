@@ -784,13 +784,19 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const albumId = pathname.split("/")[3];
         
         // 1. 抓出這本相簿所有的照片
-        const { results: photos } = await env.DB.prepare("SELECT id, file_name FROM Photo WHERE album_id = ?").bind(albumId).all();
-        
+        //    縮圖的網址也要撈：只刪 file_name 會把兩張縮圖永遠留在 R2 佔額度
+        const { results: photos } = await env.DB.prepare(
+          "SELECT id, file_name, thumb_url, thumb_sm_url FROM Photo WHERE album_id = ?"
+        ).bind(albumId).all();
+
         if (photos.length > 0) {
-          // 2. 從 R2 刪除實體檔案
-          const fileNames = photos.map(p => p.file_name as string);
-          await env.BUCKET.delete(fileNames);
-          
+          // 2. 從 R2 刪除實體檔案（主檔 + 800px + 400px）
+          //    R2 的 delete 一次最多吃 1000 個鍵，一本相簿可能上千張，得分批
+          const keys = photos.flatMap((p) => r2KeysForPhoto(p));
+          for (let i = 0; i < keys.length; i += 1000) {
+            await env.BUCKET.delete(keys.slice(i, i + 1000));
+          }
+
           // 3. 刪除所有這些照片的 Tag 關聯
           await env.DB.prepare(`DELETE FROM PhotoTag WHERE photo_id IN (SELECT id FROM Photo WHERE album_id = ?)`).bind(albumId).run();
         }
@@ -806,6 +812,50 @@ if (method === "POST" && pathname === "/api/verify-password") {
 
         return new Response(JSON.stringify({ success: true }), { headers });
       }
+
+/*
+ * 輔助函式：從 `/api/photos/view/<key>` 這種對外網址反推 R2 的物件鍵。
+ *
+ * 刪除縮圖時不能用「thumb_ + file_name」去猜。縮圖的副檔名跟著實際編碼格式走
+ * （舊照片是 .jpg，Phase 2 之後是 .webp，不支援 WebP 的瀏覽器又會退回 .jpg），
+ * 猜錯就是安靜地刪不到 —— 物件會永遠留在 R2 裡佔免費額度，而且完全沒有錯誤訊息。
+ * thumb_url / thumb_sm_url 存的就是權威答案，直接從那裡拆。
+ */
+function r2KeyFromViewUrl(viewUrl: unknown): string | null {
+  if (typeof viewUrl !== "string") return null;
+  const marker = "/api/photos/view/";
+  const at = viewUrl.indexOf(marker);
+  if (at < 0) return null;
+  const raw = viewUrl.slice(at + marker.length).split(/[?#]/)[0];
+  if (!raw) return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    // 不是合法的 percent-encoding 就當作沒編碼過，總比直接放棄好
+    return raw;
+  }
+}
+
+/** 一張照片在 R2 佔用的所有物件鍵（主檔 + 兩種縮圖），已去重且濾掉空值 */
+function r2KeysForPhoto(photo: any): string[] {
+  const keys = [
+    typeof photo?.file_name === "string" ? photo.file_name : null,
+    r2KeyFromViewUrl(photo?.thumb_url),
+    r2KeyFromViewUrl(photo?.thumb_sm_url),
+  ].filter((k): k is string => !!k);
+  return [...new Set(keys)];
+}
+
+/**
+ * 縮圖的副檔名要跟著實際的 content type 走，不能寫死 .jpg。
+ * 舊版寫死副檔名不痛不癢是因為當時只有 JPEG 一種；現在混著 WebP，
+ * 副檔名對不上會讓上面那個反推規則以外的任何猜測都失效。
+ */
+function thumbExtFor(contentType: string): string {
+  if (contentType === "image/webp") return "webp";
+  if (contentType === "image/png") return "png";
+  return "jpg";
+}
 
 // 輔助函式：計算 ArrayBuffer 的 SHA-256 Hex 雜湊
 async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
@@ -832,7 +882,10 @@ function hammingDistance(hex1: string, hex2: string): number {
         // 回傳型別會解析到不含 File 的那一份，直接 as File 會被 TS 擋下來。
         // 實際 runtime 是 Workers，取到的就是 File；下面仍有 !file 的檢查。
         const file = formData.get('file') as unknown as File | null;
+        // thumb = 800px（相簿格線）、thumb_sm = 400px（首頁卡片與地圖標記）。
+        // 舊版前端只送 thumb，這裡兩個都允許缺席，缺的欄位留 NULL 讓讀取端 COALESCE 退回去。
         const thumb = formData.get('thumb') as unknown as File | null;
+        const thumbSm = formData.get('thumb_sm') as unknown as File | null;
         const albumId = formData.get('album_id') as string;
         const exifData = formData.get('exif') as string || null;
         const takenAt = formData.get('taken_at') as string || null;
@@ -855,16 +908,32 @@ function hammingDistance(hex1: string, hex2: string): number {
           httpMetadata: { contentType: file.type }
         });
         
-        let thumbUrl = null;
-        if (thumb) {
-          const thumbFileName = `thumb_${fileName}`;
-          await env.BUCKET.put(thumbFileName, thumb.stream(), {
-            httpMetadata: { contentType: thumb.type || 'image/jpeg' }
-          });
-          thumbUrl = `${new URL(request.url).origin}/api/photos/view/${encodeURIComponent(thumbFileName)}`;
-        }
-        
         const host = new URL(request.url).origin;
+
+        /*
+         * 兩個尺寸的縮圖各存一顆 R2 物件。
+         *
+         * 舊版只有一張 400px、而且是 `'image/jpeg', 1.0` 編碼的 —— q1.0 幾乎不壓縮，
+         * 實測平均 118 KB，光縮圖在 15 萬張時就要 18 GB，本身就會撐爆 10 GB 免費額度。
+         * 現在前端送 400px + 800px 的 WebP q80（10.9 + 41.3 KB），兩張加起來還不到舊版一張的一半。
+         *
+         * 物件鍵的副檔名跟著實際 content type 走：前端在不支援 WebP 編碼的瀏覽器上
+         * 會退回 JPEG，寫死副檔名會讓 R2 上的鍵與內容不一致。
+         */
+        const baseName = fileName.replace(/\.[^/.]+$/, '');
+        const putThumb = async (blob: File | null, prefix: string): Promise<string | null> => {
+          if (!blob) return null;
+          const contentType = blob.type || 'image/jpeg';
+          const key = `${prefix}_${baseName}.${thumbExtFor(contentType)}`;
+          await env.BUCKET.put(key, blob.stream(), { httpMetadata: { contentType } });
+          return `${host}/api/photos/view/${encodeURIComponent(key)}`;
+        };
+        // 兩顆物件互不相干，併發送出省掉一趟 R2 往返
+        const [thumbUrl, thumbSmUrl] = await Promise.all([
+          putThumb(thumb, 'thumb'),
+          putThumb(thumbSm, 'thumbsm'),
+        ]);
+
         const fileUrl = `${host}/api/photos/view/${encodeURIComponent(fileName)}`;
 
         // 由 EXIF 推導座標與時區。前端送來的 exif 已把時間欄位保留為原始字串，
@@ -887,11 +956,11 @@ function hammingDistance(hex1: string, hex2: string): number {
           // 而漏填的照片 shuffle_key 是 NULL，會被 /api/albums 的預覽查詢整個跳過。
           // random() & 0x7FFFFFFF 保證落在 JS 安全整數內，後端才算得出同樣的種子。
           `INSERT INTO Photo
-             (title, file_name, album_id, url, thumb_url, exif, taken_at, file_hash, phash,
+             (title, file_name, album_id, url, thumb_url, thumb_sm_url, exif, taken_at, file_hash, phash,
               lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, shuffle_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
-          file.name, fileName, albumId, fileUrl, thumbUrl, exifData,
+          file.name, fileName, albumId, fileUrl, thumbUrl, thumbSmUrl, exifData,
           uploadTakenAt, fileHash, clientPhash,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
           uploadTimeSource,
@@ -907,6 +976,7 @@ function hammingDistance(hex1: string, hex2: string): number {
           id: inserted.meta?.last_row_id ?? null,
           url: fileUrl,
           thumb_url: thumbUrl,
+          thumb_sm_url: thumbSmUrl,
           file_hash: fileHash,
           lat: geo.lat,
           lng: geo.lng,
@@ -940,10 +1010,13 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：刪除照片
       if (method === "DELETE" && pathname.startsWith("/api/photos/") && pathname.split("/").length === 4) {
         const photoId = pathname.split("/")[3];
-        const photo = await env.DB.prepare("SELECT file_name, url FROM Photo WHERE id = ?").bind(photoId).first();
+        const photo = await env.DB.prepare(
+          "SELECT file_name, url, thumb_url, thumb_sm_url FROM Photo WHERE id = ?"
+        ).bind(photoId).first();
         if (!photo) return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
-        
-        await env.BUCKET.delete(photo.file_name as string);
+
+        // 主檔 + 兩張縮圖一起刪，只刪 file_name 會留下孤兒縮圖佔 R2 額度
+        await env.BUCKET.delete(r2KeysForPhoto(photo));
         await env.DB.prepare("DELETE FROM PhotoTag WHERE photo_id = ?").bind(photoId).run();
         // 如果該照片是某個相簿的封面，則清除該相簿的封面
         await env.DB.prepare("UPDATE Album SET cover_photo_url = NULL WHERE cover_photo_url = ?").bind(photo.url).run();
@@ -1332,17 +1405,26 @@ function hammingDistance(hex1: string, hex2: string): number {
         } else if (decision === "replace") {
           // 刪除多個舊檔案
           if (replacePhotoIds && Array.isArray(replacePhotoIds) && replacePhotoIds.length > 0) {
-            const filesToDelete: string[] = [];
             const validIds: number[] = [];
             for (const id of replacePhotoIds) {
               const existingPhoto = (existingPhotos || []).find((p: any) => p.id === id);
-              if (existingPhoto) {
-                filesToDelete.push(existingPhoto.file_name);
-                validIds.push(existingPhoto.id);
-              }
+              if (existingPhoto) validIds.push(existingPhoto.id);
             }
-            if (filesToDelete.length > 0) {
-              await env.BUCKET.delete(filesToDelete);
+            if (validIds.length > 0) {
+              /*
+               * 要刪的物件鍵一律回 D1 查，不要用前端送回來的 existingPhotos。
+               * 那份是 sync-photo 當時回給前端、再由前端原樣送回來的，既不保證帶得到
+               * thumb_url / thumb_sm_url，也不保證跟現況一致 —— 少一個欄位的下場是
+               * 縮圖被留在 R2 裡，沒有任何錯誤訊息。
+               */
+              const fetched = await env.DB.batch<any>(
+                chunkIds(validIds).map((c) => env.DB.prepare(
+                  `SELECT file_name, thumb_url, thumb_sm_url FROM Photo
+                    WHERE id IN (${placeholdersFor(c)})`
+                ).bind(...c)),
+              );
+              const keys = fetched.flatMap((part) => part.results.flatMap((p: any) => r2KeysForPhoto(p)));
+              if (keys.length > 0) await env.BUCKET.delete(keys);
               await env.DB.batch(
                 chunkIds(validIds).map((c) => env.DB.prepare(
                   `DELETE FROM Photo WHERE id IN (${placeholdersFor(c)})`
@@ -1413,7 +1495,9 @@ function hammingDistance(hex1: string, hex2: string): number {
 
         const { results } = await env.DB.prepare(`
           SELECT p.id, p.title, p.album_id, a.name AS album_name,
-                 COALESCE(p.thumb_url, p.url) AS url,
+                 -- 地圖標記畫出來只有幾十像素，一律拿最小的 400px；
+                 -- 舊照片沒有 thumb_sm_url 才逐級退回
+                 COALESCE(p.thumb_sm_url, p.thumb_url, p.url) AS url,
                  p.lat, p.lng, p.place_name, p.geo_source,
                  ${LOCAL_TIME_EXPR} AS local_time,
                  -- 顯示用的是 local_time，但要跟 GPS 軌跡排到同一條時間軸上
@@ -1476,7 +1560,7 @@ function hammingDistance(hex1: string, hex2: string): number {
           // NOT IN 要一次排除全部，拆開跑每塊都會把別塊的 id 當成漏網之魚撈回來。
           // 相簿內、落在時間範圍內的照片本來就沒幾張，撈回來過濾很便宜。
           const { results } = await env.DB.prepare(`
-            SELECT p.id, p.title, COALESCE(p.thumb_url, p.url) AS url, ${LOCAL_TIME_EXPR} AS local_time
+            SELECT p.id, p.title, COALESCE(p.thumb_sm_url, p.thumb_url, p.url) AS url, ${LOCAL_TIME_EXPR} AS local_time
             FROM Photo p
             WHERE p.album_id IN (${aph})
               AND ${LOCAL_TIME_EXPR} BETWEEN ? AND ?

@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, type UploadedPhoto } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, type UploadedPhoto } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
@@ -1104,9 +1104,9 @@ function AlbumContent() {
                   </div>
                 </>
               )}
-              <img 
-                src={photo.thumb_url || photo.url} 
-                alt={photo.title} 
+              <img
+                src={photoThumbSrc(photo, 'md')}
+                alt={photo.title}
                 className={styles.photoImage} 
                 loading="lazy" 
                 decoding="async" 

@@ -27,6 +27,23 @@ export interface Tag {
   name: string;
 }
 
+/**
+ * 挑一張照片該用哪個網址當縮圖。
+ *
+ * `'sm'` 是小格子（首頁搜尋結果、選取面板、地圖泡泡），`'md'` 是相簿格線。
+ * 一定要逐級退回而不是直接取單一欄位：Phase 2 之前上傳的照片沒有 thumb_sm_url，
+ * Google 同步進來的連 thumb_url 都是 null —— 少寫一級就會安靜地掉到 2000px 原圖，
+ * 一頁載幾十張的地方等於把 R2 流量放大幾十倍，而畫面看起來完全正常。
+ */
+export function photoThumbSrc(
+  photo: { url: string; thumb_url?: string; thumb_sm_url?: string },
+  size: 'sm' | 'md' = 'md',
+): string {
+  return size === 'sm'
+    ? photo.thumb_sm_url || photo.thumb_url || photo.url
+    : photo.thumb_url || photo.thumb_sm_url || photo.url;
+}
+
 export interface Photo {
   id: number;
   title: string;
@@ -34,7 +51,10 @@ export interface Photo {
   file_name: string;
   album_id: number;
   url: string;
+  /** 800px WebP，相簿格線用。Phase 2 之前上傳的是 400px JPEG */
   thumb_url?: string;
+  /** 400px WebP，小格子與地圖標記用。Phase 2 之前上傳的照片是 null */
+  thumb_sm_url?: string;
   sort_order: number;
   taken_at?: string;
   /** 牆上時間 'YYYY-MM-DD HH:MM:SS'，顯示與行程段比對都用這個 */
@@ -321,48 +341,91 @@ export async function fetchGeoPendingPhotos(onlyMissing: boolean): Promise<Photo
   }
 }
 
-async function generateThumbnail(file: File): Promise<Blob | null> {
-  if (!file.type.startsWith('image/')) return null;
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        const MAX_WIDTH = 400;
-        const MAX_HEIGHT = 400;
-        let width = img.width;
-        let height = img.height;
+/*
+ * ---- R2 縮圖 ----
+ *
+ * 舊版只產一張 400px，而且是用 `'image/jpeg', 1.0` 編碼的。q1.0 幾乎不壓縮，
+ * 實測 133 張現有縮圖平均 118 KB —— 光縮圖在 15 萬張時就要 18 GB，
+ * 現有程式碼本身就會撐爆 R2 的 10 GB 免費額度，跟任何新功能無關。
+ *
+ * 改成兩個尺寸的 WebP q80：
+ *   400px（10.9 KB）給首頁相簿卡片輪播與地圖標記
+ *   800px（41.3 KB）給相簿格線
+ * 兩張加起來 52.2 KB，還不到舊版一張的一半。
+ *
+ * 主檔（resizeImageFile 產的 2000px JPEG）刻意不動：它帶著 piexifjs 寫回去的
+ * EXIF，而 piexifjs 不支援 WebP，改格式等於把 EXIF 從檔案裡剝掉。
+ * 主檔搬去 Drive 是 Phase 3 的事。
+ */
+const THUMB_QUALITY = 0.8;
+const THUMB_MAX_EDGE_SM = 400;
+const THUMB_MAX_EDGE_MD = 800;
 
-        if (width > height) {
-          if (width > MAX_WIDTH) {
-            height *= MAX_WIDTH / width;
-            width = MAX_WIDTH;
-          }
-        } else {
-          if (height > MAX_HEIGHT) {
-            width *= MAX_HEIGHT / height;
-            height = MAX_HEIGHT;
-          }
-        }
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.imageSmoothingEnabled = true;
-          ctx.imageSmoothingQuality = 'high';
-          ctx.drawImage(img, 0, 0, width, height);
-          canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 1.0);
-        } else {
-          resolve(null);
-        }
-      };
-      img.onerror = () => resolve(null);
-      img.src = e.target?.result as string;
-    };
-    reader.onerror = () => resolve(null);
-    reader.readAsDataURL(file);
+let webpEncodable: boolean | null = null;
+/**
+ * `canvas.toBlob` 給不認得的 MIME 型別時會**安靜地**吐 PNG 回來，不會報錯。
+ * 不先問清楚的話，不支援 WebP 編碼的瀏覽器會把 PNG 當縮圖傳上去 —— 那比原本的
+ * JPEG 還大，等於在修額度問題的同時把它弄得更糟。
+ */
+function canEncodeWebp(): boolean {
+  if (webpEncodable === null) {
+    const probe = document.createElement('canvas');
+    probe.width = probe.height = 1;
+    webpEncodable = probe.toDataURL('image/webp').startsWith('data:image/webp');
+  }
+  return webpEncodable;
+}
+
+function loadImage(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    // 用 objectURL 而不是 FileReader 的 data URL：後者要先把整份檔案 base64 化，
+    // 多花 33% 記憶體與一趟編碼，批次上傳幾百張時很有感
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(objectUrl); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(objectUrl); reject(new Error('圖片解碼失敗')); };
+    img.src = objectUrl;
   });
+}
+
+function encodeThumb(img: HTMLImageElement, maxEdge: number): Promise<Blob | null> {
+  // 只縮不放：原圖比目標還小的時候放大只會多佔位元組，畫質一點都不會變好
+  const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
+  const width = Math.max(1, Math.round(img.width * scale));
+  const height = Math.max(1, Math.round(img.height * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return Promise.resolve(null);
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, 0, 0, width, height);
+
+  const type = canEncodeWebp() ? 'image/webp' : 'image/jpeg';
+  return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), type, THUMB_QUALITY));
+}
+
+interface ThumbnailSet {
+  /** 400px，給首頁卡片輪播與地圖標記 */
+  sm: Blob | null;
+  /** 800px，給相簿格線 */
+  md: Blob | null;
+}
+
+async function generateThumbnails(file: File): Promise<ThumbnailSet> {
+  if (!file.type.startsWith('image/')) return { sm: null, md: null };
+
+  // 兩個尺寸共用同一次解碼。2000px 的 JPEG 解一次就要好幾十毫秒，
+  // 各解一次等於整批上傳白等一倍的時間
+  const img = await loadImage(file);
+  const [sm, md] = await Promise.all([
+    encodeThumb(img, THUMB_MAX_EDGE_SM),
+    encodeThumb(img, THUMB_MAX_EDGE_MD),
+  ]);
+  return { sm, md };
 }
 
 /** 上傳成功後回傳的那一筆，null 代表失敗 */
@@ -378,14 +441,15 @@ export async function uploadPhoto(albumId: string, file: File, exifData?: any, t
   formData.append('file', file);
   formData.append('album_id', albumId);
   
-  // Generate and append thumbnail
+  // 產生兩個尺寸的縮圖。任一個缺席後端都收得下（欄位留 NULL），
+  // 讀取端一律 COALESCE 逐級退回，所以這裡失敗不會擋住上傳
   try {
-    const thumbBlob = await generateThumbnail(file);
-    if (thumbBlob) {
-      formData.append('thumb', thumbBlob, `thumb_${file.name}`);
-    }
+    const { sm, md } = await generateThumbnails(file);
+    // R2 的物件鍵副檔名由後端依 blob.type 決定，這裡的檔名只是 FormData 的擺設
+    if (md) formData.append('thumb', md, 'thumb');
+    if (sm) formData.append('thumb_sm', sm, 'thumb_sm');
   } catch (err) {
-    console.warn("Failed to generate thumbnail", err);
+    console.warn("縮圖產生失敗，這張照片只會有原圖", err);
   }
 
   if (exifData) {
