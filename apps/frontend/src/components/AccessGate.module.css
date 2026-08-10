@@ -1,0 +1,119 @@
+/* 進站畫面。刻意跟站內其他 modal 長得不一樣 —— 這不是一個「可以關掉的對話框」，
+   而是整個站的門，關不掉也沒有取消鈕 */
+
+.screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.card {
+  width: 100%;
+  max-width: 360px;
+  background: var(--card-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  box-shadow: 0 10px 30px var(--shadow-color);
+  padding: 36px 28px 28px;
+  text-align: center;
+}
+
+.brand {
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+
+.subtitle {
+  font-size: 13px;
+  color: var(--text-light);
+  margin-bottom: 26px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  text-align: left;
+}
+
+.field input {
+  width: 100%;
+  padding: 12px 14px;
+  font-size: 16px; /* 小於 16px 的話 iOS Safari 聚焦時會自己放大整頁 */
+  font-family: inherit;
+  color: var(--text-color);
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 12px;
+  outline: none;
+  transition: border-color var(--transition-speed);
+}
+
+.field input:focus {
+  border-color: var(--accent-color);
+}
+
+.submit {
+  width: 100%;
+  margin-top: 14px;
+  padding: 12px 16px;
+  font-size: 15px;
+  font-family: inherit;
+  color: #fff;
+  background: #8a7866;
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: opacity var(--transition-speed);
+}
+
+.submit:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.error {
+  margin-top: 14px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+  font-size: 13px;
+  line-height: 1.7;
+  text-align: left;
+}
+
+.divider {
+  margin: 24px 0 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+/* 管理員入口。刻意做得比進站鈕安靜 —— 這扇門平常是給家人走的 */
+.adminLink {
+  background: none;
+  border: none;
+  padding: 4px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text-light);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.adminLink:hover {
+  color: var(--text-color);
+}
+
+/* 還在問後端「這張 token 還算數嗎」的那半秒。留白就好，
+   不要先畫出進站畫面 —— 已經登入的人每次重整都會看到它閃一下 */
+.splash {
+  min-height: 100vh;
+}

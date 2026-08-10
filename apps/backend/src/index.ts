@@ -10,6 +10,15 @@ export interface Env {
   DB: D1Database;
   BUCKET: R2Bucket;
   APP_PASSWORD: string;
+  /**
+   * 進站密碼（訪客）。**跟 APP_PASSWORD 是兩把不同的鑰匙**：這一把只換得到
+   * 「看得到公開內容」的 token，換不到管理權，所以可以放心給家人朋友。
+   *
+   * **沒設就沒有人進得來**（同 ADMIN_EMAILS 的理由）—— 不是「沒設就全站公開」。
+   * 忘記設定的代價該是自己被鎖在外面，不是把整站默默攤開給全世界。
+   * 管理員仍然可以用 Google 登入或 APP_PASSWORD 進來，不會真的把自己關死。
+   */
+  GUEST_PASSWORD?: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
   /**
@@ -48,51 +57,77 @@ export interface Env {
 const SETTING_PHOTOS_FOLDER = "drive_photos_folder_id";
 const SETTING_TRASH_FOLDER = "drive_trash_folder_id";
 
-async function generateJWT(env: Env): Promise<string> {
+/**
+ * token 裡的身分。兩層，沒有第三層：
+ *   - `admin`：所有編輯權限，看得到私密座標與軌跡。來源是 Google 登入或 APP_PASSWORD。
+ *   - `guest`：只是「進得了站」。看到的內容與從前的匿名訪客完全一樣
+ *     （applyGeoPrivacy 照樣把私密座標抹掉），差別只在匿名的人現在連清單都拿不到。
+ *
+ * 兩者都是同一把 HMAC 金鑰（APP_PASSWORD）簽的 —— 金鑰只是簽章用，
+ * 換得到哪一種 token 才是由密碼決定的。
+ */
+type Role = 'admin' | 'guest';
+
+async function generateJWT(env: Env, role: Role = 'admin'): Promise<string> {
   const encoder = new TextEncoder();
   const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const payload = btoa(JSON.stringify({ iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 86400 * 7 })); // 7 days
+  const payload = btoa(JSON.stringify({ role, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 86400 * 7 })); // 7 days
   const data = `${header}.${payload}`;
-  
+
   const key = await crypto.subtle.importKey('raw', encoder.encode(env.APP_PASSWORD), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data));
   const signatureB64 = btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  
+
   return `${data}.${signatureB64}`;
 }
 
-async function verifyJWT(token: string, env: Env): Promise<boolean> {
+/**
+ * 驗簽 + 驗到期，回傳這張 token 代表的身分；不合法一律 null。
+ *
+ * **沒有 role 欄位的當 admin** —— 那是加訪客層之前發出去的 token，只有管理員拿得到。
+ * 反過來預設成 guest 的話，這次改動會把所有還沒過期的管理員降級，
+ * 而且是安靜地降級（畫面上編輯工具消失，看起來像壞掉）。
+ */
+async function verifyJWT(token: string, env: Env): Promise<Role | null> {
   try {
     const parts = token.split('.');
-    if (parts.length !== 3) return false;
+    if (parts.length !== 3) return null;
     const [header, payload, signature] = parts;
-    
+
     const payloadObj = JSON.parse(atob(payload));
-    if (payloadObj.exp < Math.floor(Date.now() / 1000)) return false;
+    if (payloadObj.exp < Math.floor(Date.now() / 1000)) return null;
 
     const data = `${header}.${payload}`;
     const encoder = new TextEncoder();
     const key = await crypto.subtle.importKey('raw', encoder.encode(env.APP_PASSWORD), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
-    
+
     const sigBytes = Uint8Array.from(atob(signature.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-    
-    return await crypto.subtle.verify('HMAC', key, sigBytes, encoder.encode(data));
+
+    const ok = await crypto.subtle.verify('HMAC', key, sigBytes, encoder.encode(data));
+    if (!ok) return null;
+    return payloadObj.role === 'guest' ? 'guest' : 'admin';
   } catch (e) {
-    return false;
+    return null;
   }
 }
 
+/** Authorization: Bearer 裡那張 token 的身分。沒帶、壞掉、過期都是 null */
+async function tokenRole(request: Request, env: Env): Promise<Role | null> {
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader) return null;
+  const token = authHeader.replace("Bearer ", "");
+  if (!token) return null;
+  return await verifyJWT(token, env);
+}
+
 /**
- * 只認 /api/verify-password 發出的 JWT。
+ * 只認 /api/verify-password 或 Google 登入發出的**管理員** JWT。
  *
  * 以前這裡也接受裸的 APP_PASSWORD 當 bearer（backward compatibility），已經移除：
  * 那個密碼同時是 JWT 的簽章金鑰，一旦外流等於可以自簽任意 token，而且撤不掉。
  */
 async function isAuthorized(request: Request, env: Env): Promise<boolean> {
-  const authHeader = request.headers.get("Authorization");
-  if (!authHeader) return false;
-  const token = authHeader.replace("Bearer ", "");
-  return await verifyJWT(token, env);
+  return (await tokenRole(request, env)) === 'admin';
 }
 
 /**
@@ -436,7 +471,10 @@ const origin = request.headers.get("Origin") || "";
     };
 
     if (method === "OPTIONS") {
-      return new Response(null, { headers });
+      // 進站閘門讓原本免預檢的 GET（/api/albums 那批）開始帶 Authorization，
+      // 於是每一支都多一次 OPTIONS。快取一天，免得每次翻頁都來回兩趟。
+      // 註：預檢快取是連查詢字串一起當鍵的，所以分頁還是各預檢一次，省不掉。
+      return new Response(null, { headers: { ...headers, "Access-Control-Max-Age": "86400" } });
     }
 
     // Block non-TW IPs
@@ -447,6 +485,37 @@ const origin = request.headers.get("Origin") || "";
         status: 403,
         headers
       });
+    }
+
+    /*
+     * ── 進站閘門 ──────────────────────────────────────────────────────────────
+     *
+     * 整站不再對匿名請求開放。以前「GET 都公開」的那批（相簿清單、相簿內容、
+     * 搜尋、標籤、足跡）現在都要一張 token，不管是 guest 還是 admin。
+     *
+     * 寫成**白名單 + 一道總閘**而不是在每支路由各加一行，是因為後者漏一支就等於
+     * 沒鎖，而漏掉的那支通常是新加的 —— 新路由預設該是關的。
+     *
+     * 白名單只有兩類：
+     *   1. 換 token 的入口（不然沒有人進得來）。
+     *   2. **圖片**。它們是 <img src>，瀏覽器不會幫忙帶 Authorization，
+     *      要擋就只能改用跨網域 cookie（SameSite=None），Safari／Chrome 的第三方
+     *      cookie 封鎖會直接讓圖片全破。使用者已決定不走那條路：R2 的物件鍵
+     *      要先拿到相簿 JSON 才知道，而相簿 JSON 現在是鎖著的。
+     *
+     * 位置很重要：**必須排在 withEdgeCache 之前**。閘門若放在各路由裡面，
+     * 訪客的回應會先進共用的邊緣快取，之後匿名請求就直接命中那份快取拿到 200。
+     */
+    const isOpenPath =
+      pathname === "/api/verify-password"
+      || pathname === "/api/verify-guest"
+      || pathname === "/api/auth/me"
+      || pathname.startsWith("/api/auth/google/")
+      || pathname.startsWith("/api/photos/view/")
+      || /^\/api\/photos\/\d+\/full$/.test(pathname);
+
+    if (!isOpenPath && !(await tokenRole(request, env))) {
+      return new Response(JSON.stringify({ error: "locked" }), { status: 401, headers });
     }
 
     try {
@@ -479,16 +548,57 @@ if (method === "POST" && pathname === "/api/verify-password") {
         return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
       }
 
+      /*
+       * 路由：進站密碼 → 訪客 token。
+       *
+       * 節流的計數器跟 verify-password **分開計**（key 加 `guest:` 前綴）：
+       * 共用的話，家人打錯五次進站密碼會連帶把管理員登入鎖十分鐘，
+       * 而那兩件事其實沒有關係。2 秒延遲與五次上限則刻意比照辦理 ——
+       * 這把鑰匙開的門比較小，但它終究還是一把可以被慢慢猜的密碼。
+       */
+      if (method === "POST" && pathname === "/api/verify-guest") {
+        if (!env.GUEST_PASSWORD) {
+          // 沒設定就沒有人進得來。回 503 而不是 401，前端才分得出「密碼打錯」
+          // 與「這個環境根本還沒設定」—— 後者叫使用者一直重打密碼是最糟的體驗
+          return new Response(JSON.stringify({ error: "not_configured" }), { status: 503, headers });
+        }
+
+        await new Promise(r => setTimeout(r, 2000));
+
+        const ip = "guest:" + (request.headers.get("CF-Connecting-IP") || "unknown");
+        const attempt = loginAttempts.get(ip) || { count: 0 };
+        if (attempt.lockUntil && attempt.lockUntil > Date.now()) {
+          return new Response(JSON.stringify({ error: "Too many attempts. Locked for 10 minutes." }), { status: 429, headers });
+        }
+
+        const body: { password: string } = await request.json();
+        if (body.password === env.GUEST_PASSWORD) {
+          loginAttempts.delete(ip);
+          const token = await generateJWT(env, 'guest');
+          return new Response(JSON.stringify({ success: true, token }), { headers });
+        }
+
+        attempt.count += 1;
+        if (attempt.count >= 5) attempt.lockUntil = Date.now() + 10 * 60 * 1000;
+        loginAttempts.set(ip, attempt);
+
+        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+      }
+
       // 路由：確認手上的 token 還有效（沒過期、簽章對）
       //
       // 前端每次進站都靠這一條決定要不要顯示編輯介面 —— 只看 localStorage 有沒有
       // token 是不夠的，過期後那個 key 還在。刻意不套 verify-password 的 2 秒延遲
       // 與登入節流：它不接受密碼，沒有可暴力破解的東西，也沒有任何副作用。
+      //
+      // 加了訪客層之後這條也回報「進不進得了站」：401 代表手上什麼都沒有，
+      // 前端該把進站畫面端出來；200 + admin:false 代表是訪客，可以瀏覽但沒有編輯權。
       if (method === "GET" && pathname === "/api/auth/me") {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ admin: false }), { status: 401, headers });
+        const role = await tokenRole(request, env);
+        if (!role) {
+          return new Response(JSON.stringify({ admin: false, guest: false }), { status: 401, headers });
         }
-        return new Response(JSON.stringify({ admin: true }), { headers });
+        return new Response(JSON.stringify({ admin: role === 'admin', guest: role === 'guest' }), { headers });
       }
 
       /*

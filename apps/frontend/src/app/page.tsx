@@ -6,6 +6,7 @@ import albumStyles from "./album/album.module.css";
 import Link from "next/link";
 import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
+import { authErrorMessage } from "@/lib/authMessages";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import PhotoLightbox from "./album/PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
@@ -125,27 +126,6 @@ function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPres
       </Link>
     </div>
   );
-}
-
-/**
- * 把後端回的原因代碼翻成人話。看得懂才知道是「換個帳號」還是「去改後端設定」，
- * 認不得的代碼就原樣顯示 —— 總比吞掉好。
- */
-function authErrorMessage(reason: string): string {
-  switch (reason) {
-    case 'not_admin':
-      return '這個 Google 帳號不在管理員名單裡。換個帳號登入，或用下面的密碼進來。';
-    case 'not_configured':
-      return '後端還沒設定管理員信箱（ADMIN_EMAILS），Google 登入暫時不能用。請先用密碼登入。';
-    case 'email_unverified':
-      return '這個 Google 帳號的信箱還沒驗證，不能用來登入管理員。';
-    case 'wrong_audience':
-      return 'Google 給的憑證不是發給這個網站的，登入流程設定可能壞了。請用密碼登入。';
-    case 'token_invalid':
-      return 'Google 憑證失效了，請再試一次。';
-    default:
-      return `Google 登入失敗（${reason}）。`;
-  }
 }
 
 export default function Home() {
