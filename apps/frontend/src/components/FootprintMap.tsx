@@ -131,6 +131,15 @@ interface Stay {
 // 一條橫跨地圖的假直線接起來。
 const MAX_GAP_MS = 24 * 60 * 60 * 1000;
 
+/*
+ * 兩趟貼路軌跡之間，最遠隔多少公尺還願意用虛線接起來。
+ *
+ * 火車、飛機、船那些段落是整趟跳過的（costingFor 回 null），拉一條幾百公里的
+ * 直線橫過地圖比讓它斷著還糟，所以一定要有上限。實測十天的空隙是 15–154m
+ * （人停下來的地方：進賣場、回公司、停車），500m 有三倍餘裕又離「換城市」很遠。
+ */
+const MATCHED_BRIDGE_MAX_M = 500;
+
 // 照片離停留質心多近才算「在同一個地方」。停留半徑是 60m，這裡放寬到兩倍，
 // 因為照片本身的 EXIF 座標也有誤差，而且大樓的另一側仍然是同一棟樓。
 const STAY_SNAP_M = 120;
@@ -497,6 +506,42 @@ export default function FootprintMap({
   const rawLines = useMemo(() => groupLines(rawTracks), [rawTracks]);
   const matchedLines = useMemo(() => groupLines(matchedTracks), [matchedTracks]);
 
+  /*
+   * 兩趟之間的虛線橋接。
+   *
+   * 貼路是一趟一趟送出去的（見 gpx.ts 的 extractTrips），所以人停下來的地方線一定
+   * 會斷 —— 走進賣場的那 75 分鐘沒有路可以貼，硬送去 matcher 只會換來一團繞著
+   * 附近街廓的假線。但兩條線各走各的看起來像資料掉了，所以用虛線把斷點接上：
+   * **實線＝真的貼在路上，虛線＝知道你從這頭到了那頭，但不知道中間怎麼走的。**
+   *
+   * 只接同一天、編號相鄰、而且兩端夠近的兩段。seg 就是「第幾趟」（runMatch 依
+   * 時間順序給的），所以照 seg 排序就是行進順序。
+   */
+  const matchedBridges = useMemo<[number, number][][]>(() => {
+    const byDay = new Map<string, Map<number, TrackPoint[]>>();
+    for (const p of matchedTracks || []) {
+      let bySeg = byDay.get(p.day_key);
+      if (!bySeg) { bySeg = new Map(); byDay.set(p.day_key, bySeg); }
+      const list = bySeg.get(p.seg);
+      if (list) list.push(p);
+      else bySeg.set(p.seg, [p]);
+    }
+
+    const out: [number, number][][] = [];
+    for (const bySeg of Array.from(byDay.values())) {
+      const segs = Array.from(bySeg.keys()).sort((a, b) => a - b);
+      for (let i = 1; i < segs.length; i++) {
+        const prev = bySeg.get(segs[i - 1])!;
+        const a = prev[prev.length - 1];
+        const b = bySeg.get(segs[i])![0];
+        // 太遠就讓它斷著。那不是「停下來一下」，是中間有一段我們根本沒有的路
+        if (metersBetween(a.lat, a.lng, b.lat, b.lng) > MATCHED_BRIDGE_MAX_M) continue;
+        out.push([[a.lng, a.lat], [b.lng, b.lat]]);
+      }
+    }
+    return out;
+  }, [matchedTracks]);
+
   // 動畫沿著哪一份軌跡跑。選了某一份卻還沒載到資料時退回濃縮版 ——
   // 否則切過去的那一瞬間動畫會整個空掉，看起來像壞了
   const animTracks = useMemo(() => {
@@ -756,6 +801,25 @@ export default function FootprintMap({
           'line-color': '#7c3aed',
           'line-width': 3.5,
           'line-opacity': 0.75,
+        },
+      });
+
+      // 兩趟之間的橋接。同色但細、虛、半透明 —— 一眼看得出是同一條路線的一部分，
+      // 又不會被誤讀成「這段路我們真的知道」。只填斷點之間的空白，跟實線幾乎不重疊
+      map.addSource('matched-bridge', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      });
+      map.addLayer({
+        id: 'matched-bridge-line',
+        type: 'line',
+        source: 'matched-bridge',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': '#7c3aed',
+          'line-width': 2,
+          'line-opacity': 0.5,
+          'line-dasharray': [1.5, 1.5],
         },
       });
 
@@ -1333,6 +1397,21 @@ export default function FootprintMap({
       })),
     });
   }, [matchedLines, showMatchedLine, ready]);
+
+  // --- 兩趟之間的虛線橋接（跟著貼路軌跡一起開關）---
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource('matched-bridge') as GeoJSONSource | undefined;
+    src?.setData({
+      type: 'FeatureCollection',
+      features: (showMatchedLine ? matchedBridges : []).map((line) => ({
+        type: 'Feature',
+        properties: {},
+        geometry: { type: 'LineString', coordinates: line },
+      })),
+    });
+  }, [matchedBridges, showMatchedLine, ready]);
 
   // --- 停留點 ---
   useEffect(() => {

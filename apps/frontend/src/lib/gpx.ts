@@ -253,9 +253,14 @@ export interface Trip {
  * 賣場、還是在騎樓下，同一個數字擺哪裡都不對。而「有沒有在移動」用速度判斷
  * 沒有這個問題 —— 靜止時的雜訊速度跟真的在走路差了一個數量級。
  *
- * 要連續 runLength 個點都超過 minKmh 才算開始移動，單點的假速度騙不過去；
- * 實測整夜在家的 603 點與室內 21 分鐘的 77 點都是 0 段，
- * 而門檻取 5 / 8 / 12 km/h 切出來的行程幾乎一樣，代表這個判準不敏感。
+ * 要連續 runLength 個點都超過 minKmh 才算開始移動，單點的假速度騙不過去。
+ *
+ * **minKmh 必須低到讓走路算數**（走路是 3–5 km/h）。這裡原本是 8，結果純走路
+ * 的路段一趟都切不出來，夾在兩段開車中間的走路就在地圖上變成一個洞 ——
+ * 而下游 vehicleFromSpeed 的 'walk' → pedestrian costing 也因此永遠走不到。
+ *
+ * 但光是把門檻調低不夠：室內雜訊的瞬時速度可以到 10–13 km/h，光看速度分不掉。
+ * 真正把它濾掉的是 minSpreadM，兩個門檻要一起看才成立。
  *
  * 兩趟之間靜止不到 mergeGapMin 分鐘就併成同一趟（等紅燈、路邊停車），
  * 免得一段路被切成十幾個碎片、每個碎片各發一次貼路請求。
@@ -264,6 +269,11 @@ export interface Trip {
  * @param runLength     要連續幾個點都超過門檻
  * @param mergeGapMin   兩段之間靜止幾分鐘以內就併回同一趟
  * @param minDistanceM  一趟至少要走多遠才留著
+ * @param minSpreadM    一趟至少要涵蓋多大的地理範圍。低於這個數字代表人根本沒有
+ *                      離開一個街廓 —— 那裡面不存在一條可以貼的路，不管它是賣場、
+ *                      地下停車場還是公園。實測分離度極大（雜訊趟最大 368m、
+ *                      真行程最小 872m），400–800m 之間取哪個數字結果都一樣。
+ *                      這**不是**在偵測室內，只是在問「有沒有真的去到別的地方」
  * @param minPoints     一趟至少要有幾個點（Valhalla 太短的輸入貼不出東西）
  * @param maxTrips      一天最多幾趟。每一趟都是一次貼路請求，所以是硬上限：
  *                      先把 mergeGapMin 加倍重試，還是超過就只留最長的幾趟
@@ -271,15 +281,16 @@ export interface Trip {
 export function extractTrips(
   points: GpxPoint[],
   {
-    minKmh = 8,
+    minKmh = 2.5,
     runLength = 3,
     mergeGapMin = 5,
     minDistanceM = 300,
+    minSpreadM = 500,
     minPoints = 8,
     maxTrips = 12,
   }: {
     minKmh?: number; runLength?: number; mergeGapMin?: number;
-    minDistanceM?: number; minPoints?: number; maxTrips?: number;
+    minDistanceM?: number; minSpreadM?: number; minPoints?: number; maxTrips?: number;
   } = {},
 ): Trip[] {
   if (points.length < minPoints) return [];
@@ -293,7 +304,7 @@ export function extractTrips(
   for (let attempt = 0; attempt < 4; attempt++) {
     trips = [];
     for (const seg of Array.from(bySeg.keys()).sort((a, b) => a - b)) {
-      trips.push(...tripsInSegment(bySeg.get(seg)!, { minKmh, runLength, gapMin, minDistanceM, minPoints }));
+      trips.push(...tripsInSegment(bySeg.get(seg)!, { minKmh, runLength, gapMin, minDistanceM, minSpreadM, minPoints }));
     }
     if (trips.length <= maxTrips) break;
     gapMin *= 2;
@@ -312,9 +323,12 @@ export function extractTrips(
 
 function tripsInSegment(
   pts: GpxPoint[],
-  opts: { minKmh: number; runLength: number; gapMin: number; minDistanceM: number; minPoints: number },
+  opts: {
+    minKmh: number; runLength: number; gapMin: number;
+    minDistanceM: number; minSpreadM: number; minPoints: number;
+  },
 ): Trip[] {
-  const { minKmh, runLength, gapMin, minDistanceM, minPoints } = opts;
+  const { minKmh, runLength, gapMin, minDistanceM, minSpreadM, minPoints } = opts;
   if (pts.length < minPoints) return [];
 
   const ms = pts.map((p) => Date.parse(p.t));
@@ -355,12 +369,38 @@ function tripsInSegment(
     let total = 0;
     for (let i = 1; i < slice.length; i++) total += distanceM(slice[i - 1], slice[i]);
     if (total < minDistanceM) continue;
+    // 走了兩公里卻沒離開一個街廓 —— 那是定位在原地繞，不是一趟行程。
+    // 這一刀非砍不可：minKmh 低到讓走路算數之後，室內雜訊也會一起過關
+    if (spreadM(slice) < minSpreadM) continue;
     // 代表速度取 85 百分位，跟 vehicles.ts 的 segmentSpeedKmh 同一套規則
     const inside = kmh.slice(a + 1, b + 1).filter((v) => Number.isFinite(v)).sort((x, y) => x - y);
     const speedKmh = inside.length ? inside[Math.min(inside.length - 1, Math.floor(inside.length * 0.85))] : 0;
     out.push({ points: slice, distanceM: total, speedKmh });
   }
   return out;
+}
+
+/**
+ * 這一串點涵蓋的地理範圍：bounding box 對角線的長度（公尺）。
+ *
+ * 用它而不是「淨位移」（頭尾直線距離）：出去繞一圈再回到原點的散步，
+ * 淨位移是 0 但範圍很大，那是真的走過的路，不該被當成雜訊丟掉。
+ */
+function spreadM(points: GpxPoint[]): number {
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  let minLng = Infinity;
+  let maxLng = -Infinity;
+  for (const p of points) {
+    if (p.lat < minLat) minLat = p.lat;
+    if (p.lat > maxLat) maxLat = p.lat;
+    if (p.lng < minLng) minLng = p.lng;
+    if (p.lng > maxLng) maxLng = p.lng;
+  }
+  return distanceM(
+    { lat: minLat, lng: minLng } as GpxPoint,
+    { lat: maxLat, lng: maxLng } as GpxPoint,
+  );
 }
 
 function groupBySeg(points: GpxPoint[]): Map<number, GpxPoint[]> {
