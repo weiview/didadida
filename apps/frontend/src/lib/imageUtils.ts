@@ -2,6 +2,61 @@ import exifr from 'exifr';
 import piexif from 'piexifjs';
 import { normalizeGeo } from './geo';
 
+/**
+ * 燈箱要用的 4K WebP。長邊 3840、q80。
+ *
+ * **一定要餵原始檔，不要餵 resizeImageFile 的產物** —— 那份已經被壓到 2000px，
+ * 再放大到 3840 只會得到一張又大又糊的圖。
+ *
+ * WebP 沒有 EXIF（piexifjs 只寫得進 JPEG），這裡刻意接受：
+ *   - 拍攝資訊在上傳當下就被解析進 D1 了，顯示不靠檔案本身
+ *   - **原始檔會原封不動另外存一份到 Drive**，EXIF 一個位元組都不會少
+ * 也就是說這張純粹是「拿來看的那一份」。
+ *
+ * 回傳 null 代表這個瀏覽器編不出 WebP 或畫布失敗 —— 呼叫端該當成
+ * 「這張沒有 4K」，照片本身照樣成立（見 [[縮圖成功就算數]]）。
+ */
+export async function encode4kWebp(file: File, maxEdge: number = 3840): Promise<Blob | null> {
+  if (!file.type.startsWith('image/')) return null;
+
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('圖片解碼失敗'));
+      el.src = objectUrl;
+    });
+
+    // 只縮不放。手機拍的 4032×3024 本來就小於 3840 的對角，放大沒有意義
+    const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
+    const width = Math.max(1, Math.round(img.width * scale));
+    const height = Math.max(1, Math.round(img.height * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, width, height);
+
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob((b) => resolve(b), 'image/webp', 0.8);
+    });
+    // toBlob 對不認得的 MIME 會安靜地吐 PNG。一張 4K 的 PNG 是好幾 MB，
+    // 寧可回 null 讓燈箱退回 R2，也不要把它塞進 Drive
+    if (!blob || blob.type !== 'image/webp') return null;
+    return blob;
+  } catch (e) {
+    console.warn('4K WebP 產生失敗', e);
+    return null;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 export async function resizeImageFile(file: File, maxEdge: number = 2000): Promise<{ file: File; exifData: any; takenAt: string | null }> {
   // 檢查是否為圖片
   if (!file.type.startsWith('image/')) {

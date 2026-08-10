@@ -3,7 +3,7 @@ import {
   normalizeGeo, formatWallClock, utcFromLocal,
   parseExifDateTime, geoOverwriteGuard, DEFAULT_TZ_OFFSET_MINUTES,
 } from './geo';
-import { listGpxFiles, fetchGpxBytes } from './drive';
+import { listGpxFiles, fetchDriveMedia, moveDriveFile, serviceAccountEmail } from './drive';
 import { syncFtsForPhotos, deleteFtsForPhotos, ftsMatchExpr } from './fts';
 
 export interface Env {
@@ -12,10 +12,21 @@ export interface Env {
   APP_PASSWORD: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
-  /** service account 金鑰 JSON 全文。唯讀，只看得到被分享的那一個 Drive 資料夾 */
+  /**
+   * service account 金鑰 JSON 全文。scope 是完整的 drive（Phase 3 要搬檔），
+   * 但看得到什麼由 Drive 的分享設定決定 —— 見 drive.ts 檔頭
+   */
   GOOGLE_DRIVE_SA_KEY?: string;
-  /** GPSLogger 上傳目的地資料夾的 Drive file id */
+  /** GPSLogger 上傳目的地資料夾的 Drive file id（只分享 Viewer 給 SA） */
   GOOGLE_DRIVE_FOLDER_ID?: string;
+  /**
+   * 照片主檔資料夾 `didadida/` 的覆寫。**平常不必設** —— 正常情況是網頁第一次
+   * 上傳時自己建資料夾、把 id 存進 AppSetting。設了就以這裡為準，
+   * 用途是把某個環境臨時指到別的資料夾
+   */
+  GOOGLE_DRIVE_PHOTOS_FOLDER_ID?: string;
+  /** `didadida/trash/` 的覆寫。同上 */
+  GOOGLE_DRIVE_TRASH_FOLDER_ID?: string;
   /**
    * map matching（軌跡貼路）用的 Valhalla 服務位址，例如
    * https://valhalla1.openstreetmap.de。放在設定裡而不是寫死在程式碼，
@@ -24,6 +35,10 @@ export interface Env {
    */
   VALHALLA_URL?: string;
 }
+
+/** AppSetting 的 key。放這麼前面是因為路由與底下的 helper 都會用到 */
+const SETTING_PHOTOS_FOLDER = "drive_photos_folder_id";
+const SETTING_TRASH_FOLDER = "drive_trash_folder_id";
 
 async function generateJWT(env: Env): Promise<string> {
   const encoder = new TextEncoder();
@@ -497,6 +512,65 @@ if (method === "POST" && pathname === "/api/verify-password") {
       }
 
       /*
+       * 路由：燈箱大圖。
+       *
+       * 這是唯一對外服務 Drive 內容的入口。Drive 的檔案沒有分享給任何人，只有
+       * service account 讀得到，所以一定要經過 Worker 代理 —— 不能給前端 Drive 連結。
+       *
+       * **任何一步失敗都退回 R2**，包含 drive_file_id 還是 NULL 的舊照片、SA 沒設定、
+       * Drive 當掉。燈箱永遠打得開，這是 [[縮圖成功就算數]] 那個決定的另一半：
+       * Drive 只是加分，不是照片存在的必要條件。
+       *
+       * 快取分兩種，不能共用一套參數：
+       *   - Drive 命中：那個 file id 的內容永遠不變 → 一年 immutable。
+       *   - 退回 R2：drive_file_id 之後補傳就會變 → 只給 5 分鐘，不寫邊緣快取，
+       *     否則補完 Drive 還要等一年才會有人真的走到新路徑。
+       */
+      if (method === "GET" && pathname.startsWith("/api/photos/")
+          && pathname.endsWith("/full") && pathname.split("/").length === 5) {
+        const photoId = pathname.split("/")[3];
+        const cache = caches.default;
+        const cacheKey = new Request(new URL(request.url).toString(), { method: "GET" });
+        const hit = await cache.match(cacheKey);
+        if (hit) return hit;
+
+        const photo = await env.DB.prepare(
+          "SELECT url, drive_file_id FROM Photo WHERE id = ?"
+        ).bind(photoId).first<any>();
+        if (!photo) {
+          return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+        }
+
+        const fallback = () => new Response(null, {
+          status: 302,
+          headers: {
+            Location: photo.url,
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=300",
+          },
+        });
+
+        if (!photo.drive_file_id || !env.GOOGLE_DRIVE_SA_KEY) return fallback();
+
+        try {
+          const upstream = await fetchDriveMedia(env.GOOGLE_DRIVE_SA_KEY, photo.drive_file_id);
+          const full = new Response(upstream.body, {
+            headers: {
+              "Content-Type": upstream.headers.get("Content-Type") || "image/webp",
+              "Access-Control-Allow-Origin": "*",
+              "Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable",
+            },
+          });
+          ctx.waitUntil(cache.put(cacheKey, full.clone()));
+          return full;
+        } catch (e) {
+          // Drive 掛掉不該讓照片看不到。不快取這次，下次再試
+          console.error("Drive 取檔失敗，退回 R2", e);
+          return fallback();
+        }
+      }
+
+      /*
        * 路由：單一相簿。
        *
        * 相簿頁本來是抓整份相簿清單再 find() 出這一本 —— 相簿清單改成分頁之後那招
@@ -697,10 +771,172 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }), { headers });
       }
 
+      /*
+       * 路由：瀏覽器要往 Drive 建檔所需要的設定。
+       *
+       * 回三樣東西：
+       *   client_id  拿 drive.file token 用。本來就會出現在 OAuth 的網址列，不是機密
+       *   sa_email   網頁建完資料夾後要把它加成 writer，否則後端讀不到裡面的檔
+       *   兩個 folder id  已經建過就直接用；null 代表網頁該去建
+       *
+       * 鎖管理員不是因為內容敏感（三樣都不是機密），而是只有上傳流程用得到它，
+       * 沒有理由讓訪客知道這個站接在誰的 Drive 上。
+       */
+      if (method === "GET" && pathname === "/api/config/drive") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const folders = await driveFolders(env);
+        let saEmail: string | null = null;
+        if (env.GOOGLE_DRIVE_SA_KEY) {
+          try {
+            saEmail = serviceAccountEmail(env.GOOGLE_DRIVE_SA_KEY);
+          } catch (e) {
+            console.error("SA 金鑰解析失敗", e);
+          }
+        }
+        return new Response(JSON.stringify({
+          client_id: env.GOOGLE_CLIENT_ID || null,
+          sa_email: saEmail,
+          photos_folder_id: folders.photos,
+          trash_folder_id: folders.trash,
+          // 少任何一項都上傳不了，讓前端一眼看出是哪裡沒設好
+          ready: Boolean(env.GOOGLE_CLIENT_ID && saEmail),
+        }), { headers });
+      }
+
+      /*
+       * 路由：還沒搬上 Drive 的照片（「補傳 Drive」批次動作的來源）。
+       *
+       * 上傳時 Drive 失敗不會擋下照片（drive_file_id 留 NULL），舊照片也全都是
+       * NULL，兩者在這裡看起來一樣 —— 本來就該一樣，補傳的動作完全相同。
+       *
+       * 只回 id 與 url：真正要重新編碼 4K 的是瀏覽器，它得自己去抓 R2 那份原圖。
+       * 會透露照片總數與上傳順序，所以跟 geo-pending 一樣鎖管理員。
+       */
+      if (method === "GET" && pathname === "/api/photos/drive-pending") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const cursor = Number(url.searchParams.get("cursor") ?? 0) || 0;
+        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 200) || 200, 1), 500);
+
+        const { results: photos } = await env.DB.prepare(`
+          SELECT id, url, file_name, title
+            FROM Photo
+           WHERE id > ? AND drive_file_id IS NULL
+           ORDER BY id LIMIT ?
+        `).bind(cursor, limit).all();
+
+        // 剩幾張要另外算：photos 只是這一批，進度條需要總數
+        const remaining = await env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM Photo WHERE drive_file_id IS NULL"
+        ).first<any>();
+
+        return new Response(JSON.stringify({
+          photos,
+          remaining: Number(remaining?.n ?? 0),
+          next_cursor: photos.length > 0 ? Number((photos[photos.length - 1] as any).id) : cursor,
+          done: photos.length < limit,
+        }), { headers });
+      }
+
       // 以下路由需要驗證
       const requiresAuth = ["POST", "PUT", "DELETE"].includes(method);
       if (requiresAuth && !(await isAuthorized(request, env))) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+      }
+
+      /*
+       * 路由：登記網頁剛建好的 Drive 資料夾 id。
+       *
+       * **只寫一次，之後拒絕覆寫。** 換了資料夾等於所有既有照片的 drive_file_id
+       * 都指向舊資料夾 —— 燈箱照樣讀得到（讀的是 file id 不是資料夾），但刪除會
+       * 把檔案從舊資料夾搬進新的 trash，兩邊混在一起。真要換得人工介入，
+       * 不該是一個 API 呼叫就能發生的事。
+       */
+      if (method === "POST" && pathname === "/api/config/drive-folders") {
+        const body = await request.json().catch(() => ({})) as {
+          photos_folder_id?: unknown; trash_folder_id?: unknown;
+        };
+        const photos = typeof body.photos_folder_id === "string" ? body.photos_folder_id : "";
+        const trash = typeof body.trash_folder_id === "string" ? body.trash_folder_id : "";
+        if (!photos || !trash) {
+          return new Response(JSON.stringify({ error: "photos_folder_id 與 trash_folder_id 都必填" }), { status: 400, headers });
+        }
+
+        const existing = await driveFolders(env);
+        if (existing.photos || existing.trash) {
+          return new Response(JSON.stringify({
+            error: "資料夾已經設定過了",
+            photos_folder_id: existing.photos,
+            trash_folder_id: existing.trash,
+          }), { status: 409, headers });
+        }
+
+        const stmt = env.DB.prepare(
+          "INSERT INTO AppSetting (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING"
+        );
+        await env.DB.batch([
+          stmt.bind(SETTING_PHOTOS_FOLDER, photos),
+          stmt.bind(SETTING_TRASH_FOLDER, trash),
+        ]);
+        return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      /*
+       * 路由：把待搬佇列裡的 Drive 檔真的搬進 `didadida/trash/`。
+       *
+       * 分批的理由跟 rebuild-fts 一樣但更硬：**Workers 一次請求的 subrequest 上限
+       * （免費版 50）**，而搬一個檔要兩次 Drive 往返，加上 D1 的來回，一次能做的
+       * 個位數到十幾個而已。呼叫端看 remaining > 0 就再打一次。
+       *
+       * attempts >= 3 的就不再自動重試。那通常代表檔案被手動刪了、或 `didadida/`
+       * 的 Editor 分享被拿掉 —— 一直重試只是白燒額度。留在表裡等人看。
+       */
+      if (method === "POST" && pathname === "/api/admin/drain-drive-trash") {
+        const { trash: trashFolderId } = await driveFolders(env);
+        if (!env.GOOGLE_DRIVE_SA_KEY || !trashFolderId) {
+          return new Response(JSON.stringify({
+            error: "尚未設定 GOOGLE_DRIVE_SA_KEY，或 trash 資料夾還沒建起來（第一次上傳時網頁會自動建）",
+          }), { status: 503, headers });
+        }
+        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 10) || 10, 1), 20);
+
+        const { results: pending } = await env.DB.prepare(
+          "SELECT id, drive_id FROM DriveTrash WHERE attempts < 3 ORDER BY id LIMIT ?"
+        ).bind(limit).all<any>();
+
+        let moved = 0;
+        const failed: string[] = [];
+        for (const row of pending) {
+          try {
+            await moveDriveFile(env.GOOGLE_DRIVE_SA_KEY, row.drive_id, trashFolderId);
+            await env.DB.prepare("DELETE FROM DriveTrash WHERE id = ?").bind(row.id).run();
+            moved++;
+          } catch (e) {
+            // 失敗不丟出去 —— 一顆壞檔不該讓整批停擺
+            const msg = e instanceof Error ? e.message : String(e);
+            await env.DB.prepare(
+              "UPDATE DriveTrash SET attempts = attempts + 1, last_error = ? WHERE id = ?"
+            ).bind(msg.slice(0, 200), row.id).run();
+            failed.push(row.drive_id);
+          }
+        }
+
+        const counts = await env.DB.prepare(`
+          SELECT SUM(CASE WHEN attempts < 3 THEN 1 ELSE 0 END) AS remaining,
+                 SUM(CASE WHEN attempts >= 3 THEN 1 ELSE 0 END) AS gave_up
+            FROM DriveTrash
+        `).first<any>();
+
+        return new Response(JSON.stringify({
+          moved,
+          failed,
+          remaining: Number(counts?.remaining ?? 0),
+          gave_up: Number(counts?.gave_up ?? 0),
+          done: Number(counts?.remaining ?? 0) === 0,
+        }), { headers });
       }
 
       // 路由：重建全文檢索索引（分批）
@@ -785,8 +1021,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
         
         // 1. 抓出這本相簿所有的照片
         //    縮圖的網址也要撈：只刪 file_name 會把兩張縮圖永遠留在 R2 佔額度
+        //    drive id 也要撈：Photo 列一刪就再也查不到該搬哪些 Drive 檔
         const { results: photos } = await env.DB.prepare(
-          "SELECT id, file_name, thumb_url, thumb_sm_url FROM Photo WHERE album_id = ?"
+          "SELECT id, file_name, thumb_url, thumb_sm_url, drive_file_id, drive_original_id FROM Photo WHERE album_id = ?"
         ).bind(albumId).all();
 
         if (photos.length > 0) {
@@ -797,17 +1034,20 @@ if (method === "POST" && pathname === "/api/verify-password") {
             await env.BUCKET.delete(keys.slice(i, i + 1000));
           }
 
-          // 3. 刪除所有這些照片的 Tag 關聯
+          // 3. Drive 的檔案登記待搬（真正的搬移由 drain-drive-trash 分批做）
+          await queueDriveTrash(env, photos);
+
+          // 4. 刪除所有這些照片的 Tag 關聯
           await env.DB.prepare(`DELETE FROM PhotoTag WHERE photo_id IN (SELECT id FROM Photo WHERE album_id = ?)`).bind(albumId).run();
         }
         
-        // 4. 刪除這些照片紀錄
+        // 5. 刪除這些照片紀錄
         await env.DB.prepare("DELETE FROM Photo WHERE album_id = ?").bind(albumId).run();
 
-        // 5. 刪除相簿本身
+        // 6. 刪除相簿本身
         await env.DB.prepare("DELETE FROM Album WHERE id = ?").bind(albumId).run();
 
-        // 6. PhotoFts 是虛擬表，沒有 FK，不會跟著 Photo 一起被刪掉
+        // 7. PhotoFts 是虛擬表，沒有 FK，不會跟著 Photo 一起被刪掉
         await deleteFtsForPhotos(env.DB, photos.map((p: any) => Number(p.id)));
 
         return new Response(JSON.stringify({ success: true }), { headers });
@@ -855,6 +1095,54 @@ function thumbExtFor(contentType: string): string {
   if (contentType === "image/webp") return "webp";
   if (contentType === "image/png") return "png";
   return "jpg";
+}
+
+/*
+ * Drive 資料夾 id 的來源有兩個，env 優先、AppSetting 次之。
+ *
+ * 正常情況兩個 id 都在 AppSetting：資料夾是**網頁自己建的**（瀏覽器只有
+ * drive.file scope，看不見使用者手動建的資料夾），所以 id 到執行期才存在。
+ * env 那條留著只是為了臨時把某個環境指到別的資料夾，平常不會設。
+ */
+async function getSetting(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB.prepare("SELECT value FROM AppSetting WHERE key = ?").bind(key).first<any>();
+  return typeof row?.value === "string" && row.value ? row.value : null;
+}
+
+async function driveFolders(env: Env): Promise<{ photos: string | null; trash: string | null }> {
+  const [photos, trash] = await Promise.all([
+    env.GOOGLE_DRIVE_PHOTOS_FOLDER_ID ? Promise.resolve(env.GOOGLE_DRIVE_PHOTOS_FOLDER_ID) : getSetting(env, SETTING_PHOTOS_FOLDER),
+    env.GOOGLE_DRIVE_TRASH_FOLDER_ID ? Promise.resolve(env.GOOGLE_DRIVE_TRASH_FOLDER_ID) : getSetting(env, SETTING_TRASH_FOLDER),
+  ]);
+  return { photos, trash };
+}
+
+/**
+ * 刪照片時，把它在 Drive 上的 4K 與原始檔登記到待搬佇列。
+ *
+ * **不在這裡真的搬。** 搬一個檔要兩次 Drive 往返，而 Workers 一次請求的
+ * subrequest 有上限（免費版 50）—— 刪一本上千張的相簿當場搬不完。這裡只寫
+ * D1（幾列，很便宜），實際搬移交給 /api/admin/drain-drive-trash 分批做。
+ *
+ * 順序很重要：**一定要在刪 Photo 列之前呼叫**。Photo 列一刪，那兩個 drive id
+ * 就沒有任何地方記得了。
+ *
+ * **刻意不呼叫 files.delete。** R2 那邊刪掉就真的沒了，Drive 這份是最後一道
+ * 後悔藥；要真的清空是使用者自己去 Drive 倒垃圾桶，不是由這支程式決定。
+ */
+async function queueDriveTrash(env: Env, photos: any[]): Promise<void> {
+  const rows = photos.flatMap((p) => [
+    { driveId: p?.drive_file_id, photoId: p?.id },
+    { driveId: p?.drive_original_id, photoId: p?.id },
+  ]).filter((r) => typeof r.driveId === "string" && r.driveId.length > 0);
+  if (rows.length === 0) return;
+
+  const stmt = env.DB.prepare("INSERT INTO DriveTrash (drive_id, photo_id) VALUES (?, ?)");
+  // 每個 statement 各自綁 2 個參數，不會撞到單一 statement 的 100 個上限，
+  // 但一次 batch 塞幾千個 statement 一樣會被 D1 擋，還是切一下
+  for (let i = 0; i < rows.length; i += 100) {
+    await env.DB.batch(rows.slice(i, i + 100).map((r) => stmt.bind(r.driveId, r.photoId ?? null)));
+  }
 }
 
 // 輔助函式：計算 ArrayBuffer 的 SHA-256 Hex 雜湊
@@ -1011,17 +1299,55 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "DELETE" && pathname.startsWith("/api/photos/") && pathname.split("/").length === 4) {
         const photoId = pathname.split("/")[3];
         const photo = await env.DB.prepare(
-          "SELECT file_name, url, thumb_url, thumb_sm_url FROM Photo WHERE id = ?"
+          "SELECT id, file_name, url, thumb_url, thumb_sm_url, drive_file_id, drive_original_id FROM Photo WHERE id = ?"
         ).bind(photoId).first();
         if (!photo) return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
 
         // 主檔 + 兩張縮圖一起刪，只刪 file_name 會留下孤兒縮圖佔 R2 額度
         await env.BUCKET.delete(r2KeysForPhoto(photo));
+        // Drive 的兩個檔登記待搬。務必在 DELETE FROM Photo 之前
+        await queueDriveTrash(env, [photo]);
         await env.DB.prepare("DELETE FROM PhotoTag WHERE photo_id = ?").bind(photoId).run();
         // 如果該照片是某個相簿的封面，則清除該相簿的封面
         await env.DB.prepare("UPDATE Album SET cover_photo_url = NULL WHERE cover_photo_url = ?").bind(photo.url).run();
         await env.DB.prepare("DELETE FROM Photo WHERE id = ?").bind(photoId).run();
         await deleteFtsForPhotos(env.DB, [Number(photoId)]);
+        return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      /*
+       * 路由：登記 Drive 檔案 id。
+       *
+       * 檔案是瀏覽器用**使用者本人的 Google 帳號**建的（service account 沒有儲存
+       * 配額，建不了檔），5 MB 的原始檔也因此不必灌過 Worker。建完之後只把兩個
+       * id 回報到這裡，D1 才知道燈箱該去哪裡拿大圖。
+       *
+       * 兩個 id 都是選填：4K 傳成功、原始檔失敗（或反過來）也要收，能記多少算多少。
+       * 已經有值的那一欄不會被 NULL 蓋掉 —— 補傳重跑時不該把上次的成果洗掉。
+       */
+      if (method === "POST" && pathname.startsWith("/api/photos/")
+          && pathname.endsWith("/drive") && pathname.split("/").length === 5) {
+        const photoId = pathname.split("/")[3];
+        const body = await request.json().catch(() => ({})) as {
+          drive_file_id?: unknown; drive_original_id?: unknown;
+        };
+        const fileId = typeof body.drive_file_id === "string" && body.drive_file_id ? body.drive_file_id : null;
+        const originalId = typeof body.drive_original_id === "string" && body.drive_original_id ? body.drive_original_id : null;
+
+        if (!fileId && !originalId) {
+          return new Response(JSON.stringify({ error: "drive_file_id 與 drive_original_id 至少要給一個" }), { status: 400, headers });
+        }
+
+        const res = await env.DB.prepare(`
+          UPDATE Photo
+             SET drive_file_id     = COALESCE(?, drive_file_id),
+                 drive_original_id = COALESCE(?, drive_original_id)
+           WHERE id = ?
+        `).bind(fileId, originalId, photoId).run();
+
+        if ((res.meta?.changes ?? 0) === 0) {
+          return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+        }
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
@@ -1419,12 +1745,14 @@ function hammingDistance(hex1: string, hex2: string): number {
                */
               const fetched = await env.DB.batch<any>(
                 chunkIds(validIds).map((c) => env.DB.prepare(
-                  `SELECT file_name, thumb_url, thumb_sm_url FROM Photo
-                    WHERE id IN (${placeholdersFor(c)})`
+                  `SELECT id, file_name, thumb_url, thumb_sm_url, drive_file_id, drive_original_id
+                     FROM Photo WHERE id IN (${placeholdersFor(c)})`
                 ).bind(...c)),
               );
-              const keys = fetched.flatMap((part) => part.results.flatMap((p: any) => r2KeysForPhoto(p)));
+              const stale = fetched.flatMap((part) => part.results as any[]);
+              const keys = stale.flatMap((p: any) => r2KeysForPhoto(p));
               if (keys.length > 0) await env.BUCKET.delete(keys);
+              await queueDriveTrash(env, stale);
               await env.DB.batch(
                 chunkIds(validIds).map((c) => env.DB.prepare(
                   `DELETE FROM Photo WHERE id IN (${placeholdersFor(c)})`
@@ -2083,7 +2411,7 @@ function hammingDistance(hex1: string, hex2: string): number {
           return new Response(JSON.stringify({ error: "file id is required" }), { status: 400, headers });
         }
 
-        const upstream = await fetchGpxBytes(env.GOOGLE_DRIVE_SA_KEY, fileId);
+        const upstream = await fetchDriveMedia(env.GOOGLE_DRIVE_SA_KEY, fileId);
         return new Response(upstream.body, {
           headers: { ...headers, "Content-Type": "application/gpx+xml" },
         });
