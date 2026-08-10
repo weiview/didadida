@@ -9,6 +9,75 @@ function getAuthHeaders() {
   };
 }
 
+/*
+ * ── Google 登入 ────────────────────────────────────────────────────────────
+ *
+ * 一次登入拿齊三樣：管理員身分、Drive 備份權限、相簿匯入權限。
+ * 所以只有一個 Google token，Picker 與 Drive 共用它，不會互相蓋掉。
+ *
+ * 走整頁跳轉（後端 /api/auth/google/login）而不是 GIS 彈窗：彈窗要「短暫啟用
+ * 狀態」才開得起來，而且拿到的 token 只能放記憶體、重整就沒了。跳轉回來的
+ * token 存得下，所以重整之後照樣傳得上 Drive。
+ */
+const GOOGLE_TOKEN_KEY = 'google_access_token';
+const GOOGLE_TOKEN_EXP_KEY = 'google_token_expires_at';
+
+/** 管理員登入 = Google 登入。`albumId` 只是為了登入後回到原本那本相簿 */
+export function googleLoginUrl(albumId?: string | number): string {
+  return `${API_BASE_URL}/auth/google/login${albumId ? `?state=${albumId}` : ''}`;
+}
+
+export function storeGoogleToken(token: string, expiresInSec: number): void {
+  localStorage.setItem(GOOGLE_TOKEN_KEY, token);
+  // 留 60 秒餘裕，免得拿到一個正好在上傳途中過期的 token
+  localStorage.setItem(GOOGLE_TOKEN_EXP_KEY, String(Date.now() + (expiresInSec - 60) * 1000));
+}
+
+/** 還沒過期就回 token，過期就順手清掉 —— 留著只會讓每個呼叫端各自吃一次 401 */
+export function getGoogleToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  const token = localStorage.getItem(GOOGLE_TOKEN_KEY);
+  if (!token) return null;
+  const exp = Number(localStorage.getItem(GOOGLE_TOKEN_EXP_KEY) || 0);
+  // 沒有到期時刻的是舊版存的，當作還能用；真的過期會由 Google 回 401
+  if (exp && exp <= Date.now()) {
+    clearGoogleToken();
+    return null;
+  }
+  return token;
+}
+
+export function clearGoogleToken(): void {
+  localStorage.removeItem(GOOGLE_TOKEN_KEY);
+  localStorage.removeItem(GOOGLE_TOKEN_EXP_KEY);
+}
+
+/**
+ * 把登入回呼塞在網址 fragment 裡的東西收進 localStorage，然後把網址擦乾淨。
+ *
+ * 為什麼是 fragment 不是 query：`#` 後面的東西不會送到任何伺服器 ——
+ * 不進 Worker 的存取記錄、不進 Referer、也不會被 CDN 記下來。
+ * 讀完立刻 replaceState 擦掉，是為了不留在瀏覽器歷史裡。
+ *
+ * 認不得的 fragment 一律不碰（可能是別人用的錨點）。
+ */
+export function consumeAuthHash(): { admin: boolean; error: string | null } {
+  if (typeof window === 'undefined') return { admin: false, error: null };
+  const raw = window.location.hash.replace(/^#/, '');
+  if (!raw) return { admin: false, error: null };
+
+  const p = new URLSearchParams(raw);
+  const error = p.get('authError');
+  const token = p.get('token');
+  const googleToken = p.get('googleToken');
+  if (!error && !token && !googleToken) return { admin: false, error: null };
+
+  if (token) localStorage.setItem('admin_token', token);
+  if (googleToken) storeGoogleToken(googleToken, Number(p.get('googleExpiresIn')) || 3600);
+  window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
+  return { admin: !!token, error };
+}
+
 export interface Album {
   id: number;
   name: string;
@@ -20,6 +89,8 @@ export interface Album {
   preview_photos?: string[];
   /** 1 = 足跡地圖不對外公開（預設） */
   map_private?: number;
+  /** 這本相簿在 Drive 上的資料夾。null = 還沒建過（沒上傳過、或上傳時 Drive 沒接上） */
+  drive_folder_id?: string | null;
 }
 
 export interface Tag {
@@ -449,11 +520,38 @@ export interface UploadedPhoto {
   lng: number | null;
 }
 
-export async function uploadPhoto(albumId: string, file: File, exifData?: any, takenAt?: string): Promise<UploadedPhoto | null> {
+/** 後端判定「這張跟相簿裡某幾張撞了」時回報的那幾張 */
+export interface DuplicateMatch {
+  id: number;
+  title: string | null;
+  thumb_url: string | null;
+  taken_at: string | null;
+}
+
+/**
+ * 上傳的三種結局。
+ *
+ * 以前只回 `UploadedPhoto | null`，`null` 同時代表「壞掉」與「不該傳」，
+ * 呼叫端沒辦法分辨，重複偵測就無從顯示。分成三種之後每種都講得出下一步。
+ */
+export type UploadResult =
+  | { status: 'ok'; photo: UploadedPhoto }
+  | { status: 'duplicate'; reason: 'same_file' | 'same_time'; existing: DuplicateMatch[] }
+  | { status: 'error' };
+
+export async function uploadPhoto(
+  albumId: string,
+  file: File,
+  exifData?: any,
+  takenAt?: string,
+  /** 使用者在重複清單裡選了「照樣上傳」才給 true */
+  allowDuplicate = false,
+): Promise<UploadResult> {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('album_id', albumId);
-  
+  if (allowDuplicate) formData.append('allow_duplicate', '1');
+
   // 產生兩個尺寸的縮圖。任一個缺席後端都收得下（欄位留 NULL），
   // 讀取端一律 COALESCE 逐級退回，所以這裡失敗不會擋住上傳
   try {
@@ -499,17 +597,27 @@ export async function uploadPhoto(albumId: string, file: File, exifData?: any, t
       headers: { 'Authorization': `Bearer ${token}` },
       body: formData,
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { status: 'error' };
     const data = await res.json();
-    if (typeof data?.id !== 'number') return null;
+    if (data?.duplicate) {
+      return {
+        status: 'duplicate',
+        reason: data.reason === 'same_file' ? 'same_file' : 'same_time',
+        existing: Array.isArray(data.existing) ? data.existing : [],
+      };
+    }
+    if (typeof data?.id !== 'number') return { status: 'error' };
     return {
-      id: data.id,
-      lat: typeof data.lat === 'number' ? data.lat : null,
-      lng: typeof data.lng === 'number' ? data.lng : null,
+      status: 'ok',
+      photo: {
+        id: data.id,
+        lat: typeof data.lat === 'number' ? data.lat : null,
+        lng: typeof data.lng === 'number' ? data.lng : null,
+      },
     };
   } catch (error) {
     console.error(error);
-    return null;
+    return { status: 'error' };
   }
 }
 
@@ -579,21 +687,54 @@ export async function recordPhotoDrive(
   }
 }
 
+/**
+ * 登記相簿在 Drive 上的資料夾 id，回傳實際生效的那個。
+ *
+ * **一定要用回傳值，不要用自己傳進去的那個** —— 後端用 COALESCE 保護既有值，
+ * 別的分頁先建過的話會回它那個，這時候自己建的那個資料夾就該放著別用了。
+ */
+export async function saveAlbumDriveFolder(
+  albumId: number,
+  folderId: string,
+): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/albums/${albumId}/drive-folder`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ folder_id: folderId }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return typeof data?.folder_id === 'string' ? data.folder_id : null;
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
 export interface DrivePendingPhoto {
   id: number;
   url: string;
+  /** 加了時間戳的 R2 鍵，不是使用者看到的檔名 */
   file_name: string;
+  /** 上傳當下的客戶端檔名。補傳時靠這個對回重選的原始檔 */
   title: string;
 }
 
-/** 還沒搬上 Drive 的照片。舊照片與上傳時 Drive 失敗的照片在這裡看起來一樣 */
+/**
+ * 還沒搬上 Drive 的照片。舊照片與上傳時 Drive 失敗的照片在這裡看起來一樣。
+ * 帶 albumId 就只看那本相簿（補傳從相簿頁進去時該帶）。
+ */
 export async function fetchDrivePending(
   cursor = 0,
   limit = 200,
+  albumId?: number,
 ): Promise<{ photos: DrivePendingPhoto[]; remaining: number; next_cursor: number; done: boolean } | null> {
   try {
+    const params = new URLSearchParams({ cursor: String(cursor), limit: String(limit) });
+    if (albumId) params.set('album_id', String(albumId));
     const res = await fetch(
-      `${API_BASE_URL}/photos/drive-pending?cursor=${cursor}&limit=${limit}`,
+      `${API_BASE_URL}/photos/drive-pending?${params}`,
       { headers: getAuthHeaders() },
     );
     if (!res.ok) return null;
@@ -741,7 +882,9 @@ export async function fetchTags(): Promise<Tag[]> {
 }
 
 function getGoogleAuthHeaders() {
-  const token = typeof window !== 'undefined' ? localStorage.getItem('google_access_token') : '';
+  // 走 getGoogleToken() 而不是直接讀 key：過期的 token 應該當作沒有，
+  // 不要送出去換一個看不懂的 401
+  const token = getGoogleToken();
   const adminToken = typeof window !== 'undefined' ? localStorage.getItem('admin_token') : '';
   return {
     'Content-Type': 'application/json',

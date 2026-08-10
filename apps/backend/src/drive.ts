@@ -213,3 +213,23 @@ export async function moveDriveFile(
   });
   if (!res.ok) throw new Error(`Drive 搬檔失敗 (${res.status})`);
 }
+
+/**
+ * 改 Drive 資料夾的名字。相簿改名時跟著叫一次，讓備份看起來跟站上一致。
+ *
+ * **失敗不是問題**，呼叫端該用 `ctx.waitUntil()` 丟出去就好：資料夾 id 存在 D1，
+ * 名字只是給人看的。漏改了只是 Drive 上的名字舊了，照片一張也不會找不到。
+ *
+ * 資料夾是瀏覽器端用使用者本人帳號建的，SA 只是 writer —— writer 改得動名字。
+ */
+export async function renameDriveFolder(
+  saKeyJson: string, folderId: string, name: string,
+): Promise<void> {
+  const token = await getAccessToken(saKeyJson);
+  const res = await fetch(`${DRIVE_FILES_URL}/${encodeURIComponent(folderId)}?fields=id`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error(`Drive 資料夾改名失敗 (${res.status})`);
+}

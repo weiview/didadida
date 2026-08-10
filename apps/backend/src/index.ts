@@ -3,7 +3,7 @@ import {
   normalizeGeo, formatWallClock, utcFromLocal,
   parseExifDateTime, geoOverwriteGuard, DEFAULT_TZ_OFFSET_MINUTES,
 } from './geo';
-import { listGpxFiles, fetchDriveMedia, moveDriveFile, serviceAccountEmail } from './drive';
+import { listGpxFiles, fetchDriveMedia, moveDriveFile, renameDriveFolder, serviceAccountEmail } from './drive';
 import { syncFtsForPhotos, deleteFtsForPhotos, ftsMatchExpr } from './fts';
 
 export interface Env {
@@ -12,6 +12,14 @@ export interface Env {
   APP_PASSWORD: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
+  /**
+   * 可以用 Google 登入當管理員的信箱，逗號分隔。
+   *
+   * **沒設就沒有人能用 Google 登入。** 不是「沒設就放行」—— 那樣的話忘了設定的
+   * 環境會把後台送給任何一個 Google 帳號。忘記設定的代價應該是自己進不去，
+   * 不是別人進得來。密碼登入不受影響，隨時是後路。
+   */
+  ADMIN_EMAILS?: string;
   /**
    * service account 金鑰 JSON 全文。scope 是完整的 drive（Phase 3 要搬檔），
    * 但看得到什麼由 Drive 的分享設定決定 —— 見 drive.ts 檔頭
@@ -290,6 +298,124 @@ interface LoginAttempt {
 }
 const loginAttempts = new Map<string, LoginAttempt>();
 
+/*
+ * Drive 資料夾 id 的來源有兩個，env 優先、AppSetting 次之。
+ *
+ * 正常情況兩個 id 都在 AppSetting：資料夾是**網頁自己建的**（瀏覽器只有
+ * drive.file scope，看不見使用者手動建的資料夾），所以 id 到執行期才存在。
+ * env 那條留著只是為了臨時把某個環境指到別的資料夾，平常不會設。
+ *
+ * 這三支（含下面的 drainDriveTrash）擺在 export default 外面是有意的 ——
+ * 檔案裡多數輔助函式其實宣告在 fetch() 內部（縮排看不出來），scheduled() 讀不到。
+ */
+async function getSetting(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB.prepare("SELECT value FROM AppSetting WHERE key = ?").bind(key).first<any>();
+  return typeof row?.value === "string" && row.value ? row.value : null;
+}
+
+async function driveFolders(env: Env): Promise<{ photos: string | null; trash: string | null }> {
+  const [photos, trash] = await Promise.all([
+    env.GOOGLE_DRIVE_PHOTOS_FOLDER_ID ? Promise.resolve(env.GOOGLE_DRIVE_PHOTOS_FOLDER_ID) : getSetting(env, SETTING_PHOTOS_FOLDER),
+    env.GOOGLE_DRIVE_TRASH_FOLDER_ID ? Promise.resolve(env.GOOGLE_DRIVE_TRASH_FOLDER_ID) : getSetting(env, SETTING_TRASH_FOLDER),
+  ]);
+  return { photos, trash };
+}
+
+/**
+ * 把待搬佇列裡的 Drive 檔真的搬進 `didadida/trash/`，一次搬 limit 個。
+ *
+ * 分批的理由跟 rebuild-fts 一樣但更硬：**Workers 一次請求的 subrequest 上限
+ * （免費版 50）**，而搬一個檔要兩次 Drive 往返。所以這裡永遠只搬一小批，
+ * 剩下的靠下一次觸發。三個觸發點：
+ *   1. 刪除當下 ctx.waitUntil()  —— 單張刪除幾秒內就進 trash/，也是使用者會看的那次
+ *   2. cron（見 wrangler.toml 的 [triggers]） —— 刪整本相簿留下的尾巴由它慢慢清
+ *   3. POST /api/admin/drain-drive-trash —— 手動催
+ * 以前只有第 3 點，而且沒有任何地方呼叫它，等於刪掉的檔永遠留在原資料夾。
+ *
+ * attempts >= 3 的就不再自動重試。那通常代表檔案被手動刪了、或 `didadida/`
+ * 的 Editor 分享被拿掉 —— 一直重試只是白燒額度。留在表裡等人看。
+ */
+async function drainDriveTrash(env: Env, limit: number): Promise<{
+  ok: boolean; moved: number; failed: string[]; remaining: number; gave_up: number; done: boolean;
+}> {
+  const empty = { moved: 0, failed: [] as string[], remaining: 0, gave_up: 0, done: true };
+  const { trash: trashFolderId } = await driveFolders(env);
+  if (!env.GOOGLE_DRIVE_SA_KEY || !trashFolderId) return { ok: false, ...empty };
+
+  const { results: pending } = await env.DB.prepare(
+    "SELECT id, drive_id FROM DriveTrash WHERE attempts < 3 ORDER BY id LIMIT ?"
+  ).bind(limit).all<any>();
+
+  let moved = 0;
+  const failed: string[] = [];
+  for (const row of pending) {
+    try {
+      await moveDriveFile(env.GOOGLE_DRIVE_SA_KEY, row.drive_id, trashFolderId);
+      await env.DB.prepare("DELETE FROM DriveTrash WHERE id = ?").bind(row.id).run();
+      moved++;
+    } catch (e) {
+      // 失敗不丟出去 —— 一顆壞檔不該讓整批停擺
+      const msg = e instanceof Error ? e.message : String(e);
+      await env.DB.prepare(
+        "UPDATE DriveTrash SET attempts = attempts + 1, last_error = ? WHERE id = ?"
+      ).bind(msg.slice(0, 200), row.id).run();
+      failed.push(row.drive_id);
+    }
+  }
+
+  const counts = await env.DB.prepare(`
+    SELECT SUM(CASE WHEN attempts < 3 THEN 1 ELSE 0 END) AS remaining,
+           SUM(CASE WHEN attempts >= 3 THEN 1 ELSE 0 END) AS gave_up
+      FROM DriveTrash
+  `).first<any>();
+  const remaining = Number(counts?.remaining ?? 0);
+
+  return { ok: true, moved, failed, remaining, gave_up: Number(counts?.gave_up ?? 0), done: remaining === 0 };
+}
+
+/**
+ * 這個 Google access token 的主人可不可以當管理員。
+ *
+ * ⚠️ **一定要比對 `aud`。** tokeninfo 回的 email 只說明「這個 token 屬於誰」，
+ * 沒說「是誰簽給他的」—— 隨便一個 app 拿同一個 Google 帳號簽出來的 token
+ * 也帶著同一個 email。少了 aud 這一步，任何人都能用自家 app 的 token 冒充你。
+ *
+ * 白名單沒設就一律不放行（見 Env.ADMIN_EMAILS）。
+ */
+async function googleAdminCheck(
+  env: Env, accessToken: string,
+): Promise<{ ok: true; email: string } | { ok: false; reason: string }> {
+  const allow = (env.ADMIN_EMAILS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (allow.length === 0) return { ok: false, reason: "not_configured" };
+  if (!env.GOOGLE_CLIENT_ID) return { ok: false, reason: "not_configured" };
+
+  const res = await fetch(
+    `https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(accessToken)}`
+  );
+  if (!res.ok) return { ok: false, reason: "token_invalid" };
+  const info: any = await res.json();
+
+  if (info.aud !== env.GOOGLE_CLIENT_ID) return { ok: false, reason: "wrong_audience" };
+  if (String(info.email_verified) !== "true") return { ok: false, reason: "email_unverified" };
+
+  const email = String(info.email || "").trim().toLowerCase();
+  if (!email || !allow.includes(email)) return { ok: false, reason: "not_admin" };
+  return { ok: true, email };
+}
+
+/**
+ * 允許的前端來源。**同時是 CORS 白名單與登入導回的白名單。**
+ *
+ * 登入那條特別重要：導回的網址帶著管理員 JWT（在 fragment 裡），
+ * 而導回的目標原本是直接取 Referer／Origin —— 那是攻擊者的網頁決定得了的東西，
+ * 等於任何網站都能把你騙去登入然後收走 token。只能從這張表裡挑。
+ */
+const ALLOWED_ORIGINS = [
+  "https://didadida-frontend.pages.dev",
+  "https://dev.didadida-frontend.pages.dev",
+  "http://localhost:3000",
+];
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -297,12 +423,8 @@ export default {
     const method = request.method;
 
 const origin = request.headers.get("Origin") || "";
-    const allowedOrigins = [
-      "https://didadida-frontend.pages.dev",
-      "https://dev.didadida-frontend.pages.dev",
-      "http://localhost:3000"
-    ];
-    
+    const allowedOrigins = ALLOWED_ORIGINS;
+
     const allowOrigin = allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
 
     // CORS Headers
@@ -811,8 +933,12 @@ if (method === "POST" && pathname === "/api/verify-password") {
        * 上傳時 Drive 失敗不會擋下照片（drive_file_id 留 NULL），舊照片也全都是
        * NULL，兩者在這裡看起來一樣 —— 本來就該一樣，補傳的動作完全相同。
        *
-       * 只回 id 與 url：真正要重新編碼 4K 的是瀏覽器，它得自己去抓 R2 那份原圖。
+       * 回 title 是給補傳用的：使用者重選原始檔之後靠檔名對回照片，
+       * 而 title 存的就是上傳當下的客戶端檔名（file_name 是加了時間戳的 R2 鍵，對不上）。
        * 會透露照片總數與上傳順序，所以跟 geo-pending 一樣鎖管理員。
+       *
+       * album_id 是選填的。補傳從相簿頁進去時帶上，一來清單短很多，
+       * 二來避免不同相簿裡剛好同名的檔案互相對錯。
        */
       if (method === "GET" && pathname === "/api/photos/drive-pending") {
         if (!(await isAuthorized(request, env))) {
@@ -820,18 +946,20 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }
         const cursor = Number(url.searchParams.get("cursor") ?? 0) || 0;
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 200) || 200, 1), 500);
+        const albumId = Number(url.searchParams.get("album_id") ?? 0) || 0;
+        const albumClause = albumId ? " AND album_id = ?" : "";
 
         const { results: photos } = await env.DB.prepare(`
           SELECT id, url, file_name, title
             FROM Photo
-           WHERE id > ? AND drive_file_id IS NULL
+           WHERE id > ? AND drive_file_id IS NULL${albumClause}
            ORDER BY id LIMIT ?
-        `).bind(cursor, limit).all();
+        `).bind(...(albumId ? [cursor, albumId, limit] : [cursor, limit])).all();
 
         // 剩幾張要另外算：photos 只是這一批，進度條需要總數
         const remaining = await env.DB.prepare(
-          "SELECT COUNT(*) AS n FROM Photo WHERE drive_file_id IS NULL"
-        ).first<any>();
+          `SELECT COUNT(*) AS n FROM Photo WHERE drive_file_id IS NULL${albumClause}`
+        ).bind(...(albumId ? [albumId] : [])).first<any>();
 
         return new Response(JSON.stringify({
           photos,
@@ -885,58 +1013,19 @@ if (method === "POST" && pathname === "/api/verify-password") {
       }
 
       /*
-       * 路由：把待搬佇列裡的 Drive 檔真的搬進 `didadida/trash/`。
-       *
-       * 分批的理由跟 rebuild-fts 一樣但更硬：**Workers 一次請求的 subrequest 上限
-       * （免費版 50）**，而搬一個檔要兩次 Drive 往返，加上 D1 的來回，一次能做的
-       * 個位數到十幾個而已。呼叫端看 remaining > 0 就再打一次。
-       *
-       * attempts >= 3 的就不再自動重試。那通常代表檔案被手動刪了、或 `didadida/`
-       * 的 Editor 分享被拿掉 —— 一直重試只是白燒額度。留在表裡等人看。
+       * 路由：手動催一次待搬佇列。平常不需要按 —— 刪除當下會自己搬（見
+       * drainDriveTrash 的說明），搬不完的由 cron 收尾。這支留著是為了「我現在就
+       * 想看它動」跟卡住時的手動排查。
        */
       if (method === "POST" && pathname === "/api/admin/drain-drive-trash") {
-        const { trash: trashFolderId } = await driveFolders(env);
-        if (!env.GOOGLE_DRIVE_SA_KEY || !trashFolderId) {
+        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 10) || 10, 1), 20);
+        const result = await drainDriveTrash(env, limit);
+        if (!result.ok) {
           return new Response(JSON.stringify({
             error: "尚未設定 GOOGLE_DRIVE_SA_KEY，或 trash 資料夾還沒建起來（第一次上傳時網頁會自動建）",
           }), { status: 503, headers });
         }
-        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 10) || 10, 1), 20);
-
-        const { results: pending } = await env.DB.prepare(
-          "SELECT id, drive_id FROM DriveTrash WHERE attempts < 3 ORDER BY id LIMIT ?"
-        ).bind(limit).all<any>();
-
-        let moved = 0;
-        const failed: string[] = [];
-        for (const row of pending) {
-          try {
-            await moveDriveFile(env.GOOGLE_DRIVE_SA_KEY, row.drive_id, trashFolderId);
-            await env.DB.prepare("DELETE FROM DriveTrash WHERE id = ?").bind(row.id).run();
-            moved++;
-          } catch (e) {
-            // 失敗不丟出去 —— 一顆壞檔不該讓整批停擺
-            const msg = e instanceof Error ? e.message : String(e);
-            await env.DB.prepare(
-              "UPDATE DriveTrash SET attempts = attempts + 1, last_error = ? WHERE id = ?"
-            ).bind(msg.slice(0, 200), row.id).run();
-            failed.push(row.drive_id);
-          }
-        }
-
-        const counts = await env.DB.prepare(`
-          SELECT SUM(CASE WHEN attempts < 3 THEN 1 ELSE 0 END) AS remaining,
-                 SUM(CASE WHEN attempts >= 3 THEN 1 ELSE 0 END) AS gave_up
-            FROM DriveTrash
-        `).first<any>();
-
-        return new Response(JSON.stringify({
-          moved,
-          failed,
-          remaining: Number(counts?.remaining ?? 0),
-          gave_up: Number(counts?.gave_up ?? 0),
-          done: Number(counts?.remaining ?? 0) === 0,
-        }), { headers });
+        return new Response(JSON.stringify(result), { headers });
       }
 
       // 路由：重建全文檢索索引（分批）
@@ -1011,8 +1100,61 @@ if (method === "POST" && pathname === "/api/verify-password") {
           values.push(albumId);
           await env.DB.prepare(query).bind(...values).run();
         }
-        
+
+        /*
+         * 改了名字就順手把 Drive 上的資料夾也改掉，讓備份看起來跟站上一致。
+         *
+         * 丟給 waitUntil，**不擋回應也不管失敗**：資料夾 id 存在 D1，名字只是給人看的。
+         * Drive 掛掉、SA 沒設、權限出問題 —— 任何一種都不該讓「相簿改名」這件事失敗。
+         */
+        if (body.name !== undefined && env.GOOGLE_DRIVE_SA_KEY) {
+          const album = await env.DB.prepare(
+            "SELECT drive_folder_id FROM Album WHERE id = ?"
+          ).bind(albumId).first<any>();
+          if (album?.drive_folder_id) {
+            ctx.waitUntil(
+              renameDriveFolder(env.GOOGLE_DRIVE_SA_KEY, album.drive_folder_id, String(body.name))
+                .catch((e) => console.error("Drive 資料夾改名失敗（不影響相簿）", e))
+            );
+          }
+        }
+
         return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      /*
+       * 路由：登記這本相簿在 Drive 上的資料夾 id。
+       *
+       * 資料夾是瀏覽器端建的（service account 沒配額建不了檔），建完回報這裡存下來。
+       * **COALESCE 保護既有值**：兩個分頁同時第一次上傳有可能各建一個資料夾，
+       * 先到的那個算數，後到的被忽略 —— 代價是 Drive 上多一個空資料夾，
+       * 比起「照片散在兩個資料夾」好得多。回傳實際生效的 id 讓呼叫端拿去用。
+       */
+      if (method === "POST" && pathname.startsWith("/api/albums/")
+          && pathname.endsWith("/drive-folder") && pathname.split("/").length === 5) {
+        const albumId = pathname.split("/")[3];
+        const body: any = await request.json();
+        const folderId = typeof body?.folder_id === "string" ? body.folder_id : null;
+        if (!folderId) {
+          return new Response(JSON.stringify({ error: "folder_id is required" }), { status: 400, headers });
+        }
+
+        await env.DB.prepare(
+          "UPDATE Album SET drive_folder_id = COALESCE(drive_folder_id, ?) WHERE id = ?"
+        ).bind(folderId, albumId).run();
+
+        const album = await env.DB.prepare(
+          "SELECT drive_folder_id FROM Album WHERE id = ?"
+        ).bind(albumId).first<any>();
+        if (!album) {
+          return new Response(JSON.stringify({ error: "Album not found" }), { status: 404, headers });
+        }
+
+        return new Response(JSON.stringify({
+          folder_id: album.drive_folder_id,
+          // 使用者建的那個沒被採用 —— 呼叫端該改用回傳的這個，別再往自己建的那個丟檔
+          kept_existing: album.drive_folder_id !== folderId,
+        }), { headers });
       }
 
       // 路由：刪除相簿 (連同底下的照片)
@@ -1034,8 +1176,10 @@ if (method === "POST" && pathname === "/api/verify-password") {
             await env.BUCKET.delete(keys.slice(i, i + 1000));
           }
 
-          // 3. Drive 的檔案登記待搬（真正的搬移由 drain-drive-trash 分批做）
+          // 3. Drive 的檔案登記待搬（真正的搬移分批做，見 drainDriveTrash）
           await queueDriveTrash(env, photos);
+          // 開頭幾個當場搬掉，剩下的交給 cron —— 整本相簿的量不可能一次搬完
+          ctx.waitUntil(drainDriveTrash(env, 10).catch((e) => console.error("Drive 待搬佇列", e)));
 
           // 4. 刪除所有這些照片的 Tag 關聯
           await env.DB.prepare(`DELETE FROM PhotoTag WHERE photo_id IN (SELECT id FROM Photo WHERE album_id = ?)`).bind(albumId).run();
@@ -1095,26 +1239,6 @@ function thumbExtFor(contentType: string): string {
   if (contentType === "image/webp") return "webp";
   if (contentType === "image/png") return "png";
   return "jpg";
-}
-
-/*
- * Drive 資料夾 id 的來源有兩個，env 優先、AppSetting 次之。
- *
- * 正常情況兩個 id 都在 AppSetting：資料夾是**網頁自己建的**（瀏覽器只有
- * drive.file scope，看不見使用者手動建的資料夾），所以 id 到執行期才存在。
- * env 那條留著只是為了臨時把某個環境指到別的資料夾，平常不會設。
- */
-async function getSetting(env: Env, key: string): Promise<string | null> {
-  const row = await env.DB.prepare("SELECT value FROM AppSetting WHERE key = ?").bind(key).first<any>();
-  return typeof row?.value === "string" && row.value ? row.value : null;
-}
-
-async function driveFolders(env: Env): Promise<{ photos: string | null; trash: string | null }> {
-  const [photos, trash] = await Promise.all([
-    env.GOOGLE_DRIVE_PHOTOS_FOLDER_ID ? Promise.resolve(env.GOOGLE_DRIVE_PHOTOS_FOLDER_ID) : getSetting(env, SETTING_PHOTOS_FOLDER),
-    env.GOOGLE_DRIVE_TRASH_FOLDER_ID ? Promise.resolve(env.GOOGLE_DRIVE_TRASH_FOLDER_ID) : getSetting(env, SETTING_TRASH_FOLDER),
-  ]);
-  return { photos, trash };
 }
 
 /**
@@ -1178,7 +1302,9 @@ function hammingDistance(hex1: string, hex2: string): number {
         const exifData = formData.get('exif') as string || null;
         const takenAt = formData.get('taken_at') as string || null;
         const clientPhash = formData.get('phash') as string || null;
-        
+        // 使用者在重複清單裡按了「照樣上傳」才會帶這個旗標
+        const allowDuplicate = formData.get('allow_duplicate') === '1';
+
         if (!file || !albumId) {
           return new Response(JSON.stringify({ error: "File and album_id are required" }), { status: 400, headers });
         }
@@ -1190,7 +1316,64 @@ function hammingDistance(hex1: string, hex2: string): number {
 
         const buffer = await file.arrayBuffer();
         const fileHash = await calculateFileHash(buffer);
-        
+
+        // 由 EXIF 推導座標與時區。前端送來的 exif 已把時間欄位保留為原始字串，
+        // 這裡才能還原出未經時區位移的牆上時間。
+        let parsedForGeo: any = null;
+        try {
+          parsedForGeo = exifData ? JSON.parse(exifData) : null;
+        } catch (e) {
+          console.warn("上傳的 exif 不是合法 JSON，略過地理正規化:", e);
+        }
+        const geo = normalizeGeo(parsedForGeo, takenAt);
+
+        // geo 沒算出時間就退回前端送來的 takenAt，那是檔案時間而非快門時間
+        const uploadTakenAt = geo.takenAtUtc || takenAt || null;
+        const uploadTimeSource =
+          geo.timeSource ?? (uploadTakenAt ? 'file_time' : null);
+
+        /*
+         * 重複偵測。**一定要排在 R2.put 前面** —— 判定重複之後才發現檔案已經寫進去，
+         * 等於白佔一份免費額度，還得回頭刪（[[free-tier-is-top-priority]]）。
+         *
+         * 兩個依據，範圍限同一本相簿：
+         * 1. `file_hash`：同一台電腦重傳同一個檔，前端縮圖的位元組一模一樣，抓得準。
+         * 2. `taken_at`：縮圖參數一改、或換個瀏覽器，hash 就對不上了，但 EXIF 的
+         *    快門時間不受縮圖影響。代價是連拍可能同秒 —— 所以是「問使用者」而不是
+         *    「直接擋」，誤判的成本只有多按一下。
+         *
+         * 不比 pHash：本機上傳這條路從來沒送過 phash，欄位是 NULL，比了也是白比。
+         */
+        if (!allowDuplicate) {
+          /*
+           * 舊資料裡有一批 `taken_at` 存成字串 "null"（不是 SQL NULL），
+           * 是早期某條路把 JS 的 null 直接塞進去留下的。萬一新上傳也算出這種值，
+           * 「時間相同」會一口氣命中那一整批，看起來像每張都重複。當沒有時間處理。
+           */
+          const dupTakenAt = uploadTakenAt && uploadTakenAt !== 'null' ? uploadTakenAt : null;
+          const { results: dupes } = await env.DB.prepare(
+            `SELECT id, title, thumb_sm_url, thumb_url, url, taken_at, file_hash
+               FROM Photo
+              WHERE album_id = ?
+                AND (file_hash = ? OR (? IS NOT NULL AND taken_at = ?))
+              LIMIT 5`
+          ).bind(albumId, fileHash, dupTakenAt, dupTakenAt).all<any>();
+
+          if (dupes.length > 0) {
+            return new Response(JSON.stringify({
+              duplicate: true,
+              // 讓前端講得出「哪裡像」：hash 一樣是同一個檔，只有時間一樣就是疑似
+              reason: dupes.some((d: any) => d.file_hash === fileHash) ? 'same_file' : 'same_time',
+              existing: dupes.map((d: any) => ({
+                id: d.id,
+                title: d.title,
+                thumb_url: d.thumb_sm_url || d.thumb_url || d.url,
+                taken_at: d.taken_at,
+              })),
+            }), { headers });
+          }
+        }
+
         const fileName = `${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
         await env.BUCKET.put(fileName, buffer, {
           httpMetadata: { contentType: file.type }
@@ -1223,21 +1406,6 @@ function hammingDistance(hex1: string, hex2: string): number {
         ]);
 
         const fileUrl = `${host}/api/photos/view/${encodeURIComponent(fileName)}`;
-
-        // 由 EXIF 推導座標與時區。前端送來的 exif 已把時間欄位保留為原始字串，
-        // 這裡才能還原出未經時區位移的牆上時間。
-        let parsedForGeo: any = null;
-        try {
-          parsedForGeo = exifData ? JSON.parse(exifData) : null;
-        } catch (e) {
-          console.warn("上傳的 exif 不是合法 JSON，略過地理正規化:", e);
-        }
-        const geo = normalizeGeo(parsedForGeo, takenAt);
-
-        // geo 沒算出時間就退回前端送來的 takenAt，那是檔案時間而非快門時間
-        const uploadTakenAt = geo.takenAtUtc || takenAt || null;
-        const uploadTimeSource =
-          geo.timeSource ?? (uploadTakenAt ? 'file_time' : null);
 
         const inserted = await env.DB.prepare(
           // shuffle_key 由 SQL 直接產生：ALTER TABLE 不接受非常數的 DEFAULT，
@@ -1307,6 +1475,8 @@ function hammingDistance(hex1: string, hex2: string): number {
         await env.BUCKET.delete(r2KeysForPhoto(photo));
         // Drive 的兩個檔登記待搬。務必在 DELETE FROM Photo 之前
         await queueDriveTrash(env, [photo]);
+        // 單張刪除就當場搬進 trash/ —— 回應照樣先送出去，搬移在背景做
+        ctx.waitUntil(drainDriveTrash(env, 10).catch((e) => console.error("Drive 待搬佇列", e)));
         await env.DB.prepare("DELETE FROM PhotoTag WHERE photo_id = ?").bind(photoId).run();
         // 如果該照片是某個相簿的封面，則清除該相簿的封面
         await env.DB.prepare("UPDATE Album SET cover_photo_url = NULL WHERE cover_photo_url = ?").bind(photo.url).run();
@@ -1378,23 +1548,48 @@ function hammingDistance(hex1: string, hex2: string): number {
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
-      // 路由：Google OAuth 登入跳轉
+      /*
+       * 路由：Google OAuth 登入跳轉。**這是管理員登入的正門，不只是相簿匯入。**
+       *
+       * 一次要齊三樣權限：`openid email`（認人）、`drive.file`（照片備份）、
+       * `photospicker`（相簿匯入）。合成一次的理由是 token 只有一個，
+       * 不會兩邊搶同一個 localStorage 鍵互相蓋掉。
+       *
+       * **走整頁跳轉而不是 GIS 彈窗**，這是刻意的：彈窗要「短暫啟用狀態」才開得起來，
+       * 而拿到的 token 只能放在記憶體，重整就沒了 —— 那正是「每次第一批照片都沒有
+       * Drive 備份」的來源。跳轉沒有這兩個問題。當初避開跳轉是怕把選好的檔案清單
+       * 弄丟，但授權移到登入這一刻就完全不衝突了。
+       *
+       * 沒有 access_type=offline：refresh token 我們不存（使用者選擇「過期就重新
+       * 登入」），跟 Google 要一個轉頭就丟掉的長期憑證沒有意義。
+       */
       if (method === "GET" && pathname === "/api/auth/google/login") {
         const urlObj = new URL(request.url);
         const albumId = urlObj.searchParams.get("state") || "";
+        /*
+         * 導回哪裡由 Referer／Origin 提示，但**一定要過 ALLOWED_ORIGINS 這關**。
+         * 回程網址的 fragment 裡有管理員 JWT，照單全收等於誰都能把你騙去登入、
+         * 再把 token 收進自己的網站。認不得的來源就留空，讓下面走預設值。
+         */
         const referer = request.headers.get("referer") || request.headers.get("origin");
         let redirectHost = "";
         if (referer) {
           try {
-            redirectHost = new URL(referer).origin;
+            const candidate = new URL(referer).origin;
+            if (ALLOWED_ORIGINS.includes(candidate)) redirectHost = candidate;
           } catch (e) {}
         }
         const combinedState = encodeURIComponent(JSON.stringify({ albumId, redirectHost }));
         const clientId = env.GOOGLE_CLIENT_ID || "";
         const redirectUri = new URL(request.url).origin + "/api/auth/google/callback";
-        const scope = "https://www.googleapis.com/auth/photospicker.mediaitems.readonly";
-        
-        const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}&access_type=offline&prompt=select_account&state=${combinedState}`;
+        const scope = [
+          "openid",
+          "email",
+          "https://www.googleapis.com/auth/drive.file",
+          "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
+        ].join(" ");
+
+        const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}&prompt=select_account&state=${combinedState}`;
         return Response.redirect(url, 302);
       }
 
@@ -1409,7 +1604,13 @@ function hammingDistance(hex1: string, hex2: string): number {
           const parsed = JSON.parse(decodeURIComponent(rawState));
           if (parsed && typeof parsed === "object") {
             albumId = parsed.albumId || "";
-            redirectHost = parsed.redirectHost || "";
+            /*
+             * state 是我們自己包的，但它繞過 Google 才回來，**中間誰都能換掉** ——
+             * 拿我們的 client_id 自己組一個授權網址、把 redirectHost 寫成自家網站，
+             * 騙人點下去就收得到回程 fragment 裡的管理員 JWT。所以這裡要再驗一次。
+             */
+            const candidate = String(parsed.redirectHost || "");
+            if (ALLOWED_ORIGINS.includes(candidate)) redirectHost = candidate;
           }
         } catch (e) {}
 
@@ -1448,10 +1649,32 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!redirectHost && (urlObj.hostname.includes("localhost") || urlObj.hostname.includes("127.0.0.1"))) {
           baseFrontEndUrl = "http://localhost:3000";
         }
-        
-        const finalUrl = albumId ? `${baseFrontEndUrl}/album?id=${albumId}&googleToken=${tokenData.access_token}` : `${baseFrontEndUrl}/?googleToken=${tokenData.access_token}`;
-        
-        return Response.redirect(finalUrl, 302);
+
+        const target = albumId ? `${baseFrontEndUrl}/album?id=${albumId}` : `${baseFrontEndUrl}/`;
+
+        /*
+         * 這條路現在同時是「管理員登入」，所以要驗身分再發自己的 JWT。
+         * 不是管理員就只回錯誤代碼，連 Google token 都不給 —— 沒有用途，
+         * 給了只是多一份會外流的東西。前端看到 authError 會改提供密碼登入。
+         */
+        const admitted = await googleAdminCheck(env, tokenData.access_token);
+        if (!admitted.ok) {
+          return Response.redirect(`${target}#authError=${encodeURIComponent(admitted.reason)}`, 302);
+        }
+
+        /*
+         * token 放在 fragment（`#`）不是 query（`?`）。
+         *
+         * fragment 不會送到任何伺服器 —— 不進 Worker 的存取記錄、不進 Referer 標頭、
+         * 也不會被 CDN 記下來。query 那份原本會跟著這些地方一起外流。
+         * 前端讀完會馬上把它從網址列擦掉，免得留在瀏覽器歷史裡。
+         */
+        const frag = new URLSearchParams({
+          token: await generateJWT(env),
+          googleToken: tokenData.access_token,
+          googleExpiresIn: String(Number(tokenData.expires_in) || 3600),
+        });
+        return Response.redirect(`${target}#${frag.toString()}`, 302);
       }
 
       // 路由：取得 Google 相簿列表
@@ -1753,6 +1976,7 @@ function hammingDistance(hex1: string, hex2: string): number {
               const keys = stale.flatMap((p: any) => r2KeysForPhoto(p));
               if (keys.length > 0) await env.BUCKET.delete(keys);
               await queueDriveTrash(env, stale);
+              ctx.waitUntil(drainDriveTrash(env, 10).catch((e) => console.error("Drive 待搬佇列", e)));
               await env.DB.batch(
                 chunkIds(validIds).map((c) => env.DB.prepare(
                   `DELETE FROM Photo WHERE id IN (${placeholdersFor(c)})`
@@ -2915,5 +3139,26 @@ function hammingDistance(hex1: string, hex2: string): number {
       console.error("API Error: ", error.message, error.stack);
       return new Response(JSON.stringify({ error: error.message }), { status: 500, headers });
     }
+  },
+
+  /**
+   * Cron：清 Drive 待搬佇列的尾巴。
+   *
+   * 刪除當下已經會搬掉前幾個，這裡負責整本相簿刪除留下的長尾。一次仍然只搬
+   * 一小批 —— 免費版單次呼叫 50 個 subrequest，一個檔要兩次 Drive 往返。
+   * 佇列空的時候這支只花一個 D1 查詢，一天 288 次對免費額度沒感覺。
+   *
+   * 本機 `wrangler dev` 不會自己跑 cron，要測就打 http://localhost:8787/__scheduled
+   */
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      drainDriveTrash(env, 20)
+        .then((r) => {
+          if (r.ok && (r.moved > 0 || r.failed.length > 0)) {
+            console.log(`Drive 待搬：搬走 ${r.moved}，失敗 ${r.failed.length}，還剩 ${r.remaining}`);
+          }
+        })
+        .catch((e) => console.error("Drive 待搬佇列（cron）", e))
+    );
   },
 };

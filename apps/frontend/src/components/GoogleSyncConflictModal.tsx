@@ -14,13 +14,34 @@ interface GoogleSyncConflictModalProps {
   tempPhoto: PhotoData;
   existingPhotos: PhotoData[];
   onResolve: (decision: "keep_both" | "replace", replacePhotoIds?: number[]) => void;
+  /**
+   * 本機上傳走這條路時多一顆「略過這張」。
+   *
+   * Google 匯入沒有這個選項是因為照片是使用者在 Picker 裡一張一張挑的；
+   * 本機上傳常常是整個資料夾拖進來，裡面混到已經傳過的很正常，
+   * 「這張不要了」必須是一個按得到的出口。給了才顯示，不影響 Google 那條路。
+   */
+  onSkip?: () => void;
+  /** 一批有好幾張撞到時顯示「第 N / M 張」，不然使用者不知道還要按幾次 */
+  counter?: { current: number; total: number };
+  /** 正在處理這張（上傳／取代），把按鈕鎖起來 */
+  busy?: boolean;
 }
 
 export default function GoogleSyncConflictModal({
-  isOpen, tempPhoto, existingPhotos, onResolve
+  isOpen, tempPhoto, existingPhotos, onResolve, onSkip, counter, busy
 }: GoogleSyncConflictModalProps) {
   const [decision, setDecision] = useState<"keep_both" | "replace" | null>(null);
   const [selectedPhotoIds, setSelectedPhotoIds] = useState<number[]>([]);
+
+  // 換下一張時把上一張的選擇清掉，不然勾選會沿用到不相干的照片上
+  const photoKey = `${tempPhoto?.url || ''}|${counter?.current ?? ''}`;
+  const [lastKey, setLastKey] = useState(photoKey);
+  if (lastKey !== photoKey) {
+    setLastKey(photoKey);
+    setDecision(null);
+    setSelectedPhotoIds([]);
+  }
 
   if (!isOpen) return null;
 
@@ -58,6 +79,11 @@ export default function GoogleSyncConflictModal({
       }}>
         <h3 style={{ margin: '0 0 15px 0', fontSize: '1.15rem', color: 'var(--text-color)', lineHeight: '1.4' }}>
           此相簿中找到多個可能重複的版本。請問您想怎麼處理？
+          {counter && (
+            <span style={{ marginLeft: 8, fontSize: '0.9rem', color: 'var(--text-light)', fontWeight: 400 }}>
+              （第 {counter.current} / {counter.total} 張）
+            </span>
+          )}
         </h3>
         
         <div style={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap', gap: '20px', marginBottom: '20px' }}>
@@ -146,10 +172,24 @@ export default function GoogleSyncConflictModal({
           </button>
         </div>
 
-        <div style={{ marginTop: '20px', textAlign: 'right' }}>
-          <button 
+        <div style={{ marginTop: '20px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '12px' }}>
+          {onSkip && (
+            <button
+              type="button"
+              onClick={onSkip}
+              disabled={busy}
+              style={{
+                padding: '10px 22px', borderRadius: '25px', background: 'transparent',
+                border: '1px solid var(--border-color)', color: 'var(--text-light)',
+                cursor: busy ? 'not-allowed' : 'pointer', fontSize: '0.95rem',
+              }}
+            >
+              略過這張
+            </button>
+          )}
+          <button
             onClick={handleConfirm}
-            disabled={!decision || (decision === 'replace' && selectedPhotoIds.length === 0)}
+            disabled={busy || !decision || (decision === 'replace' && selectedPhotoIds.length === 0)}
             style={{
               padding: '10px 30px', borderRadius: '25px',
               background: (!decision || (decision === 'replace' && selectedPhotoIds.length === 0)) ? '#ccc' : 'var(--accent-color)',
@@ -157,7 +197,7 @@ export default function GoogleSyncConflictModal({
               fontSize: '1rem', fontWeight: 'bold'
             }}
           >
-            確認
+            {busy ? '處理中...' : '確認'}
           </button>
         </div>
       </div>

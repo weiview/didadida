@@ -11,6 +11,12 @@ compatibility_date = "2024-05-29"
 # 放在設定而非程式碼裡是條款的明文要求 —— 清空這一行就等於關掉這個功能。
 VALHALLA_URL = "https://valhalla1.openstreetmap.de"
 
+# 定期清 Drive 的待搬佇列（scheduled handler 在 src/index.ts 最下面）。
+# 刪照片當下就會搬掉前幾個，這裡只負責刪整本相簿留下的長尾，所以十分鐘一次夠了。
+# 一天 144 次，對免費版的 100K 請求／日沒有影響。
+[triggers]
+crons = ["*/10 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "didadida-db"
@@ -23,6 +29,9 @@ preview_bucket_name = "didadida-photos-preview"
 
 [env.dev]
 name = "didadida-api-dev"
+# 具名環境不會繼承上面的 [triggers]，要各自寫一份
+[env.dev.triggers]
+crons = ["*/10 * * * *"]
 [env.dev.vars]
 VALHALLA_URL = "https://valhalla1.openstreetmap.de"
 

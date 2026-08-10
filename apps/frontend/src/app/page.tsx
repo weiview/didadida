@@ -127,16 +127,43 @@ function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPres
   );
 }
 
+/**
+ * 把後端回的原因代碼翻成人話。看得懂才知道是「換個帳號」還是「去改後端設定」，
+ * 認不得的代碼就原樣顯示 —— 總比吞掉好。
+ */
+function authErrorMessage(reason: string): string {
+  switch (reason) {
+    case 'not_admin':
+      return '這個 Google 帳號不在管理員名單裡。換個帳號登入，或用下面的密碼進來。';
+    case 'not_configured':
+      return '後端還沒設定管理員信箱（ADMIN_EMAILS），Google 登入暫時不能用。請先用密碼登入。';
+    case 'email_unverified':
+      return '這個 Google 帳號的信箱還沒驗證，不能用來登入管理員。';
+    case 'wrong_audience':
+      return 'Google 給的憑證不是發給這個網站的，登入流程設定可能壞了。請用密碼登入。';
+    case 'token_invalid':
+      return 'Google 憑證失效了，請再試一次。';
+    default:
+      return `Google 登入失敗（${reason}）。`;
+  }
+}
+
 export default function Home() {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [loading, setLoading] = useState(true);
-  const { isAdmin, checking: isCheckingAuth, login } = useAdmin();
+  const { isAdmin, checking: isCheckingAuth, login, loginWithGoogle, authError } = useAdmin();
 
   // Modal state
   const [showModal, setShowModal] = useState(false);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [newAlbumName, setNewAlbumName] = useState("");
   const [passwordInput, setPasswordInput] = useState("");
+  /**
+   * 密碼那條後路平常收起來 —— 正門是 Google，多一個密碼框只會讓人以為那才是主要入口。
+   * Google 登入被打回票（帳號不在白名單、OAuth 設定壞了）時自動攤開，
+   * 那正是唯一還需要密碼的時候。
+   */
+  const [showPasswordFallback, setShowPasswordFallback] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Batch delete state
@@ -405,6 +432,13 @@ export default function Home() {
    * 就是要顯示的東西。這裡保留這個名字只是為了不用改動下面一整片 JSX。
    */
   const displayAlbums = albums;
+
+  // Google 那邊回了拒絕：把登入視窗打開、密碼後路一起攤開，不然使用者只會看到網址閃一下
+  useEffect(() => {
+    if (!authError) return;
+    setShowLoginModal(true);
+    setShowPasswordFallback(true);
+  }, [authError]);
 
   const handleLogin = async () => {
     setIsSubmitting(true);
@@ -1073,29 +1107,67 @@ export default function Home() {
         <div className={styles.modalOverlay} onClick={() => setShowLoginModal(false)}>
           <div className={styles.modal} onClick={e => e.stopPropagation()}>
             <h2 className={styles.modalTitle}>管理員登入</h2>
-            <div className={styles.inputGroup}>
-              <label>密碼</label>
-              <input 
-                type="password" 
-                placeholder="請輸入管理員密碼..." 
-                value={passwordInput}
-                onChange={e => setPasswordInput(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && handleLogin()}
-                autoFocus
-                required
-              />
-            </div>
-            <div className={styles.modalActions}>
-              <button type="button" className={styles.cancelButton} onClick={() => setShowLoginModal(false)}>取消</button>
-              <button 
-                type="button"
-                className={styles.submitButton} 
-                onClick={handleLogin}
-                disabled={!passwordInput || isSubmitting}
-              >
-                {isSubmitting ? "登入中..." : "登入"}
-              </button>
-            </div>
+
+            {authError && (
+              <p style={{ margin: '0 0 14px', padding: '9px 12px', borderRadius: 8,
+                background: '#fef2f2', border: '1px solid #fecaca', color: '#991b1b',
+                fontSize: 13, lineHeight: 1.7 }}>
+                {authErrorMessage(authError)}
+              </p>
+            )}
+
+            {/* 正門。整頁跳去 Google，回來時 Drive 備份與相簿匯入的權限一起到手 */}
+            <button
+              type="button"
+              className={styles.submitButton}
+              style={{ width: '100%' }}
+              onClick={() => loginWithGoogle()}
+            >
+              使用 Google 帳號登入
+            </button>
+
+            {!showPasswordFallback ? (
+              <div className={styles.modalActions}>
+                <button type="button" className={styles.cancelButton} onClick={() => setShowLoginModal(false)}>取消</button>
+                <button
+                  type="button"
+                  className={styles.cancelButton}
+                  onClick={() => setShowPasswordFallback(true)}
+                >
+                  改用密碼登入
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className={styles.inputGroup} style={{ marginTop: 16 }}>
+                  <label>密碼</label>
+                  <input
+                    type="password"
+                    placeholder="請輸入管理員密碼..."
+                    value={passwordInput}
+                    onChange={e => setPasswordInput(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && handleLogin()}
+                    autoFocus
+                    required
+                  />
+                  {/* 密碼登入拿不到 Google token，講在前面，免得等到要上傳才發現 */}
+                  <small style={{ color: '#78350f', fontSize: 12, lineHeight: 1.6 }}>
+                    密碼登入不會帶到 Google 授權：進得了後台，但這次不能備份到 Drive、也不能從 Google 相簿匯入。
+                  </small>
+                </div>
+                <div className={styles.modalActions}>
+                  <button type="button" className={styles.cancelButton} onClick={() => setShowLoginModal(false)}>取消</button>
+                  <button
+                    type="button"
+                    className={styles.submitButton}
+                    onClick={handleLogin}
+                    disabled={!passwordInput || isSubmitting}
+                  >
+                    {isSubmitting ? "登入中..." : "登入"}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
