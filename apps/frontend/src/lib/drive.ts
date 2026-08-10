@@ -6,122 +6,85 @@
  * Google 帳號建立。順帶的好處是 5 MB 的原始檔不必灌過 Worker 一趟。
  * 建完之後只把 file id 回報給後端（見 recordPhotoDrive）。
  *
- * 授權用 Google Identity Services 的 token client（彈出視窗），不是沿用
- * `/api/auth/google/login` 那條整頁跳轉 —— 跳轉會把使用者選好的檔案清單弄丟。
+ * **這裡不做授權。** token 是管理員登入時就拿到的（`/api/auth/google/login`
+ * 一次要齊 `openid email` + `drive.file` + `photospicker`），存在 localStorage，
+ * 這個檔只負責拿來用。所以沒有「連結 Google Drive」這個步驟 —— 登入即已連結。
+ *
+ * 早期版本用 GIS token client（彈出視窗）自己要授權，那條路有兩個治不好的毛病：
+ * 彈窗要「短暫啟用狀態」才開得起來（所以不能在選完檔案之後才要授權），
+ * 而且 token 只能放記憶體、重整就沒了（所以每個工作階段的第一批照片必然沒備份）。
+ * 改成登入時一起拿之後兩個問題同時消失。
+ *
  * 拿到的是 1 小時的 access token，沒有 refresh token，所以也就沒有
- * 「同意畫面還在 Testing → refresh token 7 天過期」那個問題。
+ * 「同意畫面還在 Testing → refresh token 7 天過期」那個問題。過期就重新登入。
  *
  * ⚠️ scope 是 `drive.file`：**per-file 授權，只看得到這個 app 自己建的檔案**。
  *    這也是為什麼 `didadida/` 一定要由網頁自己建 —— 指定一個使用者手動建的
  *    資料夾當 parent，Drive 會回 404，因為 app 根本看不見它。
+ *    （2026-08-10 實測確認可行：資料夾建得起來，SA 也加得進去當 writer。）
+ *
+ * Drive 上的長相：
+ *
+ *     didadida/
+ *       <相簿名>/
+ *         <photoId>_<檔名>_4k.webp   ← 燈箱代理這份
+ *         <photoId>_<原檔名>          ← 相機原始檔，純備份
+ *       trash/                       ← 刪掉的檔搬進來，不鏡射相簿結構
+ *
+ * 相簿資料夾的 id 存在 D1 的 `Album.drive_folder_id`；照片不會在相簿之間搬動，
+ * 所以檔案放進去就不用再動。相簿改名由後端跟著改資料夾名字（純外觀）。
  *
  * 換 NAS 的時候只有這個檔和 backend/src/drive.ts 要改。
  */
 
-import { fetchDriveConfig, saveDriveFolders } from './api';
+import {
+  fetchDriveConfig, saveDriveFolders, saveAlbumDriveFolder, recordPhotoDrive, fetchAlbum,
+  getGoogleToken,
+  type DriveConfig,
+} from './api';
+import { encode4kWebp } from './imageUtils';
 
-const SCOPE = 'https://www.googleapis.com/auth/drive.file';
-const GIS_SRC = 'https://accounts.google.com/gsi/client';
 const DRIVE_FILES = 'https://www.googleapis.com/drive/v3/files';
 const DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const ROOT_FOLDER_NAME = 'didadida';
 const TRASH_FOLDER_NAME = 'trash';
 
-interface TokenResponse {
-  access_token?: string;
-  expires_in?: number;
-  error?: string;
+/**
+ * 手上還有沒有可用的 Drive token。
+ *
+ * 就是登入時拿到的那個 Google token（見 api.ts 的 getGoogleToken）。
+ * 過期會被當作沒有 —— 那代表登入過期，要重新登入，不是「還沒連結 Drive」。
+ */
+export function hasDriveToken(): boolean {
+  return !!getGoogleToken();
 }
 
-interface TokenClient {
-  requestAccessToken: (overrides?: { prompt?: string }) => void;
-  callback: (res: TokenResponse) => void;
+/** 沒 token 就講清楚是登入過期，不要讓呼叫端自己猜 */
+function requireToken(): string {
+  const token = getGoogleToken();
+  if (!token) throw new Error('Google 登入已過期，請重新登入');
+  return token;
 }
 
-declare global {
-  interface Window {
-    google?: {
-      accounts?: {
-        oauth2?: {
-          initTokenClient: (cfg: {
-            client_id: string;
-            scope: string;
-            callback: (res: TokenResponse) => void;
-            error_callback?: (err: unknown) => void;
-          }) => TokenClient;
-        };
-      };
-    };
-  }
+let cachedConfig: DriveConfig | null = null;
+
+async function getConfig(): Promise<DriveConfig> {
+  if (cachedConfig) return cachedConfig;
+  const config = await fetchDriveConfig();
+  if (!config) throw new Error('拿不到 Drive 設定');
+  cachedConfig = config;
+  return config;
 }
-
-let gisPromise: Promise<void> | null = null;
-
-function loadGis(): Promise<void> {
-  if (window.google?.accounts?.oauth2) return Promise.resolve();
-  if (gisPromise) return gisPromise;
-
-  gisPromise = new Promise<void>((resolve, reject) => {
-    const script = document.createElement('script');
-    script.src = GIS_SRC;
-    script.async = true;
-    script.onload = () => resolve();
-    script.onerror = () => {
-      // 失敗就把 promise 清掉，下次再試。留著一個 rejected promise 會讓
-      // 之後每一次呼叫都直接失敗，即使只是一時的網路問題
-      gisPromise = null;
-      reject(new Error('載入 Google 授權元件失敗'));
-    };
-    document.head.appendChild(script);
-  });
-  return gisPromise;
-}
-
-// token 只放在記憶體。上傳是一次頁面工作階段內的事，沒必要留到 sessionStorage 去
-let cachedToken: { value: string; expiresAt: number } | null = null;
-let tokenClient: TokenClient | null = null;
 
 /**
- * 取得 drive.file 的 access token，必要時彈出 Google 的授權視窗。
+ * 先把後端的 Drive 設定抓回來放著。
  *
- * 第一次會要使用者選帳號並同意；之後只要 Google 那邊的登入還在，
- * 同一個工作階段內續期不會再打擾（GIS 自己處理）。
- *
- * ⚠️ 一定要由使用者的點擊直接觸發，否則彈出視窗會被瀏覽器擋掉。
+ * 純粹是省掉真正要用時的那一趟往返 —— 已經沒有「彈窗來不及開」的壓力了
+ * （授權在登入時就完成）。失敗不用理會，要用的時候還會再試一次。
  */
-export async function getDriveToken(clientId: string): Promise<string> {
-  const now = Date.now();
-  // 留 60 秒餘裕，免得拿到一個正好在上傳途中過期的 token
-  if (cachedToken && cachedToken.expiresAt > now + 60_000) return cachedToken.value;
-
-  await loadGis();
-  const oauth2 = window.google?.accounts?.oauth2;
-  if (!oauth2) throw new Error('Google 授權元件沒有就緒');
-
-  return new Promise<string>((resolve, reject) => {
-    if (!tokenClient) {
-      tokenClient = oauth2.initTokenClient({
-        client_id: clientId,
-        scope: SCOPE,
-        // callback 每次 requestAccessToken 都會被叫到，所以下面每次都重新指派
-        callback: () => {},
-        error_callback: (err) => reject(err instanceof Error ? err : new Error('Google 授權被取消或失敗')),
-      });
-    }
-    tokenClient.callback = (res) => {
-      if (!res.access_token) {
-        reject(new Error(res.error || 'Google 沒有回傳 access token'));
-        return;
-      }
-      cachedToken = {
-        value: res.access_token,
-        expiresAt: Date.now() + (Number(res.expires_in) || 3600) * 1000,
-      };
-      resolve(res.access_token);
-    };
-    tokenClient.requestAccessToken();
-  });
+export function prewarmDrive(): void {
+  getConfig().catch(() => {});
 }
 
 async function driveJson(token: string, url: string, init?: RequestInit): Promise<any> {
@@ -136,10 +99,16 @@ async function driveJson(token: string, url: string, init?: RequestInit): Promis
   return res.json();
 }
 
-/** 找這個 app 自己建過的資料夾。drive.file 之下 files.list 本來就只看得到自建的檔 */
+/**
+ * 找這個 app 自己建過的資料夾。drive.file 之下 files.list 本來就只看得到自建的檔。
+ *
+ * 名字會被塞進 Drive 的查詢字串裡，所以要跳脫 —— 現在傳進來的是使用者取的
+ * 相簿名，什麼字元都可能有。**反斜線要先跳脫**，不然它會把後面補的那個反斜線吃掉。
+ */
 async function findOwnFolder(token: string, name: string, parentId?: string): Promise<string | null> {
+  const escaped = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   const clauses = [
-    `name = '${name.replace(/'/g, "\\'")}'`,
+    `name = '${escaped}'`,
     `mimeType = '${FOLDER_MIME}'`,
     'trashed = false',
   ];
@@ -188,12 +157,9 @@ export interface DriveFolders {
  * 代價是 Drive 上多一個空資料夾 —— 罕見而且無害，不值得為它上鎖。
  */
 export async function ensureDriveFolders(): Promise<DriveFolders & { token: string }> {
-  const config = await fetchDriveConfig();
-  if (!config) throw new Error('拿不到 Drive 設定');
-  if (!config.client_id) throw new Error('後端沒有設定 GOOGLE_CLIENT_ID');
+  const token = requireToken();
+  const config = await getConfig();
   if (!config.sa_email) throw new Error('後端沒有設定 GOOGLE_DRIVE_SA_KEY');
-
-  const token = await getDriveToken(config.client_id);
 
   if (config.photos_folder_id && config.trash_folder_id) {
     return {
@@ -218,7 +184,38 @@ export async function ensureDriveFolders(): Promise<DriveFolders & { token: stri
   }
 
   await saveDriveFolders(photosFolderId, trashFolderId);
+  // 快取跟著更新，不然下一次呼叫會拿到 folder id 還是 null 的舊設定，白跑一次 bootstrap
+  cachedConfig = { ...config, photos_folder_id: photosFolderId, trash_folder_id: trashFolderId };
   return { photosFolderId, trashFolderId, token };
+}
+
+/**
+ * 找出（必要時建立）這本相簿在 Drive 上的資料夾，回傳資料夾 id。
+ *
+ * **分類的邏輯全在這裡**：`didadida/<相簿名>/`。照片不會在相簿之間搬動，
+ * 所以檔案放進去就不用再動；相簿改名由後端在 PUT /api/albums/:id 跟著改資料夾名字。
+ *
+ * 資料夾 id 存在 D1 的 `Album.drive_folder_id`，**不靠名字去找** ——
+ * 名字會變，而且 Drive 允許同名資料夾並存，用名字當鍵遲早會建出第二個。
+ * 只有第一次（D1 還沒有 id）才會退回名字搜尋，那是為了讓中途失敗重跑不會重複建。
+ */
+export async function ensureAlbumFolder(
+  drive: { photosFolderId: string; token: string },
+  albumId: number,
+): Promise<string> {
+  // 自己去抓而不是讓呼叫端傳進來：另一個分頁剛建過的話，畫面上的 state 是舊的
+  const album = await fetchAlbum(String(albumId));
+  if (!album) throw new Error('找不到相簿');
+  if (album.drive_folder_id) return album.drive_folder_id;
+
+  const name = (album.name || '').trim() || `相簿 ${albumId}`;
+  const folderId =
+    (await findOwnFolder(drive.token, name, drive.photosFolderId))
+    ?? (await createFolder(drive.token, name, drive.photosFolderId));
+
+  // 後端可能回別人先建好的那個。以它為準，自己建的那個就放著別用
+  const effective = await saveAlbumDriveFolder(albumId, folderId);
+  return effective || folderId;
 }
 
 /**
@@ -250,4 +247,48 @@ export async function uploadToDrive(
   const data = await res.json();
   if (!data?.id) throw new Error('Drive 上傳沒有回傳 file id');
   return data.id;
+}
+
+/**
+ * 把一張照片的 4K 與原始檔送上 Drive，再把 file id 記回 D1。
+ *
+ * **兩份分開處理，一份失敗不影響另一份。** 後端的 COALESCE 收得下只有一個 id
+ * 的情況，能存多少算多少 —— 照片在 R2 那邊早就存在了，這裡純粹是加分。
+ *
+ * 檔名前面加照片 id，是為了在 Drive 上直接看得出哪個檔對應哪張照片；
+ * 真正的對應關係還是靠 D1 的 drive_file_id，不靠檔名解析。
+ *
+ * 上傳與補傳共用同一條路 —— 補傳餵的就是同一批原始檔，沒有第二種語意。
+ * 回傳「有沒有記進 D1」，補傳畫面要靠它算成功幾張。
+ *
+ * `folderId` 是**相簿的**資料夾，不是 `didadida/` 根目錄（見 ensureAlbumFolder）。
+ */
+export async function pushPhotoToDrive(
+  target: { folderId: string; token: string },
+  photoId: number,
+  rawFile: File,
+): Promise<boolean> {
+  const { folderId, token } = target;
+  const base = rawFile.name.replace(/\.[^/.]+$/, '');
+
+  let driveFileId: string | null = null;
+  try {
+    // 一定要餵原始檔：resizeImageFile 的產物只有 2000px，放大成 4K 又大又糊
+    const webp4k = await encode4kWebp(rawFile);
+    if (webp4k) {
+      driveFileId = await uploadToDrive(token, webp4k, `${photoId}_${base}_4k.webp`, folderId);
+    }
+  } catch (err) {
+    console.warn(`照片 ${photoId} 的 4K 沒送上 Drive`, err);
+  }
+
+  let driveOriginalId: string | null = null;
+  try {
+    driveOriginalId = await uploadToDrive(token, rawFile, `${photoId}_${rawFile.name}`, folderId);
+  } catch (err) {
+    console.warn(`照片 ${photoId} 的原始檔沒送上 Drive`, err);
+  }
+
+  if (!driveFileId && !driveOriginalId) return false;
+  return await recordPhotoDrive(photoId, { driveFileId, driveOriginalId });
 }

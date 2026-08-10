@@ -4,9 +4,8 @@ import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, recordPhotoDrive, type UploadedPhoto } from "@/lib/api";
-import { ensureDriveFolders, uploadToDrive } from "@/lib/drive";
-import { encode4kWebp } from "@/lib/imageUtils";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, getGoogleToken, googleLoginUrl, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
+import { ensureAlbumFolder, ensureDriveFolders, hasDriveToken, prewarmDrive, pushPhotoToDrive } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
@@ -14,6 +13,7 @@ import AssignPlaceModal from "@/components/AssignPlaceModal";
 import FixTimeModal from "@/components/FixTimeModal";
 import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import PlaceCheckinModal from "@/components/PlaceCheckinModal";
+import DriveBackfillModal from "@/components/DriveBackfillModal";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
@@ -23,43 +23,23 @@ import FabMenu, { type FabAction } from "@/components/FabMenu";
 import BottomActionBar from "@/components/BottomActionBar";
 
 /**
- * 把一張照片的 4K 與原始檔送上 Drive，再把 file id 記回 D1。
+ * 被判定為重複、還沒寫進去的那一張。
  *
- * **兩份分開處理，一份失敗不影響另一份。** 後端的 COALESCE 收得下只有一個 id
- * 的情況，能存多少算多少 —— 照片在 R2 那邊早就存在了，這裡純粹是加分。
- *
- * 檔名前面加照片 id，是為了在 Drive 上直接看得出哪個檔對應哪張照片；
- * 真正的對應關係還是靠 D1 的 drive_file_id，不靠檔名解析。
+ * `resized` 是已經縮好的那份 —— 使用者選「照樣上傳」時直接用它，
+ * 不必再解一次圖（大批照片重解會讓瀏覽器卡住）。`file` 是原始檔，
+ * 給預覽圖與 Drive 備份用。
  */
-async function pushToDrive(
-  drive: { photosFolderId: string; token: string },
-  photoId: number,
-  rawFile: File,
-): Promise<void> {
-  const base = rawFile.name.replace(/\.[^/.]+$/, '');
-
-  let driveFileId: string | null = null;
-  try {
-    // 一定要餵原始檔：resizeImageFile 的產物只有 2000px，放大成 4K 又大又糊
-    const webp4k = await encode4kWebp(rawFile);
-    if (webp4k) {
-      driveFileId = await uploadToDrive(drive.token, webp4k, `${photoId}_${base}_4k.webp`, drive.photosFolderId);
-    }
-  } catch (err) {
-    console.warn(`照片 ${photoId} 的 4K 沒送上 Drive`, err);
-  }
-
-  let driveOriginalId: string | null = null;
-  try {
-    driveOriginalId = await uploadToDrive(drive.token, rawFile, `${photoId}_${rawFile.name}`, drive.photosFolderId);
-  } catch (err) {
-    console.warn(`照片 ${photoId} 的原始檔沒送上 Drive`, err);
-  }
-
-  if (driveFileId || driveOriginalId) {
-    await recordPhotoDrive(photoId, { driveFileId, driveOriginalId });
-  }
-}
+type PendingDuplicate = {
+  key: string;
+  file: File;
+  resized: File;
+  /** 原始檔的 object URL，給視窗左邊那張「準備匯入的新照片」用。走完要 revoke */
+  previewUrl: string;
+  exifData: any;
+  takenAt?: string;
+  reason: 'same_file' | 'same_time';
+  existing: DuplicateMatch[];
+};
 
 function AlbumContent() {
   const searchParams = useSearchParams();
@@ -69,7 +49,7 @@ function AlbumContent() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const { isAdmin } = useAdmin();
+  const { isAdmin, loginWithGoogle } = useAdmin();
   const [selectedPhotoIndex, setSelectedPhotoIndex] = useState<number | null>(null);
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
   const [visibleCount, setVisibleCount] = useState<number>(24);
@@ -77,6 +57,28 @@ function AlbumContent() {
   const [hasGoogleToken, setHasGoogleToken] = useState(false);
   /** Drive 沒接上時的原因。照片照樣傳得上去，只是少了 4K 與原始檔備份 */
   const [driveError, setDriveError] = useState<string | null>(null);
+  const [showDriveBackfill, setShowDriveBackfill] = useState(false);
+  /**
+   * 剛上傳、但沒送上 Drive 的那一批：照片 id 配上使用者原本選的那個 File。
+   *
+   * 留著它，黃色橫幅那顆按鈕才能真的「補傳這批」—— 授權完直接拿這些檔案送出去，
+   * 不必請人再選一次，也不必靠檔名對回照片（id 是上傳當下回傳的，不會對錯）。
+   * File 物件在沒重整頁面、原檔沒被移動的前提下一直有效。
+   * 重整之後就沒了，那時只剩「補傳 Drive」那條重選檔案的路。
+   */
+  const [pendingDriveBatch, setPendingDriveBatch] = useState<{ photoId: number; file: File }[]>([]);
+  const [driveBatchProgress, setDriveBatchProgress] = useState<{ current: number; total: number } | null>(null);
+  /**
+   * 後端擋下來的重複照片，跑完一批之後一張一張問，用的是 Google 匯入那套
+   * 衝突視窗（可複選要取代哪幾張既有照片）。空陣列＝沒東西要問。
+   */
+  const [duplicateItems, setDuplicateItems] = useState<PendingDuplicate[]>([]);
+  const [duplicateIndex, setDuplicateIndex] = useState(0);
+  const [duplicateBusy, setDuplicateBusy] = useState(false);
+  /** 這一批的 Drive 位置，重複那幾張決定要傳時直接沿用，不必重跑一次 bootstrap */
+  const driveRef = useRef<{ folderId: string; token: string } | null>(null);
+  /** 重複那幾張補傳成功的，等整個佇列走完再一起丟給補地點的視窗 */
+  const dupUploadedRef = useRef<UploadedPhoto[]>([]);
 
   // 批次刪除 State
   const [selectedPhotos, setSelectedPhotos] = useState<number[]>([]);
@@ -220,17 +222,14 @@ function AlbumContent() {
       loadData();
     }
     
-    // 管理員狀態由 useAdmin 負責（會去問後端 token 還有沒有效）
+    /*
+     * 管理員狀態與登入回呼都由 useAdmin 負責（fragment 在那裡收，網址也在那裡擦）。
+     * 這裡只是問一句「手上那個 Google token 還能用嗎」—— 它同時是相簿匯入
+     * 與 Drive 備份的憑證，登入時一起拿到的。
+     */
     if (typeof window !== "undefined") {
-      const gToken = searchParams?.get("googleToken");
-      if (gToken) {
-        localStorage.setItem("google_access_token", gToken);
-        // 清除網址上的 token
-        window.history.replaceState({}, document.title, window.location.pathname + "?id=" + id);
-        setHasGoogleToken(true);
-      } else if (localStorage.getItem("google_access_token")) {
-        setHasGoogleToken(true);
-      }
+      setHasGoogleToken(!!getGoogleToken());
+      prewarmDrive();
     }
   }, [id, searchParams]);
 
@@ -426,8 +425,153 @@ function AlbumContent() {
         title: '整本相簿攤開，照日期看哪些照片還缺位置或地名',
         onClick: () => setShowPlaceCheckin(true),
       },
+      // 頁面重整之後黃色橫幅就沒了，但沒備份的照片還在。這裡是它唯一的常駐入口
+      {
+        key: 'drive',
+        label: '補傳 Drive',
+        title: '重選原始檔，補上缺的 4K 與原始檔備份',
+        onClick: () => setShowDriveBackfill(true),
+      },
       { key: 'edit', label: '編輯照片', onClick: () => setIsEditingPhotos(true) },
     ];
+  };
+
+  /**
+   * 黃色橫幅那顆按鈕：把剛上傳那批的 4K 與原始檔補上去。
+   *
+   * 不必請人重選檔案，也不必靠檔名對回照片 —— `pendingDriveBatch` 裡的照片 id
+   * 是上傳當下後端回傳的，配對不可能錯。只有重整過頁面（File 沒了）才退回
+   * 「補傳 Drive」那條重選檔案的路。
+   */
+  const handleBackfillCurrentBatch = async () => {
+    if (driveBatchProgress || !id) return;
+    if (pendingDriveBatch.length === 0) {
+      setShowDriveBackfill(true);
+      return;
+    }
+
+    const batch = pendingDriveBatch;
+    setDriveBatchProgress({ current: 0, total: batch.length });
+
+    let drive: { folderId: string; token: string };
+    try {
+      const folders = await ensureDriveFolders();
+      drive = { folderId: await ensureAlbumFolder(folders, Number(id)), token: folders.token };
+    } catch (err) {
+      console.warn('Drive 連結失敗', err);
+      setDriveBatchProgress(null);
+      setDriveError(err instanceof Error ? err.message : 'Google Drive 授權失敗');
+      return;
+    }
+
+    // 沒補成功的留在佇列裡，按鈕可以再按一次；成功的不要重傳，會在 Drive 上留兩份
+    const stillMissing: { photoId: number; file: File }[] = [];
+    for (let i = 0; i < batch.length; i++) {
+      setDriveBatchProgress({ current: i + 1, total: batch.length });
+      try {
+        if (!(await pushPhotoToDrive(drive, batch[i].photoId, batch[i].file))) stillMissing.push(batch[i]);
+      } catch (err) {
+        console.warn(`照片 ${batch[i].photoId} 補傳失敗`, err);
+        stillMissing.push(batch[i]);
+      }
+    }
+
+    setDriveBatchProgress(null);
+    setPendingDriveBatch(stillMissing);
+    setDriveError(stillMissing.length > 0 ? `還有 ${stillMissing.length} 張沒補成功，可以再按一次` : null);
+    await loadData();
+  };
+
+  /*
+   * 先把 Drive 準備好（必要時建資料夾），一批只做一次。
+   *
+   * Drive 的授權是登入時一起拿的，這裡不會有任何彈窗 —— 手上沒 token 就代表
+   * 登入過期了，這種時候絕對不能在上傳中途跳轉去登入（使用者選好的檔案會全沒）。
+   *
+   * 沒接上**不擋上傳** —— 照片只要 R2 的縮圖成功就算存在，Drive 是加分項。
+   * drive_file_id 留 NULL，之後用「補傳 Drive」補。
+   */
+  const prepareDrive = async (): Promise<{ folderId: string; token: string } | null> => {
+    if (!hasDriveToken()) {
+      setDriveError('Google 登入已過期，這批只會有 R2 的版本 —— 重新登入之後按下面那顆按鈕補傳');
+      return null;
+    }
+    try {
+      const folders = await ensureDriveFolders();
+      // 照片放進這本相簿自己的資料夾，不是 didadida/ 根目錄
+      const folderId = await ensureAlbumFolder(folders, Number(id));
+      setDriveError(null);
+      return { folderId, token: folders.token };
+    } catch (err) {
+      console.warn('Drive 沒接上，這批照片只會有 R2 的版本', err);
+      setDriveError(err instanceof Error ? err.message : 'Google Drive 授權失敗');
+      return null;
+    }
+  };
+
+  /** 佇列走完：收拾狀態、重抓資料，該補地點的再問一次 */
+  const finishDuplicateQueue = async () => {
+    duplicateItems.forEach((d) => URL.revokeObjectURL(d.previewUrl));
+    setDuplicateItems([]);
+    setDuplicateIndex(0);
+    const uploaded = dupUploadedRef.current;
+    dupUploadedRef.current = [];
+    if (uploaded.length === 0) return;
+    await loadData();
+    if (uploaded.some((p) => p.lat === null || p.lng === null)) {
+      setPostUploadIds(uploaded.map((p) => p.id));
+    }
+  };
+
+  const advanceDuplicate = async () => {
+    if (duplicateIndex + 1 < duplicateItems.length) setDuplicateIndex(duplicateIndex + 1);
+    else await finishDuplicateQueue();
+  };
+
+  /**
+   * 重複視窗按下確認：`keep_both` 是兩張都留，`replace` 是傳新的、再刪掉勾選的舊照片。
+   *
+   * **一定要先上傳成功才刪。** 反過來的話上傳失敗就變成舊的也沒了、新的也沒進來，
+   * 使用者以為只是取代一下，結果照片憑空消失。
+   */
+  const resolveDuplicate = async (decision: 'keep_both' | 'replace', replaceIds?: number[]) => {
+    const item = duplicateItems[duplicateIndex];
+    if (!id || !item || duplicateBusy) return;
+
+    setDuplicateBusy(true);
+    try {
+      const result = await uploadPhoto(id, item.resized, item.exifData, item.takenAt, true);
+      if (result.status !== 'ok') {
+        alert('這張上傳失敗，先跳過。');
+        return;
+      }
+      dupUploadedRef.current.push(result.photo);
+
+      // Drive 沿用整批那次的授權；沒有就記進待補清單，跟一般上傳一樣
+      if (driveRef.current) {
+        try {
+          await pushPhotoToDrive(driveRef.current, result.photo.id, item.file);
+        } catch (err) {
+          console.warn('新照片沒送上 Drive', err);
+          setPendingDriveBatch((prev) => [...prev, { photoId: result.photo.id, file: item.file }]);
+        }
+      } else {
+        setPendingDriveBatch((prev) => [...prev, { photoId: result.photo.id, file: item.file }]);
+      }
+
+      if (decision === 'replace' && replaceIds && replaceIds.length > 0) {
+        // 刪除端點自己會處理 R2 的檔與 Drive 的待搬佇列，這裡不用另外收尾
+        const failed = (await Promise.all(replaceIds.map((pid) => deletePhoto(pid))))
+          .filter((ok) => !ok).length;
+        if (failed > 0) alert(`新照片已上傳，但有 ${failed} 張舊照片沒刪掉。`);
+      }
+    } catch (err) {
+      console.error(err);
+      alert('處理這張時出錯了，先跳過。');
+    } finally {
+      setDuplicateBusy(false);
+      await advanceDuplicate();
+    }
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -439,24 +583,14 @@ function AlbumContent() {
     let allSuccess = true;
     const total = files.length;
     const uploaded: UploadedPhoto[] = [];
+    // Drive 沒接上時，把「哪張照片配哪個原始檔」留下來給橫幅那顆按鈕用
+    const missedDrive: { photoId: number; file: File }[] = [];
+    // 後端判定跟相簿裡撞了的那幾張。**它們一個位元組都還沒寫進去**，跑完再統一問
+    const dupes: PendingDuplicate[] = [];
 
-    /*
-     * 先把 Drive 準備好（授權、必要時建資料夾）。
-     *
-     * 失敗**不擋上傳** —— 照片只要 R2 的縮圖成功就算存在，Drive 是加分項。
-     * 沒接上就把 drive_file_id 留 NULL，之後用「補傳 Drive」補。
-     *
-     * 放在這裡而不是每張都試，是因為 GIS 的授權會彈視窗，一定要貼著使用者的
-     * 操作發生才不會被瀏覽器擋掉；一批上傳只該問一次。
-     */
-    let drive: { photosFolderId: string; token: string } | null = null;
-    try {
-      drive = await ensureDriveFolders();
-      setDriveError(null);
-    } catch (err) {
-      console.warn('Drive 沒接上，這批照片只會有 R2 的版本', err);
-      setDriveError(err instanceof Error ? err.message : 'Google Drive 授權失敗');
-    }
+    const drive = await prepareDrive();
+    // 重複那幾張稍後才決定要不要傳，那時不該再跑一次 bootstrap，沿用這批的位置
+    driveRef.current = drive;
 
     for (let i = 0; i < total; i++) {
       const rawFile = files[i];
@@ -465,10 +599,19 @@ function AlbumContent() {
         // 縮圖處理 (長邊不超過 2000px)
         const { file, exifData, takenAt } = await resizeImageFile(rawFile, 2000);
         const result = await uploadPhoto(id, file, exifData, takenAt || undefined);
-        if (result) {
-          uploaded.push(result);
+        if (result.status === 'ok') {
+          uploaded.push(result.photo);
           // 4K 與原始檔送 Drive。任何一步失敗都只是少一份備份，照片已經存在了
-          if (drive) await pushToDrive(drive, result.id, rawFile);
+          if (drive) await pushPhotoToDrive(drive, result.photo.id, rawFile);
+          else missedDrive.push({ photoId: result.photo.id, file: rawFile });
+        } else if (result.status === 'duplicate') {
+          // 縮好的 file 一起留著：使用者若選「照樣上傳」，不必再解一次圖
+          dupes.push({
+            key: `${Date.now()}-${i}-${rawFile.name}`,
+            file: rawFile, resized: file, previewUrl: URL.createObjectURL(rawFile),
+            exifData, takenAt: takenAt || undefined,
+            reason: result.reason, existing: result.existing,
+          });
         } else {
           allSuccess = false;
         }
@@ -477,6 +620,9 @@ function AlbumContent() {
         allSuccess = false;
       }
     }
+
+    // 累加而不是覆蓋：連傳兩批都沒接上 Drive 時，第一批不該被第二批洗掉
+    if (missedDrive.length > 0) setPendingDriveBatch((prev) => [...prev, ...missedDrive]);
 
     if (!allSuccess) {
       alert("部分或全部照片上傳失敗，請稍後再試。");
@@ -490,7 +636,9 @@ function AlbumContent() {
     if (uploaded.some((p) => p.lat === null || p.lng === null)) {
       setPostUploadIds(uploaded.map((p) => p.id));
     }
-    
+    // 重複清單疊在補件視窗上面：先決定要不要傳，關掉之後才輪到補地點
+    if (dupes.length > 0) setDuplicateItems(dupes);
+
     // reset input
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -500,8 +648,8 @@ function AlbumContent() {
   const handleGoogleSync = async (initialSession: any, popup: Window | null) => {
     try {
       if (!hasGoogleToken) {
-        const loginUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8787/api';
-        window.location.href = `${loginUrl}/auth/google/login?state=${id}`;
+        // 沒 token 就是還沒登入（或登入過期）。同一次授權會把相簿匯入與 Drive 備份一起帶回來
+        window.location.href = googleLoginUrl(id ?? undefined);
         return;
       }
 
@@ -1089,6 +1237,10 @@ function AlbumContent() {
       {/*
         * Drive 沒接上要講出來，不能只寫進 console。照片是傳成功了，但少了 4K 與
         * 原始檔備份 —— 使用者以為備份好了才是真正的問題。
+        *
+        * 橫幅裡那顆按鈕分兩種情況：手上還有 Google token 就直接補傳剛才那批；
+        * token 過期就只能先去登入 —— 跳轉會把記在記憶體裡的 File 弄丟，
+        * 所以標籤要講清楚回來之後得走「補傳 Drive」重選檔案那條路。
         */}
       {isAdmin && driveError && (
         <div style={{
@@ -1097,7 +1249,29 @@ function AlbumContent() {
           fontSize: 13.5, lineHeight: 1.7,
         }}>
           照片已經上傳，但 <strong>Google Drive 沒接上</strong>（{driveError}），
-          這批只有 R2 的版本，缺 4K 與原始檔備份。之後可以用「補傳 Drive」補回來。
+          這批只有 R2 的版本，缺 4K 與原始檔備份。
+          {driveBatchProgress ? (
+            <div style={{ marginTop: 8 }}>
+              補傳中... {driveBatchProgress.current} / {driveBatchProgress.total}
+            </div>
+          ) : (
+            <div style={{ marginTop: 8 }}>
+              <button
+                type="button"
+                onClick={() => (hasGoogleToken ? handleBackfillCurrentBatch() : loginWithGoogle(id ?? undefined))}
+                style={{
+                  padding: '7px 14px', borderRadius: 7, border: 'none',
+                  background: '#b45309', color: '#fff', fontSize: 13.5, cursor: 'pointer',
+                }}
+              >
+                {!hasGoogleToken
+                  ? '重新登入 Google（回來後用「補傳 Drive」重選檔案）'
+                  : pendingDriveBatch.length > 0
+                    ? `補傳這批（${pendingDriveBatch.length} 張）`
+                    : '補傳 Drive'}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -1341,6 +1515,38 @@ function AlbumContent() {
           setSelectedPhotos(ids);
           setPostUploadIds([]);
           setShowFixTime(true);
+        }}
+      />
+
+      {/*
+        本機上傳撞到重複：一張一張問，跟 Google 匯入用同一個視窗、同一套選項
+        （全部保留／勾選要被取代的舊照片，可複選）。疊在補件視窗上面，先處理這個。
+      */}
+      {duplicateItems[duplicateIndex] && (
+        <GoogleSyncConflictModal
+          isOpen={true}
+          tempPhoto={{ url: duplicateItems[duplicateIndex].previewUrl }}
+          existingPhotos={duplicateItems[duplicateIndex].existing.map((e) => ({
+            id: e.id,
+            url: e.thumb_url || '',
+            taken_at: e.taken_at || undefined,
+          }))}
+          onResolve={(decision, replaceIds) => { resolveDuplicate(decision, replaceIds); }}
+          onSkip={() => { if (!duplicateBusy) advanceDuplicate(); }}
+          counter={{ current: duplicateIndex + 1, total: duplicateItems.length }}
+          busy={duplicateBusy}
+        />
+      )}
+
+      {/* 補傳 Drive：重選原始檔，把缺的 4K 與原始檔補上去 */}
+      <DriveBackfillModal
+        isOpen={showDriveBackfill}
+        albumId={id ? Number(id) : undefined}
+        onClose={() => setShowDriveBackfill(false)}
+        onDone={async () => {
+          // 補完了就把橫幅收掉，不然它會一直宣稱備份沒做
+          setDriveError(null);
+          await loadData();
         }}
       />
 
