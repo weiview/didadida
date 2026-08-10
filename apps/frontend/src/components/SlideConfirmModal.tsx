@@ -18,15 +18,25 @@ export default function SlideConfirmModal({
   onCancel
 }: SlideConfirmModalProps) {
   const [sliderPosition, setSliderPosition] = useState(0);
+  /**
+   * 已完成的比例（0～1），底下那條填色用的。
+   *
+   * 不能直接拿 `sliderPosition` 當寬度：滑塊的 left 是它**左緣**的位置，
+   * 起點 0 對應的填色卻要是 0、終點對應的要是滿版。之前用
+   * `27px + sliderPosition` 去湊（7px 內距 + 半顆滑塊），結果沒動就先亮一截、
+   * 滑到底又差 23px 到不了底。位置與比例是兩件事，分開存最省事。
+   */
+  const [progress, setProgress] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [isConfirmed, setIsConfirmed] = useState(false);
-  
+
   const sliderRef = useRef<HTMLDivElement>(null);
   const thumbRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (isOpen) {
       setSliderPosition(0);
+      setProgress(0);
       setIsConfirmed(false);
       setIsDragging(false);
     }
@@ -44,18 +54,24 @@ export default function SlideConfirmModal({
     const sliderRect = sliderRef.current.getBoundingClientRect();
     const thumbWidth = thumbRef.current.offsetWidth;
     const maxPosition = sliderRect.width - thumbWidth - 10; // 10px padding total
-    
+    if (maxPosition <= 0) return;
+
     let newPosition = e.clientX - sliderRect.left - (thumbWidth / 2);
-    
+
     if (newPosition < 0) newPosition = 0;
     if (newPosition > maxPosition) newPosition = maxPosition;
-    
-    setSliderPosition(newPosition);
-    
+
+    // 過門檻就直接把滑塊補到底：解鎖了卻停在 95% 的位置，看起來像沒滑完
     if (newPosition >= maxPosition * 0.95) {
+      setSliderPosition(maxPosition);
+      setProgress(1);
       setIsConfirmed(true);
       setIsDragging(false);
+      return;
     }
+
+    setSliderPosition(newPosition);
+    setProgress(newPosition / maxPosition);
   };
 
   const handlePointerUp = (e: React.PointerEvent) => {
@@ -63,6 +79,7 @@ export default function SlideConfirmModal({
     setIsDragging(false);
     if (!isConfirmed) {
       setSliderPosition(0);
+      setProgress(0);
     }
     (e.target as HTMLElement).releasePointerCapture(e.pointerId);
   };
@@ -132,7 +149,7 @@ export default function SlideConfirmModal({
           
           <div style={{
             position: 'absolute', top: 0, left: 0, height: '100%',
-            width: `calc(27px + ${sliderPosition}px)`,
+            width: `${progress * 100}%`,
             backgroundColor: isConfirmed ? 'rgba(129, 199, 132, 0.2)' : 'rgba(229, 115, 115, 0.15)',
             transition: isDragging ? 'none' : 'width 0.3s ease',
             zIndex: 1
