@@ -1,8 +1,23 @@
 // 這裡設定 Cloudflare Workers API 的預設位置
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8787/api';
 
+/**
+ * 進站 token 的 localStorage key。
+ *
+ * 名字是歷史遺留：**這個 key 現在裝的可能是管理員 token，也可能是訪客 token**。
+ * 兩種都是後端簽的 JWT，差別在 payload 裡的 role，前端一律原封不動送出去，
+ * 由後端決定給到哪裡。沒有改名是因為改了會把所有還沒過期的登入狀態洗掉，
+ * 而那個代價換不到任何實質好處。
+ */
+const SITE_TOKEN_KEY = 'admin_token';
+
+function clearSiteToken(): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(SITE_TOKEN_KEY);
+}
+
 function getAuthHeaders() {
-  const token = typeof window !== 'undefined' ? localStorage.getItem('admin_token') : '';
+  const token = typeof window !== 'undefined' ? localStorage.getItem(SITE_TOKEN_KEY) : '';
   return {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${token}`
@@ -72,7 +87,7 @@ export function consumeAuthHash(): { admin: boolean; error: string | null } {
   const googleToken = p.get('googleToken');
   if (!error && !token && !googleToken) return { admin: false, error: null };
 
-  if (token) localStorage.setItem('admin_token', token);
+  if (token) localStorage.setItem(SITE_TOKEN_KEY, token);
   if (googleToken) storeGoogleToken(googleToken, Number(p.get('googleExpiresIn')) || 3600);
   window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
   return { admin: !!token, error };
@@ -223,7 +238,7 @@ export async function verifyLogin(password: string): Promise<{ success: boolean;
 
     const data = await res.json();
     if (res.ok && data.success && data.token) {
-      localStorage.setItem('admin_token', data.token);
+      localStorage.setItem(SITE_TOKEN_KEY, data.token);
       return { success: true };
     }
     return { success: false, message: data.error || "密碼錯誤" };
@@ -234,29 +249,83 @@ export async function verifyLogin(password: string): Promise<{ success: boolean;
 }
 
 /**
- * 確認 localStorage 裡的 token 還有效（沒過期、簽章對）。
+ * 進站密碼 → 訪客 token。
  *
- * 這是「是不是管理員」的唯一依據。以前是把明文密碼存在 localStorage 再重打一次
- * verify-password，那個密碼同時是 JWT 的簽章金鑰，不該留在瀏覽器裡；而只檢查
- * token 這個 key 存不存在也不行 —— 過期後 key 還在，編輯介面會繼續出現然後每一
- * 個按鈕都被後端 401 擋掉。
+ * 跟 verifyLogin 是兩把不同的鑰匙：這一把只換得到「看得到公開內容」的身分，
+ * 換不到編輯權。成功之後 token 存在同一個 key（見 SITE_TOKEN_KEY），
+ * 所以之後每一個請求都會自動帶著它 —— 相簿清單那批現在沒有它就 401。
+ *
+ * `notConfigured` 是後端還沒設 GUEST_PASSWORD。這件事跟「密碼打錯」要分開講，
+ * 不然使用者會一直重打一個永遠不可能對的密碼。
  */
-export async function checkAuth(): Promise<boolean> {
-  if (typeof window === 'undefined') return false;
+export async function verifyGuest(
+  password: string,
+): Promise<{ success: boolean; message?: string; notConfigured?: boolean }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/verify-guest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+
+    const contentType = res.headers.get('content-type');
+    if (!contentType || !contentType.includes('application/json')) {
+      const text = await res.text();
+      return { success: false, message: `伺服器阻擋: ${res.status} ${text}` };
+    }
+
+    const data = await res.json();
+    if (res.ok && data.success && data.token) {
+      localStorage.setItem(SITE_TOKEN_KEY, data.token);
+      return { success: true };
+    }
+    if (res.status === 503 || data.error === 'not_configured') {
+      return { success: false, notConfigured: true, message: '這個網站還沒設定進站密碼' };
+    }
+    return { success: false, message: data.error === 'Unauthorized' ? '密碼錯誤' : (data.error || '密碼錯誤') };
+  } catch (error: any) {
+    console.error(error);
+    return { success: false, message: `連線錯誤: ${error.message}` };
+  }
+}
+
+/** 進站狀態。兩個都是 false 代表連門都還沒進，該顯示進站畫面 */
+export interface AuthState {
+  admin: boolean;
+  guest: boolean;
+}
+
+/**
+ * 確認 localStorage 裡的 token 還有效（沒過期、簽章對），以及它是哪一種身分。
+ *
+ * 這是「是不是管理員」與「進不進得了站」的唯一依據。以前是把明文密碼存在
+ * localStorage 再重打一次 verify-password，那個密碼同時是 JWT 的簽章金鑰，
+ * 不該留在瀏覽器裡；而只檢查 token 這個 key 存不存在也不行 —— 過期後 key 還在，
+ * 編輯介面會繼續出現然後每一個按鈕都被後端 401 擋掉。
+ *
+ * 連不上後端時回全 false。**這代表整站被擋在進站畫面外**，看起來很嚴厲，
+ * 但反過來（樂觀放行）更糟：畫面會進得去而每一支 API 都空手而回，
+ * 使用者只會看到一個空相簿列表，完全不知道是網路斷了。
+ */
+export async function checkAuth(): Promise<AuthState> {
+  const locked: AuthState = { admin: false, guest: false };
+  if (typeof window === 'undefined') return locked;
   // 舊版把明文密碼存在這個 key。清掉已經留在使用者瀏覽器裡的那一份，
   // 否則它會一直躺在那裡。等所有裝置都開過一次站之後這行就可以刪了。
   localStorage.removeItem('admin_password');
-  if (!localStorage.getItem('admin_token')) return false;
+  if (!localStorage.getItem(SITE_TOKEN_KEY)) return locked;
   try {
     const res = await fetch(`${API_BASE_URL}/auth/me`, { headers: getAuthHeaders() });
-    if (res.ok) return true;
+    if (res.ok) {
+      const data = await res.json();
+      return { admin: !!data.admin, guest: !!data.guest };
+    }
     // 401 = 過期或無效。留著只會讓下次進站又錯判一遍
-    if (res.status === 401) localStorage.removeItem('admin_token');
-    return false;
+    if (res.status === 401) clearSiteToken();
+    return locked;
   } catch (error) {
-    // 連不上就當作沒登入 —— 寧可少顯示編輯介面，也不要顯示一堆會失敗的按鈕
     console.error(error);
-    return false;
+    return locked;
   }
 }
 
@@ -295,7 +364,10 @@ export async function fetchAlbums(
   opts: QueryOptions = {},
 ): Promise<{ albums: Album[]; hasMore: boolean }> {
   try {
-    const res = await fetch(`${API_BASE_URL}/albums${queryString(opts)}`);
+    // 進站閘門之後這條也要帶 token（訪客或管理員都行），不帶就是 401
+    const res = await fetch(`${API_BASE_URL}/albums${queryString(opts)}`, {
+      headers: getAuthHeaders(),
+    });
     if (!res.ok) throw new Error('Failed to fetch albums');
     const data = await res.json();
     return { albums: data.albums ?? [], hasMore: !!data.has_more };
@@ -327,7 +399,9 @@ export async function fetchAllAlbums(): Promise<Album[]> {
  */
 export async function fetchAlbum(albumId: string | number): Promise<Album | null> {
   try {
-    const res = await fetch(`${API_BASE_URL}/albums/${albumId}`);
+    const res = await fetch(`${API_BASE_URL}/albums/${albumId}`, {
+      headers: getAuthHeaders(),
+    });
     if (!res.ok) throw new Error('Failed to fetch album');
     return res.json();
   } catch (error) {
@@ -591,7 +665,7 @@ export async function uploadPhoto(
   if (takenAt) formData.append('taken_at', takenAt);
 
   try {
-    const token = localStorage.getItem('admin_token') || '';
+    const token = localStorage.getItem(SITE_TOKEN_KEY) || '';
     const res = await fetch(`${API_BASE_URL}/upload`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}` },
@@ -872,7 +946,7 @@ export async function removePhotoTag(photoId: number, tagId: number): Promise<bo
 
 export async function fetchTags(): Promise<Tag[]> {
   try {
-    const res = await fetch(`${API_BASE_URL}/tags`);
+    const res = await fetch(`${API_BASE_URL}/tags`, { headers: getAuthHeaders() });
     if (!res.ok) throw new Error('Failed to fetch tags');
     return await res.json();
   } catch (error) {
@@ -885,7 +959,7 @@ function getGoogleAuthHeaders() {
   // 走 getGoogleToken() 而不是直接讀 key：過期的 token 應該當作沒有，
   // 不要送出去換一個看不懂的 401
   const token = getGoogleToken();
-  const adminToken = typeof window !== 'undefined' ? localStorage.getItem('admin_token') : '';
+  const adminToken = typeof window !== 'undefined' ? localStorage.getItem(SITE_TOKEN_KEY) : '';
   return {
     'Content-Type': 'application/json',
     'X-Google-Token': token || '',
