@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import styles from "./lightbox.module.css";
-import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag } from "@/lib/api";
+import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc } from "@/lib/api";
 import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
 
@@ -184,7 +184,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           onTouchMove={onTouchMoveEvent}
           onTouchEnd={onTouchEndEvent}
         >
-          <img src={photo.url} alt={photo.title} className={styles.image} />
+          {/* 走 Worker 代理拿 Drive 的 4K；沒有 Drive 版本會自動退回 R2 的 2000px */}
+          <img src={photoFullSrc(photo)} alt={photo.title} className={styles.image} />
           {hasPrev && (
             <button className={`${styles.navButton} ${styles.prevButton}`} onClick={(e) => { e.stopPropagation(); onPrev?.(); }}>
               &#10094;

@@ -4,7 +4,9 @@ import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, type UploadedPhoto } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, recordPhotoDrive, type UploadedPhoto } from "@/lib/api";
+import { ensureDriveFolders, uploadToDrive } from "@/lib/drive";
+import { encode4kWebp } from "@/lib/imageUtils";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
@@ -20,6 +22,45 @@ import FilterBottomSheet from "@/components/FilterBottomSheet";
 import FabMenu, { type FabAction } from "@/components/FabMenu";
 import BottomActionBar from "@/components/BottomActionBar";
 
+/**
+ * 把一張照片的 4K 與原始檔送上 Drive，再把 file id 記回 D1。
+ *
+ * **兩份分開處理，一份失敗不影響另一份。** 後端的 COALESCE 收得下只有一個 id
+ * 的情況，能存多少算多少 —— 照片在 R2 那邊早就存在了，這裡純粹是加分。
+ *
+ * 檔名前面加照片 id，是為了在 Drive 上直接看得出哪個檔對應哪張照片；
+ * 真正的對應關係還是靠 D1 的 drive_file_id，不靠檔名解析。
+ */
+async function pushToDrive(
+  drive: { photosFolderId: string; token: string },
+  photoId: number,
+  rawFile: File,
+): Promise<void> {
+  const base = rawFile.name.replace(/\.[^/.]+$/, '');
+
+  let driveFileId: string | null = null;
+  try {
+    // 一定要餵原始檔：resizeImageFile 的產物只有 2000px，放大成 4K 又大又糊
+    const webp4k = await encode4kWebp(rawFile);
+    if (webp4k) {
+      driveFileId = await uploadToDrive(drive.token, webp4k, `${photoId}_${base}_4k.webp`, drive.photosFolderId);
+    }
+  } catch (err) {
+    console.warn(`照片 ${photoId} 的 4K 沒送上 Drive`, err);
+  }
+
+  let driveOriginalId: string | null = null;
+  try {
+    driveOriginalId = await uploadToDrive(drive.token, rawFile, `${photoId}_${rawFile.name}`, drive.photosFolderId);
+  } catch (err) {
+    console.warn(`照片 ${photoId} 的原始檔沒送上 Drive`, err);
+  }
+
+  if (driveFileId || driveOriginalId) {
+    await recordPhotoDrive(photoId, { driveFileId, driveOriginalId });
+  }
+}
+
 function AlbumContent() {
   const searchParams = useSearchParams();
   const id = searchParams.get("id");
@@ -34,6 +75,8 @@ function AlbumContent() {
   const [visibleCount, setVisibleCount] = useState<number>(24);
   const [uploadProgress, setUploadProgress] = useState<{current: number, total: number, fileName: string} | null>(null);
   const [hasGoogleToken, setHasGoogleToken] = useState(false);
+  /** Drive 沒接上時的原因。照片照樣傳得上去，只是少了 4K 與原始檔備份 */
+  const [driveError, setDriveError] = useState<string | null>(null);
 
   // 批次刪除 State
   const [selectedPhotos, setSelectedPhotos] = useState<number[]>([]);
@@ -397,6 +440,24 @@ function AlbumContent() {
     const total = files.length;
     const uploaded: UploadedPhoto[] = [];
 
+    /*
+     * 先把 Drive 準備好（授權、必要時建資料夾）。
+     *
+     * 失敗**不擋上傳** —— 照片只要 R2 的縮圖成功就算存在，Drive 是加分項。
+     * 沒接上就把 drive_file_id 留 NULL，之後用「補傳 Drive」補。
+     *
+     * 放在這裡而不是每張都試，是因為 GIS 的授權會彈視窗，一定要貼著使用者的
+     * 操作發生才不會被瀏覽器擋掉；一批上傳只該問一次。
+     */
+    let drive: { photosFolderId: string; token: string } | null = null;
+    try {
+      drive = await ensureDriveFolders();
+      setDriveError(null);
+    } catch (err) {
+      console.warn('Drive 沒接上，這批照片只會有 R2 的版本', err);
+      setDriveError(err instanceof Error ? err.message : 'Google Drive 授權失敗');
+    }
+
     for (let i = 0; i < total; i++) {
       const rawFile = files[i];
       setUploadProgress({ current: i + 1, total, fileName: rawFile.name });
@@ -406,6 +467,8 @@ function AlbumContent() {
         const result = await uploadPhoto(id, file, exifData, takenAt || undefined);
         if (result) {
           uploaded.push(result);
+          // 4K 與原始檔送 Drive。任何一步失敗都只是少一份備份，照片已經存在了
+          if (drive) await pushToDrive(drive, result.id, rawFile);
         } else {
           allSuccess = false;
         }
@@ -1023,6 +1086,21 @@ function AlbumContent() {
         </div>
       </div>
       
+      {/*
+        * Drive 沒接上要講出來，不能只寫進 console。照片是傳成功了，但少了 4K 與
+        * 原始檔備份 —— 使用者以為備份好了才是真正的問題。
+        */}
+      {isAdmin && driveError && (
+        <div style={{
+          margin: '10px 0', padding: '10px 14px', borderRadius: 8,
+          background: '#fef3c7', border: '1px solid #fcd34d', color: '#78350f',
+          fontSize: 13.5, lineHeight: 1.7,
+        }}>
+          照片已經上傳，但 <strong>Google Drive 沒接上</strong>（{driveError}），
+          這批只有 R2 的版本，缺 4K 與原始檔備份。之後可以用「補傳 Drive」補回來。
+        </div>
+      )}
+
       {uploadProgress && (
         <div className={styles.progressContainer}>
           <div className={styles.progressBar}>

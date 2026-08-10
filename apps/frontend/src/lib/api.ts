@@ -44,6 +44,19 @@ export function photoThumbSrc(
     : photo.thumb_url || photo.thumb_sm_url || photo.url;
 }
 
+/**
+ * 燈箱大圖的網址。
+ *
+ * 一律走 `/api/photos/:id/full`，**不要直接用 `photo.url`**。Drive 上的 4K 沒有
+ * 分享給任何人，只有 service account 讀得到，所以必須經過 Worker 代理；
+ * 那條路由自己會處理「還沒搬上 Drive」與「Drive 掛掉」，退回 R2 的 2000px。
+ *
+ * 前端因此不需要知道 drive_file_id 有沒有值 —— 也不該知道，那是後端的事。
+ */
+export function photoFullSrc(photo: { id: number }): string {
+  return `${API_BASE_URL}/photos/${photo.id}/full`;
+}
+
 export interface Photo {
   id: number;
   title: string;
@@ -494,6 +507,97 @@ export async function uploadPhoto(albumId: string, file: File, exifData?: any, t
       lat: typeof data.lat === 'number' ? data.lat : null,
       lng: typeof data.lng === 'number' ? data.lng : null,
     };
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+/* ---- Drive（Phase 3）---- */
+
+export interface DriveConfig {
+  /** OAuth 用戶端 id。拿 drive.file token 用 */
+  client_id: string | null;
+  /** service account 的信箱，網頁建完資料夾要把它加成 writer */
+  sa_email: string | null;
+  /** null 代表還沒建過，網頁該去 bootstrap */
+  photos_folder_id: string | null;
+  trash_folder_id: string | null;
+  /** client_id 與 sa_email 都齊了才有辦法上傳 */
+  ready: boolean;
+}
+
+export async function fetchDriveConfig(): Promise<DriveConfig | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/config/drive`, { headers: getAuthHeaders() });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+/** 只寫得進去一次；後端對已設定過的回 409（見那條路由的說明） */
+export async function saveDriveFolders(photosFolderId: string, trashFolderId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/config/drive-folders`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ photos_folder_id: photosFolderId, trash_folder_id: trashFolderId }),
+    });
+    // 409 = 別人已經寫過了。那正是我們要的狀態，不算失敗
+    return res.ok || res.status === 409;
+  } catch (error) {
+    console.error(error);
+    return false;
+  }
+}
+
+/**
+ * 把 Drive 的 file id 記回 D1。兩個都是選填 —— 只成功一個也要記，
+ * 後端用 COALESCE 保護已有的值，重跑不會把上次的成果洗成 NULL。
+ */
+export async function recordPhotoDrive(
+  photoId: number,
+  ids: { driveFileId?: string | null; driveOriginalId?: string | null },
+): Promise<boolean> {
+  if (!ids.driveFileId && !ids.driveOriginalId) return false;
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/${photoId}/drive`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        drive_file_id: ids.driveFileId ?? undefined,
+        drive_original_id: ids.driveOriginalId ?? undefined,
+      }),
+    });
+    return res.ok;
+  } catch (error) {
+    console.error(error);
+    return false;
+  }
+}
+
+export interface DrivePendingPhoto {
+  id: number;
+  url: string;
+  file_name: string;
+  title: string;
+}
+
+/** 還沒搬上 Drive 的照片。舊照片與上傳時 Drive 失敗的照片在這裡看起來一樣 */
+export async function fetchDrivePending(
+  cursor = 0,
+  limit = 200,
+): Promise<{ photos: DrivePendingPhoto[]; remaining: number; next_cursor: number; done: boolean } | null> {
+  try {
+    const res = await fetch(
+      `${API_BASE_URL}/photos/drive-pending?cursor=${cursor}&limit=${limit}`,
+      { headers: getAuthHeaders() },
+    );
+    if (!res.ok) return null;
+    return await res.json();
   } catch (error) {
     console.error(error);
     return null;
