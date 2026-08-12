@@ -110,7 +110,8 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
     setBusy(true);
     setResult(null);
 
-    // 這一步會彈出 Google 授權視窗。跑在按鈕的 click 裡才開得起來
+    // 寫入用的 token 跟後端換（是「Drive 寫入帳號」的，不是登入者自己的），
+    // 所以這裡不會有任何彈窗。沒連結／授權過期會在這一步就丟錯
     let drive: { folderId: string; token: string };
     try {
       const folders = await ensureDriveFolders();
