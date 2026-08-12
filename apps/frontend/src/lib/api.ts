@@ -76,21 +76,35 @@ export function clearGoogleToken(): void {
  *
  * 認不得的 fragment 一律不碰（可能是別人用的錨點）。
  */
-export function consumeAuthHash(): { admin: boolean; error: string | null } {
-  if (typeof window === 'undefined') return { admin: false, error: null };
+export interface AuthHashResult {
+  admin: boolean;
+  error: string | null;
+  /** 這次跳轉是去連結 Drive 寫入帳號的：連結成功的信箱，或失敗代碼 */
+  driveLinked: string | null;
+  driveLinkError: string | null;
+}
+
+export function consumeAuthHash(): AuthHashResult {
+  const empty: AuthHashResult = { admin: false, error: null, driveLinked: null, driveLinkError: null };
+  if (typeof window === 'undefined') return empty;
   const raw = window.location.hash.replace(/^#/, '');
-  if (!raw) return { admin: false, error: null };
+  if (!raw) return empty;
 
   const p = new URLSearchParams(raw);
   const error = p.get('authError');
   const token = p.get('token');
   const googleToken = p.get('googleToken');
-  if (!error && !token && !googleToken) return { admin: false, error: null };
+  if (!error && !token && !googleToken) return empty;
 
   if (token) localStorage.setItem(SITE_TOKEN_KEY, token);
   if (googleToken) storeGoogleToken(googleToken, Number(p.get('googleExpiresIn')) || 3600);
   window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
-  return { admin: !!token, error };
+  return {
+    admin: !!token,
+    error,
+    driveLinked: p.get('driveLinked'),
+    driveLinkError: p.get('driveLinkError'),
+  };
 }
 
 export interface Album {
@@ -705,8 +719,70 @@ export interface DriveConfig {
   /** null 代表還沒建過，網頁該去 bootstrap */
   photos_folder_id: string | null;
   trash_folder_id: string | null;
-  /** client_id 與 sa_email 都齊了才有辦法上傳 */
+  /**
+   * Drive 上唯一的寫入身分。**不是「現在登入的人」** —— 所有管理員上傳時都跟後端
+   * 換這個帳號的短效 token，這樣誰建的相簿都寫得進去（見 lib/drive.ts 檔頭）。
+   * null＝還沒連結過，誰都傳不了。
+   */
+  writer_email: string | null;
+  /** 上次連結的時間（ISO）。同意畫面還在測試中的話 refresh token 只活 7 天，這欄是給人自己判斷用的 */
+  writer_linked_at: string | null;
+  /** client_id、sa_email、寫入帳號三樣都齊了才有辦法上傳 */
   ready: boolean;
+}
+
+/** 連結／重新連結 Drive 寫入帳號的入口。跳完會帶 `#driveLinked=` 或 `#driveLinkError=` 回來 */
+export function driveWriterLoginUrl(albumId?: string | number): string {
+  const params = new URLSearchParams({ mode: 'drive_writer' });
+  if (albumId) params.set('state', String(albumId));
+  return `${API_BASE_URL}/auth/google/login?${params.toString()}`;
+}
+
+export interface DriveWriterToken {
+  accessToken: string;
+  /** 後端已經先扣掉一點餘裕了，直接拿來算過期時間即可 */
+  expiresIn: number;
+  email: string | null;
+}
+
+export class DriveWriterError extends Error {
+  constructor(
+    /** `not_linked`／`expired` 要人去連結，`failed` 才值得重試 */
+    readonly reason: 'not_linked' | 'expired' | 'failed',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'DriveWriterError';
+  }
+}
+
+/**
+ * 跟後端換一張 Drive 寫入用的 access token。
+ *
+ * 拿不到就丟 DriveWriterError —— 上傳流程要靠 reason 決定是「叫人重新連結」
+ * 還是「等一下再試」，回 null 的話這兩件事分不出來。
+ */
+export async function fetchDriveWriterToken(): Promise<DriveWriterToken> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE_URL}/drive/token`, { method: 'POST', headers: getAuthHeaders() });
+  } catch (error) {
+    console.error(error);
+    throw new DriveWriterError('failed', '連不上後端，拿不到 Drive 授權');
+  }
+  const data = await res.json().catch(() => null) as
+    | { access_token?: string; expires_in?: number; email?: string | null; error?: string; reason?: string }
+    | null;
+
+  if (!res.ok || !data?.access_token) {
+    const reason = data?.reason === 'not_linked' || data?.reason === 'expired' ? data.reason : 'failed';
+    throw new DriveWriterError(reason, data?.error || `Drive 授權失敗（HTTP ${res.status}）`);
+  }
+  return {
+    accessToken: data.access_token,
+    expiresIn: Number(data.expires_in) || 300,
+    email: data.email ?? null,
+  };
 }
 
 export async function fetchDriveConfig(): Promise<DriveConfig | null> {
@@ -766,16 +842,20 @@ export async function recordPhotoDrive(
  *
  * **一定要用回傳值，不要用自己傳進去的那個** —— 後端用 COALESCE 保護既有值，
  * 別的分頁先建過的話會回它那個，這時候自己建的那個資料夾就該放著別用了。
+ *
+ * `rebind` 會蓋掉既有值，只給一種情況用：記著的資料夾是別的帳號建的、
+ * 寫入身分看不見（探路回 404）。其他任何理由都不該傳（見後端那條路由的說明）。
  */
 export async function saveAlbumDriveFolder(
   albumId: number,
   folderId: string,
+  rebind = false,
 ): Promise<string | null> {
   try {
     const res = await fetch(`${API_BASE_URL}/albums/${albumId}/drive-folder`, {
       method: 'POST',
       headers: getAuthHeaders(),
-      body: JSON.stringify({ folder_id: folderId }),
+      body: JSON.stringify({ folder_id: folderId, ...(rebind ? { rebind: true } : {}) }),
     });
     if (!res.ok) return null;
     const data = await res.json();

@@ -4,8 +4,8 @@ import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, getGoogleToken, googleLoginUrl, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
-import { ensureAlbumFolder, ensureDriveFolders, hasDriveToken, prewarmDrive, pushPhotoToDrive } from "@/lib/drive";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, getGoogleToken, googleLoginUrl, driveWriterLoginUrl, DriveWriterError, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
+import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive, resetDriveWriterToken } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
@@ -14,6 +14,7 @@ import FixTimeModal from "@/components/FixTimeModal";
 import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import PlaceCheckinModal from "@/components/PlaceCheckinModal";
 import DriveBackfillModal from "@/components/DriveBackfillModal";
+import DriveAccessModal from "@/components/DriveAccessModal";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
@@ -49,7 +50,7 @@ function AlbumContent() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const { isAdmin, loginWithGoogle } = useAdmin();
+  const { isAdmin, driveLink } = useAdmin();
   const [selectedPhotoIndex, setSelectedPhotoIndex] = useState<number | null>(null);
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
   const [visibleCount, setVisibleCount] = useState<number>(24);
@@ -58,6 +59,14 @@ function AlbumContent() {
   /** Drive 沒接上時的原因。照片照樣傳得上去，只是少了 4K 與原始檔備份 */
   const [driveError, setDriveError] = useState<string | null>(null);
   const [showDriveBackfill, setShowDriveBackfill] = useState(false);
+  const [showDriveAccess, setShowDriveAccess] = useState(false);
+  /**
+   * 這次失敗是不是「Drive 寫入帳號沒接上」——沒連結過，或存著的授權過期了。
+   *
+   * 這種要跳去 Google 重新連結一次，跟一般的上傳失敗（重試就好）完全兩回事，
+   * 按鈕的行為也不同，所以分開記。
+   */
+  const [driveNeedsLink, setDriveNeedsLink] = useState(false);
   /**
    * 剛上傳、但沒送上 Drive 的那一批：照片 id 配上使用者原本選的那個 File。
    *
@@ -432,9 +441,64 @@ function AlbumContent() {
         title: '重選原始檔，補上缺的 4K 與原始檔備份',
         onClick: () => setShowDriveBackfill(true),
       },
+      // 連結寫入帳號的常駐入口，順便是「到底卡在哪一步」的診斷
+      {
+        key: 'drive-access',
+        label: 'Drive 寫入帳號',
+        title: '連結／重新連結備份用的 Google 帳號，並逐項檢查存取狀況',
+        onClick: () => setShowDriveAccess(true),
+      },
       { key: 'edit', label: '編輯照片', onClick: () => setIsEditingPhotos(true) },
     ];
   };
+
+  /**
+   * Drive 失敗的統一記錄點。
+   *
+   * 分辨「要重新連結寫入帳號」跟「重試就好」是這裡唯一在做的事 ——
+   * 前者給一顆會跳去 Google 的按鈕，後者給補傳。給一顆按了也沒用的按鈕
+   * 比不給還糟。
+   *
+   * **絕對不自動跳轉。** 跳走會把記在記憶體裡的 File 全部弄丟（那批就再也
+   * 補不回來，只能重選檔案），所以一律等使用者自己按。
+   */
+  const noteDriveFailure = (err: unknown) => {
+    const needsLink = err instanceof DriveWriterError && err.reason !== 'failed';
+    setDriveNeedsLink(needsLink);
+    setDriveError(
+      needsLink
+        ? (err as DriveWriterError).reason === 'not_linked'
+          ? '還沒連結 Drive 寫入帳號'
+          : 'Drive 寫入帳號的授權過期了（同意畫面還在測試中的話只有 7 天）'
+        : err instanceof Error ? err.message : 'Google Drive 沒接上',
+    );
+  };
+
+  /*
+   * 剛從「連結 Drive 寫入帳號」跳轉回來。
+   *
+   * 成功就只是把狀態清乾淨（連結前那批照片的 File 早在跳轉時就沒了，
+   * 要補得走「補傳 Drive」重選檔案，這裡不假裝能自動處理）。
+   * 失敗最常見的是 Google 不再發第二張 refresh token，訊息要直接講怎麼解。
+   *
+   * 兩種情況都要丟掉這一頁的舊 token —— 換了帳號的話，抱著舊的會一路 404。
+   */
+  useEffect(() => {
+    if (!driveLink) return;
+    resetDriveWriterToken();
+    if (driveLink.error) {
+      setDriveNeedsLink(true);
+      setDriveError(
+        driveLink.error === 'no_refresh_token'
+          ? 'Google 沒有給長期授權 —— 到「Google 帳號 → 安全性 → 你的第三方應用程式」把這個網站的存取權移除，再連結一次'
+          : `連結失敗（${driveLink.error}）`,
+      );
+      return;
+    }
+    setDriveNeedsLink(false);
+    setDriveError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [driveLink]);
 
   /**
    * 黃色橫幅那顆按鈕：把剛上傳那批的 4K 與原始檔補上去。
@@ -460,7 +524,7 @@ function AlbumContent() {
     } catch (err) {
       console.warn('Drive 連結失敗', err);
       setDriveBatchProgress(null);
-      setDriveError(err instanceof Error ? err.message : 'Google Drive 授權失敗');
+      noteDriveFailure(err);
       return;
     }
 
@@ -478,6 +542,7 @@ function AlbumContent() {
 
     setDriveBatchProgress(null);
     setPendingDriveBatch(stillMissing);
+    if (stillMissing.length === 0) setDriveNeedsLink(false);
     setDriveError(stillMissing.length > 0 ? `還有 ${stillMissing.length} 張沒補成功，可以再按一次` : null);
     await loadData();
   };
@@ -485,26 +550,23 @@ function AlbumContent() {
   /*
    * 先把 Drive 準備好（必要時建資料夾），一批只做一次。
    *
-   * Drive 的授權是登入時一起拿的，這裡不會有任何彈窗 —— 手上沒 token 就代表
-   * 登入過期了，這種時候絕對不能在上傳中途跳轉去登入（使用者選好的檔案會全沒）。
+   * 寫入用的 token 是跟後端換的（不是登入者自己的），所以這裡不會有任何彈窗，
+   * 也不會在上傳中途跳走 —— 跳走的話使用者選好的檔案會全沒。
    *
    * 沒接上**不擋上傳** —— 照片只要 R2 的縮圖成功就算存在，Drive 是加分項。
    * drive_file_id 留 NULL，之後用「補傳 Drive」補。
    */
   const prepareDrive = async (): Promise<{ folderId: string; token: string } | null> => {
-    if (!hasDriveToken()) {
-      setDriveError('Google 登入已過期，這批只會有 R2 的版本 —— 重新登入之後按下面那顆按鈕補傳');
-      return null;
-    }
     try {
       const folders = await ensureDriveFolders();
       // 照片放進這本相簿自己的資料夾，不是 didadida/ 根目錄
       const folderId = await ensureAlbumFolder(folders, Number(id));
+      setDriveNeedsLink(false);
       setDriveError(null);
       return { folderId, token: folders.token };
     } catch (err) {
       console.warn('Drive 沒接上，這批照片只會有 R2 的版本', err);
-      setDriveError(err instanceof Error ? err.message : 'Google Drive 授權失敗');
+      noteDriveFailure(err);
       return null;
     }
   };
@@ -648,7 +710,8 @@ function AlbumContent() {
   const handleGoogleSync = async (initialSession: any, popup: Window | null) => {
     try {
       if (!hasGoogleToken) {
-        // 沒 token 就是還沒登入（或登入過期）。同一次授權會把相簿匯入與 Drive 備份一起帶回來
+        // 沒 token 就是還沒登入（或登入過期）。這個 token 只給 Google 相簿匯入用，
+        // Drive 備份走的是另一套（後端的寫入帳號）
         window.location.href = googleLoginUrl(id ?? undefined);
         return;
       }
@@ -1254,21 +1317,34 @@ function AlbumContent() {
             <div style={{ marginTop: 8 }}>
               補傳中... {driveBatchProgress.current} / {driveBatchProgress.total}
             </div>
+          ) : driveNeedsLink ? (
+            // 連結是整頁跳轉，會把記憶體裡的 File 弄丟，所以要先講清楚回來要做什麼
+            <div style={{ marginTop: 8 }}>
+              <a
+                href={driveWriterLoginUrl(id ?? undefined)}
+                style={{
+                  display: 'inline-block', padding: '7px 14px', borderRadius: 7,
+                  background: '#b45309', color: '#fff', fontSize: 13.5, textDecoration: 'none',
+                }}
+              >
+                連結 Drive 寫入帳號（回來後用「補傳 Drive」重選檔案）
+              </a>
+            </div>
           ) : (
             <div style={{ marginTop: 8 }}>
+              {/* Drive 用的是後端換來的寫入 token，跟「有沒有 Google 登入」無關，
+                  所以這裡不必再管 hasGoogleToken —— 重試就好 */}
               <button
                 type="button"
-                onClick={() => (hasGoogleToken ? handleBackfillCurrentBatch() : loginWithGoogle(id ?? undefined))}
+                onClick={handleBackfillCurrentBatch}
                 style={{
                   padding: '7px 14px', borderRadius: 7, border: 'none',
                   background: '#b45309', color: '#fff', fontSize: 13.5, cursor: 'pointer',
                 }}
               >
-                {!hasGoogleToken
-                  ? '重新登入 Google（回來後用「補傳 Drive」重選檔案）'
-                  : pendingDriveBatch.length > 0
-                    ? `補傳這批（${pendingDriveBatch.length} 張）`
-                    : '補傳 Drive'}
+                {pendingDriveBatch.length > 0
+                  ? `補傳這批（${pendingDriveBatch.length} 張）`
+                  : '補傳 Drive'}
               </button>
             </div>
           )}
@@ -1548,6 +1624,13 @@ function AlbumContent() {
           setDriveError(null);
           await loadData();
         }}
+      />
+
+      {/* Drive 寫入帳號的連結與存取檢查 */}
+      <DriveAccessModal
+        isOpen={showDriveAccess}
+        albumId={id ? Number(id) : undefined}
+        onClose={() => setShowDriveAccess(false)}
       />
 
       {/* 相簿層級的打卡補件。同樣不自己寫座標，挑完照片交給下面的 AssignPlaceModal */}

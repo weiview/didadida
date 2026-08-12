@@ -40,6 +40,14 @@ interface AuthValue {
    * 常見的是 `not_admin`（信箱不在白名單）與 `not_configured`（後端沒設 ADMIN_EMAILS）。
    */
   authError: string | null;
+  /**
+   * 這一次載入是從「連結 Drive 寫入帳號」回來的：成功就是那個信箱，
+   * 失敗是代碼（目前只有 `no_refresh_token`）。相簿頁靠它回報結果。
+   *
+   * 放在這裡而不是各頁自己讀 fragment：fragment 只能被收走一次，
+   * 而收走它的人是這個 Provider（見上面的說明）。
+   */
+  driveLink: { email: string | null; error: string | null } | null;
 }
 
 const AuthContext = createContext<AuthValue | null>(null);
@@ -48,6 +56,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AuthState>({ admin: false, guest: false });
   const [checking, setChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [driveLink, setDriveLink] = useState<AuthValue['driveLink']>(null);
 
   useEffect(() => {
     let alive = true;
@@ -56,6 +65,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // 一定要排在 checkAuth() 前面，不然剛登入回來的那一次會被判成沒登入
     const back = consumeAuthHash();
     if (back.error) setAuthError(back.error);
+    if (back.driveLinked || back.driveLinkError) {
+      setDriveLink({ email: back.driveLinked, error: back.driveLinkError });
+    }
     if (back.admin) {
       setState({ admin: true, guest: false });
       setChecking(false);
@@ -97,7 +109,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     login,
     loginWithGoogle,
     authError,
-  }), [state, checking, unlock, login, loginWithGoogle, authError]);
+    driveLink,
+  }), [state, checking, unlock, login, loginWithGoogle, authError, driveLink]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

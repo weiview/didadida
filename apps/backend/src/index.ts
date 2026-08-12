@@ -56,6 +56,20 @@ export interface Env {
 /** AppSetting 的 key。放這麼前面是因為路由與底下的 helper 都會用到 */
 const SETTING_PHOTOS_FOLDER = "drive_photos_folder_id";
 const SETTING_TRASH_FOLDER = "drive_trash_folder_id";
+/*
+ * Drive 的**唯一寫入身分**。
+ *
+ * 為什麼要存 refresh token（先前明確決定不存的東西）：`drive.file` 是 per-file
+ * 授權，第二位管理員碰不到第一位建的子資料夾（2026-08-12 實測確認，Picker 授權
+ * 根目錄也不會往下涵蓋）。要讓一家人共用同一份 Drive 資料夾，寫入者就只能有一個。
+ * 於是所有人的上傳都改成跟後端換一張**這個帳號**的短效 access token。
+ *
+ * ⚠️ 同意畫面還在「測試中」的話，refresh token **7 天就會失效**，得重新連結一次。
+ *    要根治只能把同意畫面發布到 Production。
+ */
+const SETTING_DRIVE_REFRESH_TOKEN = "drive_writer_refresh_token";
+const SETTING_DRIVE_WRITER_EMAIL = "drive_writer_email";
+const SETTING_DRIVE_LINKED_AT = "drive_writer_linked_at";
 
 /**
  * token 裡的身分。兩層，沒有第三層：
@@ -346,6 +360,64 @@ const loginAttempts = new Map<string, LoginAttempt>();
 async function getSetting(env: Env, key: string): Promise<string | null> {
   const row = await env.DB.prepare("SELECT value FROM AppSetting WHERE key = ?").bind(key).first<any>();
   return typeof row?.value === "string" && row.value ? row.value : null;
+}
+
+async function setSetting(env: Env, key: string, value: string): Promise<void> {
+  await env.DB
+    .prepare("INSERT INTO AppSetting (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')")
+    .bind(key, value)
+    .run();
+}
+
+/**
+ * 拿存著的 refresh token 換一張短效 access token（Drive 的唯一寫入身分）。
+ *
+ * 回傳的 `reason` 是給前端分辨用的，三種要走完全不同的路：
+ *   `not_linked`  還沒連結過 —— 管理員按一次「連結」就好
+ *   `expired`     refresh token 失效（多半是同意畫面還在測試中，7 天到期），
+ *                 要重新連結。**不要自動重試**，那只會一直撞同一面牆
+ *   `failed`      其他錯誤（網路、Google 暫時性問題），可以重試
+ */
+async function mintDriveWriterToken(
+  env: Env,
+): Promise<
+  | { ok: true; accessToken: string; expiresIn: number; email: string | null }
+  | { ok: false; reason: "not_linked" | "expired" | "failed"; detail: string }
+> {
+  const refreshToken = await getSetting(env, SETTING_DRIVE_REFRESH_TOKEN);
+  if (!refreshToken) return { ok: false, reason: "not_linked", detail: "還沒有連結 Drive 寫入帳號" };
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+    return { ok: false, reason: "failed", detail: "後端缺 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET" };
+  }
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: env.GOOGLE_CLIENT_ID,
+      client_secret: env.GOOGLE_CLIENT_SECRET,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    }),
+  });
+  const data: any = await res.json().catch(() => null);
+
+  if (!res.ok || !data?.access_token) {
+    // invalid_grant＝被撤銷或過期，這種再試幾次都一樣，要人重新連結
+    const expired = data?.error === "invalid_grant";
+    return {
+      ok: false,
+      reason: expired ? "expired" : "failed",
+      detail: String(data?.error_description || data?.error || `HTTP ${res.status}`),
+    };
+  }
+
+  return {
+    ok: true,
+    accessToken: data.access_token,
+    expiresIn: Number(data.expires_in) || 3600,
+    email: await getSetting(env, SETTING_DRIVE_WRITER_EMAIL),
+  };
 }
 
 async function driveFolders(env: Env): Promise<{ photos: string | null; trash: string | null }> {
@@ -1006,12 +1078,13 @@ if (method === "POST" && pathname === "/api/verify-password") {
       /*
        * 路由：瀏覽器要往 Drive 建檔所需要的設定。
        *
-       * 回三樣東西：
-       *   client_id  拿 drive.file token 用。本來就會出現在 OAuth 的網址列，不是機密
-       *   sa_email   網頁建完資料夾後要把它加成 writer，否則後端讀不到裡面的檔
+       * 回這幾樣東西：
+       *   client_id     本來就會出現在 OAuth 的網址列，不是機密
+       *   sa_email      網頁建完資料夾後要把它加成 writer，否則後端讀不到裡面的檔
        *   兩個 folder id  已經建過就直接用；null 代表網頁該去建
+       *   writer_*      Drive 上唯一的寫入身分（見 /api/drive/token 的說明）
        *
-       * 鎖管理員不是因為內容敏感（三樣都不是機密），而是只有上傳流程用得到它，
+       * 鎖管理員不是因為內容敏感（都不是機密），而是只有上傳流程用得到它，
        * 沒有理由讓訪客知道這個站接在誰的 Drive 上。
        */
       if (method === "GET" && pathname === "/api/config/drive") {
@@ -1027,13 +1100,20 @@ if (method === "POST" && pathname === "/api/verify-password") {
             console.error("SA 金鑰解析失敗", e);
           }
         }
+        const [writerEmail, linkedAt] = await Promise.all([
+          getSetting(env, SETTING_DRIVE_WRITER_EMAIL),
+          getSetting(env, SETTING_DRIVE_LINKED_AT),
+        ]);
         return new Response(JSON.stringify({
           client_id: env.GOOGLE_CLIENT_ID || null,
           sa_email: saEmail,
           photos_folder_id: folders.photos,
           trash_folder_id: folders.trash,
+          // 所有人的上傳都用這個帳號的身分寫進 Drive；null＝還沒連結，誰都傳不了
+          writer_email: writerEmail,
+          writer_linked_at: linkedAt,
           // 少任何一項都上傳不了，讓前端一眼看出是哪裡沒設好
-          ready: Boolean(env.GOOGLE_CLIENT_ID && saEmail),
+          ready: Boolean(env.GOOGLE_CLIENT_ID && saEmail && writerEmail),
         }), { headers });
       }
 
@@ -1083,6 +1163,35 @@ if (method === "POST" && pathname === "/api/verify-password") {
       const requiresAuth = ["POST", "PUT", "DELETE"].includes(method);
       if (requiresAuth && !(await isAuthorized(request, env))) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+      }
+
+      /*
+       * 路由：換一張 Drive 寫入用的短效 access token。
+       *
+       * 為什麼所有人都拿同一個帳號的 token：`drive.file` 是 per-file 授權，
+       * 「誰建的檔誰才碰得到」。實測確認**根資料夾的 Picker 授權不會往下涵蓋
+       * 別人建的子資料夾**，所以「每個管理員用自己的身分寫」這條路一定會在
+       * 「A 建的相簿、B 要上傳」時撞 404。改成 Drive 上永遠只有一個寫入者，
+       * 相簿是誰建的都無所謂。誰上傳的記在 D1，不靠 Drive 的擁有者欄位。
+       *
+       * token 不落地：只在記憶體裡活到過期，前端也只快取在變數。
+       * 錯誤帶 reason 讓前端分辨「按一下就好」與「重新連結」。
+       */
+      if (method === "POST" && pathname === "/api/drive/token") {
+        const minted = await mintDriveWriterToken(env);
+        if (!minted.ok) {
+          // 409：狀態不對（沒連結／過期），不是請求本身有問題，重試也沒用
+          return new Response(JSON.stringify({ error: minted.detail, reason: minted.reason }), {
+            status: minted.reason === "failed" ? 502 : 409,
+            headers,
+          });
+        }
+        return new Response(JSON.stringify({
+          access_token: minted.accessToken,
+          // 早 60 秒讓前端當作過期，免得剛好卡在邊界上送出請求
+          expires_in: Math.max(minted.expiresIn - 60, 60),
+          email: minted.email,
+        }), { headers });
       }
 
       /*
@@ -1239,6 +1348,12 @@ if (method === "POST" && pathname === "/api/verify-password") {
        * **COALESCE 保護既有值**：兩個分頁同時第一次上傳有可能各建一個資料夾，
        * 先到的那個算數，後到的被忽略 —— 代價是 Drive 上多一個空資料夾，
        * 比起「照片散在兩個資料夾」好得多。回傳實際生效的 id 讓呼叫端拿去用。
+       *
+       * `rebind: true` 是唯一能蓋掉既有值的路，給的是一種真的會發生的死局：
+       * 記著的資料夾是**另一個 Google 帳號**建的（多帳號各自寫入的舊做法留下來的），
+       * 現在唯一的寫入身分看不見它，往後每一張都會 404。前端只在探路確定 404
+       * 時才帶這個旗標。舊資料夾裡的檔案不受影響 —— 燈箱走 service account，
+       * 它在根目錄就有權限，讀得到兩邊。
        */
       if (method === "POST" && pathname.startsWith("/api/albums/")
           && pathname.endsWith("/drive-folder") && pathname.split("/").length === 5) {
@@ -1250,7 +1365,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }
 
         await env.DB.prepare(
-          "UPDATE Album SET drive_folder_id = COALESCE(drive_folder_id, ?) WHERE id = ?"
+          body?.rebind === true
+            ? "UPDATE Album SET drive_folder_id = ? WHERE id = ?"
+            : "UPDATE Album SET drive_folder_id = COALESCE(drive_folder_id, ?) WHERE id = ?"
         ).bind(folderId, albumId).run();
 
         const album = await env.DB.prepare(
@@ -1689,7 +1806,14 @@ function hammingDistance(hex1: string, hex2: string): number {
             if (ALLOWED_ORIGINS.includes(candidate)) redirectHost = candidate;
           } catch (e) {}
         }
-        const combinedState = encodeURIComponent(JSON.stringify({ albumId, redirectHost }));
+        /*
+         * `mode=drive_writer`：這一次登入的目的是**把這個帳號設成 Drive 的寫入身分**，
+         * 所以要 `access_type=offline` + `prompt=consent` 才拿得到 refresh token
+         * （Google 只在明確同意那一次給，之後同一個帳號再登入都不會再給）。
+         * 平常登入不帶這個參數，行為完全不變。
+         */
+        const mode = urlObj.searchParams.get("mode") === "drive_writer" ? "drive_writer" : "";
+        const combinedState = encodeURIComponent(JSON.stringify({ albumId, redirectHost, mode }));
         const clientId = env.GOOGLE_CLIENT_ID || "";
         const redirectUri = new URL(request.url).origin + "/api/auth/google/callback";
         const scope = [
@@ -1699,7 +1823,12 @@ function hammingDistance(hex1: string, hex2: string): number {
           "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
         ].join(" ");
 
-        const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}&prompt=select_account&state=${combinedState}`;
+        // prompt 吃空白分隔的清單：consent 是為了拿 refresh token，
+        // select_account 是為了讓人挑「要當備份倉庫的是哪個帳號」而不是預設當下那個
+        const extra = mode === "drive_writer"
+          ? "&access_type=offline&prompt=" + encodeURIComponent("consent select_account") + "&include_granted_scopes=true"
+          : "&prompt=select_account";
+        const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}${extra}&state=${combinedState}`;
         return Response.redirect(url, 302);
       }
 
@@ -1710,10 +1839,12 @@ function hammingDistance(hex1: string, hex2: string): number {
         const rawState = urlObj.searchParams.get("state") || "";
         let albumId = rawState;
         let redirectHost = "";
+        let mode = "";
         try {
           const parsed = JSON.parse(decodeURIComponent(rawState));
           if (parsed && typeof parsed === "object") {
             albumId = parsed.albumId || "";
+            mode = parsed.mode === "drive_writer" ? "drive_writer" : "";
             /*
              * state 是我們自己包的，但它繞過 Google 才回來，**中間誰都能換掉** ——
              * 拿我們的 client_id 自己組一個授權網址、把 redirectHost 寫成自家網站，
@@ -1784,6 +1915,25 @@ function hammingDistance(hex1: string, hex2: string): number {
           googleToken: tokenData.access_token,
           googleExpiresIn: String(Number(tokenData.expires_in) || 3600),
         });
+
+        /*
+         * 這一次是來設定 Drive 寫入身分的：把 refresh token 收起來。
+         *
+         * 只在 `mode=drive_writer` 時存，平常登入一律不存 —— 存一份長期憑證是有
+         * 代價的東西，不該因為某次登入剛好帶回來就默默留下。
+         * 拿不到 refresh_token 幾乎都是同一個原因：這個帳號先前已經同意過，
+         * Google 就不再給第二張。訊息要講清楚該去哪裡移除授權再來一次。
+         */
+        if (mode === "drive_writer") {
+          if (typeof tokenData.refresh_token === "string" && tokenData.refresh_token) {
+            await setSetting(env, SETTING_DRIVE_REFRESH_TOKEN, tokenData.refresh_token);
+            await setSetting(env, SETTING_DRIVE_WRITER_EMAIL, admitted.email);
+            await setSetting(env, SETTING_DRIVE_LINKED_AT, new Date().toISOString());
+            frag.set("driveLinked", admitted.email);
+          } else {
+            frag.set("driveLinkError", "no_refresh_token");
+          }
+        }
         return Response.redirect(`${target}#${frag.toString()}`, 302);
       }
 
