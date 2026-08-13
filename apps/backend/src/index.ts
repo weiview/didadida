@@ -3,7 +3,7 @@ import {
   normalizeGeo, formatWallClock, utcFromLocal,
   parseExifDateTime, geoOverwriteGuard, DEFAULT_TZ_OFFSET_MINUTES,
 } from './geo';
-import { listGpxFiles, fetchDriveMedia, moveDriveFile, renameDriveFolder, serviceAccountEmail } from './drive';
+import { listGpxFiles, listSharedFolders, fetchDriveMedia, moveDriveFile, renameDriveFolder, serviceAccountEmail } from './drive';
 import { syncFtsForPhotos, deleteFtsForPhotos, ftsMatchExpr } from './fts';
 
 export interface Env {
@@ -167,6 +167,62 @@ async function tokenIdentity(request: Request, env: Env): Promise<Identity | nul
 }
 
 /**
+ * 地圖上每個人的軌跡顏色。固定調色盤，家人自己從裡面挑一個（見 PUT /api/me）。
+ *
+ * 為什麼是固定清單而不是自由取色：這幾個顏色是挑過的 —— 在 OpenFreeMap positron
+ * 底圖上彼此分得開、也不會跟道路／水域／行政區界撞色。開放任意 hex 的話，
+ * 有人選了淺灰就等於他的軌跡消失了。
+ *
+ * 第一個是紫色，也就是原本貼路線的顏色 —— uid 1 沒挑過色時退回的預設值，
+ * 讓既有畫面在這次改動前後長得一樣。
+ *
+ * **前端有一份同樣的清單**（`apps/frontend/src/lib/trackColors.ts`），色票列要畫得出來。
+ * 兩邊要一起改。
+ */
+const TRACK_PALETTE = [
+  '#7c3aed', // 紫（原本的貼路線）
+  '#2563eb', // 藍
+  '#0d9488', // 青
+  '#16a34a', // 綠
+  '#ca8a04', // 芥末黃
+  '#ea580c', // 橘
+  '#db2777', // 桃紅
+  '#dc2626', // 紅
+  '#0891b2', // 天藍
+  '#65a30d', // 草綠
+] as const;
+
+/**
+ * 這個人在地圖上該是什麼顏色。
+ *
+ * 沒挑過色（`track_color` 是 NULL）也一定要有一個 —— 而且**不能所有人同色**，
+ * 不然多身分足跡在沒人動過設定之前完全看不出誰是誰。依 uid 輪流分配，
+ * 家庭規模（≤ 10 人）內不會重複。
+ *
+ * 後端一律回**算好的顏色**，前端不必再做一次退讓；代價是分不出「他挑的就是紫」
+ * 跟「他沒挑，預設是紫」—— 那個差別對畫面沒有意義。
+ */
+function trackColorFor(uid: number | null, stored: string | null | undefined): string {
+  if (stored) return stored;
+  const n = uid && uid > 0 ? uid : 1;
+  return TRACK_PALETTE[(n - 1) % TRACK_PALETTE.length];
+}
+
+/**
+ * 使用者挑的顏色。null／空字串＝清掉（退回 trackColorFor 的預設）；
+ * 不在調色盤裡就是 undefined（呼叫端回 400）。
+ *
+ * 只收清單內的值，理由同 TRACK_PALETTE 的註解：自由取色會讓人把自己調成看不見的。
+ * 舊資料若存了清單外的顏色照樣畫得出來 —— 這裡擋的是寫入，不是讀取。
+ */
+function normalizeTrackColor(raw: unknown): string | null | undefined {
+  if (raw == null) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return null;
+  return (TRACK_PALETTE as readonly string[]).includes(s) ? s : undefined;
+}
+
+/**
  * 這次操作背後的**人**。token 只說了 uid，權限得回 D1 拿 ——
  * 寫在 token 裡的話，撤銷一個人的權限要等他手上那張過期（最長七天）才生效。
  */
@@ -176,6 +232,16 @@ interface Actor {
   name: string | null;
   isOwner: boolean;
   canManageOthers: boolean;
+  /**
+   * 他自己那個 GPSLogger Drive 資料夾（見 migrations/0009）。
+   * 跟著 Actor 一起帶出來是因為它就在同一列上 —— 另外查一次是白花讀取額度。
+   */
+  trackFolderId: string | null;
+  /**
+   * 他的軌跡在地圖上的顏色。**永遠是算好的值**（沒挑過就依 uid 給預設，
+   * 見 trackColorFor），所以拿到的一定不是 null。同一列上，理由同 trackFolderId。
+   */
+  trackColor: string;
 }
 
 /**
@@ -202,16 +268,25 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
   // 沒有 uid 的舊 token／密碼登入：當站長（見 Identity 的註解）
   if (identity.uid == null) {
     const owner = await env.DB.prepare(
-      "SELECT id, name, email FROM User WHERE role = 'owner' AND active = 1 ORDER BY id LIMIT 1"
+      "SELECT id, name, email, track_color, track_drive_folder_id FROM User WHERE role = 'owner' AND active = 1 ORDER BY id LIMIT 1"
     ).first<any>();
     if (owner) {
-      return { uid: owner.id, email: owner.email, name: owner.name, isOwner: true, canManageOthers: true };
+      return {
+        uid: owner.id, email: owner.email, name: owner.name,
+        isOwner: true, canManageOthers: true,
+        trackFolderId: owner.track_drive_folder_id ?? null,
+        trackColor: trackColorFor(owner.id, owner.track_color),
+      };
     }
-    return { uid: null, email: identity.email, name: null, isOwner: true, canManageOthers: true };
+    return {
+      uid: null, email: identity.email, name: null,
+      isOwner: true, canManageOthers: true, trackFolderId: null,
+      trackColor: trackColorFor(null, null),
+    };
   }
 
   const row = await env.DB.prepare(
-    "SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?"
+    "SELECT id, name, email, role, can_manage_others, active, track_color, track_drive_folder_id FROM User WHERE id = ?"
   ).bind(identity.uid).first<any>();
   // 列不見了或被移出白名單 —— 手上那張 token 立刻失效，不等它過期
   if (!row || Number(row.active) !== 1) return null;
@@ -223,6 +298,8 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
     name: row.name,
     isOwner,
     canManageOthers: isOwner || Number(row.can_manage_others) === 1,
+    trackFolderId: row.track_drive_folder_id ?? null,
+    trackColor: trackColorFor(row.id, row.track_color),
   };
 }
 
@@ -321,6 +398,68 @@ const LOCAL_TIME_EXPR =
  */
 const matchedKey = (dayKey: string) => `tracks/${encodeURIComponent(dayKey)}.matched.json`;
 
+/** 原始 GPX 在 R2 的 key。跟 matchedKey 同一套規則 */
+const rawTrackKey = (dayKey: string) => `tracks/${encodeURIComponent(dayKey)}.gpx`;
+
+/*
+ * ---- 軌跡的 day_key 前綴 ----
+ *
+ * day_key 原本就是 Drive 上的檔名，而兩個家庭成員同一天都會產出
+ * '20260813.gpx' —— ingest 是「整批刪掉再插入」，不加前綴就會互相洗掉。
+ *
+ * 前綴規則：**uid 1 無前綴，其餘 'u<uid>:'**。uid 1 是既有資料的擁有者，
+ * 這是資料歷史而不是權限判斷，所以用 uid 而不是 role='owner'。
+ * 詳細理由（為什麼不改主鍵、為什麼站長不加前綴）見 migrations/0009。
+ *
+ * 擁有權的唯一權威永遠是 TrackDay.user_id，前綴只負責讓 key 不撞。
+ */
+const TRACK_LEGACY_UID = 1;
+const TRACK_KEY_PREFIX_RE = /^u(\d+):/;
+
+/** 這個人的某個 Drive 檔名對應到哪個 day_key */
+function trackDayKeyFor(uid: number | null, name: string): string {
+  if (uid == null || uid === TRACK_LEGACY_UID) return name;
+  return `u${uid}:${name}`;
+}
+
+/** 去掉前綴還原成 Drive 檔名。沒有前綴就原樣回傳 */
+function stripTrackKeyPrefix(dayKey: string): string {
+  return dayKey.replace(TRACK_KEY_PREFIX_RE, '');
+}
+
+/**
+ * 這個 day_key 的字面上宣稱屬於誰。
+ *
+ * 只在資料庫還沒有這一列時當作意圖判讀（例如第一次同步），
+ * **不是**授權依據 —— 有列的時候一律以 TrackDay.user_id 為準。
+ */
+function trackKeyClaimedUid(dayKey: string): number {
+  const m = dayKey.match(TRACK_KEY_PREFIX_RE);
+  return m ? Number(m[1]) : TRACK_LEGACY_UID;
+}
+
+/** 這一天的軌跡是誰的。找不到回 null（呼叫端要回 404 或當成新的一天） */
+async function trackDayOwnership(env: Env, dayKey: string): Promise<{ user_id: any } | null> {
+  return await env.DB.prepare("SELECT user_id FROM TrackDay WHERE day_key = ?").bind(dayKey).first<any>();
+}
+
+/**
+ * 這個人的 GPSLogger 軌跡要去哪個 Drive 資料夾拿。沒綁定回 null。
+ *
+ * 每個人只能傳到**自己的** Drive —— GPSLogger 的 scope 只有 `drive.file`，
+ * 看不到也寫不進別人建的資料夾（上游 issue #1173），所以「全家傳進站長的
+ * Drive」在技術上不存在。各自把自己的資料夾分享給同一個 SA 信箱，
+ * 站長在 /admin 綁定，這裡就查得到。
+ *
+ * uid 1 退回 `GOOGLE_DRIVE_FOLDER_ID` 環境變數：那是多身分之前就設好的站長資料夾，
+ * 讓既有部署不必重設 secret 也不必去後台點一次。
+ */
+function trackFolderFor(env: Env, actor: Actor): string | null {
+  if (actor.trackFolderId) return actor.trackFolderId;
+  if (actor.uid == null || actor.uid === TRACK_LEGACY_UID) return env.GOOGLE_DRIVE_FOLDER_ID ?? null;
+  return null;
+}
+
 /*
  * Google 時間軸的「紀念層」在 R2 的位置。
  *
@@ -331,9 +470,20 @@ const matchedKey = (dayKey: string) => `tracks/${encodeURIComponent(dayKey)}.mat
  *
  * 順帶避開了 TrackDay.day_key 是單一主鍵的問題 —— 同一天要能同時
  * 有 GPSLogger 軌跡與時間軸軌跡，塞進同一張表就得改主鍵。
+ *
+ * ---- 多身分（P1）----
+ *
+ * 每個人各自匯入自己的時間軸，所以 key 依 uid 分開放。規則跟 day_key 前綴一致：
+ * **uid 1 用舊 key，其餘放進 `timeline/u<uid>/`** —— 站長既有的那包不必搬，
+ * 而搬 R2 物件是要一個一個 copy + delete 的。
+ *
+ * 匯入語意仍然是「整包覆蓋」（Google 每次匯出都是 2014 年至今的全量 dump），
+ * 只是現在各自覆蓋自己那一包。
  */
-const TIMELINE_INDEX_KEY = 'timeline/index.json';
-const timelineMonthKey = (month: string) => `timeline/${month}.json`;
+const timelineIndexKey = (uid: number | null) =>
+  uid == null || uid === TRACK_LEGACY_UID ? 'timeline/index.json' : `timeline/u${uid}/index.json`;
+const timelineMonthKey = (uid: number | null, month: string) =>
+  uid == null || uid === TRACK_LEGACY_UID ? `timeline/${month}.json` : `timeline/u${uid}/${month}.json`;
 /** 嚴格比對而不是 encodeURIComponent：只放行 'YYYY-MM'，路徑穿越就無從談起 */
 const TIMELINE_MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 /** 單月上限。最密的一個月約 280KB，12MB 已經是兩位數的餘裕 */
@@ -872,13 +1022,20 @@ if (method === "POST" && pathname === "/api/verify-password") {
             id: actor.uid, name: actor.name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
             can_manage_others: actor.canManageOthers ? 1 : 0,
+            track_color: actor.trackColor,
           } : null,
         }), { headers });
       }
 
       /*
-       * 路由：改自己的顯示名稱。只有這一個欄位 ——
+       * 路由：改自己的個人設定。就兩個欄位 ——
        * 信箱是身分（改了等於換人），權限不能自己給自己加。
+       *
+       *   name         顯示名稱
+       *   track_color  他的軌跡在地圖上的顏色。**每個人自己挑自己的**（使用者定調），
+       *                所以是這裡而不是站長後台。送 null 就是清掉，退回依 uid 的預設色。
+       *
+       * 兩個都是選填、各自獨立更新 —— 只送顏色不會把名字洗掉。
        */
       if (method === "PUT" && pathname === "/api/me") {
         const actor = await currentActor(request, env);
@@ -889,23 +1046,76 @@ if (method === "POST" && pathname === "/api/verify-password") {
           // 空資料庫的密碼登入，沒有列可以改
           return new Response(JSON.stringify({ error: "no_account" }), { status: 409, headers });
         }
-        const body: { name?: string } = await request.json();
-        const name = String(body.name ?? "").trim();
-        if (!name) {
-          return new Response(JSON.stringify({ error: "顯示名稱不能空白" }), { status: 400, headers });
+        const body = await request.json().catch(() => ({})) as { name?: string; track_color?: unknown };
+
+        const sets: string[] = [];
+        const binds: any[] = [];
+
+        let name = actor.name;
+        if (body.name !== undefined) {
+          name = String(body.name ?? "").trim();
+          if (!name) {
+            return new Response(JSON.stringify({ error: "顯示名稱不能空白" }), { status: 400, headers });
+          }
+          if (name.length > 40) {
+            return new Response(JSON.stringify({ error: "顯示名稱最多 40 個字" }), { status: 400, headers });
+          }
+          sets.push("name = ?");
+          binds.push(name);
         }
-        if (name.length > 40) {
-          return new Response(JSON.stringify({ error: "顯示名稱最多 40 個字" }), { status: 400, headers });
+
+        let trackColor = actor.trackColor;
+        if (body.track_color !== undefined) {
+          const color = normalizeTrackColor(body.track_color);
+          if (color === undefined) {
+            return new Response(JSON.stringify({ error: "不是調色盤裡的顏色" }), { status: 400, headers });
+          }
+          sets.push("track_color = ?");
+          binds.push(color);
+          trackColor = trackColorFor(actor.uid, color);
         }
-        await env.DB.prepare("UPDATE User SET name = ? WHERE id = ?").bind(name, actor.uid).run();
+
+        if (sets.length === 0) {
+          return new Response(JSON.stringify({ error: "沒有要變更的內容" }), { status: 400, headers });
+        }
+        await env.DB.prepare(`UPDATE User SET ${sets.join(", ")} WHERE id = ?`)
+          .bind(...binds, actor.uid).run();
+
         return new Response(JSON.stringify({
           success: true,
           user: {
             id: actor.uid, name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
             can_manage_others: actor.canManageOthers ? 1 : 0,
+            track_color: trackColor,
           },
         }), { headers });
+      }
+
+      /*
+       * 路由：站上的家人清單（id / 名字 / 顏色）。**任何管理員都讀得到**，
+       * 不是站長專屬 —— 它不是白名單管理，是地圖圖例與色票列的資料來源：
+       *
+       *   - 地圖頁要把 user_id 換成人名與顏色（軌跡點只帶 id）
+       *   - 帳號牌的色票列要標出「這個顏色 OO 已經在用了」
+       *
+       * 刻意不含信箱、權限、最後登入時間 —— 那些是 /api/admin/users 的事。
+       * 訪客不給：軌跡本來就要登入才看得到（/api/tracks 是 401），
+       * 給了只是白白洩漏站上有誰。
+       */
+      if (method === "GET" && pathname === "/api/track-members") {
+        if (!(await isAuthorized(request, env))) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const { results } = await env.DB.prepare(
+          "SELECT id, name, track_color FROM User WHERE active = 1 ORDER BY id"
+        ).all();
+        return new Response(JSON.stringify((results as any[]).map((u) => ({
+          id: Number(u.id),
+          name: u.name,
+          // 算好的顏色，理由同 Actor.trackColor：退讓規則只寫在後端一處
+          track_color: trackColorFor(Number(u.id), u.track_color),
+        }))), { headers });
       }
 
       /* ── 站長專用：站台開關 ────────────────────────────────────────────────
@@ -959,6 +1169,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           const { results } = await env.DB.prepare(`
             SELECT u.id, u.name, u.email, u.role, u.can_manage_others, u.active,
                    u.last_login_at, u.created_at,
+                   u.track_color, u.track_drive_folder_id,
                    (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
                    (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id WHERE a.user_id = u.id) AS photo_count
               FROM User u
@@ -977,26 +1188,84 @@ if (method === "POST" && pathname === "/api/verify-password") {
           const name = String(body.name ?? "").trim() || email.split("@")[0];
           const canManage = body.can_manage_others ? 1 : 0;
 
+          /*
+           * 配一個還沒被用到的顏色。
+           *
+           * 依 uid 的預設色（trackColorFor）已經保證「不會全部同色」，但它不知道
+           * 別人手動挑過什麼 —— 站長把自己改成藍色之後，第二個人的預設剛好也是藍色。
+           * 所以這裡看一遍**現在實際生效的顏色**（含預設），挑第一個沒人用的存進去。
+           *
+           * 存進去而不是繼續走預設：新成員一加進來，顏色就定了，不會因為別人改色
+           * 而跟著飄。全部十色都用完（家庭不會發生）就交給 trackColorFor 去輪。
+           */
+          const { results: taken } = await env.DB.prepare(
+            "SELECT id, track_color FROM User WHERE active = 1"
+          ).all();
+          const used = new Set((taken as any[]).map((u) => trackColorFor(Number(u.id), u.track_color)));
+          const freeColor = TRACK_PALETTE.find((c) => !used.has(c)) ?? null;
+
           const existing = await env.DB.prepare(
-            "SELECT id, active FROM User WHERE lower(email) = ?"
+            "SELECT id, active, track_color FROM User WHERE lower(email) = ?"
           ).bind(email).first<any>();
           if (existing) {
-            // 曾經被移出白名單的人再加回來 —— 就是把 active 打開，他的相簿都還在
+            // 曾經被移出白名單的人再加回來 —— 就是把 active 打開，他的相簿都還在。
+            // 顏色只在他從來沒有過的時候才補（COALESCE）：以前挑過什麼就還他什麼
             await env.DB.prepare(
-              "UPDATE User SET active = 1, can_manage_others = ?, name = ? WHERE id = ?"
-            ).bind(canManage, name, existing.id).run();
-            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?")
+              "UPDATE User SET active = 1, can_manage_others = ?, name = ?, track_color = COALESCE(track_color, ?) WHERE id = ?"
+            ).bind(canManage, name, freeColor, existing.id).run();
+            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active, track_color FROM User WHERE id = ?")
               .bind(existing.id).first();
             return new Response(JSON.stringify({ success: true, restored: Number(existing.active) !== 1, user: row }), { headers });
           }
 
           const res = await env.DB.prepare(
-            "INSERT INTO User (name, email, role, can_manage_others, active) VALUES (?, ?, 'member', ?, 1)"
-          ).bind(name, email, canManage).run();
+            "INSERT INTO User (name, email, role, can_manage_others, active, track_color) VALUES (?, ?, 'member', ?, 1, ?)"
+          ).bind(name, email, canManage, freeColor).run();
           const id = res.meta.last_row_id;
-          const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?")
+          const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active, track_color FROM User WHERE id = ?")
             .bind(id).first();
           return new Response(JSON.stringify({ success: true, user: row }), { headers });
+        }
+
+        /* ── 綁定某個人的 GPSLogger Drive 資料夾 ──────────────────────────────
+         *
+         * 為什麼是**獨立一條**而不是塞進 PUT /api/admin/users/:id：那一條為了
+         * 防呆，站長自己那一列一律 400（權限不能自己改掉）。但資料夾是要綁的，
+         * 站長自己也得綁得了，所以拆開來。
+         *
+         * folder_id 送 null／空字串＝解除綁定。這裡不驗證資料夾在 Drive 上
+         * 存不存在 —— 驗證交給 shared-folders 那條列出來的清單，站長是從
+         * 下拉選單挑的，不是自己打 id。
+         */
+        const folderMatch = pathname.match(/^\/api\/admin\/users\/(\d+)\/track-folder$/);
+        if (folderMatch && method === "PUT") {
+          const targetId = Number(folderMatch[1]);
+          const target = await env.DB.prepare("SELECT id FROM User WHERE id = ?").bind(targetId).first<any>();
+          if (!target) {
+            return new Response(JSON.stringify({ error: "找不到這個帳號" }), { status: 404, headers });
+          }
+          const body = await request.json().catch(() => ({})) as { folder_id?: any };
+          const raw = body.folder_id == null ? "" : String(body.folder_id).trim();
+          const folderId = raw || null;
+
+          /*
+           * 一個資料夾只能綁一個人。綁重了兩個人會同步到同一批 GPX，
+           * 而 day_key 帶各自的前綴 —— 同一天的軌跡會憑空多出一份「別人的」。
+           */
+          if (folderId) {
+            const dup = await env.DB.prepare(
+              "SELECT id, name FROM User WHERE track_drive_folder_id = ? AND id != ?"
+            ).bind(folderId, targetId).first<any>();
+            if (dup) {
+              return new Response(JSON.stringify({
+                error: `這個資料夾已經綁在「${dup.name}」身上了`,
+              }), { status: 409, headers });
+            }
+          }
+
+          await env.DB.prepare("UPDATE User SET track_drive_folder_id = ? WHERE id = ?")
+            .bind(folderId, targetId).run();
+          return new Response(JSON.stringify({ success: true, folder_id: folderId }), { headers });
         }
 
         /* ── 刪除帳號。跟「移出白名單」是完全不同的兩件事 ─────────────────────
@@ -1045,8 +1314,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
                   WHERE a.user_id = ?) AS photos_in_albums,
                 (SELECT COUNT(*) FROM Photo WHERE uploaded_by = ?) AS photos_uploaded,
                 (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id
-                  WHERE p.uploaded_by = ? AND a.user_id <> ?) AS photos_elsewhere
-            `).bind(targetId, targetId, targetId, targetId, targetId).first<any>();
+                  WHERE p.uploaded_by = ? AND a.user_id <> ?) AS photos_elsewhere,
+                (SELECT COUNT(*) FROM TrackDay WHERE user_id = ?) AS track_days
+            `).bind(targetId, targetId, targetId, targetId, targetId, targetId).first<any>();
             return new Response(JSON.stringify({
               id: targetId,
               email: target.email,
@@ -1054,6 +1324,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
               photos_in_albums: Number(counts?.photos_in_albums ?? 0),
               photos_uploaded: Number(counts?.photos_uploaded ?? 0),
               photos_elsewhere: Number(counts?.photos_elsewhere ?? 0),
+              track_days: Number(counts?.track_days ?? 0),
             }), { headers });
           }
 
@@ -1065,6 +1336,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
 
           const dropAlbums = url.searchParams.get("albums") === "1";
           const dropPhotos = url.searchParams.get("photos") === "1";
+          const dropTracks = url.searchParams.get("tracks") === "1";
 
           // 1. 要整本刪掉的相簿。drive_folder_id 一定要在刪列之前撈出來，
           //    列一刪就再也查不到該把哪個資料夾搬進 trash/
@@ -1163,9 +1435,39 @@ if (method === "POST" && pathname === "/api/verify-password") {
           }
 
           /*
+           * 5b. GPS 軌跡。跟相簿同一套語意：勾了就連 R2 上的原始 GPX
+           *     與貼路結果一起清，沒勾就在下一步改掛站長。
+           *
+           *     TrackPoint / TrackSegment 有 ON DELETE CASCADE，刪 TrackDay
+           *     會一起帶走；但 **R2 的物件沒有外鍵**，不在這裡清就永遠是孤兒
+           *     （key 由 day_key 推得，列一刪就再也算不出來）。
+           */
+          let deletedTrackDays = 0;
+          if (dropTracks) {
+            const { results: dayRows } = await env.DB.prepare(
+              "SELECT day_key, raw_key FROM TrackDay WHERE user_id = ?"
+            ).bind(targetId).all<any>();
+            deletedTrackDays = dayRows.length;
+            if (dayRows.length > 0) {
+              const keys = dayRows.flatMap((d) => [
+                typeof d.raw_key === "string" && d.raw_key ? d.raw_key : rawTrackKey(d.day_key),
+                matchedKey(d.day_key),
+              ]);
+              for (let i = 0; i < keys.length; i += 1000) {
+                await env.BUCKET.delete(keys.slice(i, i + 1000));
+              }
+              await env.DB.prepare("DELETE FROM TrackDay WHERE user_id = ?").bind(targetId).run();
+            }
+          }
+
+          /*
            * 6. 沒被刪掉的東西改掛站長名下。**一定要排在刪 User 之前** ——
            *    Album.user_id 是 ON DELETE CASCADE，順序反過來就會把留下來的
            *    相簿連同照片一起被外鍵帶走，而且 R2 與 Drive 上的檔案不會跟著清。
+           *
+           *    TrackDay.user_id 沒有 CASCADE（0009 刻意的），但同樣要在這裡改掛：
+           *    留著指向已刪帳號的 user_id，那些軌跡在地圖上會變成沒有主人、
+           *    也沒有顏色的一條線。
            */
           const moved = await env.DB.prepare(
             "UPDATE Album SET user_id = ? WHERE user_id = ?"
@@ -1175,6 +1477,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
           const orphaned = await env.DB.prepare(
             "UPDATE Photo SET uploaded_by = NULL WHERE uploaded_by = ?"
           ).bind(targetId).run();
+          const movedTracks = await env.DB.prepare(
+            "UPDATE TrackDay SET user_id = ? WHERE user_id = ?"
+          ).bind(actor.uid, targetId).run();
 
           // 7. 人本身
           await env.DB.prepare("DELETE FROM User WHERE id = ?").bind(targetId).run();
@@ -1190,8 +1495,10 @@ if (method === "POST" && pathname === "/api/verify-password") {
             email: target.email,
             deleted_albums: albumIds.size,
             deleted_photos: photoIds.length,
+            deleted_track_days: deletedTrackDays,
             kept_albums: Number(moved.meta?.changes ?? 0),
             kept_photos: Number(orphaned.meta?.changes ?? 0),
+            kept_track_days: Number(movedTracks.meta?.changes ?? 0),
           }), { headers });
         }
 
@@ -1799,17 +2106,32 @@ if (method === "POST" && pathname === "/api/verify-password") {
         return true;
       };
 
-      /*
-       * 全站共用的東西：GPS 軌跡、Google 時間軸、Drive 資料夾設定、維護工具。
+      /**
+       * 這一天的軌跡在不在我的管轄範圍。找不到那一列也回 false ——
+       * 呼叫端要嘛回 404，要嘛（ingest）自己決定要開在誰的名下。
        *
-       * 它們不屬於任何一本相簿，「只能動自己的」在這裡沒有意義 —— 那是站的資產，
-       * 而且軌跡本身就是「這台手機去過哪裡」。所以一律要 can_manage_others。
+       * 軌跡從 0009 起是「每個人各自一份」，不再是全站共用資產，
+       * 所以規則跟相簿、照片完全一樣：canManageOthers 全開，其餘只動自己的。
+       */
+      const canTouchTrackDay = async (dayKey: string): Promise<boolean> => {
+        if (me.canManageOthers) return true;
+        const row = await trackDayOwnership(env, dayKey);
+        return row ? actorOwns(me, row) : false;
+      };
+
+      /*
+       * 全站共用的東西：Google 時間軸、Drive 資料夾設定、維護工具。
+       *
+       * 它們不屬於任何一本相簿，「只能動自己的」在這裡沒有意義 —— 那是站的資產。
        * （白名單那幾支更嚴，是站長限定，而且在上面就先回應了。）
+       *
+       * **GPS 軌跡與 Google 時間軸都不在這份清單裡**：每個成員各自上傳、
+       * 各自擁有，擋在這裡會讓一般成員連自己的東西都寫不進來。
+       * 軌跡改由各路由用 canTouchTrackDay() 逐日檢查 —— 那才問得出「這一天是誰的」；
+       * 時間軸則是 R2 key 依 uid 分開（timelineIndexKey），寫入永遠只寫得到自己那一包。
        */
       const isSharedResourceWrite =
-        pathname.startsWith("/api/tracks/")
-        || pathname.startsWith("/api/timeline/")
-        || pathname === "/api/config/drive-folders"
+        pathname === "/api/config/drive-folders"
         || pathname.startsWith("/api/admin/");
       if (requiresAuth && isSharedResourceWrite && !me.canManageOthers) {
         return forbidden(headers, "這是全站共用的資料，只有可以管理別人內容的帳號能修改");
@@ -3589,16 +3911,33 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：列出 Drive 上的 GPX 檔與各自的同步狀態
       // 會暴露檔名（＝出門的日期），僅管理者可讀
       if (method === "GET" && pathname === "/api/tracks/drive/files") {
-        if (!(await isAuthorized(request, env))) {
+        const viewer = await currentActor(request, env);
+        if (!viewer) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
-        if (!env.GOOGLE_DRIVE_SA_KEY || !env.GOOGLE_DRIVE_FOLDER_ID) {
+        if (!env.GOOGLE_DRIVE_SA_KEY) {
           return new Response(JSON.stringify({
-            error: "尚未設定 GOOGLE_DRIVE_SA_KEY 或 GOOGLE_DRIVE_FOLDER_ID",
+            error: "尚未設定 GOOGLE_DRIVE_SA_KEY",
+          }), { status: 503, headers });
+        }
+        /*
+         * 每個人各看各的資料夾（P1）。GPSLogger 只拿得到 `drive.file` scope，
+         * 只碰得到自己建的檔，所以「大家都傳進站長的 Drive」在技術上不可能 ——
+         * 每個人傳進自己的 Drive，再把那個資料夾分享給 Service Account，
+         * 由站長在 /admin 綁上去。沒綁的人這裡就直接說清楚，不要回空陣列
+         * 讓人以為是「Drive 上沒檔案」。
+         */
+        const folderId = trackFolderFor(env, viewer);
+        if (!folderId) {
+          // code 給前端判斷用：這不是故障，是「還沒設定」。開頁自動同步碰到它
+          // 要安靜地跳過，不能每次進地圖都跳一次紅字
+          return new Response(JSON.stringify({
+            code: "track_folder_unbound",
+            error: "你還沒有綁定 Drive 軌跡資料夾。請把 GPSLogger 上傳的資料夾分享給站上的服務帳號，再請站長到後台綁定。",
           }), { status: 503, headers });
         }
 
-        const files = await listGpxFiles(env.GOOGLE_DRIVE_SA_KEY, env.GOOGLE_DRIVE_FOLDER_ID);
+        const files = await listGpxFiles(env.GOOGLE_DRIVE_SA_KEY, folderId);
         const { results: days } = await env.DB.prepare(
           "SELECT day_key, md5, point_count, synced_at, ingest_source FROM TrackDay"
         ).all();
@@ -3607,9 +3946,17 @@ function hammingDistance(hex1: string, hex2: string): number {
         // md5 相同就代表內容一個點都沒變 —— 每次 auto-send 都會動 modifiedTime，
         // 只看時間會把整天的檔案白抓白解析一遍
         const list = files.map(f => {
-          const known = byKey.get(f.name);
+          /*
+           * 檔名 → day_key 的轉換**在這裡就做掉**，前端從頭到尾只看得到
+           * 完整的 day_key。ingest、saveTrackRaw、貼路結果三者共用同一個 key，
+           * 任何一處拿到裸檔名都會寫到別人（或不存在）的那一列去。
+           */
+          const dayKey = trackDayKeyFor(viewer.uid, f.name);
+          const known = byKey.get(dayKey);
           return {
-            dayKey: f.name,
+            dayKey,
+            // 給畫面顯示用：day_key 帶著前綴，人看的是檔名
+            fileName: f.name,
             driveFileId: f.id,
             md5: f.md5Checksum ?? null,
             modifiedTime: f.modifiedTime ?? null,
@@ -3623,6 +3970,41 @@ function hammingDistance(hex1: string, hex2: string): number {
           };
         });
         return new Response(JSON.stringify(list), { headers });
+      }
+
+      /*
+       * 路由：列出「分享給服務帳號」的 Drive 資料夾，給站長在後台挑來綁。
+       *
+       * 站長限定：清單裡有別人的 Google 信箱與資料夾名稱。
+       * ownerEmail 有對上站上帳號的話一併回傳 suggestedUserId，後台就能
+       * 直接把「小明的 GPSLogger」擺到小明那一列旁邊，不用人工比對。
+       */
+      if (method === "GET" && pathname === "/api/tracks/drive/shared-folders") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.isOwner) {
+          return new Response(JSON.stringify({ error: "只有站長可以綁定軌跡資料夾" }), { status: 403, headers });
+        }
+        if (!env.GOOGLE_DRIVE_SA_KEY) {
+          return new Response(JSON.stringify({ error: "尚未設定 GOOGLE_DRIVE_SA_KEY" }), { status: 503, headers });
+        }
+
+        const folders = await listSharedFolders(env.GOOGLE_DRIVE_SA_KEY);
+        const { results: users } = await env.DB.prepare(
+          "SELECT id, lower(email) AS email FROM User WHERE email IS NOT NULL"
+        ).all();
+        const byEmail = new Map((users as any[]).map(u => [String(u.email), Number(u.id)]));
+
+        return new Response(JSON.stringify({
+          // 站長要把資料夾分享給誰，畫面上得看得到這個信箱
+          serviceAccount: serviceAccountEmail(env.GOOGLE_DRIVE_SA_KEY),
+          folders: folders.map(f => ({
+            ...f,
+            suggestedUserId: f.ownerEmail ? byEmail.get(f.ownerEmail.toLowerCase()) ?? null : null,
+          })),
+        }), { headers });
       }
 
       // 路由：代理單一 GPX 檔的原始 bytes 給前端解析
@@ -3662,9 +4044,12 @@ function hammingDistance(hex1: string, hex2: string): number {
         // 用相關子查詢而不是 GROUP BY 掃全表：idx_trackpoint_day 是
         // (day_key, t_utc)，day_key 給定之後 MIN/MAX 就是索引的頭尾兩次 seek，
         // 每天各兩筆。GROUP BY 會把整個 TrackPoint 掃過一遍，天數一多就是白花讀取額度。
+        // user_id / user_name：這一天是誰的。家人之間互相看得到彼此的足跡
+        // （使用者定調），所以這裡回全部，由前端決定要不要篩選與能不能編輯。
         const { results } = await env.DB.prepare(`
           SELECT d.day_key, d.ingest_source, d.drive_file_id, d.md5, d.point_count,
                  d.tz_offset_minutes, d.synced_at, d.is_private,
+                 d.user_id, u.name AS user_name,
                  d.raw_key IS NOT NULL AS has_raw,
                  strftime('%Y-%m-%d',
                    (SELECT MIN(p.t_utc) FROM TrackPoint p WHERE p.day_key = d.day_key),
@@ -3675,6 +4060,7 @@ function hammingDistance(hex1: string, hex2: string): number {
                    COALESCE(d.tz_offset_minutes, ${DEFAULT_TZ_OFFSET_MINUTES}) || ' minutes'
                  ) AS last_local_day
           FROM TrackDay d
+          LEFT JOIN User u ON u.id = d.user_id
           ORDER BY d.day_key DESC
         `).all();
         return new Response(JSON.stringify(results), { headers });
@@ -3714,13 +4100,19 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
         }
+        /*
+         * 一般成員要有那一列才存得了原文（canTouchTrackDay 對不存在的列回 false）。
+         * 這正好符合真實流程 —— 前端一律是 ingest 成功之後才呼叫這支。
+         * 反過來讓它先建檔的話，等於任何成員都能往別人未來的 day_key 塞內容。
+         */
+        if (!(await canTouchTrackDay(dayKey))) {
+          return forbidden(headers, "這一天的軌跡不是你的，或還沒有同步過");
+        }
         const xml = await request.text();
         if (!xml.trim()) {
           return new Response(JSON.stringify({ error: "內容是空的" }), { status: 400, headers });
         }
-        // key 用 encodeURIComponent 包起來：day_key 就是 Drive 檔名，
-        // 不保證不含斜線之類會在 R2 裡長出假目錄的字元
-        const rawKey = `tracks/${encodeURIComponent(dayKey)}.gpx`;
+        const rawKey = rawTrackKey(dayKey);
         await env.BUCKET.put(rawKey, xml, {
           httpMetadata: { contentType: "application/gpx+xml" },
         });
@@ -3842,6 +4234,10 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
         }
+        // 貼路結果是從那一天的點推出來的，跟著同一份擁有權走
+        if (!(await canTouchTrackDay(dayKey))) {
+          return forbidden(headers, "這一天的軌跡不是你的，或還沒有同步過");
+        }
         const json = await request.text();
         if (!json.trim()) {
           return new Response(JSON.stringify({ error: "內容是空的" }), { status: 400, headers });
@@ -3860,6 +4256,9 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
         }
+        if (!(await canTouchTrackDay(dayKey))) {
+          return forbidden(headers, "這一天的軌跡不是你的，或還沒有同步過");
+        }
         await env.BUCKET.delete(matchedKey(dayKey));
         return new Response(JSON.stringify({ success: true, dayKey }), { headers });
       }
@@ -3868,10 +4267,44 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 冪等：同一個 day_key 重灌就是整批換掉，所以重複同步不會長出重複的點
       if (method === "POST" && pathname === "/api/tracks/ingest") {
         const body: any = await request.json().catch(() => ({}));
-        const dayKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
-        if (!dayKey) {
+        const requestedKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
+        if (!requestedKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
         }
+
+        /*
+         * 這一批點要寫進誰的名下。
+         *
+         * 規則只有一條：**day_key 由後端依 actor 重新組一次，不信任前端送什麼**。
+         * 少了它，任何成員只要把 dayKey 打成別人的，就能整批洗掉對方那天的軌跡
+         * （ingest 是 DELETE 全部再插入）。重組是冪等的：`u2:20260813.gpx`
+         * 拆掉前綴再貼回去還是同一個，所以正常流程（drive/files 回好的 key）
+         * 走這裡什麼都不會變。
+         *
+         * 刻意**不因為前綴不對就 403** —— 送進來的字串是「哪一天」而不是
+         * 「誰的」，硬要報錯只會讓手動上傳 GPX（P1）那條路莫名其妙失敗。
+         * 重組後它必然落在自己的命名空間裡，覆蓋不到別人。
+         *
+         * 管得到別人的人是例外，照原樣收：站長要修別人那天的軌跡，
+         * 得指得到別人那一列。
+         */
+        const dayKey = me.canManageOthers
+          ? requestedKey
+          : trackDayKeyFor(me.uid, stripTrackKeyPrefix(requestedKey));
+
+        // 防禦性檢查。重組過的 key 照理不可能是別人的，但 uid 1 無前綴那條規則
+        // 讓「沒有前綴」同時代表舊資料與站長的資料，還是攔一道比較安全
+        const existing = await trackDayOwnership(env, dayKey);
+        if (existing && !actorOwns(me, existing)) {
+          return forbidden(headers, "這一天的軌跡是別人的，不能覆蓋");
+        }
+        /*
+         * 已經有那一列 → user_id 是唯一權威（換主人是刪帳號那條路才做的事）。
+         * 還沒有 → 站長可以替別人開（key 上宣稱誰就是誰），其餘一律開在自己名下。
+         */
+        const ownerUid: number | null = existing && existing.user_id != null
+          ? Number(existing.user_id)
+          : (me.canManageOthers ? trackKeyClaimedUid(dayKey) : me.uid);
 
         const rawPoints = Array.isArray(body?.points) ? body.points : [];
         // 上限擋的是「一次匯入十年份時間軸」那種會直接吃掉整天 D1 寫入額度的情況
@@ -3894,8 +4327,8 @@ function hammingDistance(hex1: string, hex2: string): number {
 
         const stmts: D1PreparedStatement[] = [
           env.DB.prepare(
-            `INSERT INTO TrackDay (day_key, ingest_source, drive_file_id, md5, point_count, tz_offset_minutes)
-             VALUES (?, ?, ?, ?, ?, ?)
+            `INSERT INTO TrackDay (day_key, user_id, ingest_source, drive_file_id, md5, point_count, tz_offset_minutes)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(day_key) DO UPDATE SET
                ingest_source = excluded.ingest_source,
                drive_file_id = excluded.drive_file_id,
@@ -3903,8 +4336,12 @@ function hammingDistance(hex1: string, hex2: string): number {
                point_count = excluded.point_count,
                tz_offset_minutes = excluded.tz_offset_minutes,
                synced_at = CURRENT_TIMESTAMP`
+            // user_id 刻意不在 DO UPDATE 裡：上面已經確認過我動得了這一列，
+            // 但「可以修改」不等於「可以把別人的軌跡改成我的」。換主人是
+            // 刪帳號那條路才做的事
           ).bind(
             dayKey,
+            ownerUid,
             typeof body?.ingestSource === 'string' ? body.ingestSource : 'gpslogger',
             body?.driveFileId ?? null,
             body?.md5 ?? null,
@@ -3951,12 +4388,29 @@ function hammingDistance(hex1: string, hex2: string): number {
         const qDay = url.searchParams.get("day_key");
         if (qDay) { conds.push("p.day_key = ?"); binds.push(qDay); }
 
+        /*
+         * 只看某幾個人的足跡。`?user_id=3,7`，省略就是全部。
+         *
+         * 家人之間互相看得到（使用者定調），所以這是**篩選不是權限** ——
+         * 但它同時省讀取額度：底下那個 LIMIT 是全域的，三個人同框等於
+         * 每個人只剩三分之一的天數，只看自己時就不該把別人的點也讀出來。
+         */
+        const qUsers = (url.searchParams.get("user_id") ?? "")
+          .split(",").map((s) => Number(s.trim()))
+          .filter((n) => Number.isInteger(n) && n > 0);
+        if (qUsers.length > 0) {
+          // 這裡的數量是「站上有幾個家人」，遠低於 D1 的 100 個綁定參數上限
+          conds.push(`d.user_id IN (${placeholdersFor(qUsers.slice(0, 50))})`);
+          binds.push(...qUsers.slice(0, 50));
+        }
+
         const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
         // 一定要有上限。軌跡一天就好幾百點，不設限的話「不選日期直接進地圖頁」
         // 會把好幾年份一次讀出來，D1 免費額度的每日讀取列數撐不住。
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 20000, 1), 50000);
         const { results } = await env.DB.prepare(`
-          SELECT p.id, p.day_key, p.t_utc, p.lat, p.lng, p.src, p.seg, p.stay_sec
+          SELECT p.id, p.day_key, p.t_utc, p.lat, p.lng, p.src, p.seg, p.stay_sec,
+                 d.user_id
           FROM TrackPoint p
           JOIN TrackDay d ON d.day_key = p.day_key
           ${where}
@@ -3974,13 +4428,13 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 兩個點（進入、離開）」，跟匯入時的停留點濃縮產生的形狀完全一樣。
       // 質心與時間由前端算好送過來 —— Worker 只做 I/O，跟 GPX 解析放在瀏覽器同一個理由。
       if (method === "POST" && pathname === "/api/tracks/points/edit") {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
         const body: any = await request.json().catch(() => ({}));
         const dayKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
+        }
+        if (!(await canTouchTrackDay(dayKey))) {
+          return forbidden(headers, "這一天的軌跡不是你的，或還沒有同步過");
         }
 
         const deleteIds = (Array.isArray(body?.deleteIds) ? body.deleteIds : [])
@@ -4045,12 +4499,30 @@ function hammingDistance(hex1: string, hex2: string): number {
        *
        * 原始的匯出檔本身永遠不會上傳：瀏覽器只送解析後的座標，
        * placeId、semanticType（含 INFERRED_HOME/WORK）、WiFi 掃描都不讀。
+       *
+       * **多身分（P1）**：R2 的 key 依 uid 分開（見 timelineIndexKey）。
+       * 寫入永遠只寫得到自己那一包 —— 沒有「幫別人匯入」這種需求，
+       * 匯出檔要從他自己的 Google 帳號下載。讀取可以用 `?user_id=` 指定別人，
+       * 家人之間本來就互相看得到（跟 /api/tracks 同一個定調）。
        */
+      const timelineViewerUid = async (): Promise<number | null | undefined> => {
+        const q = url.searchParams.get("user_id");
+        if (q) {
+          const n = Number(q);
+          return Number.isInteger(n) && n > 0 ? n : undefined; // undefined ＝ 參數不合法
+        }
+        return (await currentActor(request, env))?.uid ?? null;
+      };
+
       if (method === "GET" && pathname === "/api/timeline/index") {
         if (!(await isAuthorized(request, env))) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
-        const object = await env.BUCKET.get(TIMELINE_INDEX_KEY);
+        const uid = await timelineViewerUid();
+        if (uid === undefined) {
+          return new Response(JSON.stringify({ error: "user_id 必須是正整數" }), { status: 400, headers });
+        }
+        const object = await env.BUCKET.get(timelineIndexKey(uid));
         // 還沒匯入過不是錯誤，回空索引讓前端不用區分這兩種情況
         if (!object) {
           return new Response(JSON.stringify({ months: [] }), { headers });
@@ -4078,7 +4550,9 @@ function hammingDistance(hex1: string, hex2: string): number {
           }))
           .sort((a: any, b: any) => a.monthKey.localeCompare(b.monthKey));
 
-        await env.BUCKET.put(TIMELINE_INDEX_KEY, JSON.stringify({
+        // 寫入只寫得到自己那一包：uid 取自 token，刻意不看 ?user_id=
+        const meUid = (await currentActor(request, env))?.uid ?? null;
+        await env.BUCKET.put(timelineIndexKey(meUid), JSON.stringify({
           months, updatedAt: new Date().toISOString(),
         }), { httpMetadata: { contentType: "application/json" } });
         return new Response(JSON.stringify({ success: true, months: months.length }), { headers });
@@ -4092,7 +4566,11 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!TIMELINE_MONTH_RE.test(month)) {
           return new Response(JSON.stringify({ error: "月份格式必須是 YYYY-MM" }), { status: 400, headers });
         }
-        const object = await env.BUCKET.get(timelineMonthKey(month));
+        const uid = await timelineViewerUid();
+        if (uid === undefined) {
+          return new Response(JSON.stringify({ error: "user_id 必須是正整數" }), { status: 400, headers });
+        }
+        const object = await env.BUCKET.get(timelineMonthKey(uid, month));
         if (!object) {
           return new Response(JSON.stringify({ error: "這個月份還沒有資料" }), { status: 404, headers });
         }
@@ -4129,7 +4607,8 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
           return new Response(JSON.stringify({ error: "內容必須是 { 日期: 點陣列 } 的物件" }), { status: 400, headers });
         }
-        await env.BUCKET.put(timelineMonthKey(month), json, {
+        const meUid = (await currentActor(request, env))?.uid ?? null;
+        await env.BUCKET.put(timelineMonthKey(meUid, month), json, {
           httpMetadata: { contentType: "application/json" },
         });
         return new Response(JSON.stringify({

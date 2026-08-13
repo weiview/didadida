@@ -9,6 +9,7 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import type { Album, FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 import { createUfoImage, UFO_PIXEL_RATIO } from '@/lib/ufo';
+import { DEFAULT_TRACK_COLOR } from '@/lib/trackColors';
 
 // OpenFreeMap：免費、免 API key、無流量上限的向量圖磚。
 // 不用 Google Maps 是因為它強制要求綁定信用卡的帳單帳戶。
@@ -96,6 +97,19 @@ interface Props {
    */
   timelineLines?: [number, number][][];
   /**
+   * 每個家人在地圖上的顏色（`{ [user_id]: '#rrggbb' }`，由 `/api/track-members` 而來）。
+   *
+   * 軌跡點只帶 user_id，顏色是後端算好的 —— 這裡不做任何退讓邏輯，
+   * 沒對應到的線一律畫成 DEFAULT_TRACK_COLOR。
+   */
+  trackColors?: Record<number, string>;
+  /**
+   * Google 紀念層要用的顏色。那一層的線是頁面切好的座標陣列，帶不了 user_id，
+   * 而它的內容永遠是**當下這個人自己的**時間軸（R2 key 依 uid 分開），
+   * 所以直接給一個色就夠了。
+   */
+  timelineColor?: string;
+  /**
    * 鏡頭要直接停在這個點（[lng, lat]），而不是把所有東西框進畫面。
    *
    * 只看一天的時候用：框住一整天的範圍會把鏡頭拉到看不出細節的高度，
@@ -115,6 +129,8 @@ interface PathNode {
   breakBefore: boolean;
   /** 'day_key#seg'。照片節點為 null —— 它不屬於任何一段軌跡 */
   segKey: string | null;
+  /** 這一點是誰的。照片沿用它時間上落在的那一段軌跡的主人 */
+  userId: number | null;
 }
 
 /** 一次停留。匯入時已把亂跳的點收成質心，這裡只是把它的時間區間還原回來 */
@@ -125,6 +141,8 @@ interface Stay {
   lng: number;
   lat: number;
   sec: number;
+  /** 誰在這裡停的。停留圈跟著那個人的顏色走，多身分同框時才分得出是誰待在那 */
+  userId: number | null;
 }
 
 // 超過這個間隔就斷開。跨夜（10 幾小時）仍然連著，隔好幾個月的兩趟旅行則不會被
@@ -147,6 +165,48 @@ const STAY_SNAP_M = 120;
 // 1x 播完整條路徑要幾秒。長度差幾百倍的日子都套同一個總時長，
 // 使用者才不用為了看完一趟長途旅行等上好幾分鐘
 const PLAY_SECONDS = 25;
+
+/*
+ * 同行判定的三個參數。跟 collapseStays 的 60m / 300s 同一個量級，不是憑空的數字：
+ *
+ *   半徑 80m —— GPS 誤差的量級。同車的兩支手機通常差不到 50m，
+ *               室內抖動收斂後的散布約 23m，兩者都進得來。
+ *   進入 120s —— 短於此的接近是擦身而過（在路口等紅燈遇到）。
+ *   解散 180s —— 比進入寬。**遲滯不可省**：沒有它，兩個人在門檻附近走一段路，
+ *               畫面上的隊形就會瘋狂閃爍。過馬路分開半分鐘不該散隊。
+ */
+const CONVOY_RADIUS_M = 80;
+const CONVOY_JOIN_MS = 120 * 1000;
+const CONVOY_PART_MS = 180 * 1000;
+
+/*
+ * 落在中斷裡多久就讓這個人的頭消失。
+ *
+ * 中斷有兩種：換軌跡段（手機停止錄製再開始）與超過 MAX_GAP_MS。短的那種
+ * 停在原地就好，讓頭消失半分鐘只會變成閃爍；長的那種代表「這段時間他根本沒出門」，
+ * 照計畫那個頭不該出現，而不是卡在他上次的位置上。
+ *
+ * 停留不受影響 —— 停留是同座標的兩個點，中間沒有 breakBefore，人確實在那裡。
+ */
+const HEAD_HIDE_GAP_MS = 30 * 60 * 1000;
+
+/*
+ * 合體之後的母船與小飛碟。
+ *
+ * 母船就是同一台飛碟畫大一號（不是換成交通工具圖示 —— 理由見 vehicles.ts 開頭：
+ * 依速度猜出來的交通工具常常猜錯，畫成真的車等於把猜測當事實展示）。
+ * 小飛碟是各人顏色的圓點，繞著母船的碟身轉，這樣才看得出「這台上面有誰」。
+ *
+ * 這幾個數字是螢幕像素，所以每一幀都要用 map.project／unproject 換算回經緯度 ——
+ * 縮放地圖時小飛碟才會維持一樣的繞行半徑，而不是隨著比例尺飛走。
+ */
+const MOTHERSHIP_SCALE = 1.5;
+/** 碟身中心相對於「光束落地點」的螢幕位移。圖是 icon-anchor: bottom，碟身在上面 */
+const SAUCER_ORBIT_CY = -52;
+const SAUCER_ORBIT_RX = 44;
+/** 壓扁成橢圓才像在繞圈，不是在畫面上平移 */
+const SAUCER_ORBIT_RY_RATIO = 0.4;
+const SAUCER_ORBIT_SEC = 7;
 
 // 地圖上最多同時保留幾張縮圖。超過就退回圓點 ——
 // 每張都是一塊要留在 GPU 上的貼圖，不設上限的話大相簿會把記憶體吃光。
@@ -219,6 +279,269 @@ interface PileSlot {
 // 固定值而不是「保留使用者目前的縮放」—— 從全球視野點進某一天，
 // 沿用當下的縮放等於停在一片什麼都看不到的地方。
 const FOCUS_ZOOM = 14;
+
+/* ══ 多身分播放 ═══════════════════════════════════════════════════════════
+ *
+ * 播放頭從「路徑上的浮點索引」改成「UTC 時間游標」。
+ *
+ * 為什麼非改不可：多身分同框時每個人的取樣密度不一樣（一個 60 秒一點、一個
+ * 10 秒一點，停留還被收成兩點），索引根本對不起來 —— 「第 300 點」在兩個人身上
+ * 是完全不同的時刻。改成真實時間之後，每個人各自在自己的點陣列上依時間內插，
+ * 畫面上看到的才是「同一個瞬間，大家分別在哪」。
+ */
+
+/** 一個成員自己的那條路徑。節點已依時間排好，breakBefore 是在**這個人自己**的序列上算的 */
+interface MemberPath {
+  userId: number | null;
+  nodes: PathNode[];
+}
+
+/**
+ * 某個成員在 UTC 時刻 t 的位置。回 null＝這個時候他的頭不該出現。
+ *
+ * 三種 null：時間游標早於他的第一點、晚於他的最後一點、或落在一段夠長的中斷裡
+ * （見 HEAD_HIDE_GAP_MS）。前兩種就是「這段範圍他沒有資料」，第三種是「這段時間
+ * 他沒出門」—— 都不該把他卡在上一個點上，那會讓人以為他真的待在那裡。
+ */
+function posAt(nodes: PathNode[], t: number): [number, number] | null {
+  const n = nodes.length;
+  if (n === 0 || !Number.isFinite(t)) return null;
+  if (t < nodes[0].t || t > nodes[n - 1].t) return null;
+
+  // 最後一個時間 <= t 的節點
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (nodes[mid].t <= t) lo = mid; else hi = mid - 1;
+  }
+  const a = nodes[lo];
+  const b = lo + 1 < n ? nodes[lo + 1] : null;
+  if (!b || b.t <= a.t) return [a.lng, a.lat];
+  if (b.breakBefore) {
+    return b.t - a.t > HEAD_HIDE_GAP_MS ? null : [a.lng, a.lat];
+  }
+  const f = (t - a.t) / (b.t - a.t);
+  return [a.lng + (b.lng - a.lng) * f, a.lat + (b.lat - a.lat) * f];
+}
+
+/**
+ * 時間 ↔ 播放進度的換算表。
+ *
+ * **播放進度不是時間，是「大家一共移動了多少公尺」。** 這是把原本那套
+ * 弧長等速（依節點數前進的話，塞車時慢吞吞、高速公路上用瞬移的 —— GPS 是按時間
+ * 取樣的，同樣的節點速率畫出來的畫面速度差好幾個數量級）
+ * 搬到多身分之後的樣子 —— 只是「弧長」現在是所有成員位移的總和。
+ *
+ * 直接讓游標照真實時間等速跑是不行的：睡覺那八小時會佔掉三分之一的播放時間。
+ * 改成依總位移前進之後，沒人在動的時段（半夜、停留、錄製中斷）位移是 0，
+ * 游標一瞬間就跨過去；有人在動的時候才慢下來。
+ *
+ * `times` 是所有成員節點時間的**聯集**，所以任何一個人的線段都剛好落在整數個
+ * 區間上，位移可以按時間比例攤進去，不必再找交點。
+ */
+interface TimeWarp {
+  times: Float64Array;
+  /** cum[i] = times[0] 到 times[i] 之間累積的位移量 */
+  cum: Float64Array;
+  total: number;
+}
+
+function buildWarp(members: MemberPath[]): TimeWarp {
+  const set = new Set<number>();
+  for (const m of members) for (const nd of m.nodes) set.add(nd.t);
+  const times = Float64Array.from(Array.from(set).sort((a, b) => a - b));
+  const k = times.length;
+  const cum = new Float64Array(k);
+  if (k < 2) return { times, cum, total: 0 };
+
+  const idx = new Map<number, number>();
+  for (let i = 0; i < k; i++) idx.set(times[i], i);
+
+  const motion = new Float64Array(k - 1);
+  for (const m of members) {
+    for (let i = 1; i < m.nodes.length; i++) {
+      const a = m.nodes[i - 1];
+      const b = m.nodes[i];
+      // 中斷那一段沒有走過，不該分到任何播放時間
+      if (b.breakBefore) continue;
+      const d = metersBetween(a.lat, a.lng, b.lat, b.lng);
+      if (d <= 0) continue;
+      const ia = idx.get(a.t);
+      const ib = idx.get(b.t);
+      if (ia === undefined || ib === undefined || ib <= ia) continue;
+      const span = b.t - a.t;
+      for (let j = ia; j < ib; j++) motion[j] += (d * (times[j + 1] - times[j])) / span;
+    }
+  }
+
+  let total = 0;
+  for (let j = 0; j < k - 1; j++) total += motion[j];
+  /*
+   * 整段完全沒有位移（照片全擠在同一點、或只有停留）就退回「照時間等速跑」。
+   * 否則總量是 0，播放鍵按下去什麼事都不會發生 —— 舊的程式碼是用
+   * nodesPerSec 這條退路處理同一件事。
+   */
+  if (total === 0) {
+    for (let j = 0; j < k - 1; j++) motion[j] = times[j + 1] - times[j];
+  }
+  for (let j = 0; j < k - 1; j++) cum[j + 1] = cum[j] + motion[j];
+  return { times, cum, total: cum[k - 1] };
+}
+
+/** 播放進度 → UTC 時刻 */
+function timeAtProgress(w: TimeWarp, p: number): number {
+  const k = w.times.length;
+  if (k === 0) return NaN;
+  if (k === 1 || p <= 0) return w.times[0];
+  if (p >= w.cum[k - 1]) return w.times[k - 1];
+  let lo = 0;
+  let hi = k - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (w.cum[mid] <= p) lo = mid; else hi = mid - 1;
+  }
+  const span = w.cum[lo + 1] - w.cum[lo];
+  if (span <= 0) return w.times[lo];
+  return w.times[lo] + (w.times[lo + 1] - w.times[lo]) * ((p - w.cum[lo]) / span);
+}
+
+/** UTC 時刻 → 播放進度。點照片跳到那個時間點用的 */
+function progressAtTime(w: TimeWarp, t: number): number {
+  const k = w.times.length;
+  if (k === 0 || !Number.isFinite(t)) return 0;
+  if (t <= w.times[0]) return 0;
+  if (t >= w.times[k - 1]) return w.cum[k - 1];
+  let lo = 0;
+  let hi = k - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (w.times[mid] <= t) lo = mid; else hi = mid - 1;
+  }
+  const dt = w.times[lo + 1] - w.times[lo];
+  const f = dt > 0 ? (t - w.times[lo]) / dt : 0;
+  return w.cum[lo] + (w.cum[lo + 1] - w.cum[lo]) * f;
+}
+
+/** 某一段時間裡的隊形。groups 裡是 members 陣列的索引，只收兩人以上的組 */
+interface ConvoyFrame {
+  t: number;
+  groups: number[][];
+}
+
+/**
+ * 逐時刻算同行，**先算完整條時間軸再存起來**。
+ *
+ * 不能在播放時當場算：遲滯要看「靠近／分開持續了多久」，那是一路累積下來的狀態，
+ * 拖時間軸跳著看的話當場算會得到跟順著播完全不同的隊形。
+ *
+ * 只在隊形**改變**的時刻記一筆 —— 遲滯本來就讓隊形很少變，一整天大概幾十筆，
+ * 播放時二分找一下就好，不必每個關鍵時刻都存一份。
+ *
+ * 成本 K × C(N,2)：家庭 N ≤ 5 就是每個時刻最多 10 次距離計算，
+ * 兩萬個時刻也才二十萬次，資料變動時算一次而已。
+ */
+function buildConvoys(members: MemberPath[], times: Float64Array): ConvoyFrame[] {
+  const n = members.length;
+  if (n < 2 || times.length === 0) return [];
+
+  const pairs = [];
+  for (let a = 0; a < n; a++) {
+    for (let b = a + 1; b < n; b++) {
+      pairs.push({ a, b, together: false, closeSince: NaN, farSince: NaN });
+    }
+  }
+
+  const out: ConvoyFrame[] = [];
+  const pos = new Array<[number, number] | null>(n);
+  // null 一定跟第一次算出來的 key（字串）不一樣，所以起手必定記一筆
+  let lastKey: string | null = null;
+
+  for (let i = 0; i < times.length; i++) {
+    const t = times[i];
+    for (let m = 0; m < n; m++) pos[m] = posAt(members[m].nodes, t);
+
+    for (const pr of pairs) {
+      const pa = pos[pr.a];
+      const pb = pos[pr.b];
+      if (!pa || !pb) {
+        // 有一方這時候不在畫面上就不算同行，而且遲滯狀態整個重來 ——
+        // 他再出現時是「重新遇到」，該重新等滿 120 秒
+        pr.together = false;
+        pr.closeSince = NaN;
+        pr.farSince = NaN;
+        continue;
+      }
+      const close = metersBetween(pa[1], pa[0], pb[1], pb[0]) <= CONVOY_RADIUS_M;
+      if (pr.together) {
+        if (close) {
+          pr.farSince = NaN;
+        } else {
+          if (!Number.isFinite(pr.farSince)) pr.farSince = t;
+          if (t - pr.farSince >= CONVOY_PART_MS) {
+            pr.together = false;
+            pr.closeSince = NaN;
+            pr.farSince = NaN;
+          }
+        }
+      } else if (close) {
+        if (!Number.isFinite(pr.closeSince)) pr.closeSince = t;
+        if (t - pr.closeSince >= CONVOY_JOIN_MS) {
+          pr.together = true;
+          pr.closeSince = NaN;
+          pr.farSince = NaN;
+        }
+      } else {
+        pr.closeSince = NaN;
+      }
+    }
+
+    // 同行是可以傳遞的：A 跟 B 同車、B 跟 C 同車，三個人就是同一台。
+    // 併集找連通分量（n 很小，路徑壓縮就夠了，不必按秩合併）
+    const parent = Array.from({ length: n }, (_, x) => x);
+    const find = (x: number): number => (parent[x] === x ? x : (parent[x] = find(parent[x])));
+    for (const pr of pairs) {
+      if (!pr.together) continue;
+      const ra = find(pr.a);
+      const rb = find(pr.b);
+      if (ra !== rb) parent[ra] = rb;
+    }
+    const byRoot = new Map<number, number[]>();
+    for (let m = 0; m < n; m++) {
+      if (!pos[m]) continue;
+      const r = find(m);
+      const list = byRoot.get(r);
+      if (list) list.push(m); else byRoot.set(r, [m]);
+    }
+    const groups = Array.from(byRoot.values()).filter((g) => g.length >= 2);
+    const key = groups.map((g) => g.join('+')).sort().join('|');
+    if (key !== lastKey) {
+      out.push({ t, groups });
+      lastKey = key;
+    }
+  }
+  return out;
+}
+
+/** 時間游標落在哪一個隊形上 */
+function convoyAt(frames: ConvoyFrame[], t: number): number[][] {
+  if (frames.length === 0 || !Number.isFinite(t) || t < frames[0].t) return [];
+  let lo = 0;
+  let hi = frames.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (frames[mid].t <= t) lo = mid; else hi = mid - 1;
+  }
+  return frames[lo].groups;
+}
+
+/** 播放列上的時間。多身分之後「第幾點／共幾點」沒有意義了 —— 每個人的點數不一樣 */
+function cursorLabel(t: number): string {
+  if (!Number.isFinite(t)) return '';
+  return new Date(t).toLocaleString([], {
+    month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+}
 
 /** 'YYYY-MM-DD HH:MM:SS' → 顯示用的短字串 */
 function shortTime(local: string): string {
@@ -433,20 +756,58 @@ const BADGE_TEXT: any = [
   ['to-string', ['get', 'pile']],
 ];
 
+/** 一條可以連起來的折線，以及它是誰走的（多身分足跡靠這個分色） */
+interface TrackLine {
+  /** 走這一段的人（TrackDay.user_id）。查不到就是 null，畫成預設色 */
+  userId: number | null;
+  line: [number, number][];
+}
+
 /**
  * 把軌跡點按「哪一天的第幾段」切成一條條折線。
  * 跨段不可以連線 —— 中間是關機或收不到訊號，接起來會憑空畫出一條沒走過的直線。
  * 資料本來就按時間遞增，這裡只做分組。
+ *
+ * `ownerByDay` 是給**衍生資料**用的退路：貼路結果存在 R2，讀回來的點沒有 user_id，
+ * 但它的 day_key 一定跟 D1 那批是同一個，所以拿 day_key 去問「這天是誰的」。
  */
-function groupLines(points: TrackPoint[] | undefined): [number, number][][] {
-  const groups = new Map<string, [number, number][]>();
+function groupLines(
+  points: TrackPoint[] | undefined,
+  ownerByDay?: Map<string, number>,
+): TrackLine[] {
+  const groups = new Map<string, TrackLine>();
   for (const p of points || []) {
     const key = segmentKey(p.day_key, p.seg);
-    const line = groups.get(key);
-    if (line) line.push([p.lng, p.lat]);
-    else groups.set(key, [[p.lng, p.lat]]);
+    const g = groups.get(key);
+    if (g) g.line.push([p.lng, p.lat]);
+    else {
+      groups.set(key, {
+        userId: p.user_id ?? ownerByDay?.get(p.day_key) ?? null,
+        line: [[p.lng, p.lat]],
+      });
+    }
   }
-  return Array.from(groups.values()).filter((line) => line.length >= 2);
+  return Array.from(groups.values()).filter((g) => g.line.length >= 2);
+}
+
+/**
+ * 依 userId 上色的 maplibre 運算式。給 line-color / circle-color 這類 paint 屬性用。
+ *
+ * 顏色寫進運算式而不是「一個人一個圖層」：圖層是在 map.on('load') 裡一次加完的，
+ * 成員數量會變（站長隨時可以加人），動態增刪圖層還要處理排序，
+ * 而 match 只是換一次 paint 屬性。
+ *
+ * 沒有任何成員資料時回一個純色字串 —— match 至少要一組標籤，硬湊一個假的
+ * 只會讓 maplibre 在 console 抱怨。
+ */
+function colorByUser(colors: Record<number, string> | undefined, fallback: string): any {
+  const entries = Object.entries(colors ?? {});
+  if (entries.length === 0) return fallback;
+  const expr: any[] = ['match', ['get', 'userId']];
+  for (const [id, hex] of entries) expr.push(Number(id), hex);
+  // feature 沒有 userId（舊資料、查不到擁有者的衍生資料）時落到這裡
+  expr.push(fallback);
+  return expr;
 }
 
 export default function FootprintMap({
@@ -457,13 +818,18 @@ export default function FootprintMap({
   showTrackLine = true,
   animateOn = 'track',
   timelineLines,
+  trackColors,
+  timelineColor = DEFAULT_TRACK_COLOR,
   focusPoint,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const rafRef = useRef<number | null>(null);
   // 地圖只建立一次，事件處理器會鎖住當時的 props。用 ref 讓它讀得到最新的資料
-  const pathRef = useRef<PathNode[]>([]);
+  const memberPathsRef = useRef<MemberPath[]>([]);
+  const convoysRef = useRef<ConvoyFrame[]>([]);
+  /** 把播放頭移到某個 UTC 時刻。點照片時用（見底下那個同步 warp 的效果） */
+  const seekRef = useRef<(t: number) => void>(() => {});
   const sortedRef = useRef<FootprintPoint[]>([]);
   const albumsRef = useRef<Album[]>([]);
   // 已經加進地圖的縮圖，以及正在下載中的。避免同一張重複抓，也用來擋住上限
@@ -479,8 +845,11 @@ export default function FootprintMap({
 
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(false);
-  // 走到第幾個點（浮點數，小數部分用來內插線段的最後一小截）
-  const [head, setHead] = useState(0);
+  /*
+   * 播放進度：**所有顯示中的人一共移動了多少公尺**，不是時間也不是點索引。
+   * 真正的時間游標由 timeAtProgress 換算出來（為什麼要這樣繞，見 TimeWarp）。
+   */
+  const [progress, setProgress] = useState(0);
   const [speed, setSpeed] = useState(1);
 
   const [editing, setEditing] = useState(false);
@@ -500,11 +869,33 @@ export default function FootprintMap({
   // 只影響 photos 這個 source 怎麼畫。動畫路徑、鏡頭框景、點擊後的資料一律走真實座標
   const piles = useMemo(() => buildPiles(sorted, !editing), [sorted, editing]);
 
-  const trackLines = useMemo(() => groupLines(tracks), [tracks]);
+  /*
+   * 每一天是誰的。D1 那批軌跡點自己就帶 user_id，但貼路結果是從 R2 讀回來的，
+   * 上面只有 day_key —— 用這張表把擁有者補回去，那條紫線才知道要畫成誰的顏色。
+   *
+   * 用 tracks 而不是另外要一份 TrackDay：貼路是從 tracks 的日子衍生出來的，
+   * 兩邊的 day_key 集合本來就一樣，多傳一個 prop 只是多一條要維護的線。
+   */
+  const ownerByDay = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const p of tracks || []) if (p.user_id != null) m.set(p.day_key, p.user_id);
+    return m;
+  }, [tracks]);
+
+  /**
+   * 某個人的顏色。圖層大多用 colorByUser 那個 match 運算式讓 maplibre 自己挑，
+   * 但小碟的顏色是我們自己一顆一顆算出來寫進 feature 的，那裡需要真的字串
+   */
+  const colorFor = useCallback(
+    (userId: number | null) => (userId != null && trackColors?.[userId]) || DEFAULT_TRACK_COLOR,
+    [trackColors],
+  );
+
+  const trackLines = useMemo(() => groupLines(tracks, ownerByDay), [tracks, ownerByDay]);
 
   // 原始軌跡與貼路軌跡的線，分組規則跟 trackLines 一樣
-  const rawLines = useMemo(() => groupLines(rawTracks), [rawTracks]);
-  const matchedLines = useMemo(() => groupLines(matchedTracks), [matchedTracks]);
+  const rawLines = useMemo(() => groupLines(rawTracks, ownerByDay), [rawTracks, ownerByDay]);
+  const matchedLines = useMemo(() => groupLines(matchedTracks, ownerByDay), [matchedTracks, ownerByDay]);
 
   /*
    * 兩趟之間的虛線橋接。
@@ -517,7 +908,7 @@ export default function FootprintMap({
    * 只接同一天、編號相鄰、而且兩端夠近的兩段。seg 就是「第幾趟」（runMatch 依
    * 時間順序給的），所以照 seg 排序就是行進順序。
    */
-  const matchedBridges = useMemo<[number, number][][]>(() => {
+  const matchedBridges = useMemo<TrackLine[]>(() => {
     const byDay = new Map<string, Map<number, TrackPoint[]>>();
     for (const p of matchedTracks || []) {
       let bySeg = byDay.get(p.day_key);
@@ -527,8 +918,8 @@ export default function FootprintMap({
       else bySeg.set(p.seg, [p]);
     }
 
-    const out: [number, number][][] = [];
-    for (const bySeg of Array.from(byDay.values())) {
+    const out: TrackLine[] = [];
+    for (const [dayKey, bySeg] of Array.from(byDay.entries())) {
       const segs = Array.from(bySeg.keys()).sort((a, b) => a - b);
       for (let i = 1; i < segs.length; i++) {
         const prev = bySeg.get(segs[i - 1])!;
@@ -536,11 +927,14 @@ export default function FootprintMap({
         const b = bySeg.get(segs[i])![0];
         // 太遠就讓它斷著。那不是「停下來一下」，是中間有一段我們根本沒有的路
         if (metersBetween(a.lat, a.lng, b.lat, b.lng) > MATCHED_BRIDGE_MAX_M) continue;
-        out.push([[a.lng, a.lat], [b.lng, b.lat]]);
+        out.push({
+          userId: a.user_id ?? ownerByDay.get(dayKey) ?? null,
+          line: [[a.lng, a.lat], [b.lng, b.lat]],
+        });
       }
     }
     return out;
-  }, [matchedTracks]);
+  }, [matchedTracks, ownerByDay]);
 
   // 動畫沿著哪一份軌跡跑。選了某一份卻還沒載到資料時退回濃縮版 ——
   // 否則切過去的那一瞬間動畫會整個空掉，看起來像壞了
@@ -581,7 +975,11 @@ export default function FootprintMap({
       const next = list[i + 1];
       const sameSeg = next && next.day_key === list[i].day_key && next.seg === list[i].seg;
       const t1 = sameSeg ? Date.parse(next.t_utc) : t0 + sec * 1000;
-      out.push({ t0, t1: Number.isFinite(t1) ? t1 : t0 + sec * 1000, lng: list[i].lng, lat: list[i].lat, sec });
+      out.push({
+        t0, t1: Number.isFinite(t1) ? t1 : t0 + sec * 1000,
+        lng: list[i].lng, lat: list[i].lat, sec,
+        userId: list[i].user_id ?? null,
+      });
     }
     return out;
   }, [tracks]);
@@ -599,11 +997,17 @@ export default function FootprintMap({
   // 手機軌跡是密集的實測位置，照片位置是同一段行程的稀疏取樣，兩者本來就該是同一條線。
   const path = useMemo<PathNode[]>(() => {
     // group 為 null 代表「不會自己造成斷點」—— 照片會接上它時間上落在的那一段軌跡
-    const raw: { t: number; lng: number; lat: number; group: string | null }[] = [];
+    const raw: { t: number; lng: number; lat: number; group: string | null; user: number | null }[] = [];
 
     for (const p of animTracks) {
       const t = Date.parse(p.t_utc);
-      if (Number.isFinite(t)) raw.push({ t, lng: p.lng, lat: p.lat, group: segmentKey(p.day_key, p.seg) });
+      if (Number.isFinite(t)) {
+        raw.push({
+          t, lng: p.lng, lat: p.lat,
+          group: segmentKey(p.day_key, p.seg),
+          user: p.user_id ?? ownerByDay.get(p.day_key) ?? null,
+        });
+      }
     }
 
     if (connectPhotos) {
@@ -621,7 +1025,9 @@ export default function FootprintMap({
           (s) => t >= s.t0 && t <= s.t1 && metersBetween(p.lat, p.lng, s.lat, s.lng) <= STAY_SNAP_M,
         );
         if (insideStay) continue;
-        raw.push({ t, lng: p.lng, lat: p.lat, group: null });
+        // 照片沒有主人可言（誰上傳的跟「那天是誰在走」是兩件事），
+        // 底下那個迴圈會讓它沿用時間上落在的那一段軌跡的主人
+        raw.push({ t, lng: p.lng, lat: p.lat, group: null, user: null });
       }
     }
 
@@ -632,94 +1038,86 @@ export default function FootprintMap({
     // 結果那張照片就把兩段本來該斷開的軌跡接成一條沒走過的直線。
     const out: PathNode[] = [];
     let lastGroup: string | null = null;
+    let lastUser: number | null = null;
     for (let i = 0; i < raw.length; i++) {
       const n = raw[i];
       const prev = i > 0 ? raw[i - 1] : null;
       const segChanged = n.group !== null && lastGroup !== null && n.group !== lastGroup;
-      if (n.group !== null) lastGroup = n.group;
+      if (n.group !== null) { lastGroup = n.group; lastUser = n.user; }
       const tooFar = prev !== null && n.t - prev.t > MAX_GAP_MS;
       out.push({
         t: n.t, lng: n.lng, lat: n.lat,
         breakBefore: prev !== null && (segChanged || tooFar),
         // 照片節點沿用它落在的那一段的交通工具，不然畫面上的圖示會一路閃爍
         segKey: n.group ?? lastGroup,
+        // 主人也一樣往後傳遞。照片自己沒有主人，跟著它落在的那段軌跡走，
+        // 才不會在多身分播放時被分到一條沒人的線上
+        userId: n.group !== null ? n.user : lastUser,
       });
     }
     return out;
-  }, [animTracks, sorted, connectPhotos, stays]);
-
-  const maxIndex = Math.max(path.length - 1, 0);
+  }, [animTracks, sorted, connectPhotos, stays, ownerByDay]);
 
   /*
-   * 路徑的累積長度（公尺）。動畫靠它跑出「一致的速度」。
-   *
-   * head 直接依節點數前進的話，速度是「每秒幾個節點」而不是「每秒幾公尺」——
-   * GPS 是按時間取樣的，塞車時一分鐘擠十幾個點、高速公路上一分鐘拉開一公里，
-   * 同樣的節點速率畫出來就是走路慢吞吞、開車用瞬移的。改成沿著弧長前進，
-   * 不管當時在幹嘛，飛碟在畫面上都是同一個速度。
-   *
-   * 斷點那一段長度算 0：那段路根本沒走過（換軌跡段或錄製中斷），
-   * 不該分到任何播放時間，飛碟會直接接到下一段的起點。
+   * 把混在一起的 path 拆成「每個人自己的一條」。播放的一切都建立在這上面 ——
+   * 位置內插、同行判定、線的生長，都是逐人算的。
    */
-  const arc = useMemo(() => {
-    const cum = new Float64Array(path.length);
-    for (let i = 1; i < path.length; i++) {
-      const a = path[i - 1];
-      const b = path[i];
-      cum[i] = cum[i - 1] + (b.breakBefore ? 0 : metersBetween(a.lat, a.lng, b.lat, b.lng));
+  const memberPaths = useMemo<MemberPath[]>(() => {
+    const by = new Map<number | null, PathNode[]>();
+    for (const n of path) {
+      const list = by.get(n.userId);
+      if (list) list.push(n); else by.set(n.userId, [n]);
     }
-    return cum;
+    const out: MemberPath[] = [];
+    for (const [userId, nodes] of Array.from(by.entries())) {
+      /*
+       * breakBefore 一定要在這裡重算。合併陣列上的那個值是「跟前一個節點（可能是別人的）
+       * 之間能不能連」，把別人抽掉之後前一個節點換人了，原本的答案就不再成立 ——
+       * 直接沿用會在兩個人交錯取樣的日子裡到處畫出假的斷線。
+       */
+      out.push({
+        userId,
+        nodes: nodes.map((n, i) => {
+          if (i === 0) return { ...n, breakBefore: false };
+          const p = nodes[i - 1];
+          const segChanged = n.segKey !== null && p.segKey !== null && n.segKey !== p.segKey;
+          return { ...n, breakBefore: segChanged || n.t - p.t > MAX_GAP_MS };
+        }),
+      });
+    }
+    // 顏色的 match 運算式與同行分組都吃索引，排序固定一點，畫面才不會因為
+    // Map 的插入順序在資料重抓後跳來跳去
+    out.sort((a, b) => (a.userId ?? 0) - (b.userId ?? 0));
+    return out;
   }, [path]);
-  const totalDist = arc.length > 0 ? arc[arc.length - 1] : 0;
 
-  /** head（浮點索引）→ 已經走了幾公尺 */
-  const distFromHead = useCallback((h: number) => {
-    if (arc.length === 0) return 0;
-    const i = Math.min(Math.max(Math.floor(h), 0), arc.length - 1);
-    const frac = Math.min(Math.max(h - i, 0), 1);
-    const next = i + 1 < arc.length ? arc[i + 1] : arc[i];
-    return arc[i] + (next - arc[i]) * frac;
-  }, [arc]);
+  /** 播放進度 ↔ 時間的換算表（見 buildWarp） */
+  const warp = useMemo(() => buildWarp(memberPaths), [memberPaths]);
+  /** 整條時間軸上的隊形變化（見 buildConvoys） */
+  const convoys = useMemo(() => buildConvoys(memberPaths, warp.times), [memberPaths, warp]);
 
-  /**
-   * 走了幾公尺 → head。
-   *
-   * 二分找「最後一個累積長度 <= d 的節點」。取最後一個是刻意的：
-   * 停留點與斷點的長度是 0，會有一串累積長度相同的節點，取最後一個才不會卡在原地。
-   */
-  const headFromDist = useCallback((d: number) => {
-    const n = arc.length;
-    if (n === 0) return 0;
-    if (d <= 0) return 0;
-    if (d >= arc[n - 1]) return n - 1;
-    let lo = 0;
-    let hi = n - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (arc[mid] <= d) lo = mid; else hi = mid - 1;
-    }
-    const span = lo + 1 < n ? arc[lo + 1] - arc[lo] : 0;
-    return span > 0 ? lo + (d - arc[lo]) / span : lo;
-  }, [arc]);
-  // head 是動畫算出來的浮點數，會被拿來當陣列索引，所以夾在合法範圍內再用。
-  // 少了下界的話，播放起頭那一瞬間的負值會變成 path[-1]
-  const headIndex = Number.isFinite(head)
-    ? Math.min(Math.max(Math.floor(head), 0), maxIndex)
-    : 0;
-  const headTime = path[headIndex]?.t ?? null;
+  /** 現在播到哪個 UTC 時刻。畫面上的一切都是從這個數字推出來的 */
+  const cursorT = useMemo(() => timeAtProgress(warp, progress), [warp, progress]);
+  const atEnd = warp.total <= 0 || progress >= warp.total;
 
   // 動畫走到哪個時間，就顯示那個時間之前最後拍的那張
   const current = useMemo(() => {
-    if (headTime === null) return undefined;
+    if (!Number.isFinite(cursorT)) return undefined;
     let found: FootprintPoint | undefined;
     for (const x of photoNodes) {
-      if (x.t > headTime) break;
+      if (x.t > cursorT) break;
       found = x.p;
     }
     return found;
-  }, [photoNodes, headTime]);
+  }, [photoNodes, cursorT]);
 
-  useEffect(() => { pathRef.current = path; }, [path]);
+  useEffect(() => { memberPathsRef.current = memberPaths; }, [memberPaths]);
+  useEffect(() => { convoysRef.current = convoys; }, [convoys]);
+  // 點照片要跳到那個時間點，但點擊的 handler 綁在地圖上只跑一次，
+  // 拿不到當下的 warp。用 ref 轉一手，讓它永遠打到最新的換算表
+  useEffect(() => {
+    seekRef.current = (t: number) => setProgress(progressAtTime(warp, t));
+  }, [warp]);
   useEffect(() => { sortedRef.current = sorted; }, [sorted]);
   useEffect(() => { albumsRef.current = albums || []; }, [albums]);
   useEffect(() => { tracksRef.current = tracks || []; }, [tracks]);
@@ -758,11 +1156,12 @@ export default function FootprintMap({
         type: 'line',
         source: 'timeline-track',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
-        // 桃紅。原本是灰藍 #64748b，跟 OpenFreeMap 底圖的道路與行政區界幾乎同色，
-        // 十二年的足跡疊上去看起來只是底圖髒了。桃紅在這張底圖上沒有任何東西在用，
-        // 也跟另外三層（綠／橘／紫）分得開。
-        // 仍然刻意細而淡：單獨一條不搶戲，重疊多的地方自己會浮出來
-        paint: { 'line-color': '#db2777', 'line-width': 1.1, 'line-opacity': 0.45 },
+        // 顏色跟著這個人自己的軌跡色走（多身分之後不再固定桃紅 —— 那個顏色
+        // 現在是調色盤裡的一格，會跟挑到它的人撞色）。
+        // 靠**細而淡**跟同色的貼路線分開：那條是 3.5 寬 / 0.75 不透明，
+        // 這條單獨一條不搶戲，重疊多的地方自己會浮出來。
+        // 實際的顏色由底下那個 paint 效果覆蓋，這裡只是還沒拿到成員資料時的起始值
+        paint: { 'line-color': DEFAULT_TRACK_COLOR, 'line-width': 1, 'line-opacity': 0.35 },
       });
 
       // 原始軌跡的對照底線，排在 gps-track 之前才會墊在它下面 ——
@@ -796,9 +1195,10 @@ export default function FootprintMap({
         type: 'line',
         source: 'matched-track',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
-        // 紫色粗實線：畫的是道路本身，比原始軌跡的虛線更該被看見
+        // 粗實線：畫的是道路本身，比原始軌跡的虛線更該被看見。
+        // 顏色由「依人上色」那個效果覆蓋（原本固定紫色，也就是現在的預設色）
         paint: {
-          'line-color': '#7c3aed',
+          'line-color': DEFAULT_TRACK_COLOR,
           'line-width': 3.5,
           'line-opacity': 0.75,
         },
@@ -816,7 +1216,8 @@ export default function FootprintMap({
         source: 'matched-bridge',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
         paint: {
-          'line-color': '#7c3aed',
+          // 同上，由「依人上色」覆蓋 —— 橋接一定要跟它接起來的實線同色
+          'line-color': DEFAULT_TRACK_COLOR,
           'line-width': 2,
           'line-opacity': 0.5,
           'line-dasharray': [1.5, 1.5],
@@ -833,7 +1234,11 @@ export default function FootprintMap({
         type: 'line',
         source: 'gps-track',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: { 'line-color': '#16a34a', 'line-width': 2.5, 'line-opacity': 0.45 },
+        // 顏色由「依人上色」那個效果覆蓋（原本固定綠色）。
+        // ⚠️ 這一層跟貼路線現在會是同一個顏色 —— 兩條同時打開是拿來比對
+        // 「貼路貼準了沒」的除錯用法，那時得靠寬度（2.5 vs 3.5）分辨。
+        // 這一頁預設只畫貼路線（SHOW_TRACK_LINE = false），平常碰不到
+        paint: { 'line-color': DEFAULT_TRACK_COLOR, 'line-width': 2.5, 'line-opacity': 0.45 },
       });
 
       // 停留點：待越久畫越大。沒有這一層的話，濃縮完的軌跡看起來只是一條線
@@ -845,10 +1250,11 @@ export default function FootprintMap({
         source: 'stays',
         paint: {
           'circle-radius': ['step', ['get', 'sec'], 7, 1800, 10, 7200, 14],
-          'circle-color': '#16a34a',
+          // 填色與外框都由「依人上色」那個效果覆蓋（原本固定綠色）
+          'circle-color': DEFAULT_TRACK_COLOR,
           'circle-opacity': 0.22,
           'circle-stroke-width': 2,
-          'circle-stroke-color': '#16a34a',
+          'circle-stroke-color': DEFAULT_TRACK_COLOR,
           'circle-stroke-opacity': 0.7,
         },
       });
@@ -868,9 +1274,11 @@ export default function FootprintMap({
         paint: { 'text-color': '#15803d', 'text-halo-color': '#ffffff', 'text-halo-width': 1.5 },
       });
 
+      // 多身分之後這裡是 FeatureCollection 而不是單一條線：每個人各自一條（甚至多條，
+      // 中斷會把一個人的路切開），每條帶著 userId 讓 match 運算式挑顏色
       map.addSource('route', {
         type: 'geojson',
-        data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } },
+        data: { type: 'FeatureCollection', features: [] },
       });
       // 路線畫兩層：底下較寬的淡色當光暈，上面實線當主體
       map.addLayer({
@@ -1084,13 +1492,34 @@ export default function FootprintMap({
         source: 'vehicle',
         layout: {
           'icon-image': 'mover',
-          'icon-size': 1,
+          // 母船（同行合體）比獨行的大一號，見 MOTHERSHIP_SCALE
+          'icon-size': ['get', 'scale'],
           'icon-allow-overlap': true,
           'icon-ignore-placement': true,
           // 圖的底部中央是光束落地點，錨在那裡才會「碟身浮在上面、光束打在軌跡上」
           'icon-anchor': 'bottom',
           // 刻意不隨行進方向旋轉：飛碟沒有明確的頭尾，轉了只是抖動
           'icon-rotation-alignment': 'viewport',
+        },
+      });
+
+      /*
+       * 母船上的小碟：合體時，每個人一顆自己顏色的圓點繞著碟身轉。
+       *
+       * 加在 vehicle-marker 後面，才會疊在碟身上而不是被它蓋掉。
+       * 用圓點而不是縮小的飛碟圖：那個圖是 80 CSS px 的動畫 canvas，縮到十幾 px
+       * 只會糊成一團色塊，反而看不出是幾個人。
+       */
+      map.addSource('heads', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+      map.addLayer({
+        id: 'head-dots',
+        type: 'circle',
+        source: 'heads',
+        paint: {
+          'circle-radius': 5,
+          'circle-color': ['get', 'color'],
+          'circle-stroke-width': 1.6,
+          'circle-stroke-color': '#ffffff',
         },
       });
 
@@ -1260,12 +1689,9 @@ export default function FootprintMap({
 
         const point = sortedRef.current.find((p) => p.id === id);
         if (point) {
-          // 路徑節點不再等於照片，得用時間找到動畫上對應的位置
+          // 播放頭是時間游標，照片本來就有時間，直接跳過去
           const t = photoUtcMs(point);
-          if (t !== null && pathRef.current.length > 0) {
-            const idx = pathRef.current.findIndex((n) => n.t >= t);
-            setHead(idx < 0 ? pathRef.current.length - 1 : idx);
-          }
+          if (t !== null) seekRef.current(t);
           onSelectPhoto?.(point);
         }
       };
@@ -1333,9 +1759,51 @@ export default function FootprintMap({
 
   // 路徑換了就把播放頭移到終點，維持「預設看到完整路線」的樣子
   useEffect(() => {
-    setHead(path.length > 0 ? path.length - 1 : 0);
+    setProgress(warp.total);
     setPlaying(false);
-  }, [path]);
+  }, [warp]);
+
+  /*
+   * --- 依人上色 ---
+   *
+   * 圖層是在 map.on('load') 裡一次加完的，那時還沒有成員資料（`/api/track-members`
+   * 是另一趟請求），而且站長隨時可以加人、家人隨時可以換色。所以顏色不寫死在
+   * addLayer 裡，改成拿到資料之後換一次 paint 屬性。
+   *
+   * 停留圈的外框與填色都跟著走 —— 只換一個會變成「紫圈藍邊」。
+   * 停留的字（stay-label）維持深綠不動：那是標籤不是軌跡，跟著人變色反而難讀。
+   */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const expr = colorByUser(trackColors, DEFAULT_TRACK_COLOR);
+    map.setPaintProperty('gps-track-line', 'line-color', expr);
+    map.setPaintProperty('matched-track-line', 'line-color', expr);
+    map.setPaintProperty('matched-bridge-line', 'line-color', expr);
+    map.setPaintProperty('stay-points', 'circle-color', expr);
+    map.setPaintProperty('stay-points', 'circle-stroke-color', expr);
+  }, [trackColors, ready]);
+
+  /*
+   * 播放路線的顏色。只有**同框不只一個人**時才依人上色。
+   *
+   * 單人時維持原本那個藍：這一層是「動畫走過的地方」，跟底下那條靜態軌跡刻意不同色，
+   * 才看得出播放頭走到哪了。多人時分辨「誰是誰」比較重要，才讓它跟著各人的顏色。
+   */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const expr = memberPaths.length > 1 ? colorByUser(trackColors, '#2563eb') : '#2563eb';
+    map.setPaintProperty('route-glow', 'line-color', expr);
+    map.setPaintProperty('route-line', 'line-color', expr);
+  }, [trackColors, memberPaths.length, ready]);
+
+  // Google 紀念層是頁面切好的線，帶不了 userId，所以單獨給一個色（見 timelineColor）
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    map.setPaintProperty('timeline-track-line', 'line-color', timelineColor);
+  }, [timelineColor, ready]);
 
   // --- 軌跡 ---
   useEffect(() => {
@@ -1344,9 +1812,9 @@ export default function FootprintMap({
     const src = map.getSource('gps-track') as GeoJSONSource | undefined;
     src?.setData({
       type: 'FeatureCollection',
-      features: (showTrackLine ? trackLines : []).map((line) => ({
+      features: (showTrackLine ? trackLines : []).map(({ userId, line }) => ({
         type: 'Feature',
-        properties: {},
+        properties: { userId },
         geometry: { type: 'LineString', coordinates: line },
       })),
     });
@@ -1375,8 +1843,10 @@ export default function FootprintMap({
     const src = map.getSource('raw-track') as GeoJSONSource | undefined;
     src?.setData({
       type: 'FeatureCollection',
-      features: (showRawLine ? rawLines : []).map((line) => ({
+      features: (showRawLine ? rawLines : []).map(({ line }) => ({
         type: 'Feature',
+        // 原始軌跡是「濃縮前長什麼樣」的對照層，不分人上色 ——
+        // 它跟濃縮後那條永遠是同一批點，兩條都依人分色反而分不出誰是誰
         properties: {},
         geometry: { type: 'LineString', coordinates: line },
       })),
@@ -1390,9 +1860,9 @@ export default function FootprintMap({
     const src = map.getSource('matched-track') as GeoJSONSource | undefined;
     src?.setData({
       type: 'FeatureCollection',
-      features: (showMatchedLine ? matchedLines : []).map((line) => ({
+      features: (showMatchedLine ? matchedLines : []).map(({ userId, line }) => ({
         type: 'Feature',
-        properties: {},
+        properties: { userId },
         geometry: { type: 'LineString', coordinates: line },
       })),
     });
@@ -1405,9 +1875,9 @@ export default function FootprintMap({
     const src = map.getSource('matched-bridge') as GeoJSONSource | undefined;
     src?.setData({
       type: 'FeatureCollection',
-      features: (showMatchedLine ? matchedBridges : []).map((line) => ({
+      features: (showMatchedLine ? matchedBridges : []).map(({ userId, line }) => ({
         type: 'Feature',
-        properties: {},
+        properties: { userId },
         geometry: { type: 'LineString', coordinates: line },
       })),
     });
@@ -1424,7 +1894,7 @@ export default function FootprintMap({
       // 綠線關掉時單獨留著只會變成一堆沒有來由的圈
       features: (showTrackLine ? stays : []).map((s) => ({
         type: 'Feature',
-        properties: { sec: s.sec, label: humanDuration(s.sec) },
+        properties: { sec: s.sec, label: humanDuration(s.sec), userId: s.userId },
         geometry: { type: 'Point', coordinates: [s.lng, s.lat] },
       })),
     });
@@ -1492,76 +1962,150 @@ export default function FootprintMap({
       bounds = bounds === null ? new LngLatBounds(c, c) : bounds.extend(c);
     };
     for (const c of coords) extend(c);
-    for (const line of lines) for (const c of line) extend(c);
+    for (const { line } of lines) for (const c of line) extend(c);
     for (const line of timelineLines ?? []) for (const c of line) extend(c);
     if (bounds === null) return;
 
     map.fitBounds(bounds, { padding: 60, maxZoom: 13, duration: 600 });
   }, [coords, trackLines, matchedLines, timelineLines, showTrackLine, showMatchedLine, focusPoint, ready]);
 
-  // --- 路線隨 head 生長 ---
+  // --- 路線隨時間游標生長 ---
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !ready) return;
     const src = map.getSource('route') as GeoJSONSource | undefined;
+    const vehicleSrc = map.getSource('vehicle') as GeoJSONSource | undefined;
+    const headsSrc = map.getSource('heads') as GeoJSONSource | undefined;
     if (!src) return;
 
-    const whole = Math.floor(head);
-    const frac = head - whole;
+    const multi = memberPaths.length > 1;
+    const lineFeatures: any[] = [];
+    /** 每個人現在在哪。null＝這個時候他不該出現（沒資料／中斷中） */
+    const pos: ([number, number] | null)[] = [];
 
-    // 走過的部分要切成多條線 —— 遇到斷點（換軌跡段、或隔太久）就另起一條，
-    // 用單一 LineString 會把中間那段沒走過的路憑空連起來
-    const lines: [number, number][][] = [];
-    let cur: [number, number][] = [];
-    for (let i = 0; i <= whole && i < path.length; i++) {
-      if (path[i].breakBefore && cur.length > 0) {
-        lines.push(cur);
+    for (const m of memberPaths) {
+      const cursorPos = posAt(m.nodes, cursorT);
+      pos.push(cursorPos);
+
+      // 走過的部分要切成多條線 —— 遇到斷點（換軌跡段、或隔太久）就另起一條，
+      // 用單一 LineString 會把中間那段沒走過的路憑空連起來
+      let cur: [number, number][] = [];
+      const flush = () => {
+        if (cur.length >= 2) {
+          lineFeatures.push({
+            type: 'Feature',
+            properties: { userId: m.userId },
+            geometry: { type: 'LineString', coordinates: cur },
+          });
+        }
         cur = [];
+      };
+      for (const nd of m.nodes) {
+        if (nd.t > cursorT) break;
+        if (nd.breakBefore) flush();
+        cur.push([nd.lng, nd.lat]);
       }
-      cur.push([path[i].lng, path[i].lat]);
+      /*
+       * 內插出最後一小截，線條才會平滑前進而不是一格一格跳。
+       * posAt 已經處理過「下一段是斷點就不內插」，這裡只要確認它真的落在
+       * 剛畫完的那一截後面（游標在資料範圍外時是 null，那就什麼都不接）
+       */
+      if (cursorPos && cur.length > 0) {
+        const tail = cur[cur.length - 1];
+        if (cursorPos[0] !== tail[0] || cursorPos[1] !== tail[1]) cur.push(cursorPos);
+      }
+      flush();
     }
-    // 內插出最後一小截，線條才會平滑前進而不是一格一格跳。
-    // 下一個節點如果是斷點就不能內插，那一段本來就沒有連線
-    const a = path[whole];
-    const b = path[whole + 1];
-    if (frac > 0 && a && b && !b.breakBefore) {
-      cur.push([a.lng + (b.lng - a.lng) * frac, a.lat + (b.lat - a.lat) * frac]);
-    }
-    if (cur.length > 0) lines.push(cur);
 
-    src.setData({
-      type: 'FeatureCollection',
-      features: lines
-        .filter((l) => l.length >= 2)
-        .map((l) => ({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: l } })),
-    });
+    src.setData({ type: 'FeatureCollection', features: lineFeatures });
 
-    // 飛碟停在路線頭端，跟線一起前進
-    const vehicleSrc = map.getSource('vehicle') as GeoJSONSource | undefined;
-    const headPos = cur.length > 0 ? cur[cur.length - 1] : null;
-    if (vehicleSrc) {
-      vehicleSrc.setData({
-        type: 'FeatureCollection',
-        features: headPos ? [{
+    /*
+     * 飛碟：同行的人合體成一台大的，各自走的各開各的。
+     *
+     * 合體時碟身畫在那一群人的形心上，每人一顆自己顏色的小圓點繞著碟身轉 ——
+     * 「大飛碟帶小飛碟」。單人時這整段會退化成「一台 scale 1 的飛碟」，
+     * 也就是改版前的樣子，一個人的站台完全看不出差別。
+     */
+    const ufoFeatures: any[] = [];
+    const dotFeatures: any[] = [];
+    const inConvoy = new Set<number>();
+    const orbitAngle = (performance.now() / 1000 / SAUCER_ORBIT_SEC) * Math.PI * 2;
+
+    for (const group of convoyAt(convoys, cursorT)) {
+      const present = group.filter((i) => pos[i]);
+      if (present.length < 2) continue;
+      for (const i of present) inConvoy.add(i);
+
+      let lng = 0;
+      let lat = 0;
+      for (const i of present) { lng += pos[i]![0]; lat += pos[i]![1]; }
+      const center: [number, number] = [lng / present.length, lat / present.length];
+      ufoFeatures.push({
+        type: 'Feature',
+        properties: { scale: MOTHERSHIP_SCALE },
+        geometry: { type: 'Point', coordinates: center },
+      });
+
+      /*
+       * 小碟的位置只能用螢幕座標算：圓點圖層沒有「每個 feature 各自位移」的辦法
+       * （icon-translate 是整層共用的），所以把形心投影成像素、在像素上排一圈、
+       * 再投影回經緯度。反正播放中本來就每幀重畫一次，不多花什麼。
+       */
+      const cpx = map.project(center);
+      present.forEach((i, k) => {
+        const ang = orbitAngle + (k / present.length) * Math.PI * 2;
+        const ll = map.unproject([
+          cpx.x + Math.cos(ang) * SAUCER_ORBIT_RX * MOTHERSHIP_SCALE,
+          cpx.y + SAUCER_ORBIT_CY * MOTHERSHIP_SCALE
+            + Math.sin(ang) * SAUCER_ORBIT_RX * SAUCER_ORBIT_RY_RATIO * MOTHERSHIP_SCALE,
+        ]);
+        dotFeatures.push({
           type: 'Feature',
-          properties: {},
-          geometry: { type: 'Point', coordinates: headPos },
-        }] : [],
+          properties: { color: colorFor(memberPaths[i].userId) },
+          geometry: { type: 'Point', coordinates: [ll.lng, ll.lat] },
+        });
       });
     }
+
+    for (let i = 0; i < memberPaths.length; i++) {
+      const p = pos[i];
+      if (!p || inConvoy.has(i)) continue;
+      ufoFeatures.push({
+        type: 'Feature',
+        properties: { scale: 1 },
+        geometry: { type: 'Point', coordinates: p },
+      });
+      // 只有一個人在場時不必標色點 —— 那顆點不回答任何問題，只是擋住光束落地處
+      if (multi) {
+        dotFeatures.push({
+          type: 'Feature',
+          properties: { color: colorFor(memberPaths[i].userId) },
+          geometry: { type: 'Point', coordinates: p },
+        });
+      }
+    }
+
+    vehicleSrc?.setData({ type: 'FeatureCollection', features: ufoFeatures });
+    headsSrc?.setData({ type: 'FeatureCollection', features: dotFeatures });
 
     /*
      * 跟拍：每一幀都把鏡頭對到飛碟目前的位置，讓它固定在畫面正中央。
      *
      * 用 setCenter 而不是 easeTo —— easeTo 是「用 N 毫秒滑過去」，每幀都下一次
      * 新的 easeTo 會不斷打斷上一次的補間，鏡頭永遠追在飛碟後面，飛碟就會飄到
-     * 畫面邊緣（原本每 600ms 才對準一次節點，正是這個症狀）。head 本身已經是
+     * 畫面邊緣（原本每 600ms 才對準一次節點，正是這個症狀）。時間游標本身已經是
      * 連續內插出來的，直接設中心就已經是平滑的移動。
+     *
+     * 多台飛碟時對準它們的形心：跟著其中一台跑的話，其他人隨時會被甩出畫面，
+     * 而「大家分頭在哪」正是多身分播放要看的東西。
      */
-    if (playing && headPos) {
-      map.setCenter(headPos as [number, number]);
+    if (playing && ufoFeatures.length > 0) {
+      let cx = 0;
+      let cy = 0;
+      for (const f of ufoFeatures) { cx += f.geometry.coordinates[0]; cy += f.geometry.coordinates[1]; }
+      map.setCenter([cx / ufoFeatures.length, cy / ufoFeatures.length]);
     }
-  }, [head, path, ready, playing]);
+  }, [cursorT, memberPaths, convoys, colorFor, ready, playing]);
 
   // --- 播放迴圈 ---
   useEffect(() => {
@@ -1571,26 +2115,19 @@ export default function FootprintMap({
       return;
     }
     // 不管一天走了 300 公尺還是 300 公里，1x 都大約 25 秒跑完 ——
-    // 換算成公尺／秒之後全程等速（見 arc 的註解）。
-    const metersPerSec = (totalDist / PLAY_SECONDS) * speed;
-    // 整條路徑長度是 0（照片全擠在同一點之類）時退回舊的節點速率，
-    // 否則 metersPerSec 是 0，播放鍵按下去什麼事都不會發生
-    const nodesPerSec = Math.max(1, path.length / PLAY_SECONDS) * speed;
+    // 進度本身就是位移總量，除以總時長就是等速（見 TimeWarp 的註解）
+    const perSec = (warp.total / PLAY_SECONDS) * speed;
     let last = performance.now();
     const tick = (now: number) => {
       // requestAnimationFrame 給的是「這一幀開始」的時間，可能早於上面那個
       // 在同一幀的 JS 裡取的 performance.now()，第一次 tick 的 dt 會是負的
       const dt = Math.max(0, (now - last) / 1000);
       last = now;
-      setHead((h) => {
-        // 每一幀都從 head 換算回距離再往前推，而不是自己存一份距離：
-        // 拖時間軸改的是 head，這樣寫拖完就能無縫接著播
-        const next = metersPerSec > 0
-          ? headFromDist(distFromHead(h) + dt * metersPerSec)
-          : h + dt * nodesPerSec;
-        if (next >= path.length - 1) {
+      setProgress((p) => {
+        const next = p + dt * perSec;
+        if (next >= warp.total) {
           setPlaying(false);
-          return Math.max(path.length - 1, 0);
+          return warp.total;
         }
         return next;
       });
@@ -1601,10 +2138,10 @@ export default function FootprintMap({
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [playing, speed, path.length, totalDist, headFromDist, distFromHead]);
+  }, [playing, speed, warp.total]);
 
   const replay = useCallback(() => {
-    setHead(0);
+    setProgress(0);
     setPlaying(true);
   }, []);
 
@@ -1895,7 +2432,7 @@ export default function FootprintMap({
       )}
 
       {/* 沒有路徑就沒有東西可以播 —— 只有照片標記、沒開「連接照片位置」時就是這樣 */}
-      {!editing && path.length > 1 && (
+      {!editing && warp.times.length > 1 && (
         <div style={{
           position: 'absolute', left: 12, right: 12, bottom: 12, padding: '10px 14px',
           background: 'rgba(255,255,255,.94)', borderRadius: 10,
@@ -1903,30 +2440,29 @@ export default function FootprintMap({
           alignItems: 'center', gap: 12, flexWrap: 'wrap',
         }}>
           <button
-            onClick={() => (head >= maxIndex ? replay() : setPlaying((p) => !p))}
+            onClick={() => (atEnd ? replay() : setPlaying((p) => !p))}
             style={{
               border: 'none', borderRadius: 8, padding: '6px 14px', cursor: 'pointer',
               background: '#2563eb', color: '#fff', fontSize: 14, flexShrink: 0,
             }}
           >
-            {head >= maxIndex ? '重播' : playing ? '暫停' : '播放'}
+            {atEnd ? '重播' : playing ? '暫停' : '播放'}
           </button>
 
           {/*
-            拉桿走的是距離而不是節點序號 —— 播放本身已經是等速前進，
-            兩邊用同一把尺，拉桿的位置才會跟畫面上的進度對得起來。
-            整條長度是 0 時退回節點序號，否則拉桿的 max 會是 0 而動不了
+            拉桿走的是播放進度（＝大家一共移動了多少）而不是時間，跟播放本身
+            同一把尺 —— 用真實時間當刻度的話，半夜那八小時會佔掉拉桿一大截，
+            拖過去卻什麼都沒發生
           */}
           <input
             type="range"
             min={0}
-            max={totalDist > 0 ? totalDist : maxIndex}
+            max={warp.total}
             step="any"
-            value={totalDist > 0 ? distFromHead(head) : head}
+            value={progress}
             onChange={(e) => {
               setPlaying(false);
-              const v = Number(e.target.value);
-              setHead(totalDist > 0 ? headFromDist(v) : v);
+              setProgress(Number(e.target.value));
             }}
             style={{ flex: '1 1 180px', minWidth: 140 }}
             aria-label="時間軸"
@@ -1971,7 +2507,11 @@ export default function FootprintMap({
             <span style={{ fontSize: 16 }} title="播放中的位置">
               {MOVER_EMOJI}
             </span>
-            {headIndex + 1} / {path.length}
+            {/*
+              改顯示時間而不是「第幾點／共幾點」：多身分同框時每個人的點數不一樣，
+              那個分母根本不知道是誰的。時間則是所有人共用的那把尺
+            */}
+            {cursorLabel(cursorT)}
           </div>
         </div>
       )}

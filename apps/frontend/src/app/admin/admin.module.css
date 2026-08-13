@@ -158,6 +158,30 @@
   flex-wrap: wrap;
 }
 
+/* 軌跡資料夾的下拉。跟 .field input 同一套外觀，select 沒辦法共用選擇器 */
+.select {
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.7);
+  font-size: 0.88rem;
+  color: inherit;
+  max-width: 260px;
+}
+
+/* 要請家人分享給哪個信箱。是要被複製走的東西，所以等寬字＋可選取 */
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+  word-break: break-all;
+  user-select: all;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 0.4rem 0.6rem;
+  display: inline-block;
+}
+
 /* 刪除帳號視窗裡的勾選項。跟 .checkbox 分開是因為那個是一列排排站的，
    這裡要一項一行，而且說明文字要能換行對齊在勾勾右邊 */
 .purgeOption {

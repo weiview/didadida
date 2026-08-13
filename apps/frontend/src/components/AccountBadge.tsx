@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useAdmin } from "@/lib/useAdmin";
+import { fetchTrackMembers, type TrackMember } from "@/lib/api";
+import { TRACK_PALETTE } from "@/lib/trackColors";
 
 /**
  * 右上角的帳號牌。收合時只有一顆圓鈕（顯示名稱的第一個字），點開才是整張卡。
@@ -25,7 +27,7 @@ const BADGE = 40;
 export default function AccountBadge() {
   const {
     isAdmin, isGuest, checking, user, isOwner, canManageOthers,
-    renameSelf, logout,
+    renameSelf, recolorSelf, logout,
   } = useAdmin();
 
   const [open, setOpen] = useState(false);
@@ -34,6 +36,16 @@ export default function AccountBadge() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  /*
+   * 其他家人各自是什麼顏色。只為了在色票上標「這個 OO 在用」——
+   * **不擋**（使用者定調：標出來就好，硬性唯一只會讓後來的人沒得選）。
+   *
+   * null ＝ 還沒問過。點開面板才去問，而且只問一次：這是一顆平常收著的按鈕，
+   * 為了它在每一頁都多打一支 API 不值得。
+   */
+  const [members, setMembers] = useState<TrackMember[] | null>(null);
+  // 正在存的那個顏色。整排一起鎖住，不然連點兩下會有兩個請求互相覆蓋
+  const [savingColor, setSavingColor] = useState<string | null>(null);
 
   // 面板收起來時把改名的狀態一起重置，下次點開不會停在上次的半途
   useEffect(() => {
@@ -45,6 +57,13 @@ export default function AccountBadge() {
   useEffect(() => {
     if (editing) inputRef.current?.focus();
   }, [editing]);
+
+  useEffect(() => {
+    if (!open || !isAdmin || user?.id == null || members !== null) return;
+    let alive = true;
+    fetchTrackMembers().then((list) => { if (alive) setMembers(list); });
+    return () => { alive = false; };
+  }, [open, isAdmin, user?.id, members]);
 
   useEffect(() => {
     if (!open) return;
@@ -76,6 +95,12 @@ export default function AccountBadge() {
         ? "家庭成員（可管理全站內容）"
         : "家庭成員（只能管自己的內容）";
 
+  // 我現在的顏色。後端一律回算好的值，沒有就是舊後端 —— 那時整排都不標選中
+  const myColor = user?.track_color ?? null;
+  /** 這個顏色被誰佔著（我自己不算）。標示用，**不阻止**選同色 */
+  const usedBy = (hex: string) =>
+    members?.find((m) => m.id !== user?.id && m.track_color === hex) ?? null;
+
   const startRename = () => {
     setDraft(user?.name ?? "");
     setError(null);
@@ -92,6 +117,20 @@ export default function AccountBadge() {
     setSaving(false);
     if (result.success) setEditing(false);
     else setError(result.message || "改名失敗");
+  };
+
+  const pickColor = async (hex: string) => {
+    if (savingColor || hex === myColor) return;
+    setSavingColor(hex);
+    setError(null);
+    const result = await recolorSelf(hex);
+    setSavingColor(null);
+    if (result.success) {
+      // 我剛佔走的顏色要立刻反映在「誰在用什麼」上，不然別人的標記會停在舊值
+      setMembers((prev) => prev?.map((m) => (m.id === user?.id ? { ...m, track_color: hex } : m)) ?? prev);
+    } else {
+      setError(result.message || "換色失敗");
+    }
   };
 
   return (
@@ -204,6 +243,53 @@ export default function AccountBadge() {
                 <button type="button" onClick={startRename} style={{ ...plainBtn, marginTop: 12, width: "100%" }}>
                   ✎ 修改顯示名稱
                 </button>
+              )}
+
+              {/* 軌跡顏色。跟改名同一個條件（要有帳號列才存得進去）。
+                  放在帳號牌而不是後台：顏色是**每個人自己的**，不是站長分配的。
+                  別人已經在用的顏色會標上他的名字，但照樣按得下去 —— 全家出遊
+                  想跟老婆同色是他們家的事，站上不該替他們決定。 */}
+              {isAdmin && user?.id != null && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>
+                    地圖上的軌跡顏色
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {TRACK_PALETTE.map(({ hex, name }) => {
+                      const taken = usedBy(hex);
+                      const mine = myColor === hex;
+                      return (
+                        <button
+                          key={hex}
+                          type="button"
+                          onClick={() => pickColor(hex)}
+                          disabled={savingColor !== null}
+                          title={taken ? `${name}（${taken.name || "另一位家人"}已經在用）` : name}
+                          aria-label={name}
+                          aria-pressed={mine}
+                          style={{
+                            width: 24,
+                            height: 24,
+                            borderRadius: "50%",
+                            // 用 backgroundColor 而不是 background 簡寫：底下還要疊
+                            // 一個 backgroundImage，簡寫會把它洗掉
+                            backgroundColor: hex,
+                            cursor: savingColor ? "progress" : "pointer",
+                            // 選中的那顆用一圈白邊 + 外框撐出來，不靠打勾 ——
+                            // 24px 上的符號在深色底上幾乎看不見
+                            border: mine ? "2px solid #fff" : "1px solid rgba(0, 0, 0, 0.18)",
+                            boxShadow: mine ? `0 0 0 2px ${hex}` : "none",
+                            opacity: savingColor && savingColor !== hex ? 0.45 : 1,
+                            // 別人在用：右下角一個小白點，只是提示，不是禁止標誌
+                            backgroundImage: taken
+                              ? "radial-gradient(circle at 78% 78%, rgba(255,255,255,0.95) 0 3px, transparent 3px)"
+                              : undefined,
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                </div>
               )}
 
               {isOwner && (

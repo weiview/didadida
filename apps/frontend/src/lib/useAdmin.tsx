@@ -3,7 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
   AuthState, CurrentUser, checkAuth, consumeAuthHash, googleLoginUrl,
-  logout as clearTokens, updateMyName, verifyGuest, verifyLogin,
+  logout as clearTokens, updateMyName, updateMyTrackColor, verifyGuest, verifyLogin,
 } from './api';
 
 /**
@@ -70,6 +70,11 @@ interface AuthValue {
   driveLink: { email: string | null; error: string | null } | null;
   /** 改自己的顯示名稱，成功會同步更新這裡的 user */
   renameSelf: (name: string) => Promise<{ success: boolean; message?: string }>;
+  /**
+   * 挑自己在地圖上的軌跡顏色（只收 TRACK_PALETTE 裡的值）。
+   * 顏色是**每個人自己的**，所以在帳號牌上改，不在站長後台。
+   */
+  recolorSelf: (color: string) => Promise<{ success: boolean; message?: string }>;
   /** 登出：清掉站上與 Google 的 token，回到進站畫面 */
   logout: () => void;
 }
@@ -144,6 +149,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return { success: result.success, message: result.message };
   }, []);
 
+  const recolorSelf = useCallback(async (color: string) => {
+    const result = await updateMyTrackColor(color);
+    if (result.success && result.user) {
+      setState((prev) => ({ ...prev, user: result.user! }));
+    }
+    return { success: result.success, message: result.message };
+  }, []);
+
   const logout = useCallback(() => {
     clearTokens();
     setState({ admin: false, guest: false, canViewMap: false, user: null });
@@ -181,9 +194,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     authError,
     driveLink,
     renameSelf,
+    recolorSelf,
     logout,
   }), [state, checking, canManageOthers, canEdit, unlock, login, loginWithGoogle,
-       authError, driveLink, renameSelf, logout]);
+       authError, driveLink, renameSelf, recolorSelf, logout]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

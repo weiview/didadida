@@ -4,8 +4,9 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import styles from "./admin.module.css";
 import {
-  PurgePreview, WhitelistUser, addWhitelistUser, fetchPurgePreview, fetchSiteSettings,
-  fetchWhitelist, purgeWhitelistUser, removeWhitelistUser, updateSiteSettings, updateWhitelistUser,
+  PurgePreview, SharedDriveFolder, WhitelistUser, addWhitelistUser, fetchPurgePreview,
+  fetchSharedDriveFolders, fetchSiteSettings, fetchWhitelist, purgeWhitelistUser,
+  removeWhitelistUser, setUserTrackFolder, updateSiteSettings, updateWhitelistUser,
 } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
@@ -48,10 +49,20 @@ export default function AdminPage() {
   const [preview, setPreview] = useState<PurgePreview | null>(null);
   const [dropAlbums, setDropAlbums] = useState(false);
   const [dropPhotos, setDropPhotos] = useState(false);
+  const [dropTracks, setDropTracks] = useState(false);
 
   /** 站台開關：訪客看不看得到足跡地圖。null = 還沒讀到 */
   const [guestMap, setGuestMap] = useState<boolean | null>(null);
   const [savingGuestMap, setSavingGuestMap] = useState(false);
+
+  /*
+   * GPS 軌跡資料夾。**刻意不在開頁時就抓** —— 那是一次 Google Drive API 往返，
+   * 而這一頁大多數時候是來加人或改權限的，資料夾綁一次之後幾年不會再動。
+   * null ＝ 還沒按過那顆按鈕。
+   */
+  const [folders, setFolders] = useState<SharedDriveFolder[] | null>(null);
+  const [saEmail, setSaEmail] = useState<string | null>(null);
+  const [loadingFolders, setLoadingFolders] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -99,6 +110,33 @@ export default function AdminPage() {
     load();
   };
 
+  const loadFolders = async () => {
+    setLoadingFolders(true);
+    setNotice(null);
+    try {
+      const data = await fetchSharedDriveFolders();
+      setFolders(data.folders);
+      setSaEmail(data.serviceAccount);
+      setError(null);
+    } catch (e: any) {
+      setError(e.message || "讀取分享資料夾失敗");
+    }
+    setLoadingFolders(false);
+  };
+
+  const bindFolder = async (user: WhitelistUser, folderId: string | null) => {
+    setBusyId(user.id);
+    setNotice(null);
+    const result = await setUserTrackFolder(user.id, folderId);
+    setBusyId(null);
+    if (!result.success) return setError(result.message || "綁定失敗");
+    setError(null);
+    setNotice(folderId
+      ? `${user.name || user.email} 的軌跡資料夾綁好了，他在地圖上按「從 Drive 同步」就會讀到自己的 GPX。`
+      : `已解除 ${user.name || user.email} 的軌跡資料夾綁定，他暫時同步不到東西。`);
+    load();
+  };
+
   const toggleGuestMap = async (next: boolean) => {
     setSavingGuestMap(true);
     setNotice(null);
@@ -133,7 +171,7 @@ export default function AdminPage() {
   };
 
   /*
-   * 打開刪除視窗。兩個勾選一律從「不勾」開始 —— 預設值決定了手滑的後果，
+   * 打開刪除視窗。三個勾選一律從「不勾」開始 —— 預設值決定了手滑的後果，
    * 而這裡手滑的後果是別人的照片從 R2 消失。
    */
   const openPurge = (user: WhitelistUser) => {
@@ -141,6 +179,7 @@ export default function AdminPage() {
     setPreview(null);
     setDropAlbums(false);
     setDropPhotos(false);
+    setDropTracks(false);
     setNotice(null);
     fetchPurgePreview(user.id)
       .then((p) => setPreview(p))
@@ -152,7 +191,7 @@ export default function AdminPage() {
 
   const handlePurge = async () => {
     const user = purging;
-    const scope = { albums: dropAlbums, photos: dropPhotos };
+    const scope = { albums: dropAlbums, photos: dropPhotos, tracks: dropTracks };
     setPurging(null);
     if (!user) return;
     setBusyId(user.id);
@@ -165,6 +204,8 @@ export default function AdminPage() {
     if (result.deletedAlbums) parts.push(`一併刪掉 ${result.deletedAlbums} 本相簿。`);
     if (result.deletedPhotos) parts.push(`一併刪掉 ${result.deletedPhotos} 張照片（Drive 上的備份會搬進 trash/）。`);
     if (result.keptAlbums) parts.push(`保留下來的 ${result.keptAlbums} 本相簿已經改掛在你名下。`);
+    if (result.deletedTrackDays) parts.push(`一併刪掉 ${result.deletedTrackDays} 天的足跡。`);
+    if (result.keptTrackDays) parts.push(`保留下來的 ${result.keptTrackDays} 天足跡已經改掛在你名下。`);
     setNotice(parts.join(""));
     load();
   };
@@ -350,6 +391,87 @@ export default function AdminPage() {
         )}
       </section>
 
+      {/*
+        GPS 軌跡資料夾。為什麼要一個人一個資料夾：GPSLogger 只拿得到
+        `drive.file` 權限（只碰得到自己建的檔），所以做不到「全家都上傳到
+        站長的 Drive」。每個人傳進自己的 Drive，再把那個資料夾分享給站上的
+        服務帳號，由這裡綁上去。
+      */}
+      <section className={`glass-panel ${styles.card}`}>
+        <h2 className={styles.sectionTitle}>GPS 軌跡資料夾</h2>
+        <p className={styles.hint}>
+          每個人的 GPSLogger 都是傳進他自己的 Google Drive（手機 App 只碰得到自己建的資料夾，
+          沒辦法直接傳到你這邊）。請他把那個資料夾<strong>分享</strong>給下面這個服務帳號，
+          再回來這裡把資料夾對上人 —— 之後他在地圖上按「從 Drive 同步」就讀得到自己的軌跡。
+        </p>
+
+        {saEmail && (
+          <p className={styles.hint}>
+            要分享給這個信箱（唯讀就夠了）：<br />
+            <span className={styles.mono}>{saEmail}</span>
+          </p>
+        )}
+
+        <div className={styles.formRow} style={{ marginBottom: "0.5rem" }}>
+          <button
+            type="button"
+            className={styles.button}
+            onClick={loadFolders}
+            disabled={loadingFolders}
+          >
+            {loadingFolders ? "讀取中..." : folders ? "重新讀取分享的資料夾" : "讀取分享給我的資料夾"}
+          </button>
+        </div>
+
+        {folders !== null && folders.length === 0 && (
+          <p className={styles.hint}>
+            目前沒有任何資料夾分享給這個服務帳號。請家人先在 Drive 上把 GPSLogger 的資料夾分享過來。
+          </p>
+        )}
+
+        {users.filter((u) => u.active === 1).map((user) => {
+          const busy = busyId === user.id;
+          const bound = user.track_drive_folder_id;
+          const known = folders?.find((f) => f.id === bound) ?? null;
+          return (
+            <div key={user.id} className={styles.userRow}>
+              <div className={styles.userMain}>
+                <div className={styles.userName}>{user.name || user.email}</div>
+                <div className={styles.userMeta}>
+                  {bound
+                    ? `目前綁定：${known ? known.name : bound}`
+                    : "還沒綁定，他同步不到任何軌跡"}
+                </div>
+              </div>
+              <div className={styles.actions}>
+                {folders === null ? (
+                  <span className={styles.userMeta}>先按上面那顆按鈕讀取資料夾</span>
+                ) : (
+                  <select
+                    className={styles.select}
+                    value={bound ?? ""}
+                    disabled={busy}
+                    onChange={(e) => bindFolder(user, e.target.value || null)}
+                  >
+                    <option value="">（未綁定）</option>
+                    {/* 已經綁著、但現在沒出現在分享清單裡的資料夾（對方取消分享了）。
+                        不補這一項的話 select 會顯示成「未綁定」，看起來像資料掉了 */}
+                    {bound && !known && <option value={bound}>{bound}（已不在分享清單）</option>}
+                    {folders.map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.name}
+                        {f.ownerEmail ? `　—　${f.ownerEmail}` : ""}
+                        {f.suggestedUserId === user.id ? "　✓ 信箱對得上" : ""}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </section>
+
       <SlideConfirmModal
         isOpen={removing !== null}
         title={`移出白名單：${removing?.name || removing?.email || ""}`}
@@ -369,14 +491,14 @@ export default function AdminPage() {
           // 沒東西可勾的人不要講「由下面的選項決定」——下面根本沒有選項
           preview
             ? `${preview.email} 會從白名單上消失，救不回來。`
-              + (preview.albums > 0 || preview.photos_uploaded > 0
+              + (preview.albums > 0 || preview.photos_uploaded > 0 || preview.track_days > 0
                 ? "要不要順便清掉他的內容，由下面的選項決定。" : "")
             : "正在算他名下有多少東西..."
         }
         onConfirm={handlePurge}
         onCancel={() => setPurging(null)}
       >
-        {preview && (preview.albums > 0 || preview.photos_uploaded > 0 ? (
+        {preview && (preview.albums > 0 || preview.photos_uploaded > 0 || preview.track_days > 0 ? (
           <>
             {preview.albums > 0 && (
               <label className={styles.purgeOption}>
@@ -413,15 +535,36 @@ export default function AdminPage() {
               </label>
             )}
 
+            {preview.track_days > 0 && (
+              <label className={styles.purgeOption}>
+                <input
+                  type="checkbox"
+                  checked={dropTracks}
+                  onChange={(e) => setDropTracks(e.target.checked)}
+                />
+                <span>
+                  一併刪除他 {preview.track_days} 天的足跡
+                  <span className={styles.purgeNote} style={{ display: "block" }}>
+                    連同原始 GPX 與貼過路的結果。
+                    <strong>這是刪他的移動紀錄，跟相簿無關</strong> —— 照片上的位置不受影響。
+                  </span>
+                </span>
+              </label>
+            )}
+
             <p className={styles.purgeNote}>
               {!dropAlbums && preview.albums > 0
                 && `沒勾的話，他那 ${preview.albums} 本相簿會改掛在你（站長）名下，內容原封不動。`}
+              {!dropTracks && preview.track_days > 0
+                && `沒勾的話，他那 ${preview.track_days} 天足跡會改掛在你（站長）名下。`}
               {(dropAlbums || dropPhotos)
                 && "刪掉的照片會直接從 R2 移除；Google Drive 上的備份是搬進 trash/ 資料夾，不會真的刪檔。"}
+              {dropTracks
+                && "足跡刪掉之後救不回來 —— 原始 GPX 還在他自己的 Google Drive 裡，站上這份是唯一的副本。"}
             </p>
           </>
         ) : (
-          <p className={styles.purgeNote}>他沒有建過相簿，也沒有上傳過照片，刪掉不會動到任何內容。</p>
+          <p className={styles.purgeNote}>他沒有建過相簿、沒有上傳過照片，也沒有足跡，刪掉不會動到任何內容。</p>
         ))}
       </SlideConfirmModal>
     </div>
