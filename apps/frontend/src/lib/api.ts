@@ -326,6 +326,12 @@ export interface CurrentUser {
   role: 'owner' | 'member';
   /** 1 = 可以新增／刪除別人的相簿與照片 */
   can_manage_others: number;
+  /**
+   * 他的軌跡在地圖上的顏色（'#rrggbb'）。後端一律回**算好的值** ——
+   * 沒挑過色的人也會拿到依 uid 分配的預設，所以正常情況下不會是 null。
+   * （舊後端沒有這一欄，所以型別上仍然可能缺。）
+   */
+  track_color?: string | null;
 }
 
 /** 進站狀態。admin 與 guest 都是 false 代表連門都還沒進，該顯示進站畫面 */
@@ -394,19 +400,63 @@ export function logout(): void {
   clearGoogleToken();
 }
 
-/** 改自己的顯示名稱。只有這一欄改得動，信箱與權限都不行 */
-export async function updateMyName(name: string): Promise<{ success: boolean; user?: CurrentUser; message?: string }> {
+/**
+ * 改自己的個人設定。就顯示名稱與軌跡顏色兩欄改得動，信箱與權限都不行。
+ *
+ * 兩個都是選填、各自獨立更新 —— 只送顏色不會把名字洗掉。
+ * `track_color` 送 null 是清掉（退回依 uid 的預設色），不是「不要改」。
+ */
+async function updateMe(
+  patch: { name?: string; track_color?: string | null },
+  failMessage: string,
+): Promise<{ success: boolean; user?: CurrentUser; message?: string }> {
   try {
     const res = await fetch(`${API_BASE_URL}/me`, {
       method: 'PUT',
       headers: getAuthHeaders(),
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(patch),
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.success) return { success: true, user: data.user };
-    return { success: false, message: data.error || '改名失敗' };
+    return { success: false, message: data.error || failMessage };
   } catch (error: any) {
     return { success: false, message: `連線錯誤: ${error.message}` };
+  }
+}
+
+/** 改自己的顯示名稱 */
+export function updateMyName(name: string) {
+  return updateMe({ name }, '改名失敗');
+}
+
+/** 挑自己在地圖上的軌跡顏色。只收 TRACK_PALETTE 裡的值，null 是退回預設色 */
+export function updateMyTrackColor(color: string | null) {
+  return updateMe({ track_color: color }, '換色失敗');
+}
+
+/**
+ * 站上的一個家人。只有畫地圖與色票列需要的三欄 ——
+ * 信箱、權限那些是 /api/admin/users（站長專屬）的事。
+ */
+export interface TrackMember {
+  id: number;
+  name: string | null;
+  /** 後端算好的顏色，一定有值 */
+  track_color: string;
+}
+
+/**
+ * 站上有哪些家人、各是什麼顏色。任何管理員都讀得到（不是站長專屬）——
+ * 地圖圖例要把 user_id 換成人名，帳號牌的色票列要標出誰用了哪個顏色。
+ */
+export async function fetchTrackMembers(): Promise<TrackMember[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/track-members`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (error) {
+    console.error(error);
+    return [];
   }
 }
 
@@ -424,6 +474,49 @@ export interface WhitelistUser extends CurrentUser {
   /** 他名下有多少東西。移除他之前要讓站長看得到這個數字 */
   album_count: number;
   photo_count: number;
+  /** 他在地圖上的軌跡顏色（P2 才給他自己挑，這裡先讀得到） */
+  track_color: string | null;
+  /** 他那個 GPSLogger Drive 資料夾的 id。null ＝ 還沒綁，他同步不到任何東西 */
+  track_drive_folder_id: string | null;
+}
+
+/** 分享給服務帳號的一個 Drive 資料夾。站長從這份清單挑來綁人 */
+export interface SharedDriveFolder {
+  id: string;
+  name: string;
+  /** 分享者的 Google 信箱。用它自動猜出這是誰的資料夾 */
+  ownerEmail: string | null;
+  modifiedTime: string | null;
+  /** 信箱對得上站上帳號時的建議人選，對不上是 null */
+  suggestedUserId: number | null;
+}
+
+/**
+ * 列出所有分享給服務帳號的 Drive 資料夾。站長限定。
+ *
+ * `serviceAccount` 是要請家人分享給誰的那個信箱 —— 畫面上一定要顯示，
+ * 不然沒有人知道資料夾該分享給誰。
+ */
+export async function fetchSharedDriveFolders(): Promise<{
+  serviceAccount: string; folders: SharedDriveFolder[];
+}> {
+  const res = await fetch(`${API_BASE_URL}/tracks/drive/shared-folders`, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取分享資料夾失敗');
+  return await res.json();
+}
+
+/** 綁定（或用 null 解除）某個人的 GPSLogger 資料夾。站長限定 */
+export async function setUserTrackFolder(
+  id: number, folderId: string | null,
+): Promise<{ success: boolean; message?: string }> {
+  const res = await fetch(`${API_BASE_URL}/admin/users/${id}/track-folder`, {
+    method: 'PUT',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ folder_id: folderId }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.success) return { success: true };
+  return { success: false, message: data.error || '綁定失敗' };
 }
 
 export async function fetchWhitelist(): Promise<WhitelistUser[]> {
@@ -487,6 +580,8 @@ export interface PurgePreview {
   photos_uploaded: number;
   /** 上一個數字裡面，放在**別人**相簿的有幾張。會動到別人的東西，得單獨講 */
   photos_elsewhere: number;
+  /** 他名下有幾天的足跡。跟相簿完全無關，所以是第四個獨立的勾選 */
+  track_days: number;
 }
 
 export async function fetchPurgePreview(id: number): Promise<PurgePreview> {
@@ -499,19 +594,21 @@ export async function fetchPurgePreview(id: number): Promise<PurgePreview> {
  * **刪除帳號**，跟 removeWhitelistUser（停權）是兩件事：這一支真的把 User 那一列
  * 刪掉，白名單上再也看不到他，而且不可逆。
  *
- * 兩個範圍各自獨立，都不勾就只是把帳號抹掉：
+ * 三個範圍各自獨立，都不勾就只是把帳號抹掉：
  * - `albums`：他建的相簿整本刪掉，**連裡面別人傳的照片也一起沒了**。
  * - `photos`：他上傳的照片刪掉，**包含放在別人相簿裡的那些**。
+ * - `tracks`：他的足跡整批刪掉，連 R2 上的原始 GPX 與貼路結果一起清。
  *
  * 沒被勾到的東西不會消失，會改掛到站長名下（相簿的主人欄位不允許空白）。
  */
 export async function purgeWhitelistUser(
-  id: number, scope: { albums: boolean; photos: boolean },
+  id: number, scope: { albums: boolean; photos: boolean; tracks: boolean },
 ): Promise<{
   success: boolean; message?: string;
   deletedAlbums?: number; deletedPhotos?: number; keptAlbums?: number;
+  deletedTrackDays?: number; keptTrackDays?: number;
 }> {
-  const query = `albums=${scope.albums ? 1 : 0}&photos=${scope.photos ? 1 : 0}`;
+  const query = `albums=${scope.albums ? 1 : 0}&photos=${scope.photos ? 1 : 0}&tracks=${scope.tracks ? 1 : 0}`;
   const res = await fetch(`${API_BASE_URL}/admin/users/${id}/purge?${query}`, {
     method: 'DELETE',
     headers: getAuthHeaders(),
@@ -523,6 +620,8 @@ export async function purgeWhitelistUser(
       deletedAlbums: data.deleted_albums,
       deletedPhotos: data.deleted_photos,
       keptAlbums: data.kept_albums,
+      deletedTrackDays: data.deleted_track_days,
+      keptTrackDays: data.kept_track_days,
     };
   }
   return { success: false, message: data.error || '刪除失敗' };
@@ -1718,8 +1817,14 @@ export async function applyTimelineMatches(
 
 /** Drive 上的一個 GPX 檔，以及它跟資料庫的同步狀態 */
 export interface DriveGpxFile {
-  /** 就是 Drive 上的檔名，同時當作 TrackDay 的主鍵。不透明，不要拿去解析日期 */
+  /**
+   * TrackDay 的主鍵。不透明，不要拿去解析日期，也不要自己拼 ——
+   * 多身分之後它是「使用者前綴 + Drive 檔名」，由後端組好（見 migrations/0009）。
+   * ingest、留存原文、貼路結果三者一定要用同一個值。
+   */
   dayKey: string;
+  /** Drive 上的檔名。純粹給畫面顯示，不要拿去打 API */
+  fileName: string;
   driveFileId: string;
   md5: string | null;
   modifiedTime: string | null;
@@ -1728,7 +1833,10 @@ export interface DriveGpxFile {
   syncedAt: string | null;
   /** md5 跟已同步的不一樣（或根本沒同步過）才需要重抓 */
   needsSync: boolean;
-  /** 'manual' 代表這天的軌跡點被手動編修過，重灌會洗掉，同步時預設跳過 */
+  /**
+   * 'manual' 代表這天的內容是人決定的 —— 軌跡點被手動編修過，或整個檔是
+   * 手動上傳的。重灌會洗掉，所以同步時預設跳過。
+   */
   ingestSource: string | null;
 }
 
@@ -1747,6 +1855,8 @@ export interface TrackPoint {
    * 一般的移動點也是 null。
    */
   stay_sec?: number | null;
+  /** 這條軌跡是誰的（TrackDay.user_id）。地圖上依此分色 */
+  user_id?: number | null;
 }
 
 /**
@@ -1756,13 +1866,18 @@ export interface TrackPoint {
  */
 export type Vehicle = 'walk' | 'bike' | 'motorbike' | 'car' | 'bus' | 'train' | 'plane' | 'boat';
 
-/** 列出 Drive 資料夾裡的 GPX 檔。僅管理者可用 */
-export async function fetchDriveGpxFiles(): Promise<{ files: DriveGpxFile[]; error?: string }> {
+/**
+ * 列出**我自己那個** Drive 資料夾裡的 GPX 檔。要登入。
+ *
+ * `code === 'track_folder_unbound'` 是「這個人還沒被綁資料夾」，不是故障 ——
+ * 呼叫端要能分辨，才不會在每次進頁時對還沒設定好的成員報錯。
+ */
+export async function fetchDriveGpxFiles(): Promise<{ files: DriveGpxFile[]; error?: string; code?: string }> {
   try {
     const res = await fetch(`${API_BASE_URL}/tracks/drive/files`, { headers: getAuthHeaders() });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      return { files: [], error: body?.error || `伺服器回應 ${res.status}` };
+      return { files: [], error: body?.error || `伺服器回應 ${res.status}`, code: body?.code };
     }
     return { files: await res.json() };
   } catch (err) {
@@ -1788,6 +1903,10 @@ export async function fetchDriveGpxText(fileId: string): Promise<string | null> 
 /**
  * 寫入一天份的軌跡點。
  * 同一個 dayKey 會整批換掉，所以重複同步不會長出重複的點。
+ *
+ * **回傳的 `dayKey` 才是實際寫進去的那一個。** 後端會依登入身分重新組一次
+ * （多身分之後 key 帶使用者前綴，由後端產生而不信任前端送的），送進去的值
+ * 不一定等於寫出來的值。接著要留存原文、要貼路，都得用回傳的這個。
  */
 export async function ingestTrack(payload: {
   dayKey: string;
@@ -1799,7 +1918,7 @@ export async function ingestTrack(payload: {
     t: string; lat: number; lng: number; src: string | null;
     hdop: number | null; seg: number; staySec?: number | null;
   }[];
-}): Promise<{ inserted: number; skipped: number } | null> {
+}): Promise<{ dayKey: string; inserted: number; skipped: number } | null> {
   try {
     const res = await fetch(`${API_BASE_URL}/tracks/ingest`, {
       method: 'POST',
@@ -1808,7 +1927,11 @@ export async function ingestTrack(payload: {
     });
     if (!res.ok) return null;
     const data = await res.json();
-    return { inserted: data?.inserted ?? 0, skipped: data?.skipped ?? 0 };
+    return {
+      dayKey: typeof data?.dayKey === 'string' && data.dayKey ? data.dayKey : payload.dayKey,
+      inserted: data?.inserted ?? 0,
+      skipped: data?.skipped ?? 0,
+    };
   } catch (err) {
     console.error(err);
     return null;
@@ -1818,6 +1941,10 @@ export async function ingestTrack(payload: {
 /** 已同步的一天軌跡。`hasRaw` 為真才還原得回原始軌跡 */
 export interface TrackDay {
   day_key: string;
+  /** 這一天是誰的。舊資料一律是站長（uid 1） */
+  user_id: number | null;
+  /** 擁有者的顯示名稱，後端 JOIN 好的。帳號被刪掉時會是 null */
+  user_name: string | null;
   ingest_source: 'gpslogger' | 'timeline' | 'manual' | string;
   drive_file_id: string | null;
   md5: string | null;
@@ -1976,13 +2103,21 @@ export interface MatchedTrack {
   }[];
 }
 
-/** 取得軌跡點。未登入時只拿得到被標為公開的日子 */
-export async function fetchTracks(opts: { from?: string; to?: string; dayKey?: string } = {}): Promise<TrackPoint[]> {
+/**
+ * 取得軌跡點。未登入時只拿得到被標為公開的日子。
+ *
+ * `userIds` 是**顯示篩選**，不是隱私牆（家人本來就互相看得到）。它的意義在額度：
+ * 後端有全域 20000 點上限，只看自己時多人的點不必一起讀進來。空陣列 = 不篩選。
+ */
+export async function fetchTracks(
+  opts: { from?: string; to?: string; dayKey?: string; userIds?: number[] } = {},
+): Promise<TrackPoint[]> {
   try {
     const qs = new URLSearchParams();
     if (opts.from) qs.set('from', opts.from);
     if (opts.to) qs.set('to', opts.to);
     if (opts.dayKey) qs.set('day_key', opts.dayKey);
+    if (opts.userIds?.length) qs.set('user_id', opts.userIds.join(','));
     const res = await fetch(`${API_BASE_URL}/tracks?${qs.toString()}`, { headers: getAuthHeaders() });
     if (!res.ok) return [];
     return await res.json();

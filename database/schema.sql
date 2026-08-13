@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS User (
   -- 0 ＝ 已移出白名單，登不進來
   active INTEGER NOT NULL DEFAULT 1,
   last_login_at TEXT,
+  -- 這個人的軌跡在地圖上的顏色（'#rrggbb'），自己選。NULL ＝ 還沒選過
+  track_color TEXT,
+  -- 這個人自己的 GPSLogger Drive 資料夾 id（見 migrations/0009）
+  track_drive_folder_id TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -93,10 +97,15 @@ CREATE INDEX IF NOT EXISTS idx_tripsegment_album ON TripSegment(album_id);
 CREATE INDEX IF NOT EXISTS idx_tripsegment_time ON TripSegment(start_local, end_local);
 
 -- TrackDay Table：一個 day_key = Drive 上的一個 GPX 檔，記同步狀態
--- day_key 是不透明字串（就是檔名），只負責「重拉時該刪哪一批」；
+-- day_key 是不透明字串（就是檔名加上使用者前綴），只負責「重拉時該刪哪一批」；
 -- 檔名是手機當地日期但檔內時戳是 UTC，兩者不可混為一談
+--
+-- 多人之後 day_key = 'u<uid>:<檔名>'（uid 1 無前綴，見 migrations/0009）：
+-- 兩個人同一天都會產出 20260813.gpx，不加前綴會互相洗掉
 CREATE TABLE IF NOT EXISTS TrackDay (
   day_key TEXT PRIMARY KEY,
+  -- 這一天的軌跡是誰的。刻意不加 ON DELETE CASCADE，見 migrations/0009
+  user_id INTEGER REFERENCES User(id),
   -- 'gpslogger' | 'timeline' | 'manual'
   ingest_source TEXT NOT NULL,
   drive_file_id TEXT,
@@ -134,6 +143,7 @@ CREATE TABLE IF NOT EXISTS TrackPoint (
 
 CREATE INDEX IF NOT EXISTS idx_trackpoint_day ON TrackPoint(day_key, t_utc);
 CREATE INDEX IF NOT EXISTS idx_trackpoint_time ON TrackPoint(t_utc);
+CREATE INDEX IF NOT EXISTS idx_trackday_user ON TrackDay(user_id);
 
 -- TrackSegment Table：每一段軌跡的交通工具。段的身分是 (day_key, seg)。
 -- 不放進 TrackPoint 會讓同一個值重複幾千列；不放進 TrackDay 是因為

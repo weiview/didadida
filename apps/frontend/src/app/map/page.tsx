@@ -11,11 +11,12 @@ import {
   editTrackPoints,
   saveTrackRaw, fetchTrackRaw, fetchTrackDays, updatePhotoGeo,
   matchTrackShape, saveTrackMatched, fetchTrackMatched, deleteTrackMatched,
-  fetchTimelineIndex, fetchTimelineMonth,
+  fetchTimelineIndex, fetchTimelineMonth, fetchTrackMembers,
   type FootprintPoint, type Album, type TripSegment, type TrackPoint,
-  type TrackPointEdit, type TrackDay, type MatchedTrack,
+  type TrackPointEdit, type TrackDay, type MatchedTrack, type TrackMember,
   type TimelineIndex, type TimelineMonthData,
 } from '@/lib/api';
+import { DEFAULT_TRACK_COLOR } from '@/lib/trackColors';
 import { toLineStrings, segmentIndices, type TrackTuple } from '@/lib/timelineTrack';
 import { useAdmin } from '@/lib/useAdmin';
 import { parseGpx, simplifyTrack, collapseStays, rejectSpikes, extractTrips } from '@/lib/gpx';
@@ -93,7 +94,7 @@ export default function MapPage() {
    * 都是**全站共用**的一份資料，後端只放行 can_manage_others 的人。一般成員看得到
    * 軌跡（GET 沒擋），但不該端出那些按鈕 —— 按了只會拿到 403。
    */
-  const { isAdmin, canManageOthers, canViewMap, checking: checkingAuth } = useAdmin();
+  const { isAdmin, canManageOthers, canViewMap, checking: checkingAuth, user } = useAdmin();
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [showTimelineImport, setShowTimelineImport] = useState(false);
@@ -105,9 +106,25 @@ export default function MapPage() {
   const [syncLog, setSyncLog] = useState<string[]>([]);
   // 停留點濃縮的參數是在匯入時寫死進資料的，改了參數就得繞過 md5 比對整批重灌
   const [forceSync, setForceSync] = useState(false);
+  // 手動上傳 GPX 用的隱藏 file input。按鈕自己畫，原生那顆長得跟頁面格格不入
+  const gpxInputRef = useRef<HTMLInputElement>(null);
   // D1 裡有的所有軌跡日（不受畫面上的日期篩選影響）。
   // 拿來算 gpsDays（決定哪幾天輪得到 Google 時間軸貼路）與查 has_raw / md5
   const [trackDays, setTrackDays] = useState<TrackDay[]>([]);
+
+  /*
+   * 站上有哪些家人、各是什麼顏色。地圖上的線要靠它把 user_id 換成顏色與人名。
+   * 只有一個人的站台不會端出篩選列（見下面的 showMemberFilter）。
+   */
+  const [members, setMembers] = useState<TrackMember[]>([]);
+  /*
+   * 被關掉的成員。存「關掉的」而不是「開著的」是刻意的 ——
+   * 站長之後加了新家人，他預設就是看得到的，不必回頭來這裡補勾。
+   *
+   * 這是**顯示篩選不是隱私牆**（使用者定調）：家人本來就互相看得到，
+   * 關掉只是這一刻不想讓那條線擋住畫面。
+   */
+  const [hiddenUsers, setHiddenUsers] = useState<Set<number>>(new Set());
 
   /*
    * 地圖上畫哪幾層，已經不再是開關而是定案：
@@ -266,10 +283,34 @@ export default function MapPage() {
    * 訪客在這一頁看到的只有相簿的打卡點，而那還要相簿自己被設成公開。
    */
   const { from: trackFrom, to: trackTo, skip: skipTracks } = range;
+
+  /*
+   * 要撈哪幾個人的軌跡。全都看得到時送 undefined（不帶 ?user_id=）。
+   *
+   * 篩選推到後端而不是撈回來再濾：`/api/tracks` 的點數上限是**全域**的，
+   * 三個人同框等於每個人只剩三分之一的天數。只看一個人時就不該把別人的點
+   * 也讀出來 —— 那既吃掉那個上限，也白花 D1 的讀取額度
+   * （[[free-tier-is-top-priority]]）。
+   *
+   * 壓成字串再進 deps：Set 每次 render 都是新物件。
+   */
+  const visibleUserIds = useMemo(() => {
+    if (hiddenUsers.size === 0) return '';
+    return members.map(m => m.id).filter(id => !hiddenUsers.has(id)).join(',');
+  }, [members, hiddenUsers]);
+
   const loadTracks = useCallback(async () => {
     if (!isAdmin || skipTracks) { setTracks([]); return; }
-    setTracks(await fetchTracks({ from: trackFrom, to: trackTo }));
-  }, [isAdmin, trackFrom, trackTo, skipTracks]);
+    // 全部關掉：不必打 API，答案一定是空的
+    if (hiddenUsers.size > 0 && !visibleUserIds) { setTracks([]); return; }
+    setTracks(await fetchTracks({
+      from: trackFrom,
+      to: trackTo,
+      userIds: visibleUserIds ? visibleUserIds.split(',').map(Number) : undefined,
+    }));
+    // hiddenUsers 只透過 visibleUserIds 影響結果，但「全關」那條捷徑要看得到它
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin, trackFrom, trackTo, skipTracks, visibleUserIds, hiddenUsers.size]);
 
   useEffect(() => {
     // 看不到這一頁的人不必為了一個畫不出來的下拉選單去撈整份相簿清單
@@ -286,6 +327,34 @@ export default function MapPage() {
   useEffect(() => { load(); }, [load]);
   useEffect(() => { loadTracks(); }, [loadTracks]);
   useEffect(() => { loadTrackDays(); }, [loadTrackDays]);
+
+  // 家人清單很小（一個家庭幾筆），進頁抓一次就夠。訪客不打（後端 401）
+  useEffect(() => {
+    if (!isAdmin) { setMembers([]); return; }
+    let cancelled = false;
+    fetchTrackMembers().then(list => { if (!cancelled) setMembers(list); });
+    return () => { cancelled = true; };
+  }, [isAdmin]);
+
+  /** user_id → 顏色。FootprintMap 的 match 運算式吃這個 */
+  const trackColors = useMemo(() => {
+    const out: Record<number, string> = {};
+    for (const m of members) out[m.id] = m.track_color;
+    return out;
+  }, [members]);
+
+  /** 我自己的顏色。Google 紀念層永遠是我自己的時間軸，跟著我的顏色走 */
+  const myColor = user?.track_color || DEFAULT_TRACK_COLOR;
+  const myUserId = user?.id ?? null;
+
+  /*
+   * 篩選列只在「站上真的不只一個人」時才端出來。
+   * 一個人的站台勾一個永遠打勾的框，只是多一排看不懂的東西。
+   */
+  const showMemberFilter = isAdmin && members.length > 1;
+
+  /** 我自己被篩掉了。我名下那些不經過 /api/tracks 的層（Google 歷史）要自己收 */
+  const meHidden = myUserId != null && hiddenUsers.has(myUserId);
 
   useEffect(() => {
     if (isAdmin) fetchTripSegments(albumId === '' ? undefined : albumId).then(setSegments);
@@ -422,6 +491,8 @@ export default function MapPage() {
             lng,
             src: 'timeline',
             seg: segs[i],
+            // 時間軸月檔存在「我自己的」R2 命名空間裡，看到的永遠是自己的
+            user_id: myUserId,
           });
         }
       }
@@ -429,7 +500,7 @@ export default function MapPage() {
     })();
 
     return () => { cancelled = true; };
-  }, [timelineDayKeys, trackFrom, trackTo]);
+  }, [timelineDayKeys, trackFrom, trackTo, myUserId]);
 
   /*
    * Google 時間軸紀念層。
@@ -666,23 +737,27 @@ export default function MapPage() {
     const log: string[] = ['正在讀取 Drive 檔案清單…'];
     setSyncLog([...log]);
 
-    const { files, error } = await fetchDriveGpxFiles();
+    const { files, error, code } = await fetchDriveGpxFiles();
     if (error) {
-      setSyncLog([`讀取失敗：${error}`]);
+      setSyncLog([code === 'track_folder_unbound' ? error : `讀取失敗：${error}`]);
       setSyncing(false);
-      return null;
+      // 還沒綁資料夾不是失敗，是還沒設定。回空陣列讓開頁自動同步安靜地結束
+      // （回 null 的話它會判定成 Drive 掛了，每次進地圖都跳一次紅字）
+      return code === 'track_folder_unbound' ? [] : null;
     }
 
     // 強制模式忽略 md5，整批重灌 —— 停留點濃縮的結果是寫死在資料裡的，
     // 檔案內容沒變但演算法參數變了的時候，只有這條路能把舊資料換掉。
-    // 平常則跳過手動編修過的日子：重灌是整批刪掉再寫入，會把手工合併／刪除的結果洗掉
+    // 平常則跳過 ingest_source='manual' 的日子：那是「人決定過內容」的日子
+    // （手動編修過軌跡點，或整個檔是手動上傳的），重灌會整批刪掉再寫入，
+    // 把那些決定洗掉而且不會有人發現
     const edited = files.filter(f => f.ingestSource === 'manual');
     const todo = force ? files : files.filter(f => f.needsSync && f.ingestSource !== 'manual');
     const skipped = force ? 0 : files.filter(f => f.needsSync && f.ingestSource === 'manual').length;
     if (todo.length === 0) {
       setSyncLog([
         `Drive 上有 ${files.length} 個軌跡檔，沒有需要同步的。`
-        + (skipped > 0 ? `（${skipped} 個手動編修過，已跳過）` : ''),
+        + (skipped > 0 ? `（${skipped} 個手動編修或上傳過，已跳過）` : ''),
       ]);
       setSyncing(false);
       return [];
@@ -692,9 +767,9 @@ export default function MapPage() {
     log.push((quiet ? '自動同步：' : '')
       + (force
         ? `${files.length} 個軌跡檔，強制全部重新匯入`
-          + (edited.length > 0 ? `（含 ${edited.length} 個手動編修過的，會被覆蓋）` : '')
+          + (edited.length > 0 ? `（含 ${edited.length} 個手動編修或上傳過的，會被覆蓋）` : '')
         : `${files.length} 個軌跡檔，其中 ${todo.length} 個有更新`
-          + (skipped > 0 ? `，另 ${skipped} 個手動編修過已跳過` : '')));
+          + (skipped > 0 ? `，另 ${skipped} 個手動編修或上傳過已跳過` : '')));
     setSyncLog([...log]);
 
     const ingested: MatchTarget[] = [];
@@ -702,14 +777,14 @@ export default function MapPage() {
     for (const f of todo) {
       const xml = await fetchDriveGpxText(f.driveFileId);
       if (!xml) {
-        log.push(`${f.dayKey}：下載失敗`);
+        log.push(`${f.fileName}：下載失敗`);
         setSyncLog([...log]);
         continue;
       }
 
       const parsed = parseGpx(xml);
       if (parsed.error) {
-        log.push(`${f.dayKey}：${parsed.error}`);
+        log.push(`${f.fileName}：${parsed.error}`);
         setSyncLog([...log]);
         continue;
       }
@@ -728,20 +803,23 @@ export default function MapPage() {
       });
 
       if (!result) {
-        log.push(`${f.dayKey}：寫入失敗`);
+        log.push(`${f.fileName}：寫入失敗`);
       } else {
         // 留存原文（給「恢復原始軌跡」用）。必須排在 ingest 之後：
         // 後端是 UPDATE TrackDay，那一列還不存在的話 raw_key 會寫不進去。
         // 存檔失敗不算同步失敗 —— 軌跡點已經進 D1 了，只是這天還原不回來
-        const rawSaved = await saveTrackRaw(f.dayKey, xml);
+        //
+        // 用 result.dayKey 而不是 f.dayKey：多身分之後 key 由後端依身分重組，
+        // 送進去的跟寫出來的不保證一樣，用錯的那個會存到一個沒有 TrackDay 的 key 上
+        const rawSaved = await saveTrackRaw(result.dayKey, xml);
         total += result.inserted;
         // 只有留存成功的才值得接著貼路 —— 貼路只吃原始 GPX，沒有原文就貼不了
-        if (rawSaved) ingested.push({ dayKey: f.dayKey, md5: f.md5 ?? null });
+        if (rawSaved) ingested.push({ dayKey: result.dayKey, md5: f.md5 ?? null });
         const dropped = parsed.skipped > 0 ? `，${parsed.skipped} 點無時間被略過` : '';
         const stays = stayCount > 0 ? `，含 ${stayCount} 處停留` : '';
         const raw = rawSaved ? '' : '（原始檔留存失敗，這天無法還原）';
         log.push(
-          `${f.dayKey}：${parsed.points.length} 點 / ${parsed.segCount} 段 → `
+          `${f.fileName}：${parsed.points.length} 點 / ${parsed.segCount} 段 → `
           + `濃縮停留 ${stayed.length} 點 → 抽稀後寫入 ${result.inserted} 點${stays}${dropped}${raw}`
         );
       }
@@ -758,6 +836,82 @@ export default function MapPage() {
 
   /** 「立即同步足跡」按鈕。強制模式的開關只影響手動這條路 */
   const syncTracks = () => runSync({ force: forceSync });
+
+  /**
+   * 手動選 GPX 上傳。走的是跟 Drive 同步**一模一樣**的管線
+   * （parseGpx → collapseStays → simplifyTrack → ingest → 留存原文），
+   * 差別只有三處：
+   *
+   * - 檔案從 `<input type=file>` 來，不經過 Drive，所以沒有 driveFileId／md5。
+   * - `ingestSource: 'manual'`：往後 Drive 同步會**跳過**這幾天。手動傳上來的
+   *   通常是「Drive 上沒有、或不想被自動覆蓋」的那一份，被自動流程洗掉會很難查。
+   * - day_key 用檔名（後端會依身分補前綴）。**同名就是同一天，會整批換掉** ——
+   *   重傳同一個檔是修正，不是新增。
+   *
+   * 為什麼每個成員都要有這條路：GPSLogger 只傳得到自己的 Drive，資料夾還沒
+   * 分享／綁定之前他一個點都同步不進來；舊手機匯出的、朋友給的 GPX 也只有這條路。
+   */
+  const uploadGpxFiles = useCallback(async (fileList: FileList | null) => {
+    const files = Array.from(fileList ?? []);
+    if (files.length === 0 || syncing) return;
+
+    setSyncing(true);
+    const log: string[] = [`準備匯入 ${files.length} 個檔案…`];
+    setSyncLog([...log]);
+
+    const ingested: MatchTarget[] = [];
+    let total = 0;
+    for (const file of files) {
+      const xml = await file.text().catch(() => null);
+      if (xml === null) {
+        log.push(`${file.name}：讀取失敗`);
+        setSyncLog([...log]);
+        continue;
+      }
+
+      const parsed = parseGpx(xml);
+      if (parsed.error) {
+        log.push(`${file.name}：${parsed.error}`);
+        setSyncLog([...log]);
+        continue;
+      }
+
+      const stayed = collapseStays(parsed.points);
+      const simplified = simplifyTrack(stayed);
+      const stayCount = simplified.filter(p => (p.staySec ?? 0) > 0).length;
+      const result = await ingestTrack({
+        dayKey: file.name,
+        ingestSource: 'manual',
+        points: simplified,
+      });
+
+      if (!result) {
+        log.push(`${file.name}：寫入失敗`);
+      } else {
+        // 同 Drive 那條路：一定要用後端回傳的 key，送進去的那個不保證相同
+        const rawSaved = await saveTrackRaw(result.dayKey, xml);
+        total += result.inserted;
+        if (rawSaved) ingested.push({ dayKey: result.dayKey, md5: null });
+        const dropped = parsed.skipped > 0 ? `，${parsed.skipped} 點無時間被略過` : '';
+        const stays = stayCount > 0 ? `，含 ${stayCount} 處停留` : '';
+        const raw = rawSaved ? '' : '（原始檔留存失敗，這天無法還原）';
+        log.push(
+          `${file.name}：${parsed.points.length} 點 / ${parsed.segCount} 段 → `
+          + `濃縮停留 ${stayed.length} 點 → 抽稀後寫入 ${result.inserted} 點${stays}${dropped}${raw}`
+        );
+      }
+      setSyncLog([...log]);
+    }
+
+    log.push(`匯入完成，共寫入 ${total} 個軌跡點。`
+      // 貼路是那個 effect 依「畫面上選的日期」自動補的，所以只在有原文時提一句，
+      // 不保證馬上發生 —— 傳的是三年前那一天就得先把日期切過去
+      + (ingested.length > 0 ? '把日期切到那幾天就會自動貼路。' : ''));
+    setSyncLog([...log]);
+    setSyncing(false);
+    loadTracks();
+    loadTrackDays();
+  }, [syncing, loadTracks, loadTrackDays]);
 
   /**
    * 軌跡貼路：把畫面上這幾天的軌跡切成一趟一趟的移動，送去 Valhalla 做
@@ -893,7 +1047,9 @@ export default function MapPage() {
    *   runMatch，兩邊同時跑會把每秒一請求的自律破功。
    */
   useEffect(() => {
-    if (!canManageOthers || matching || matchedLoading || unmatchedKeys.length === 0) return;
+    // isAdmin（任何登入的成員）而不是 canManageOthers：軌跡是各自的，
+    // 每個人都要貼得了自己那幾天。後端 saveTrackMatched 仍逐日擋
+    if (!isAdmin || matching || matchedLoading || unmatchedKeys.length === 0) return;
 
     const todo = unmatchedKeys.filter(k => !attemptedMatch.current.has(k));
     if (todo.length === 0) return;
@@ -923,13 +1079,14 @@ export default function MapPage() {
     // trackDays 只是拿來查 has_raw/md5，它變動時 rawDayKeys 也會跟著變並重讀一輪，
     // 不需要它自己觸發這個 effect
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canManageOthers, matching, matchedLoading, unmatchedKeys, runMatch]);
+  }, [isAdmin, matching, matchedLoading, unmatchedKeys, runMatch]);
 
   /*
    * 開頁自動同步。取代 cron 的作法（見 runSync 的註解為什麼不做 cron）。
    *
    * 三個刻意的界線：
-   * - 只有管理者：讀 Drive 的路由本來就只給管理者，訪客跑這個只會拿到 401。
+   * - 只有登入的成員：讀 Drive 的那條路由要身分（各人讀各人綁定的資料夾），
+   *   訪客跑這個只會拿到 401。
    * - 不擋畫面：不 await 在渲染路徑上，地圖照常先畫，同步在背景跑。
    * - 絕不強制重灌：force 只走手動那條路。自動流程若把手動編修過的日子洗掉，
    *   你會在完全不知情的狀況下失去那些編輯。
@@ -938,7 +1095,7 @@ export default function MapPage() {
    * 只同步不貼的話你隔天打開地圖會發現紫線無故消失。
    */
   useEffect(() => {
-    if (!canManageOthers || autoSyncStarted.current) return;
+    if (!isAdmin || autoSyncStarted.current) return;
     autoSyncStarted.current = true;
 
     const last = Number(localStorage.getItem(AUTO_SYNC_KEY) ?? 0);
@@ -957,7 +1114,7 @@ export default function MapPage() {
       const requests = await runMatch(ingested, { quiet: true });
       setAutoStatus(`已同步 ${ingested.length} 天，貼路 ${requests} 趟`);
     })();
-  }, [canManageOthers, runSync, runMatch]);
+  }, [isAdmin, runSync, runMatch]);
 
   const currentAlbum = albums.find(a => a.id === albumId);
 
@@ -983,8 +1140,10 @@ export default function MapPage() {
    * 播放到跨越兩種來源的那一天就會斷掉。
    */
   const routeTracks = useMemo(
-    () => [...matchedTracks, ...timelineTracks],
-    [matchedTracks, timelineTracks],
+    // 貼路那半邊是從 tracks 的日子推出來的，已經被伺服器端篩過了；
+    // Google 歷史那半邊繞過 D1 自己去 R2 撈，所以要在這裡自己收
+    () => [...matchedTracks, ...(meHidden ? [] : timelineTracks)],
+    [matchedTracks, timelineTracks, meHidden],
   );
 
   const focusPoint = useMemo<[number, number] | null>(() => {
@@ -1101,11 +1260,47 @@ export default function MapPage() {
               checked={showTimeline}
               onChange={(e) => setShowTimeline(e.target.checked)}
             />
-            <span title="從 Google 時間軸匯入的足跡，畫成最底層的桃紅色細線。唯讀 —— 不修正、不貼路，也不會拿來推算照片位置。跟貼路軌跡是兩個獨立開關，可以同時開著對照。">
+            <span title="從 Google 時間軸匯入的足跡，畫成最底層的細線，顏色跟著你自己的軌跡色。唯讀 —— 不修正、不貼路，也不會拿來推算照片位置。跟貼路軌跡是兩個獨立開關，可以同時開著對照。">
               顯示 Google 足跡
             </span>
           </label>
         )}
+        {/*
+          成員篩選。**這是顯示篩選，不是隱私牆** —— 收起來只是畫面清爽一點，
+          不代表誰的軌跡被保護了（後端本來就讓所有管理員看得到彼此的）。
+          只有一個人時整排不出現：勾一個永遠打勾的框沒有意義。
+          濾掉的人不送進 /api/tracks（那支的 20000 點上限是全站共用的，
+          少載一個人就是多留一點額度給看得到的人）。
+        */}
+        {showMemberFilter && members.map(m => {
+          const hidden = hiddenUsers.has(m.id);
+          return (
+            <label
+              key={m.id}
+              style={{ fontSize: 13, display: 'flex', gap: 7, alignItems: 'center', cursor: 'pointer' }}
+            >
+              <input
+                type="checkbox"
+                checked={!hidden}
+                onChange={(e) => setHiddenUsers(prev => {
+                  const next = new Set(prev);
+                  if (e.target.checked) next.delete(m.id); else next.add(m.id);
+                  return next;
+                })}
+              />
+              <span
+                title={`地圖上只顯示打勾的人。取消勾選只是不畫，資料還在。`}
+                style={{ display: 'flex', gap: 5, alignItems: 'center', opacity: hidden ? 0.5 : 1 }}
+              >
+                <span style={{
+                  width: 10, height: 10, borderRadius: '50%',
+                  background: m.track_color, flexShrink: 0,
+                }} />
+                {m.name || `#${m.id}`}
+              </span>
+            </label>
+          );
+        })}
 
         <div style={{ marginLeft: 'auto', fontSize: 13, color: '#64748b', textAlign: 'right' }}>
           <div>
@@ -1127,7 +1322,7 @@ export default function MapPage() {
             </div>
           )}
           {showTimeline && (
-            <div style={{ fontSize: 12, color: '#db2777', marginTop: 2 }}>
+            <div style={{ fontSize: 12, color: myColor, marginTop: 2 }}>
               {timelineLoading ? `讀取 Google 足跡…（${timelineMonths.length} 個月）`
                 : timelineStats && timelineStats.points > 0
                   ? `Google 足跡 ${timelineStats.points.toLocaleString()} 點 / ${timelineStats.days} 天`
@@ -1169,7 +1364,10 @@ export default function MapPage() {
         showMatchedLine={SHOW_MATCHED_LINE}
         showTrackLine={SHOW_TRACK_LINE}
         animateOn={ANIMATE_ON}
-        timelineLines={showTimeline ? timelineLines : undefined}
+        trackColors={trackColors}
+        timelineColor={myColor}
+        // 我自己被篩掉時，我的 Google 紀念層也跟著收 —— 那一層畫的就是我
+        timelineLines={showTimeline && !meHidden ? timelineLines : undefined}
         focusPoint={focusPoint}
         // 點縮圖就跳去那本相簿。地圖上看到一張照片時，下一個想做的事
         // 幾乎都是「看那天其他張」—— 編輯模式下點擊是選取，FootprintMap 自己擋掉了
@@ -1184,13 +1382,25 @@ export default function MapPage() {
         {/* 同一條線兩種來源：有 GPS 的日子是貼路結果，沒有的是 Google 歷史原始點。
             不分色 —— 兩者的差別看線本身就知道（一個貼著路走，一個是折線）。
             訪客畫面上沒有這條線，圖例也就不列 */}
-        {isAdmin && <span style={{ color: '#7c3aed' }}>
-          — 軌跡（GPS 貼 OSM 路網{timelineTracks.length > 0 ? '／Google 歷史原始點' : ''}）
-        </span>}
-        {showTimeline && <span style={{ color: '#db2777' }}>— Google 足跡（唯讀）</span>}
+        {/* 多人時圖例改成列人名 —— 「哪條線是誰」是看多身分地圖時最先要問的事。
+            只有一個人就維持原本那句，不必為了一個人做一份色票對照表 */}
+        {isAdmin && (showMemberFilter
+          ? members.filter(m => !hiddenUsers.has(m.id)).map(m => (
+            <span key={m.id} style={{ color: m.track_color }}>— {m.name || `#${m.id}`}</span>
+          ))
+          : <span style={{ color: myColor }}>
+            — 軌跡（GPS 貼 OSM 路網{timelineTracks.length > 0 ? '／Google 歷史原始點' : ''}）
+          </span>)}
+        {showTimeline && <span style={{ color: myColor }}>— Google 足跡（唯讀）</span>}
       </div>
 
-      {canManageOthers && (
+      {/*
+        軌跡從 0009 起是「每個人各自一份」，所以這一區對**所有登入的成員**開放 ——
+        同步自己的 Drive 資料夾、手動上傳自己的 GPX、貼自己的路，後端都只讓他
+        動到自己那幾天（canTouchTrackDay）。區塊內真正全站共用的東西（行程段）
+        才另外用 canManageOthers 收起來。訪客沒有 isAdmin，整區看不到。
+      */}
+      {isAdmin && (
         <div style={{ marginTop: 30 }}>
           {/* 整區收合。平常來這一頁是要看地圖的，貼路與同步也都自動化了，
               工具區留在展開狀態只是把地圖往上擠 */}
@@ -1203,7 +1413,7 @@ export default function MapPage() {
             }}
           >
             <span style={{ fontSize: 13, color: '#94a3b8' }}>{showAdminTools ? '▾' : '▸'}</span>
-            管理工具
+            {canManageOthers ? '管理工具' : '我的足跡工具'}
           </button>
 
           {showAdminTools && (
@@ -1222,6 +1432,28 @@ export default function MapPage() {
             >
               {syncing ? '同步中…' : '🛰️ 立即同步足跡'}
             </button>
+            {/* 手動上傳。Drive 資料夾還沒綁好的人、或想補一個 Drive 上沒有的舊檔，
+                只有這條路。檔案不上傳到 Drive，只有解析後的點進 D1、原文進 R2 */}
+            <button
+              disabled={syncing}
+              onClick={() => gpxInputRef.current?.click()}
+              style={{ ...toolBtn, borderColor: '#7c3aed', color: '#7c3aed' }}
+              title="直接選手機或電腦上的 .gpx 檔匯入。同名的檔案視為同一天，會整批取代。"
+            >
+              📄 手動上傳 GPX
+            </button>
+            <input
+              ref={gpxInputRef}
+              type="file"
+              accept=".gpx,application/gpx+xml,text/xml"
+              multiple
+              hidden
+              onChange={(e) => {
+                uploadGpxFiles(e.target.files);
+                // 清掉才選得了同一個檔第二次（改完內容重傳是常見動作）
+                e.target.value = '';
+              }}
+            />
             <label style={{
               fontSize: 12.5, color: '#64748b', display: 'flex',
               gap: 6, alignItems: 'center', cursor: 'pointer',
@@ -1333,6 +1565,10 @@ export default function MapPage() {
             </div>
           )}
 
+          {/* 行程段是全站共用的一份（不屬於任何人的軌跡），所以維持只給
+              can_manage_others 的人。一般成員看到刪除鈕只會拿到 403 */}
+          {canManageOthers && (
+          <>
           <h3 style={{ fontSize: 15, marginBottom: 8 }}>行程段（{segments.length}）</h3>
           {segments.length === 0 ? (
             <p style={{ fontSize: 13.5, color: '#64748b' }}>
@@ -1368,6 +1604,8 @@ export default function MapPage() {
                 </div>
               ))}
             </div>
+          )}
+          </>
           )}
           </>
           )}

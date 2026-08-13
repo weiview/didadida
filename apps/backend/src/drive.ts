@@ -34,6 +34,14 @@ export interface DriveFile {
   size?: string;
 }
 
+/** 別人分享給這個 SA 的資料夾。`ownerEmail` 是拿來跟站上的帳號自動對應的 */
+export interface SharedFolder {
+  id: string;
+  name: string;
+  ownerEmail: string | null;
+  modifiedTime: string | null;
+}
+
 interface ServiceAccountKey {
   client_email: string;
   private_key: string;
@@ -157,6 +165,44 @@ export async function listGpxFiles(saKeyJson: string, folderId: string): Promise
   const data: any = await res.json();
   const files: DriveFile[] = Array.isArray(data?.files) ? data.files : [];
   return files.filter((f) => typeof f.name === 'string' && f.name.toLowerCase().endsWith('.gpx'));
+}
+
+/**
+ * 列出**別人分享給這個 service account** 的所有資料夾。
+ *
+ * 多身分足跡的綁定介面用的：每個家人各自在自己的 Drive 裡讓 GPSLogger 建資料夾，
+ * 再把那個資料夾分享給 SA 的信箱。SA 這邊看得到的就是這份清單。
+ *
+ * 帶回 `owners[].emailAddress` 是為了跟 `User.email` 自動對應 —— 家人用哪個
+ * Google 帳號登入站上，通常就是他手機上那個帳號。對不上的（手機用另一個帳號）
+ * 才需要站長手動指派。
+ *
+ * `sharedWithMe` 只回「分享給我而且我沒有自己再放進某個資料夾」的東西，
+ * 對 SA 來說就是全部 —— 它自己沒有配額，不會有自建的目錄結構。
+ */
+export async function listSharedFolders(saKeyJson: string): Promise<SharedFolder[]> {
+  const token = await getAccessToken(saKeyJson);
+  const params = new URLSearchParams({
+    q: "sharedWithMe and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+    fields: 'files(id,name,modifiedTime,owners(emailAddress))',
+    pageSize: '200',
+    orderBy: 'name',
+  });
+
+  const res = await fetch(`${DRIVE_FILES_URL}?${params}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Drive 列資料夾失敗 (${res.status})`);
+
+  const data: any = await res.json();
+  const files: any[] = Array.isArray(data?.files) ? data.files : [];
+  return files.map((f) => ({
+    id: String(f.id),
+    name: String(f.name ?? ''),
+    // owners 只有在對方允許顯示時才有；拿不到就交給站長手動指派
+    ownerEmail: f?.owners?.[0]?.emailAddress ? String(f.owners[0].emailAddress) : null,
+    modifiedTime: f?.modifiedTime ?? null,
+  }));
 }
 
 /**
