@@ -88,7 +88,12 @@ export default function MapPage() {
   const [tracks, setTracks] = useState<TrackPoint[]>([]);
   const [albums, setAlbums] = useState<Album[]>([]);
   const [segments, setSegments] = useState<TripSegment[]>([]);
-  const { isAdmin } = useAdmin();
+  /**
+   * 這一頁的管理工具（同步 Drive 軌跡、貼路、匯入 Google 時間軸、行程段）動到的
+   * 都是**全站共用**的一份資料，後端只放行 can_manage_others 的人。一般成員看得到
+   * 軌跡（GET 沒擋），但不該端出那些按鈕 —— 按了只會拿到 403。
+   */
+  const { isAdmin, canManageOthers, canViewMap, checking: checkingAuth } = useAdmin();
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [showTimelineImport, setShowTimelineImport] = useState(false);
@@ -175,6 +180,8 @@ export default function MapPage() {
   const [albumSpan, setAlbumSpan] = useState<{ first: string; last: string } | null>(null);
 
   const load = useCallback(async () => {
+    // 訪客沒被開放看足跡時後端會回 403，這裡先不打 —— 主控台不必多一行紅字
+    if (!canViewMap) { setPoints([]); setLoading(false); return; }
     setLoading(true);
     const data = await fetchFootprint({
       from: from || undefined,
@@ -184,7 +191,7 @@ export default function MapPage() {
     });
     setPoints(data);
     setLoading(false);
-  }, [from, to, albumId]);
+  }, [from, to, albumId, canViewMap]);
 
   // 軌跡不隸屬任何相簿，只能用時間限縮。選了相簿卻不限縮的話，
   // 看 2024 年的相簿會冒出今年的軌跡。t_utc 是 UTC ISO，跟這裡的字串前綴相容。
@@ -231,7 +238,7 @@ export default function MapPage() {
    * 3/1～3/2 之後範圍就再也回不到整本相簿了。
    */
   useEffect(() => {
-    if (albumId === '') { setAlbumSpan(null); setFrom(''); setTo(''); return; }
+    if (albumId === '' || !canViewMap) { setAlbumSpan(null); setFrom(''); setTo(''); return; }
 
     let cancelled = false;
     (async () => {
@@ -250,7 +257,7 @@ export default function MapPage() {
     })();
 
     return () => { cancelled = true; };
-  }, [albumId]);
+  }, [albumId, canViewMap]);
 
   /*
    * 拆成基本型別再進 deps —— range 物件每次都是新的，照片重載時會白打一次 API。
@@ -265,8 +272,10 @@ export default function MapPage() {
   }, [isAdmin, trackFrom, trackTo, skipTracks]);
 
   useEffect(() => {
+    // 看不到這一頁的人不必為了一個畫不出來的下拉選單去撈整份相簿清單
+    if (!canViewMap) { setAlbums([]); return; }
     fetchAllAlbums().then(setAlbums);
-  }, []);
+  }, [canViewMap]);
 
   // 只有管理者讀得到（會暴露出門的日期）
   const loadTrackDays = useCallback(async () => {
@@ -884,7 +893,7 @@ export default function MapPage() {
    *   runMatch，兩邊同時跑會把每秒一請求的自律破功。
    */
   useEffect(() => {
-    if (!isAdmin || matching || matchedLoading || unmatchedKeys.length === 0) return;
+    if (!canManageOthers || matching || matchedLoading || unmatchedKeys.length === 0) return;
 
     const todo = unmatchedKeys.filter(k => !attemptedMatch.current.has(k));
     if (todo.length === 0) return;
@@ -914,7 +923,7 @@ export default function MapPage() {
     // trackDays 只是拿來查 has_raw/md5，它變動時 rawDayKeys 也會跟著變並重讀一輪，
     // 不需要它自己觸發這個 effect
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAdmin, matching, matchedLoading, unmatchedKeys, runMatch]);
+  }, [canManageOthers, matching, matchedLoading, unmatchedKeys, runMatch]);
 
   /*
    * 開頁自動同步。取代 cron 的作法（見 runSync 的註解為什麼不做 cron）。
@@ -929,7 +938,7 @@ export default function MapPage() {
    * 只同步不貼的話你隔天打開地圖會發現紫線無故消失。
    */
   useEffect(() => {
-    if (!isAdmin || autoSyncStarted.current) return;
+    if (!canManageOthers || autoSyncStarted.current) return;
     autoSyncStarted.current = true;
 
     const last = Number(localStorage.getItem(AUTO_SYNC_KEY) ?? 0);
@@ -948,7 +957,7 @@ export default function MapPage() {
       const requests = await runMatch(ingested, { quiet: true });
       setAutoStatus(`已同步 ${ingested.length} 天，貼路 ${requests} 趟`);
     })();
-  }, [isAdmin, runSync, runMatch]);
+  }, [canManageOthers, runSync, runMatch]);
 
   const currentAlbum = albums.find(a => a.id === albumId);
 
@@ -1004,6 +1013,24 @@ export default function MapPage() {
     const photo = firstPhoto ?? points[0];
     return photo ? [photo.lng, photo.lat] : null;
   }, [from, to, loading, tracks, routeTracks, timelineLines, points]);
+
+  // 還在問後端「我是誰」。這半秒留白 —— 先畫出地圖再收回去，或先說找不到
+  // 再冒出整張地圖，兩種都很難看
+  if (checkingAuth) return <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 16px 60px' }} />;
+
+  /*
+   * 站長沒開放訪客看足跡。**不解釋、不給登入入口** —— 訪客身上不留任何
+   * 升級身分的提示（跟 /admin 同一套處理）。真正的閘門在後端：`/api/footprint`
+   * 對沒開放的訪客一律 403，把網址背起來也拿不到座標。
+   */
+  if (!canViewMap) {
+    return (
+      <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 16px 60px' }}>
+        <Link href="/" style={{ fontSize: 14, color: '#2563eb', textDecoration: 'none' }}>← 回相簿</Link>
+        <h1 style={{ fontSize: 24, marginTop: 18 }}>找不到這一頁</h1>
+      </div>
+    );
+  }
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 16px 60px' }}>
@@ -1163,7 +1190,7 @@ export default function MapPage() {
         {showTimeline && <span style={{ color: '#db2777' }}>— Google 足跡（唯讀）</span>}
       </div>
 
-      {isAdmin && (
+      {canManageOthers && (
         <div style={{ marginTop: 30 }}>
           {/* 整區收合。平常來這一頁是要看地圖的，貼路與同步也都自動化了，
               工具區留在展開狀態只是把地圖往上擠 */}

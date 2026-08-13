@@ -1,8 +1,19 @@
 -- User Table
+--
+-- 同時就是「可以用 Google 登入當管理員」的白名單（見 migrations/0008）。
+-- 移出白名單是把 active 設成 0，**不是刪列** —— Album.user_id 的外鍵是
+-- ON DELETE CASCADE，刪列會連他建過的相簿一起帶走。
 CREATE TABLE IF NOT EXISTS User (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   email TEXT UNIQUE NOT NULL,
+  -- 'owner'（站長，權限全開且是唯一能改白名單的人）| 'member'
+  role TEXT NOT NULL DEFAULT 'member',
+  -- 可以動**別人**的相簿與照片。0 就只動得了自己的
+  can_manage_others INTEGER NOT NULL DEFAULT 0,
+  -- 0 ＝ 已移出白名單，登不進來
+  active INTEGER NOT NULL DEFAULT 1,
+  last_login_at TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -51,6 +62,8 @@ CREATE TABLE IF NOT EXISTS Photo (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   url TEXT,
   thumb_url TEXT,
+  -- 誰傳的。NULL ＝ 這一層不表態，回頭看相簿的 user_id（見 migrations/0008）
+  uploaded_by INTEGER,
   FOREIGN KEY (album_id) REFERENCES Album(id) ON DELETE CASCADE
 );
 

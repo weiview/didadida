@@ -3,6 +3,7 @@ import "./globals.css";
 import ScrollOptimizer from "@/components/ScrollOptimizer";
 import ScrollToTopButton from "@/components/ScrollToTopButton";
 import AccessGate from "@/components/AccessGate";
+import AccountBadge from "@/components/AccountBadge";
 import { AuthProvider } from "@/lib/useAdmin";
 
 export const metadata: Metadata = {
@@ -33,6 +34,9 @@ export default function RootLayout({
         */}
         <AuthProvider>
           <AccessGate>
+            {/* 右上角的帳號牌。跟回到頂端鈕一樣掛在這裡而不是各頁自己做一顆 ——
+                「我現在是誰、怎麼登出」在每一頁都該問得到 */}
+            <AccountBadge />
             <main>{children}</main>
             <ScrollToTopButton />
           </AccessGate>

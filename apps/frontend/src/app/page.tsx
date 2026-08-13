@@ -6,7 +6,6 @@ import albumStyles from "./album/album.module.css";
 import Link from "next/link";
 import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
-import { authErrorMessage } from "@/lib/authMessages";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import PhotoLightbox from "./album/PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
@@ -14,7 +13,14 @@ import FilterBottomSheet from "@/components/FilterBottomSheet";
 import FabMenu from "@/components/FabMenu";
 import BottomActionBar from "@/components/BottomActionBar";
 
-function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPressIndex, sortBy, index, handlePointerDown, handlePointerUpOrLeave, handleDragStart, handleDragEnter, handleDragEnd, isSelected, onSelectToggle }: any) {
+/**
+ * `canEdit` = 這本相簿是不是我動得了的（我建的，或我可以管全站內容）。
+ * false 時不畫勾選框 —— 勾了也只會在按下刪除時被後端 403，不如一開始就不端出來。
+ *
+ * `canReorder` 是另一回事：排序是**全站共用**的一份順序，只有可以管別人內容的人
+ * 才碰得到，所以它不看單本相簿是誰的。
+ */
+function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, draggingIndex, longPressIndex, sortBy, index, handlePointerDown, handlePointerUpOrLeave, handleDragStart, handleDragEnter, handleDragEnd, isSelected, onSelectToggle }: any) {
   const [hovered, setHovered] = useState(false);
   const [photoIndex, setPhotoIndex] = useState(0);
   const previews: string[] = album.preview_photos ?? [];
@@ -53,7 +59,7 @@ function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPres
 
   return (
     <div style={{ position: 'relative' }} className={styles.albumCardWrapper}>
-      {isAdmin && isEditing && (
+      {isAdmin && isEditing && canEdit && (
         <input
           type="checkbox"
           checked={isSelected}
@@ -70,7 +76,7 @@ function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPres
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         className={`glass-panel ${styles.albumCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
-        draggable={isAdmin && longPressIndex === index && sortBy === "custom"}
+        draggable={isAdmin && canReorder && longPressIndex === index && sortBy === "custom"}
         onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
         onPointerUp={handlePointerUpOrLeave}
         onPointerLeave={handlePointerUpOrLeave}
@@ -79,10 +85,10 @@ function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPres
             e.preventDefault();
           }
         }}
-        onDragStart={() => isAdmin && sortBy === "custom" && handleDragStart(index)}
-        onDragEnter={() => isAdmin && sortBy === "custom" && handleDragEnter(index)}
-        onDragEnd={isAdmin && sortBy === "custom" ? handleDragEnd : undefined}
-        onDragOver={(e) => isAdmin && sortBy === "custom" && e.preventDefault()}
+        onDragStart={() => isAdmin && canReorder && sortBy === "custom" && handleDragStart(index)}
+        onDragEnter={() => isAdmin && canReorder && sortBy === "custom" && handleDragEnter(index)}
+        onDragEnd={isAdmin && canReorder && sortBy === "custom" ? handleDragEnd : undefined}
+        onDragOver={(e) => isAdmin && canReorder && sortBy === "custom" && e.preventDefault()}
       >
         <div className={styles.coverPlaceholder}>
           {/* Carousel images（只掛已經輪到的，見上面 mountedCount 的說明） */}
@@ -131,19 +137,11 @@ function AlbumCardComponent({ album, isAdmin, isEditing, draggingIndex, longPres
 export default function Home() {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [loading, setLoading] = useState(true);
-  const { isAdmin, checking: isCheckingAuth, login, loginWithGoogle, authError } = useAdmin();
+  const { isAdmin, checking: isCheckingAuth, canEdit, canManageOthers, canViewMap } = useAdmin();
 
   // Modal state
   const [showModal, setShowModal] = useState(false);
-  const [showLoginModal, setShowLoginModal] = useState(false);
   const [newAlbumName, setNewAlbumName] = useState("");
-  const [passwordInput, setPasswordInput] = useState("");
-  /**
-   * 密碼那條後路平常收起來 —— 正門是 Google，多一個密碼框只會讓人以為那才是主要入口。
-   * Google 登入被打回票（帳號不在白名單、OAuth 設定壞了）時自動攤開，
-   * 那正是唯一還需要密碼的時候。
-   */
-  const [showPasswordFallback, setShowPasswordFallback] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Batch delete state
@@ -413,24 +411,11 @@ export default function Home() {
    */
   const displayAlbums = albums;
 
-  // Google 那邊回了拒絕：把登入視窗打開、密碼後路一起攤開，不然使用者只會看到網址閃一下
-  useEffect(() => {
-    if (!authError) return;
-    setShowLoginModal(true);
-    setShowPasswordFallback(true);
-  }, [authError]);
-
-  const handleLogin = async () => {
-    setIsSubmitting(true);
-    const result = await login(passwordInput);
-    if (result.success) {
-      setShowLoginModal(false);
-      setPasswordInput("");
-    } else {
-      alert(result.message || "密碼錯誤");
-    }
-    setIsSubmitting(false);
-  };
+  /** 畫面上這些相簿裡，我真的動得了的那些。批次刪除的「全選」只認這一份 */
+  const editableAlbums = useMemo(
+    () => displayAlbums.filter((album) => canEdit(album)),
+    [displayAlbums, canEdit],
+  );
 
   const handleCreateAlbum = async () => {
     if (!newAlbumName.trim()) return;
@@ -472,8 +457,9 @@ export default function Home() {
 
   // Drag and Drop handlers
   const handlePointerDown = (index: number) => {
-    // 篩選中畫面上只是子集合，拖曳算出來的 sort_order 會是錯的（見 handleDragEnd）
-    if (!isAdmin || isFiltering) return;
+    // 篩選中畫面上只是子集合，拖曳算出來的 sort_order 會是錯的（見 handleDragEnd）。
+    // 排序是全站共用的一份，動得了它的只有可以管別人內容的人
+    if (!isAdmin || isFiltering || !canManageOthers) return;
     timerRef.current = setTimeout(() => {
       setLongPressIndex(index);
     }, 1000);
@@ -540,15 +526,18 @@ export default function Home() {
             DidaDida
           </h1>
           <p className={styles.subtitle}>紀錄每一個美好瞬間</p>
-          <Link
-            href="/map"
-            style={{
-              display: 'inline-block', marginTop: 10, fontSize: 14,
-              color: 'var(--accent-color, #2563eb)', textDecoration: 'none',
-            }}
-          >
-            🗺️ 足跡地圖
-          </Link>
+          {/* 站長沒開放訪客看足跡的話，這個連結就不存在 —— 直接打網址也一樣進不去 */}
+          {canViewMap && (
+            <Link
+              href="/map"
+              style={{
+                display: 'inline-block', marginTop: 10, fontSize: 14,
+                color: 'var(--accent-color, #2563eb)', textDecoration: 'none',
+              }}
+            >
+              🗺️ 足跡地圖
+            </Link>
+          )}
         </div>
         <div className={styles.controls}>
           <div className={styles.filters}>
@@ -890,6 +879,8 @@ export default function Home() {
                     album={album}
                     index={index}
                     isAdmin={isAdmin}
+                    canEdit={canEdit(album)}
+                    canReorder={canManageOthers}
                     isEditing={isEditingAlbums}
                     draggingIndex={draggingIndex}
                     longPressIndex={longPressIndex}
@@ -926,6 +917,8 @@ export default function Home() {
               album={album}
               index={index}
               isAdmin={isAdmin}
+              canEdit={canEdit(album)}
+              canReorder={canManageOthers}
               isEditing={isEditingAlbums}
               draggingIndex={draggingIndex}
               longPressIndex={longPressIndex}
@@ -987,8 +980,9 @@ export default function Home() {
       {selectedPhotoIndex !== null && (
         <PhotoLightbox 
           photo={displayPhotos[selectedPhotoIndex]}
-          isAdmin={isAdmin} 
-          availableTags={[]} 
+          // 搜尋結果混著各人的相簿，逐張問「這張是不是我的」
+          isAdmin={canEdit(displayPhotos[selectedPhotoIndex])}
+          availableTags={[]}
           onClose={() => setSelectedPhotoIndex(null)}
           onUpdate={loadData}
           onPrev={selectedPhotoIndex > 0 ? () => setSelectedPhotoIndex(selectedPhotoIndex - 1) : undefined}
@@ -1008,9 +1002,8 @@ export default function Home() {
                   { key: 'create', label: '建立相簿', icon: '＋', onClick: () => setShowModal(true) },
                   { key: 'edit', label: '編輯相簿', icon: '✎', onClick: () => setIsEditingAlbums(true) },
                 ]
-              : [
-                  { key: 'login', label: '管理員登入', icon: '🔑', onClick: () => setShowLoginModal(true) },
-                ]
+              /* 訪客：一顆按鈕都不給。看跟登出（右上角帳號牌）就是全部 */
+              : []
         }
       />
 
@@ -1020,14 +1013,15 @@ export default function Home() {
           <button
             className={styles.actionButton}
             onClick={() => {
-              if (selectedAlbums.length === displayAlbums.length) {
+              if (selectedAlbums.length === editableAlbums.length) {
                 setSelectedAlbums([]);
               } else {
-                setSelectedAlbums(displayAlbums.map(a => a.id));
+                setSelectedAlbums(editableAlbums.map(a => a.id));
               }
             }}
           >
-            {selectedAlbums.length === displayAlbums.length ? '取消全選' : '全選'}
+            {/* 「全選」只涵蓋我動得了的那些 —— 別人的相簿連勾選框都沒有 */}
+            {selectedAlbums.length === editableAlbums.length ? '取消全選' : '全選'}
           </button>
 
           <button
@@ -1082,76 +1076,6 @@ export default function Home() {
           </div>
         </div>
       )}
-      {/* 登入 Modal */}
-      {showLoginModal && (
-        <div className={styles.modalOverlay} onClick={() => setShowLoginModal(false)}>
-          <div className={styles.modal} onClick={e => e.stopPropagation()}>
-            <h2 className={styles.modalTitle}>管理員登入</h2>
-
-            {authError && (
-              <p style={{ margin: '0 0 14px', padding: '9px 12px', borderRadius: 8,
-                background: '#fef2f2', border: '1px solid #fecaca', color: '#991b1b',
-                fontSize: 13, lineHeight: 1.7 }}>
-                {authErrorMessage(authError)}
-              </p>
-            )}
-
-            {/* 正門。整頁跳去 Google，回來時 Drive 備份與相簿匯入的權限一起到手 */}
-            <button
-              type="button"
-              className={styles.submitButton}
-              style={{ width: '100%' }}
-              onClick={() => loginWithGoogle()}
-            >
-              使用 Google 帳號登入
-            </button>
-
-            {!showPasswordFallback ? (
-              <div className={styles.modalActions}>
-                <button type="button" className={styles.cancelButton} onClick={() => setShowLoginModal(false)}>取消</button>
-                <button
-                  type="button"
-                  className={styles.cancelButton}
-                  onClick={() => setShowPasswordFallback(true)}
-                >
-                  改用密碼登入
-                </button>
-              </div>
-            ) : (
-              <>
-                <div className={styles.inputGroup} style={{ marginTop: 16 }}>
-                  <label>密碼</label>
-                  <input
-                    type="password"
-                    placeholder="請輸入管理員密碼..."
-                    value={passwordInput}
-                    onChange={e => setPasswordInput(e.target.value)}
-                    onKeyDown={e => e.key === "Enter" && handleLogin()}
-                    autoFocus
-                    required
-                  />
-                  {/* 密碼登入拿不到 Google token，講在前面，免得等到要上傳才發現 */}
-                  <small style={{ color: '#78350f', fontSize: 12, lineHeight: 1.6 }}>
-                    密碼登入不會帶到 Google 授權：進得了後台，但這次不能備份到 Drive、也不能從 Google 相簿匯入。
-                  </small>
-                </div>
-                <div className={styles.modalActions}>
-                  <button type="button" className={styles.cancelButton} onClick={() => setShowLoginModal(false)}>取消</button>
-                  <button
-                    type="button"
-                    className={styles.submitButton}
-                    onClick={handleLogin}
-                    disabled={!passwordInput || isSubmitting}
-                  >
-                    {isSubmitting ? "登入中..." : "登入"}
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* Slide Confirm Modal for Albums */}
       <SlideConfirmModal 
         isOpen={showDeleteConfirm}

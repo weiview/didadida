@@ -50,7 +50,17 @@ function AlbumContent() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const { isAdmin, driveLink } = useAdmin();
+  const { isAdmin, driveLink, canEdit } = useAdmin();
+  /**
+   * 這本相簿本身。留著它是為了 `canEditAlbum` —— 光有 isAdmin 不夠，
+   * 一般成員只動得了自己建的相簿（跟後端 canTouchAlbum 同一條規則）。
+   */
+  const [album, setAlbum] = useState<Album | null>(null);
+  /**
+   * 這本相簿我動不動得了 —— 頁面上所有編輯入口都看它，而不是只看 isAdmin。
+   * 相簿還沒載進來時是 false，寧可晚半秒才長出按鈕，也不要先給再收回去。
+   */
+  const canEditAlbum = canEdit(album);
   const [selectedPhotoIndex, setSelectedPhotoIndex] = useState<number | null>(null);
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
   const [visibleCount, setVisibleCount] = useState<number>(24);
@@ -214,6 +224,7 @@ function AlbumContent() {
     ]);
 
     if (current) {
+      setAlbum(current);
       setAlbumName(current.name);
       setCurrentCoverPhotoUrl(current.cover_photo_url || null);
     }
@@ -238,9 +249,11 @@ function AlbumContent() {
      */
     if (typeof window !== "undefined") {
       setHasGoogleToken(!!getGoogleToken());
-      prewarmDrive();
+      // 訪客不預熱：`/api/config/drive` 是管理員才讀得到的設定，訪客打過去
+      // 一定是 401，主控台就多一行紅字。備份是管理員的功能，訪客連按都按不到
+      if (isAdmin) prewarmDrive();
     }
-  }, [id, searchParams]);
+  }, [id, searchParams, isAdmin]);
 
   // 計算經過篩選與排序的照片
   const displayPhotos = useMemo(() => {
@@ -866,7 +879,7 @@ function AlbumContent() {
 
   // Drag and Drop handlers
   const handlePointerDown = (index: number) => {
-    if (!isAdmin) return;
+    if (!canEditAlbum) return;
     timerRef.current = setTimeout(() => {
       setLongPressIndex(index);
     }, 1000);
@@ -990,7 +1003,7 @@ function AlbumContent() {
           ) : (
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <h1 className={styles.title} style={{ marginBottom: 0 }}>{albumName}</h1>
-              {isAdmin && (
+              {canEditAlbum && (
                 <button
                   onClick={() => {
                     setEditingNameInput(albumName);
@@ -1284,7 +1297,7 @@ function AlbumContent() {
             </div>
           </FilterBottomSheet>
           {/* 管理用的按鈕都收進右下角的 FabMenu，頁首只留搜尋與篩選 */}
-          {isAdmin && (
+          {canEditAlbum && (
             <input
               type="file"
               ref={fileInputRef}
@@ -1378,7 +1391,7 @@ function AlbumContent() {
                 else photoCardRefs.current.delete(index);
               }}
               className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
-              draggable={isAdmin && longPressIndex === index && sortBy === "custom"}
+              draggable={canEditAlbum && longPressIndex === index && sortBy === "custom"}
               onClick={async () => {
                 if (longPressIndex !== null || draggingIndex !== null) return;
                 if (isEditingPhotos) {
@@ -1399,13 +1412,13 @@ function AlbumContent() {
                   e.preventDefault();
                   return;
                 }
-                if (isAdmin && sortBy === "custom") handleDragStart(index);
+                if (canEditAlbum && sortBy === "custom") handleDragStart(index);
               }}
-              onDragEnter={() => isAdmin && sortBy === "custom" && handleDragEnter(index)}
-              onDragEnd={isAdmin && sortBy === "custom" ? handleDragEnd : undefined}
-              onDragOver={(e) => isAdmin && sortBy === "custom" && e.preventDefault()}
+              onDragEnter={() => canEditAlbum && sortBy === "custom" && handleDragEnter(index)}
+              onDragEnd={canEditAlbum && sortBy === "custom" ? handleDragEnd : undefined}
+              onDragOver={(e) => canEditAlbum && sortBy === "custom" && e.preventDefault()}
             >
-              {isAdmin && isEditingPhotos && (
+              {canEditAlbum && isEditingPhotos && (
                 <>
                   <input
                     type="checkbox"
@@ -1492,7 +1505,8 @@ function AlbumContent() {
       {selectedPhotoIndex !== null && (
         <PhotoLightbox 
           photo={displayPhotos[selectedPhotoIndex]}
-          isAdmin={isAdmin} 
+          // 燈箱裡的編輯（改標題、改時間、刪這張）跟頁面上是同一組權限
+          isAdmin={canEditAlbum}
           availableTags={availableTags}
           onClose={() => setSelectedPhotoIndex(null)} 
           onUpdate={loadData}
@@ -1509,7 +1523,7 @@ function AlbumContent() {
 
       {/* 右下角浮動操作鈕。編輯模式下交棒給底部動作列，所以這裡給空陣列 */}
       <FabMenu
-        actions={!isAdmin || isEditingPhotos ? [] : buildFabActions()}
+        actions={!canEditAlbum || isEditingPhotos ? [] : buildFabActions()}
       />
 
       {/* 底部動作列 (編輯模式) */}

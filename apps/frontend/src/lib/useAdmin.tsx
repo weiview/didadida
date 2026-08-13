@@ -2,7 +2,8 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
-  AuthState, checkAuth, consumeAuthHash, googleLoginUrl, verifyGuest, verifyLogin,
+  AuthState, CurrentUser, checkAuth, consumeAuthHash, googleLoginUrl,
+  logout as clearTokens, updateMyName, verifyGuest, verifyLogin,
 } from './api';
 
 /**
@@ -29,6 +30,25 @@ interface AuthValue {
   /** 進得了站就是 true（訪客或管理員）。AccessGate 唯一看的就是它 */
   hasAccess: boolean;
   checking: boolean;
+  /** 登入中的那個人。訪客是 null */
+  user: CurrentUser | null;
+  /** 站長。唯一看得到 /admin 後台設定的人 */
+  isOwner: boolean;
+  /** 可以動別人的相簿與照片。站長永遠是 true */
+  canManageOthers: boolean;
+  /**
+   * 看不看得到足跡地圖。管理員永遠是 true，訪客要站長在後台開了才有。
+   * 沒有就不端出首頁那個連結，`/map` 本身也會擋（後端 403，這裡只是不讓人白跑）。
+   */
+  canViewMap: boolean;
+  /**
+   * 這本相簿／這張照片是不是「我的」，也就是畫面上該不該出現編輯與刪除。
+   *
+   * 跟後端 actorOwns 同一條規則：相簿主人是我、或照片是我傳的，任一相符就算數。
+   * **前端這一層只是不端出按了會失敗的按鈕**，真正的閘門在後端 —— 這裡放行
+   * 不等於改得動，這裡擋掉也不代表資料是安全的。
+   */
+  canEdit: (target: { user_id?: number | null; uploaded_by?: number | null } | null | undefined) => boolean;
   /** 進站密碼 → 訪客身分 */
   unlock: (password: string) => Promise<{ success: boolean; message?: string; notConfigured?: boolean }>;
   /** 後路：管理員密碼登入 */
@@ -37,7 +57,7 @@ interface AuthValue {
   loginWithGoogle: (albumId?: string | number) => void;
   /**
    * Google 登入失敗的原因代碼，登入畫面靠它決定要不要把密碼那條後路端出來。
-   * 常見的是 `not_admin`（信箱不在白名單）與 `not_configured`（後端沒設 ADMIN_EMAILS）。
+   * 常見的是 `not_admin`（信箱不在白名單，得先請站長加）與 `revoked`（在名單上但被停權）。
    */
   authError: string | null;
   /**
@@ -48,12 +68,16 @@ interface AuthValue {
    * 而收走它的人是這個 Provider（見上面的說明）。
    */
   driveLink: { email: string | null; error: string | null } | null;
+  /** 改自己的顯示名稱，成功會同步更新這裡的 user */
+  renameSelf: (name: string) => Promise<{ success: boolean; message?: string }>;
+  /** 登出：清掉站上與 Google 的 token，回到進站畫面 */
+  logout: () => void;
 }
 
 const AuthContext = createContext<AuthValue | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [state, setState] = useState<AuthState>({ admin: false, guest: false });
+  const [state, setState] = useState<AuthState>({ admin: false, guest: false, canViewMap: false, user: null });
   const [checking, setChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
   const [driveLink, setDriveLink] = useState<AuthValue['driveLink']>(null);
@@ -68,10 +92,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (back.driveLinked || back.driveLinkError) {
       setDriveLink({ email: back.driveLinked, error: back.driveLinkError });
     }
+    /*
+     * 剛從 Google 回來。token 已經在 localStorage 裡了，但**還是要打一次
+     * /auth/me** —— 「我是誰、能不能管別人」只有後端知道，fragment 裡沒有。
+     * 先樂觀把 admin 設成 true 讓畫面立刻可用，帳號資料隨後補上。
+     */
     if (back.admin) {
-      setState({ admin: true, guest: false });
-      setChecking(false);
-      return;
+      setState({ admin: true, guest: false, canViewMap: true, user: null });
+      checkAuth().then((next) => {
+        if (!alive) return;
+        setState(next);
+        setChecking(false);
+      });
+      return () => { alive = false; };
     }
 
     checkAuth().then((next) => {
@@ -90,27 +123,67 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // verifyGuest / verifyLogin 都已經把 token 寫進 localStorage，這裡只更新畫面狀態
   const unlock = useCallback(async (password: string) => {
     const result = await verifyGuest(password);
-    if (result.success) setState({ admin: false, guest: true });
+    // 這裡要回後端問一次而不是自己拼 state：訪客看不看得到足跡地圖
+    // 是站長的設定，只有 /auth/me 知道
+    if (result.success) setState(await checkAuth());
     return result;
   }, []);
 
   const login = useCallback(async (password: string) => {
     const result = await verifyLogin(password);
-    if (result.success) setState({ admin: true, guest: false });
+    // 密碼登入拿到的是站長身分，但帳號資料一樣得回後端問
+    if (result.success) setState(await checkAuth());
     return result;
   }, []);
+
+  const renameSelf = useCallback(async (name: string) => {
+    const result = await updateMyName(name);
+    if (result.success && result.user) {
+      setState((prev) => ({ ...prev, user: result.user! }));
+    }
+    return { success: result.success, message: result.message };
+  }, []);
+
+  const logout = useCallback(() => {
+    clearTokens();
+    setState({ admin: false, guest: false, canViewMap: false, user: null });
+    setAuthError(null);
+    setDriveLink(null);
+  }, []);
+
+  const canManageOthers = state.user
+    ? state.user.role === 'owner' || state.user.can_manage_others === 1
+    // 沒有帳號資料的管理員只可能是舊 token（後端會當站長）。維持原本的全開行為，
+    // 免得升級的當下所有編輯按鈕突然消失，看起來像壞掉
+    : state.admin;
+
+  const canEdit = useCallback((target: { user_id?: number | null; uploaded_by?: number | null } | null | undefined) => {
+    if (!state.admin) return false;
+    if (canManageOthers) return true;
+    const uid = state.user?.id;
+    if (uid == null || !target) return false;
+    return target.user_id === uid || target.uploaded_by === uid;
+  }, [state.admin, state.user, canManageOthers]);
 
   const value = useMemo<AuthValue>(() => ({
     isAdmin: state.admin,
     isGuest: state.guest,
     hasAccess: state.admin || state.guest,
     checking,
+    user: state.user,
+    isOwner: state.user?.role === 'owner',
+    canManageOthers,
+    canViewMap: state.canViewMap,
+    canEdit,
     unlock,
     login,
     loginWithGoogle,
     authError,
     driveLink,
-  }), [state, checking, unlock, login, loginWithGoogle, authError, driveLink]);
+    renameSelf,
+    logout,
+  }), [state, checking, canManageOthers, canEdit, unlock, login, loginWithGoogle,
+       authError, driveLink, renameSelf, logout]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
