@@ -1,0 +1,203 @@
+.container {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 3rem 1.25rem 6rem;
+}
+
+.header {
+  margin-bottom: 2rem;
+}
+
+.back {
+  display: inline-block;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+  color: var(--text-light);
+  text-decoration: none;
+}
+
+.title {
+  font-size: 1.8rem;
+  font-weight: 300;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.4rem;
+}
+
+.hint {
+  font-size: 0.85rem;
+  color: var(--text-light);
+  line-height: 1.8;
+}
+
+.card {
+  padding: 1.25rem 1.4rem;
+  margin-bottom: 1.5rem;
+}
+
+.sectionTitle {
+  font-size: 1rem;
+  font-weight: 500;
+  margin-bottom: 1rem;
+}
+
+.formRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: flex-end;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  flex: 1 1 200px;
+}
+
+.field label {
+  font-size: 0.78rem;
+  color: var(--text-light);
+}
+
+.field input[type="text"],
+.field input[type="email"] {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.7);
+  font-size: 0.95rem;
+  color: inherit;
+}
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.88rem;
+  padding-bottom: 0.6rem;
+  cursor: pointer;
+}
+
+.button {
+  padding: 0.55rem 1.1rem;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.6);
+  font-size: 0.9rem;
+  cursor: pointer;
+  color: inherit;
+  white-space: nowrap;
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.primary {
+  background: rgba(var(--glass-tint-accent), 0.9);
+  font-weight: 500;
+}
+
+.danger {
+  color: #9b2c2c;
+  border-color: rgba(155, 44, 44, 0.3);
+}
+
+/* 一列一個人。表格在手機上一定會爆版，所以用卡片列 */
+.userRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  align-items: center;
+  padding: 0.9rem 0;
+  border-top: 1px solid var(--border-color);
+}
+
+.userRow:first-of-type {
+  border-top: none;
+}
+
+.userMain {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.userName {
+  font-size: 0.98rem;
+  font-weight: 500;
+  word-break: break-word;
+}
+
+.userMeta {
+  font-size: 0.78rem;
+  color: var(--text-light);
+  line-height: 1.7;
+  word-break: break-all;
+}
+
+.tag {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  background: rgba(var(--glass-tint-accent), 0.55);
+  vertical-align: middle;
+}
+
+.tagOff {
+  background: rgba(120, 100, 84, 0.12);
+  color: var(--text-light);
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* 刪除帳號視窗裡的勾選項。跟 .checkbox 分開是因為那個是一列排排站的，
+   這裡要一項一行，而且說明文字要能換行對齊在勾勾右邊 */
+.purgeOption {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  margin-bottom: 0.7rem;
+  cursor: pointer;
+}
+
+.purgeOption input {
+  margin-top: 0.25rem;
+  flex-shrink: 0;
+}
+
+.purgeNote {
+  font-size: 0.78rem;
+  color: var(--text-light);
+  line-height: 1.7;
+  margin: 0;
+}
+
+.message {
+  margin: 0 0 1rem;
+  padding: 0.7rem 0.9rem;
+  border-radius: 10px;
+  font-size: 0.85rem;
+  line-height: 1.7;
+}
+
+.ok {
+  background: rgba(220, 252, 231, 0.8);
+  border: 1px solid rgba(134, 239, 172, 0.7);
+  color: #14532d;
+}
+
+.err {
+  background: rgba(254, 242, 242, 0.9);
+  border: 1px solid rgba(254, 202, 202, 0.9);
+  color: #991b1b;
+}

@@ -120,6 +120,8 @@ export interface Album {
   map_private?: number;
   /** 這本相簿在 Drive 上的資料夾。null = 還沒建過（沒上傳過、或上傳時 Drive 沒接上） */
   drive_folder_id?: string | null;
+  /** 建立這本相簿的人。搭配 useAdmin 的 canEdit() 決定要不要端出編輯與刪除 */
+  user_id?: number | null;
 }
 
 export interface Tag {
@@ -187,6 +189,13 @@ export interface Photo {
    * 非管理者取得的資料中，被扣住的照片座標一律為 null
    */
   geo_private?: number;
+  /**
+   * 擁有權。跟後端 actorOwns 讀的是同一組欄位：
+   * `user_id` 是**相簿主人**（不是照片自己的欄位，後端 JOIN 出來的），
+   * `uploaded_by` 是傳這張的人（舊照片是 null，退回看相簿主人）。
+   */
+  user_id?: number | null;
+  uploaded_by?: number | null;
 }
 
 // 值域與權威順序定義在 geo.ts（前後端共用同一份），這裡只做轉出，
@@ -303,10 +312,32 @@ export async function verifyGuest(
   }
 }
 
-/** 進站狀態。兩個都是 false 代表連門都還沒進，該顯示進站畫面 */
+/**
+ * 登入中的那個人。訪客一律是 null。
+ *
+ * `id` 為 null 只可能發生在「資料庫裡連一個帳號都沒有 + 用管理員密碼登入」，
+ * 那時後端把他當站長。畫面上照樣顯示得出來，只是改不了名字。
+ */
+export interface CurrentUser {
+  id: number | null;
+  name: string | null;
+  email: string | null;
+  /** 'owner' = 站長，唯一看得到後台設定的人 */
+  role: 'owner' | 'member';
+  /** 1 = 可以新增／刪除別人的相簿與照片 */
+  can_manage_others: number;
+}
+
+/** 進站狀態。admin 與 guest 都是 false 代表連門都還沒進，該顯示進站畫面 */
 export interface AuthState {
   admin: boolean;
   guest: boolean;
+  /**
+   * 看不看得到足跡地圖。管理員永遠 true；訪客要站長在後台開了才有。
+   * 沒開的話首頁不會出現那個連結，直接打 /map 也會被擋。
+   */
+  canViewMap: boolean;
+  user: CurrentUser | null;
 }
 
 /**
@@ -322,7 +353,7 @@ export interface AuthState {
  * 使用者只會看到一個空相簿列表，完全不知道是網路斷了。
  */
 export async function checkAuth(): Promise<AuthState> {
-  const locked: AuthState = { admin: false, guest: false };
+  const locked: AuthState = { admin: false, guest: false, canViewMap: false, user: null };
   if (typeof window === 'undefined') return locked;
   // 舊版把明文密碼存在這個 key。清掉已經留在使用者瀏覽器裡的那一份，
   // 否則它會一直躺在那裡。等所有裝置都開過一次站之後這行就可以刪了。
@@ -332,7 +363,13 @@ export async function checkAuth(): Promise<AuthState> {
     const res = await fetch(`${API_BASE_URL}/auth/me`, { headers: getAuthHeaders() });
     if (res.ok) {
       const data = await res.json();
-      return { admin: !!data.admin, guest: !!data.guest };
+      return {
+        admin: !!data.admin,
+        guest: !!data.guest,
+        // 舊後端不回這個欄位 —— 管理員照樣看得到，訪客則保守地當成沒開
+        canViewMap: data.can_view_map != null ? !!data.can_view_map : !!data.admin,
+        user: data.user ?? null,
+      };
     }
     // 401 = 過期或無效。留著只會讓下次進站又錯判一遍
     if (res.status === 401) clearSiteToken();
@@ -341,6 +378,181 @@ export async function checkAuth(): Promise<AuthState> {
     console.error(error);
     return locked;
   }
+}
+
+/**
+ * 登出：把手上的兩張 token 都丟掉。
+ *
+ * Google 的那張一定要一起清 —— 只清站上的 token，下一個人在同一台電腦上
+ * 按「傳到 Drive」時用的還是前一個人的 Google 授權。
+ *
+ * 沒有對應的後端呼叫：JWT 是無狀態的，作廢它只能等過期，或由站長在後台
+ * 把那個帳號移出白名單（那一步是立刻生效的，見後端的 currentActor）。
+ */
+export function logout(): void {
+  clearSiteToken();
+  clearGoogleToken();
+}
+
+/** 改自己的顯示名稱。只有這一欄改得動，信箱與權限都不行 */
+export async function updateMyName(name: string): Promise<{ success: boolean; user?: CurrentUser; message?: string }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/me`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) return { success: true, user: data.user };
+    return { success: false, message: data.error || '改名失敗' };
+  } catch (error: any) {
+    return { success: false, message: `連線錯誤: ${error.message}` };
+  }
+}
+
+/* ── 站長專用：白名單 ──────────────────────────────────────────────────────
+ *
+ * 這幾支後端只讓 role='owner' 進，前端的 /admin 頁面也只在站長身上顯示。
+ * 兩邊都擋不是重複 —— 前端那層是為了不端出按下去必定失敗的介面。
+ */
+
+export interface WhitelistUser extends CurrentUser {
+  id: number;
+  active: number;
+  last_login_at: string | null;
+  created_at: string | null;
+  /** 他名下有多少東西。移除他之前要讓站長看得到這個數字 */
+  album_count: number;
+  photo_count: number;
+}
+
+export async function fetchWhitelist(): Promise<WhitelistUser[]> {
+  const res = await fetch(`${API_BASE_URL}/admin/users`, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取白名單失敗');
+  return await res.json();
+}
+
+export async function addWhitelistUser(
+  email: string, name: string, canManageOthers: boolean,
+): Promise<{ success: boolean; restored?: boolean; message?: string }> {
+  const res = await fetch(`${API_BASE_URL}/admin/users`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ email, name, can_manage_others: canManageOthers }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.success) return { success: true, restored: !!data.restored };
+  return { success: false, message: data.error || '新增失敗' };
+}
+
+export async function updateWhitelistUser(
+  id: number, patch: { name?: string; can_manage_others?: boolean; active?: boolean },
+): Promise<{ success: boolean; message?: string }> {
+  const res = await fetch(`${API_BASE_URL}/admin/users/${id}`, {
+    method: 'PUT',
+    headers: getAuthHeaders(),
+    body: JSON.stringify(patch),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.success) return { success: true };
+  return { success: false, message: data.error || '修改失敗' };
+}
+
+/**
+ * 移出白名單 ＝ **停權**，後端永遠不刪那一列（刪了會 CASCADE 掉他的相簿，而且
+ * 停權的人留在名單上才看得見、才點得回來）。`albumCount` 是他名下還留著幾本相簿，
+ * 用來告訴站長「東西還在」。
+ */
+export async function removeWhitelistUser(
+  id: number,
+): Promise<{ success: boolean; albumCount?: number; message?: string }> {
+  const res = await fetch(`${API_BASE_URL}/admin/users/${id}`, {
+    method: 'DELETE',
+    headers: getAuthHeaders(),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.success) return { success: true, albumCount: data.album_count };
+  return { success: false, message: data.error || '移除失敗' };
+}
+
+/** 刪掉一個帳號**之前**先問清楚會少掉什麼。三個數字互相獨立，勾選才有意義 */
+export interface PurgePreview {
+  id: number;
+  email: string;
+  /** 他建立的相簿有幾本 */
+  albums: number;
+  /** 那些相簿裡總共幾張照片（含別人傳進去的 —— 相簿刪掉它們也留不住） */
+  photos_in_albums: number;
+  /** 他上傳過的照片總數，也就是勾「清除他上傳的相片」會刪掉的量 */
+  photos_uploaded: number;
+  /** 上一個數字裡面，放在**別人**相簿的有幾張。會動到別人的東西，得單獨講 */
+  photos_elsewhere: number;
+}
+
+export async function fetchPurgePreview(id: number): Promise<PurgePreview> {
+  const res = await fetch(`${API_BASE_URL}/admin/users/${id}/purge`, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取失敗');
+  return await res.json();
+}
+
+/**
+ * **刪除帳號**，跟 removeWhitelistUser（停權）是兩件事：這一支真的把 User 那一列
+ * 刪掉，白名單上再也看不到他，而且不可逆。
+ *
+ * 兩個範圍各自獨立，都不勾就只是把帳號抹掉：
+ * - `albums`：他建的相簿整本刪掉，**連裡面別人傳的照片也一起沒了**。
+ * - `photos`：他上傳的照片刪掉，**包含放在別人相簿裡的那些**。
+ *
+ * 沒被勾到的東西不會消失，會改掛到站長名下（相簿的主人欄位不允許空白）。
+ */
+export async function purgeWhitelistUser(
+  id: number, scope: { albums: boolean; photos: boolean },
+): Promise<{
+  success: boolean; message?: string;
+  deletedAlbums?: number; deletedPhotos?: number; keptAlbums?: number;
+}> {
+  const query = `albums=${scope.albums ? 1 : 0}&photos=${scope.photos ? 1 : 0}`;
+  const res = await fetch(`${API_BASE_URL}/admin/users/${id}/purge?${query}`, {
+    method: 'DELETE',
+    headers: getAuthHeaders(),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.success) {
+    return {
+      success: true,
+      deletedAlbums: data.deleted_albums,
+      deletedPhotos: data.deleted_photos,
+      keptAlbums: data.kept_albums,
+    };
+  }
+  return { success: false, message: data.error || '刪除失敗' };
+}
+
+/** 站台開關。目前只有一個，之後要加就往這裡放 */
+export interface SiteSettings {
+  /** 訪客能不能看足跡地圖。預設 0 */
+  guest_can_view_map: number;
+}
+
+export async function fetchSiteSettings(): Promise<SiteSettings> {
+  const res = await fetch(`${API_BASE_URL}/admin/settings`, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取站台設定失敗');
+  return await res.json();
+}
+
+export async function updateSiteSettings(
+  patch: Partial<Record<keyof SiteSettings, boolean>>,
+): Promise<{ success: boolean; settings?: SiteSettings; message?: string }> {
+  const res = await fetch(`${API_BASE_URL}/admin/settings`, {
+    method: 'PUT',
+    headers: getAuthHeaders(),
+    body: JSON.stringify(patch),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.success) {
+    return { success: true, settings: { guest_can_view_map: data.guest_can_view_map ?? 0 } };
+  }
+  return { success: false, message: data.error || '修改失敗' };
 }
 
 /** 分頁查詢的共用參數。q 與 tags 交給後端做，前端不再自己過濾 */

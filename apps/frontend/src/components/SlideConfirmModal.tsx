@@ -6,6 +6,13 @@ interface SlideConfirmModalProps {
   isOpen: boolean;
   title?: string;
   message?: string;
+  /**
+   * 訊息與滑桿之間的額外內容，例如「要不要順便刪掉他的相簿」這種刪除前的選項。
+   *
+   * 刻意排在滑桿**上面**：滑到底是整個流程的最後一個動作，選項排在它後面
+   * 等於解鎖完還能改主意，那顆鎖就白裝了。
+   */
+  children?: React.ReactNode;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -14,6 +21,7 @@ export default function SlideConfirmModal({
   isOpen,
   title = "確認刪除",
   message = "確定要執行刪除動作嗎？",
+  children,
   onConfirm,
   onCancel
 }: SlideConfirmModalProps) {
@@ -100,8 +108,21 @@ export default function SlideConfirmModal({
         border: '1px solid var(--border-color)', boxShadow: '0 20px 40px rgba(0,0,0,0.1)'
       }} onClick={e => e.stopPropagation()}>
         <h3 style={{ margin: '0 0 15px 0', color: '#e57373', fontSize: '1.5rem', fontWeight: 500 }}>{title}</h3>
-        <p style={{ color: 'var(--text-light)', marginBottom: '30px', fontSize: '1rem' }}>{message}</p>
-        
+        <p style={{ color: 'var(--text-light)', marginBottom: children ? '20px' : '30px', fontSize: '1rem' }}>{message}</p>
+
+        {/* 解鎖之後就不給改了：滑到底代表「我讀完上面那段、決定就是這樣」，
+            解鎖完還能翻選項的話，最後按下去的內容跟當初讀的不是同一件事 */}
+        {children && (
+          <div style={{
+            textAlign: 'left', marginBottom: '25px',
+            opacity: isConfirmed ? 0.5 : 1,
+            pointerEvents: isConfirmed ? 'none' : 'auto',
+            transition: 'opacity 0.3s ease',
+          }}>
+            {children}
+          </div>
+        )}
+
         <div 
           ref={sliderRef}
           style={{

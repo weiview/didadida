@@ -14,21 +14,18 @@ export interface Env {
    * 進站密碼（訪客）。**跟 APP_PASSWORD 是兩把不同的鑰匙**：這一把只換得到
    * 「看得到公開內容」的 token，換不到管理權，所以可以放心給家人朋友。
    *
-   * **沒設就沒有人進得來**（同 ADMIN_EMAILS 的理由）—— 不是「沒設就全站公開」。
+   * **沒設就沒有人進得來** —— 不是「沒設就全站公開」。
    * 忘記設定的代價該是自己被鎖在外面，不是把整站默默攤開給全世界。
    * 管理員仍然可以用 Google 登入或 APP_PASSWORD 進來，不會真的把自己關死。
    */
   GUEST_PASSWORD?: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
-  /**
-   * 可以用 Google 登入當管理員的信箱，逗號分隔。
-   *
-   * **沒設就沒有人能用 Google 登入。** 不是「沒設就放行」—— 那樣的話忘了設定的
-   * 環境會把後台送給任何一個 Google 帳號。忘記設定的代價應該是自己進不去，
-   * 不是別人進得來。密碼登入不受影響，隨時是後路。
+  /*
+   * 這裡以前有 ADMIN_EMAILS（可以當管理員的信箱，逗號分隔）。**已移除**：
+   * 白名單自 0008 起是 D1 的 User 表，由站長在 /admin 維護，環境變數不該是第二份名單。
+   * 遠端也不必再設這個 secret，設了也沒有人會讀。見 googleAdminCheck()。
    */
-  ADMIN_EMAILS?: string;
   /**
    * service account 金鑰 JSON 全文。scope 是完整的 drive（Phase 3 要搬檔），
    * 但看得到什麼由 Drive 的分享設定決定 —— 見 drive.ts 檔頭
@@ -70,6 +67,13 @@ const SETTING_TRASH_FOLDER = "drive_trash_folder_id";
 const SETTING_DRIVE_REFRESH_TOKEN = "drive_writer_refresh_token";
 const SETTING_DRIVE_WRITER_EMAIL = "drive_writer_email";
 const SETTING_DRIVE_LINKED_AT = "drive_writer_linked_at";
+/**
+ * 訪客看不看得到足跡地圖。**預設關**（沒有這一列就是關）。
+ *
+ * 為什麼是全站一個開關而不是每個訪客一個：訪客共用同一把 `GUEST_PASSWORD`，
+ * 根本沒有「這個訪客」這種東西可以掛設定。
+ */
+const SETTING_GUEST_MAP = "guest_can_view_map";
 
 /**
  * token 裡的身分。兩層，沒有第三層：
@@ -82,10 +86,34 @@ const SETTING_DRIVE_LINKED_AT = "drive_writer_linked_at";
  */
 type Role = 'admin' | 'guest';
 
-async function generateJWT(env: Env, role: Role = 'admin'): Promise<string> {
+/**
+ * token 說了什麼。`role` 之外多了「是誰」—— 沒有這一段的話，站上永遠不知道
+ * 這次操作是三個管理員裡的哪一個，也就沒有「自己的相簿」這回事。
+ *
+ * `uid` 為 null 的兩種來源，都當**站長**處理：
+ *   1. APP_PASSWORD 密碼登入（那是站長自己的後路，理論上會補上 uid，
+ *      但站上連一個 owner 都沒有時就補不上）。
+ *   2. 0008 之前發出、還沒過期的舊 token。它們只可能在管理員手上，
+ *      預設成權限最小的成員反而會讓站長自己突然動不了東西。
+ */
+interface Identity {
+  role: Role;
+  uid: number | null;
+  email: string | null;
+}
+
+async function generateJWT(
+  env: Env, role: Role = 'admin', user?: { id: number; email?: string | null } | null,
+): Promise<string> {
   const encoder = new TextEncoder();
   const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const payload = btoa(JSON.stringify({ role, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 86400 * 7 })); // 7 days
+  const payload = btoa(JSON.stringify({
+    role,
+    uid: user?.id ?? null,
+    email: user?.email ?? null,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 86400 * 7,
+  })); // 7 days
   const data = `${header}.${payload}`;
 
   const key = await crypto.subtle.importKey('raw', encoder.encode(env.APP_PASSWORD), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
@@ -102,7 +130,7 @@ async function generateJWT(env: Env, role: Role = 'admin'): Promise<string> {
  * 反過來預設成 guest 的話，這次改動會把所有還沒過期的管理員降級，
  * 而且是安靜地降級（畫面上編輯工具消失，看起來像壞掉）。
  */
-async function verifyJWT(token: string, env: Env): Promise<Role | null> {
+async function verifyJWT(token: string, env: Env): Promise<Identity | null> {
   try {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
@@ -119,14 +147,18 @@ async function verifyJWT(token: string, env: Env): Promise<Role | null> {
 
     const ok = await crypto.subtle.verify('HMAC', key, sigBytes, encoder.encode(data));
     if (!ok) return null;
-    return payloadObj.role === 'guest' ? 'guest' : 'admin';
+    return {
+      role: payloadObj.role === 'guest' ? 'guest' : 'admin',
+      uid: Number.isInteger(payloadObj.uid) ? payloadObj.uid : null,
+      email: typeof payloadObj.email === 'string' ? payloadObj.email : null,
+    };
   } catch (e) {
     return null;
   }
 }
 
 /** Authorization: Bearer 裡那張 token 的身分。沒帶、壞掉、過期都是 null */
-async function tokenRole(request: Request, env: Env): Promise<Role | null> {
+async function tokenIdentity(request: Request, env: Env): Promise<Identity | null> {
   const authHeader = request.headers.get("Authorization");
   if (!authHeader) return null;
   const token = authHeader.replace("Bearer ", "");
@@ -135,13 +167,114 @@ async function tokenRole(request: Request, env: Env): Promise<Role | null> {
 }
 
 /**
- * 只認 /api/verify-password 或 Google 登入發出的**管理員** JWT。
+ * 這次操作背後的**人**。token 只說了 uid，權限得回 D1 拿 ——
+ * 寫在 token 裡的話，撤銷一個人的權限要等他手上那張過期（最長七天）才生效。
+ */
+interface Actor {
+  uid: number | null;
+  email: string | null;
+  name: string | null;
+  isOwner: boolean;
+  canManageOthers: boolean;
+}
+
+/**
+ * 同一個 request 只查一次 D1。
+ *
+ * isAuthorized() 在單一路由裡會被呼叫好幾次（閘門一次、快取判斷一次、
+ * 權限檢查再一次），每一次都打一趟 D1 的話讀取量會平白翻好幾倍 ——
+ * 而免費額度是最高宗旨。key 是 Request 物件本身，請求結束就整個被回收。
+ */
+const actorCache = new WeakMap<Request, Promise<Actor | null>>();
+
+async function currentActor(request: Request, env: Env): Promise<Actor | null> {
+  const cached = actorCache.get(request);
+  if (cached) return cached;
+  const pending = resolveActor(request, env);
+  actorCache.set(request, pending);
+  return pending;
+}
+
+async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
+  const identity = await tokenIdentity(request, env);
+  if (!identity || identity.role !== 'admin') return null;
+
+  // 沒有 uid 的舊 token／密碼登入：當站長（見 Identity 的註解）
+  if (identity.uid == null) {
+    const owner = await env.DB.prepare(
+      "SELECT id, name, email FROM User WHERE role = 'owner' AND active = 1 ORDER BY id LIMIT 1"
+    ).first<any>();
+    if (owner) {
+      return { uid: owner.id, email: owner.email, name: owner.name, isOwner: true, canManageOthers: true };
+    }
+    return { uid: null, email: identity.email, name: null, isOwner: true, canManageOthers: true };
+  }
+
+  const row = await env.DB.prepare(
+    "SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?"
+  ).bind(identity.uid).first<any>();
+  // 列不見了或被移出白名單 —— 手上那張 token 立刻失效，不等它過期
+  if (!row || Number(row.active) !== 1) return null;
+
+  const isOwner = row.role === 'owner';
+  return {
+    uid: row.id,
+    email: row.email,
+    name: row.name,
+    isOwner,
+    canManageOthers: isOwner || Number(row.can_manage_others) === 1,
+  };
+}
+
+/**
+ * 只認 /api/verify-password 或 Google 登入發出的**管理員** JWT，
+ * 而且那個人現在還在白名單上。
  *
  * 以前這裡也接受裸的 APP_PASSWORD 當 bearer（backward compatibility），已經移除：
  * 那個密碼同時是 JWT 的簽章金鑰，一旦外流等於可以自簽任意 token，而且撤不掉。
  */
 async function isAuthorized(request: Request, env: Env): Promise<boolean> {
-  return (await tokenRole(request, env)) === 'admin';
+  return (await currentActor(request, env)) !== null;
+}
+
+/**
+ * 這個人動得了這本相簿／這張照片嗎。
+ *
+ * 規則就兩層（使用者原話）：站長與 can_manage_others=1 全開；其餘只動得了自己的。
+ * 「自己的」＝ 相簿主人是我，**或**照片是我傳的 —— 任一相符就算數。
+ */
+function actorOwns(actor: Actor, row: { user_id?: any; uploaded_by?: any }): boolean {
+  if (actor.canManageOthers) return true;
+  if (actor.uid == null) return false;
+  if (row.user_id != null && Number(row.user_id) === actor.uid) return true;
+  if (row.uploaded_by != null && Number(row.uploaded_by) === actor.uid) return true;
+  return false;
+}
+
+/**
+ * 沒權限時統一的回應。訊息給前端直接顯示。
+ *
+ * 一定要帶上呼叫端的 CORS 標頭 —— 少了它，瀏覽器會在 JS 讀到之前就擋掉這個回應，
+ * 使用者看到的是「網路錯誤」而不是「這不是你的相簿」。
+ */
+function forbidden(headers: Record<string, string>, message = "沒有權限修改別人的相簿或照片"): Response {
+  return new Response(JSON.stringify({ error: message, reason: "forbidden" }), { status: 403, headers });
+}
+
+/**
+ * 相簿的擁有權資料。找不到相簿回 null（呼叫端要回 404）。
+ */
+async function albumOwnership(env: Env, albumId: string | number): Promise<{ user_id: any } | null> {
+  return await env.DB.prepare("SELECT user_id FROM Album WHERE id = ?").bind(albumId).first<any>();
+}
+
+/**
+ * 照片的擁有權資料：上傳者 + 所屬相簿的主人。
+ */
+async function photoOwnership(env: Env, photoId: string | number): Promise<{ user_id: any; uploaded_by: any } | null> {
+  return await env.DB.prepare(
+    "SELECT a.user_id AS user_id, p.uploaded_by AS uploaded_by FROM Photo p JOIN Album a ON a.id = p.album_id WHERE p.id = ?"
+  ).bind(photoId).first<any>();
 }
 
 /**
@@ -367,6 +500,32 @@ async function setSetting(env: Env, key: string, value: string): Promise<void> {
     .prepare("INSERT INTO AppSetting (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')")
     .bind(key, value)
     .run();
+  settingMemo.delete(key);
+}
+
+/**
+ * 「訪客能不能看足跡」這種開關會被**每一個訪客的每一次請求**問到
+ * （`/api/auth/me`、`/api/footprint`），而訪客那條路線本來是刻意不碰 D1 的。
+ * 所以在 isolate 裡快取 60 秒 —— 免費額度是最高宗旨，一個開關不值得
+ * 每次都去讀一次資料庫。
+ *
+ * 60 秒是「站長改完設定，最慢多久全站生效」。`setSetting` 會直接把該 key
+ * 踢掉，所以改設定的那個 isolate 是立刻生效的。
+ */
+const settingMemo = new Map<string, { value: string | null; at: number }>();
+const SETTING_MEMO_TTL_MS = 60_000;
+
+async function getSettingCached(env: Env, key: string): Promise<string | null> {
+  const hit = settingMemo.get(key);
+  if (hit && Date.now() - hit.at < SETTING_MEMO_TTL_MS) return hit.value;
+  const value = await getSetting(env, key);
+  settingMemo.set(key, { value, at: Date.now() });
+  return value;
+}
+
+/** 訪客看不看得到足跡地圖。沒設定過＝關 */
+async function guestCanViewMap(env: Env): Promise<boolean> {
+  return (await getSettingCached(env, SETTING_GUEST_MAP)) === "1";
 }
 
 /**
@@ -487,13 +646,20 @@ async function drainDriveTrash(env: Env, limit: number): Promise<{
  * 沒說「是誰簽給他的」—— 隨便一個 app 拿同一個 Google 帳號簽出來的 token
  * 也帶著同一個 email。少了 aud 這一步，任何人都能用自家 app 的 token 冒充你。
  *
- * 白名單沒設就一律不放行（見 Env.ADMIN_EMAILS）。
+ * **白名單（D1 的 User 表，見 migrations/0008）是唯一的判準：表裡沒有這個信箱就直接拒絕，
+ * 這裡不會替任何人建列。** 想登入得先請站長在 /admin 加進去。
+ *
+ * 曾經有一條 ADMIN_EMAILS 的 bootstrap（查無此人就看環境變數、命中就自動建一列），
+ * 已移除 —— 那等於一份看不見的第二白名單：那些人沒登入過就不會出現在 /admin 上，
+ * 站長既看不到也管不到。唯一的入口只能有一個。
+ *
+ * 站長自己不會被鎖在外面：0008 保證 User 表一定有 role='owner' 那一列。
+ * 真的被鎖住（例如有人把 owner 停權了）只能開 D1 主控台下 SQL —— 那是刻意的，
+ * 「這個站是誰的」不該由一個環境變數說了算。
  */
 async function googleAdminCheck(
   env: Env, accessToken: string,
-): Promise<{ ok: true; email: string } | { ok: false; reason: string }> {
-  const allow = (env.ADMIN_EMAILS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  if (allow.length === 0) return { ok: false, reason: "not_configured" };
+): Promise<{ ok: true; user: { id: number; email: string; name: string } } | { ok: false; reason: string }> {
   if (!env.GOOGLE_CLIENT_ID) return { ok: false, reason: "not_configured" };
 
   const res = await fetch(
@@ -506,8 +672,21 @@ async function googleAdminCheck(
   if (String(info.email_verified) !== "true") return { ok: false, reason: "email_unverified" };
 
   const email = String(info.email || "").trim().toLowerCase();
-  if (!email || !allow.includes(email)) return { ok: false, reason: "not_admin" };
-  return { ok: true, email };
+  if (!email) return { ok: false, reason: "not_admin" };
+
+  // 大小寫不敏感比對：Google 回的一律小寫，但表裡的是人手打進去的
+  const row = await env.DB.prepare(
+    "SELECT id, name, email, active FROM User WHERE lower(email) = ?"
+  ).bind(email).first<any>();
+
+  // 名單上沒有這個人 —— 到此為止，不建列、不放行
+  if (!row) return { ok: false, reason: "not_admin" };
+
+  // 在名單上但被停權。跟「從來不在名單上」分開回報，前端才講得出人話
+  if (Number(row.active) !== 1) return { ok: false, reason: "revoked" };
+
+  await env.DB.prepare("UPDATE User SET last_login_at = datetime('now') WHERE id = ?").bind(row.id).run();
+  return { ok: true, user: { id: row.id, email: row.email, name: row.name } };
 }
 
 /**
@@ -586,7 +765,7 @@ const origin = request.headers.get("Origin") || "";
       || pathname.startsWith("/api/photos/view/")
       || /^\/api\/photos\/\d+\/full$/.test(pathname);
 
-    if (!isOpenPath && !(await tokenRole(request, env))) {
+    if (!isOpenPath && !(await tokenIdentity(request, env))) {
       return new Response(JSON.stringify({ error: "locked" }), { status: 401, headers });
     }
 
@@ -606,7 +785,15 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const body: { password: string } = await request.json();
         if (body.password === env.APP_PASSWORD) {
           loginAttempts.delete(ip); // Reset on success
-          const token = await generateJWT(env);
+          // 密碼登入的是站長本人（那是他自己的後路）。查得到就把身分寫進 token，
+          // 查不到（空資料庫）也照發 —— currentActor 會把沒有 uid 的當站長
+          const owner = await env.DB.prepare(
+            "SELECT id, email FROM User WHERE role = 'owner' AND active = 1 ORDER BY id LIMIT 1"
+          ).first<any>();
+          if (owner) {
+            await env.DB.prepare("UPDATE User SET last_login_at = datetime('now') WHERE id = ?").bind(owner.id).run();
+          }
+          const token = await generateJWT(env, 'admin', owner);
           return new Response(JSON.stringify({ success: true, token }), { headers });
         }
         
@@ -666,11 +853,411 @@ if (method === "POST" && pathname === "/api/verify-password") {
       // 加了訪客層之後這條也回報「進不進得了站」：401 代表手上什麼都沒有，
       // 前端該把進站畫面端出來；200 + admin:false 代表是訪客，可以瀏覽但沒有編輯權。
       if (method === "GET" && pathname === "/api/auth/me") {
-        const role = await tokenRole(request, env);
-        if (!role) {
-          return new Response(JSON.stringify({ admin: false, guest: false }), { status: 401, headers });
+        const identity = await tokenIdentity(request, env);
+        if (!identity) {
+          return new Response(JSON.stringify({ admin: false, guest: false, user: null }), { status: 401, headers });
         }
-        return new Response(JSON.stringify({ admin: role === 'admin', guest: role === 'guest' }), { headers });
+        // 管理員才查 D1（也才有東西可查）。訪客走這裡是每次進站都會發生的事，
+        // 多一次讀取乘上每個家人的每次重整，不值得
+        const actor = identity.role === 'admin' ? await currentActor(request, env) : null;
+        // 足跡地圖對訪客開不開。管理員一律看得到，不必問設定
+        const canViewMap = actor !== null || await guestCanViewMap(env);
+        return new Response(JSON.stringify({
+          // 白名單被撤掉的人 token 還沒過期 —— 這裡就要說 admin:false，
+          // 不然前端會端出一整套按下去全是 403 的編輯介面
+          admin: actor !== null,
+          guest: identity.role === 'guest' || (identity.role === 'admin' && actor === null),
+          can_view_map: canViewMap ? 1 : 0,
+          user: actor ? {
+            id: actor.uid, name: actor.name, email: actor.email,
+            role: actor.isOwner ? 'owner' : 'member',
+            can_manage_others: actor.canManageOthers ? 1 : 0,
+          } : null,
+        }), { headers });
+      }
+
+      /*
+       * 路由：改自己的顯示名稱。只有這一個欄位 ——
+       * 信箱是身分（改了等於換人），權限不能自己給自己加。
+       */
+      if (method === "PUT" && pathname === "/api/me") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (actor.uid == null) {
+          // 空資料庫的密碼登入，沒有列可以改
+          return new Response(JSON.stringify({ error: "no_account" }), { status: 409, headers });
+        }
+        const body: { name?: string } = await request.json();
+        const name = String(body.name ?? "").trim();
+        if (!name) {
+          return new Response(JSON.stringify({ error: "顯示名稱不能空白" }), { status: 400, headers });
+        }
+        if (name.length > 40) {
+          return new Response(JSON.stringify({ error: "顯示名稱最多 40 個字" }), { status: 400, headers });
+        }
+        await env.DB.prepare("UPDATE User SET name = ? WHERE id = ?").bind(name, actor.uid).run();
+        return new Response(JSON.stringify({
+          success: true,
+          user: {
+            id: actor.uid, name, email: actor.email,
+            role: actor.isOwner ? 'owner' : 'member',
+            can_manage_others: actor.canManageOthers ? 1 : 0,
+          },
+        }), { headers });
+      }
+
+      /* ── 站長專用：站台開關 ────────────────────────────────────────────────
+       *
+       * 目前只有一個：訪客能不能看足跡地圖。跟白名單同一個理由歸站長 ——
+       * 「訪客看得到什麼」是站的門，不是編輯權限。
+       */
+      if (pathname === "/api/admin/settings") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.isOwner) {
+          return new Response(JSON.stringify({ error: "只有站長可以改站台設定" }), { status: 403, headers });
+        }
+
+        if (method === "GET") {
+          return new Response(JSON.stringify({
+            guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
+          }), { headers });
+        }
+
+        if (method === "PUT") {
+          const body: { guest_can_view_map?: any } = await request.json();
+          if (body.guest_can_view_map !== undefined) {
+            await setSetting(env, SETTING_GUEST_MAP, body.guest_can_view_map ? "1" : "0");
+          }
+          return new Response(JSON.stringify({
+            success: true,
+            guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
+          }), { headers });
+        }
+      }
+
+      /* ── 站長專用：白名單管理 ──────────────────────────────────────────────
+       *
+       * 只有 role='owner' 進得來。can_manage_others 給的是「動別人的內容」，
+       * **不包含「決定誰進得來」** —— 那是站的鑰匙，不是編輯權限。
+       */
+      if (pathname === "/api/admin/users" || pathname.startsWith("/api/admin/users/")) {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.isOwner) {
+          return new Response(JSON.stringify({ error: "只有站長可以管理白名單" }), { status: 403, headers });
+        }
+
+        // 路由：白名單清單。附上「他名下有多少東西」，站長才知道移除他會影響什麼
+        if (method === "GET" && pathname === "/api/admin/users") {
+          const { results } = await env.DB.prepare(`
+            SELECT u.id, u.name, u.email, u.role, u.can_manage_others, u.active,
+                   u.last_login_at, u.created_at,
+                   (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
+                   (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id WHERE a.user_id = u.id) AS photo_count
+              FROM User u
+             ORDER BY (u.role = 'owner') DESC, u.active DESC, u.id
+          `).all();
+          return new Response(JSON.stringify(results), { headers });
+        }
+
+        // 路由：加一個人進白名單。只需要信箱 —— 他第一次 Google 登入就自動對上
+        if (method === "POST" && pathname === "/api/admin/users") {
+          const body: { email?: string; name?: string; can_manage_others?: any } = await request.json();
+          const email = String(body.email ?? "").trim().toLowerCase();
+          if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+            return new Response(JSON.stringify({ error: "請填一個看起來像信箱的東西" }), { status: 400, headers });
+          }
+          const name = String(body.name ?? "").trim() || email.split("@")[0];
+          const canManage = body.can_manage_others ? 1 : 0;
+
+          const existing = await env.DB.prepare(
+            "SELECT id, active FROM User WHERE lower(email) = ?"
+          ).bind(email).first<any>();
+          if (existing) {
+            // 曾經被移出白名單的人再加回來 —— 就是把 active 打開，他的相簿都還在
+            await env.DB.prepare(
+              "UPDATE User SET active = 1, can_manage_others = ?, name = ? WHERE id = ?"
+            ).bind(canManage, name, existing.id).run();
+            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?")
+              .bind(existing.id).first();
+            return new Response(JSON.stringify({ success: true, restored: Number(existing.active) !== 1, user: row }), { headers });
+          }
+
+          const res = await env.DB.prepare(
+            "INSERT INTO User (name, email, role, can_manage_others, active) VALUES (?, ?, 'member', ?, 1)"
+          ).bind(name, email, canManage).run();
+          const id = res.meta.last_row_id;
+          const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?")
+            .bind(id).first();
+          return new Response(JSON.stringify({ success: true, user: row }), { headers });
+        }
+
+        /* ── 刪除帳號。跟「移出白名單」是完全不同的兩件事 ─────────────────────
+         *
+         * 移出白名單只是停權（active=0，列還在，隨時放他回來）。這裡是真的把
+         * User 那一列刪掉，白名單上再也看不到他。**不可逆**。
+         *
+         * 兩個選填的清除範圍，由站長各自勾（都不勾就只是把帳號抹掉）：
+         *
+         *   albums=1  他建立的相簿整本刪掉。**連裡面別人傳的照片也一起沒了** ——
+         *             相簿沒了，裡面的照片沒有地方可以放。
+         *   photos=1  他上傳的照片刪掉，**包含放在別人相簿裡的那些**（照 uploaded_by 走，
+         *             使用者指定）。兩個都勾就是聯集。
+         *
+         * 沒被勾到的東西不會消失，而是**改掛到站長名下**。這不是設計上的偏好，是
+         * 資料庫逼出來的：Album.user_id 是 NOT NULL（沒有「無主相簿」這種狀態）
+         * 而且是 ON DELETE CASCADE —— 先改掛再刪 User，順序反過來就會把他整個人的
+         * 回憶連同 R2／Drive 上的孤兒檔案一起帶走。
+         *
+         * GET 同一條路徑＝刪之前先問「會少掉什麼」，站長才不是閉著眼睛勾。
+         */
+        const purgeMatch = pathname.match(/^\/api\/admin\/users\/(\d+)\/purge$/);
+        if (purgeMatch && (method === "GET" || method === "DELETE")) {
+          const targetId = Number(purgeMatch[1]);
+          const target = await env.DB.prepare(
+            "SELECT id, name, email, role FROM User WHERE id = ?"
+          ).bind(targetId).first<any>();
+          if (!target) {
+            return new Response(JSON.stringify({ error: "找不到這個帳號" }), { status: 404, headers });
+          }
+          // 站長刪不得，理由同上面的權限修改：刪掉就沒有人能管白名單了
+          if (target.role === 'owner' || targetId === actor.uid) {
+            return new Response(JSON.stringify({ error: "站長的帳號不能刪除" }), { status: 400, headers });
+          }
+
+          if (method === "GET") {
+            /*
+             * photos_elsewhere 要掃 Photo.uploaded_by，而那一欄沒有索引 ——
+             * 所以這個數字**只在站長真的打開刪除視窗時才算**，不塞進白名單清單。
+             * 塞進去的話 /admin 每開一次就全表掃一遍，免費額度撐不住。
+             */
+            const counts = await env.DB.prepare(`
+              SELECT
+                (SELECT COUNT(*) FROM Album WHERE user_id = ?) AS albums,
+                (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id
+                  WHERE a.user_id = ?) AS photos_in_albums,
+                (SELECT COUNT(*) FROM Photo WHERE uploaded_by = ?) AS photos_uploaded,
+                (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id
+                  WHERE p.uploaded_by = ? AND a.user_id <> ?) AS photos_elsewhere
+            `).bind(targetId, targetId, targetId, targetId, targetId).first<any>();
+            return new Response(JSON.stringify({
+              id: targetId,
+              email: target.email,
+              albums: Number(counts?.albums ?? 0),
+              photos_in_albums: Number(counts?.photos_in_albums ?? 0),
+              photos_uploaded: Number(counts?.photos_uploaded ?? 0),
+              photos_elsewhere: Number(counts?.photos_elsewhere ?? 0),
+            }), { headers });
+          }
+
+          // 保留下來的相簿要有人接手，而接手的人是站長本人。極端情況下站上
+          // 一個 owner 列都沒有（舊 token 密碼登入 + User 表被清過），那就別動
+          if (actor.uid == null) {
+            return new Response(JSON.stringify({ error: "站上找不到站長的帳號列，無法接手保留下來的內容" }), { status: 400, headers });
+          }
+
+          const dropAlbums = url.searchParams.get("albums") === "1";
+          const dropPhotos = url.searchParams.get("photos") === "1";
+
+          // 1. 要整本刪掉的相簿。drive_folder_id 一定要在刪列之前撈出來，
+          //    列一刪就再也查不到該把哪個資料夾搬進 trash/
+          const albums = dropAlbums
+            ? (await env.DB.prepare(
+                "SELECT id, drive_folder_id FROM Album WHERE user_id = ?"
+              ).bind(targetId).all<any>()).results
+            : [];
+          const albumIds = new Set(albums.map((a) => Number(a.id)));
+          // 有資料夾的那幾本，整個資料夾搬走就好，裡面的檔案不必再逐個登記
+          //（理由見刪相簿那條路：逐檔搬會把 trash/ 攤平成幾千個散檔）
+          const folderRows = albums.filter(
+            (a) => typeof a.drive_folder_id === "string" && a.drive_folder_id
+          );
+          const folderedAlbums = new Set(folderRows.map((a) => Number(a.id)));
+
+          /*
+           * 2. 要刪的照片。兩個勾選取聯集：他相簿裡的（不管誰傳的）
+           *    ＋ 他傳的（不管在誰的相簿裡）。
+           *
+           * 相簿用子查詢而不是把 id 攤成 IN (?,?,…)：D1 單一 statement 只吃
+           * 100 個綁定參數，一百多本相簿就會 500（見 chunkIds 的說明）。
+           */
+          const clauses: string[] = [];
+          const binds: any[] = [];
+          if (dropAlbums) {
+            clauses.push("album_id IN (SELECT id FROM Album WHERE user_id = ?)");
+            binds.push(targetId);
+          }
+          if (dropPhotos) {
+            clauses.push("uploaded_by = ?");
+            binds.push(targetId);
+          }
+          const photos = clauses.length > 0
+            ? (await env.DB.prepare(`
+                SELECT id, album_id, url, file_name, thumb_url, thumb_sm_url,
+                       drive_file_id, drive_original_id
+                  FROM Photo WHERE ${clauses.join(" OR ")}
+              `).bind(...binds).all<any>()).results
+            : [];
+          const photoIds = photos.map((p) => Number(p.id));
+
+          // 3. R2 的實體檔案（主檔 + 800px + 400px）。一次最多 1000 個鍵
+          if (photos.length > 0) {
+            const keys = photos.flatMap((p) => r2KeysForPhoto(p));
+            for (let i = 0; i < keys.length; i += 1000) {
+              await env.BUCKET.delete(keys.slice(i, i + 1000));
+            }
+          }
+
+          // 4. Drive：整本刪掉的相簿搬資料夾，其餘（別人相簿裡的照片、
+          //    還有分資料夾之前的舊相簿）才逐檔登記。兩條路都不呼叫 files.delete
+          if (folderRows.length > 0) {
+            const stmt = env.DB.prepare("INSERT INTO DriveTrash (drive_id, photo_id) VALUES (?, NULL)");
+            for (let i = 0; i < folderRows.length; i += 100) {
+              await env.DB.batch(folderRows.slice(i, i + 100).map((a) => stmt.bind(a.drive_folder_id)));
+            }
+          }
+          const loosePhotos = photos.filter((p) => !folderedAlbums.has(Number(p.album_id)));
+          if (loosePhotos.length > 0) await queueDriveTrash(env, loosePhotos);
+
+          if (photoIds.length > 0) {
+            for (const part of chunkIds(photoIds)) {
+              await env.DB.prepare(
+                `DELETE FROM PhotoTag WHERE photo_id IN (${placeholdersFor(part)})`
+              ).bind(...part).run();
+            }
+
+            /*
+             * 被刪掉的照片如果正好是某本相簿的封面，封面要清掉，否則那本相簿
+             * 會一直指著一個 404 的網址。只有**留下來的**相簿要處理 ——
+             * 整本要刪的那幾本自己馬上就不在了。
+             */
+            const coverUrls = [...new Set(photos
+              .filter((p) => !albumIds.has(Number(p.album_id)) && typeof p.url === "string" && p.url)
+              .map((p) => p.url as string))];
+            for (let i = 0; i < coverUrls.length; i += 90) {
+              const part = coverUrls.slice(i, i + 90);
+              await env.DB.prepare(
+                `UPDATE Album SET cover_photo_url = NULL WHERE cover_photo_url IN (${placeholdersFor(part)})`
+              ).bind(...part).run();
+            }
+
+            for (const part of chunkIds(photoIds)) {
+              await env.DB.prepare(
+                `DELETE FROM Photo WHERE id IN (${placeholdersFor(part)})`
+              ).bind(...part).run();
+            }
+            // PhotoFts 是虛擬表，沒有 FK，不會跟著 Photo 一起消失
+            await deleteFtsForPhotos(env.DB, photoIds);
+          }
+
+          // 5. 相簿本身。一條 statement 就掃完，不必按 id 切塊
+          if (dropAlbums) {
+            await env.DB.prepare("DELETE FROM Album WHERE user_id = ?").bind(targetId).run();
+          }
+
+          /*
+           * 6. 沒被刪掉的東西改掛站長名下。**一定要排在刪 User 之前** ——
+           *    Album.user_id 是 ON DELETE CASCADE，順序反過來就會把留下來的
+           *    相簿連同照片一起被外鍵帶走，而且 R2 與 Drive 上的檔案不會跟著清。
+           */
+          const moved = await env.DB.prepare(
+            "UPDATE Album SET user_id = ? WHERE user_id = ?"
+          ).bind(actor.uid, targetId).run();
+          // uploaded_by 沒有外鍵，不清會留下指向不存在帳號的 id
+          //（前端的 canEdit 拿它跟自己的 uid 比對，id 被重用時會誤判）
+          const orphaned = await env.DB.prepare(
+            "UPDATE Photo SET uploaded_by = NULL WHERE uploaded_by = ?"
+          ).bind(targetId).run();
+
+          // 7. 人本身
+          await env.DB.prepare("DELETE FROM User WHERE id = ?").bind(targetId).run();
+
+          if (folderRows.length > 0 || loosePhotos.length > 0) {
+            // 開頭幾個當場搬掉，剩下的交給 cron
+            ctx.waitUntil(drainDriveTrash(env, 10).catch((e) => console.error("Drive 待搬佇列", e)));
+          }
+
+          return new Response(JSON.stringify({
+            success: true,
+            mode: "deleted",
+            email: target.email,
+            deleted_albums: albumIds.size,
+            deleted_photos: photoIds.length,
+            kept_albums: Number(moved.meta?.changes ?? 0),
+            kept_photos: Number(orphaned.meta?.changes ?? 0),
+          }), { headers });
+        }
+
+        const idMatch = pathname.match(/^\/api\/admin\/users\/(\d+)$/);
+        if (idMatch && (method === "PUT" || method === "DELETE")) {
+          const targetId = Number(idMatch[1]);
+          const target = await env.DB.prepare(
+            "SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?"
+          ).bind(targetId).first<any>();
+          if (!target) {
+            return new Response(JSON.stringify({ error: "找不到這個帳號" }), { status: 404, headers });
+          }
+          /*
+           * 站長這一列動不得：降權或停用會讓站上再也沒有人能改白名單，
+           * 而唯一的復原辦法是直接開 D1 主控台。這種門不該裝在網頁上。
+           */
+          if (target.role === 'owner') {
+            return new Response(JSON.stringify({ error: "站長的權限不能在這裡修改" }), { status: 400, headers });
+          }
+
+          // 路由：改權限／改名／停權復權
+          if (method === "PUT") {
+            const body: { name?: string; can_manage_others?: any; active?: any } = await request.json();
+            const sets: string[] = [];
+            const binds: any[] = [];
+            if (typeof body.name === "string") {
+              const n = body.name.trim();
+              if (!n) return new Response(JSON.stringify({ error: "顯示名稱不能空白" }), { status: 400, headers });
+              sets.push("name = ?"); binds.push(n.slice(0, 40));
+            }
+            if (body.can_manage_others !== undefined) {
+              sets.push("can_manage_others = ?"); binds.push(body.can_manage_others ? 1 : 0);
+            }
+            if (body.active !== undefined) {
+              sets.push("active = ?"); binds.push(body.active ? 1 : 0);
+            }
+            if (sets.length === 0) {
+              return new Response(JSON.stringify({ error: "沒有要改的東西" }), { status: 400, headers });
+            }
+            await env.DB.prepare(`UPDATE User SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, targetId).run();
+            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?")
+              .bind(targetId).first();
+            return new Response(JSON.stringify({ success: true, user: row }), { headers });
+          }
+
+          /*
+           * 路由：移出白名單。**一律停權（active=0），永遠不刪列。** 兩個理由：
+           *
+           * 1. Album.user_id 是 ON DELETE CASCADE，刪掉這一列會連他建過的相簿和
+           *    照片一起消失（連 R2 與 Drive 上的檔案都不會被清，變成孤兒）。
+           *    「這個人不能再進來」跟「刪掉他的回憶」是兩件事。
+           * 2. 停權留在名單上看得見（前端標「已停權」），要放他回來就是再加一次；
+           *    刪掉的話這個人就從畫面上蒸發，站長事後想不起來自己踢過誰。
+           *
+           * 名下有幾本相簿照樣回報，前端才講得出「他的東西還在」。
+           * 真的要把一個人從名單上抹掉是另一顆按鈕：見上面的 `/purge`。
+           */
+          const owned = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM Album WHERE user_id = ?"
+          ).bind(targetId).first<any>();
+          const albumCount = Number(owned?.n ?? 0);
+          await env.DB.prepare("UPDATE User SET active = 0 WHERE id = ?").bind(targetId).run();
+          return new Response(JSON.stringify({ success: true, mode: "deactivated", album_count: albumCount }), { headers });
+        }
+
+        return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });
       }
 
       /*
@@ -900,7 +1487,10 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const albumId = parts[3];
 
         const { results: rawPhotos } = await env.DB.prepare(`
-          SELECT p.*, a.map_private
+          -- a.user_id 帶出來給前端判斷「這張是不是我的」。名字跟 actorOwns 讀的
+          -- 那組欄位一致（user_id = 相簿主人、uploaded_by = 傳的人），前端才能
+          -- 直接套同一條規則，不必自己再拼一次
+          SELECT p.*, a.user_id AS user_id, a.map_private
           FROM Photo p
           LEFT JOIN Album a ON a.id = p.album_id
           WHERE p.album_id = ?
@@ -1001,7 +1591,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }
 
         const { results: rawPhotos } = await env.DB.prepare(`
-          SELECT p.*, a.name AS album_name, a.map_private
+          SELECT p.*, a.name AS album_name, a.user_id AS user_id, a.map_private
           FROM Photo p
           LEFT JOIN Album a ON a.id = p.album_id
           WHERE ${where.join(" AND ")}
@@ -1159,10 +1749,70 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }), { headers });
       }
 
-      // 以下路由需要驗證
+      /*
+       * 以下路由需要驗證。
+       *
+       * 這裡只回答「是不是站上的管理員」；「動不動得了這一本／這一張」是另一回事，
+       * 由各路由自己用 writeActor 判斷（規則見 actorOwns）。
+       * currentActor 對同一個 request 只查一次 D1，底下再叫幾次都不花額外讀取。
+       */
       const requiresAuth = ["POST", "PUT", "DELETE"].includes(method);
-      if (requiresAuth && !(await isAuthorized(request, env))) {
+      const writeActor = requiresAuth ? await currentActor(request, env) : null;
+      if (requiresAuth && !writeActor) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+      }
+      // 上面那一行已經擋掉 null，這個別名只是讓底下不必一路寫 `!`
+      const me = writeActor as Actor;
+
+      /** 這本相簿在不在我的管轄範圍。找不到相簿也回 false（呼叫端一律回 403/404） */
+      const canTouchAlbum = async (albumId: string | number): Promise<boolean> => {
+        if (me.canManageOthers) return true;
+        const row = await albumOwnership(env, albumId);
+        return row ? actorOwns(me, row) : false;
+      };
+
+      /** 這張照片在不在我的管轄範圍 */
+      const canTouchPhoto = async (photoId: string | number): Promise<boolean> => {
+        if (me.canManageOthers) return true;
+        const row = await photoOwnership(env, photoId);
+        return row ? actorOwns(me, row) : false;
+      };
+
+      /**
+       * 一整批照片全都是我的嗎。批次類的端點（geo/*、reorder）用這個，
+       * 一次 SQL 問完 —— 逐張問會讓一批兩百張變成兩百次讀取。
+       * D1 的綁定參數上限是 100，所以要切塊（見 chunkIds）。
+       */
+      const canTouchPhotos = async (ids: (string | number)[]): Promise<boolean> => {
+        if (me.canManageOthers) return true;
+        if (me.uid == null) return false;
+        const numeric = ids.map((v) => Number(v)).filter((v) => Number.isFinite(v));
+        for (const chunk of chunkIds(numeric, 2)) {
+          if (chunk.length === 0) continue;
+          const row = await env.DB.prepare(`
+            SELECT COUNT(*) AS n FROM Photo p JOIN Album a ON a.id = p.album_id
+             WHERE p.id IN (${placeholdersFor(chunk)})
+               AND a.user_id != ? AND (p.uploaded_by IS NULL OR p.uploaded_by != ?)
+          `).bind(...chunk, me.uid, me.uid).first<any>();
+          if (Number(row?.n ?? 0) > 0) return false;
+        }
+        return true;
+      };
+
+      /*
+       * 全站共用的東西：GPS 軌跡、Google 時間軸、Drive 資料夾設定、維護工具。
+       *
+       * 它們不屬於任何一本相簿，「只能動自己的」在這裡沒有意義 —— 那是站的資產，
+       * 而且軌跡本身就是「這台手機去過哪裡」。所以一律要 can_manage_others。
+       * （白名單那幾支更嚴，是站長限定，而且在上面就先回應了。）
+       */
+      const isSharedResourceWrite =
+        pathname.startsWith("/api/tracks/")
+        || pathname.startsWith("/api/timeline/")
+        || pathname === "/api/config/drive-folders"
+        || pathname.startsWith("/api/admin/");
+      if (requiresAuth && isSharedResourceWrite && !me.canManageOthers) {
+        return forbidden(headers, "這是全站共用的資料，只有可以管理別人內容的帳號能修改");
       }
 
       /*
@@ -1276,36 +1926,56 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }), { headers });
       }
 
-      // 路由：重新排序相簿
+      /*
+       * 路由：重新排序相簿。
+       *
+       * 這一支要 can_manage_others：首頁的排列是**整個站共用的一份**，
+       * 送上來的清單一定會蓋到別人的相簿。只挑自己的來更新會排出一個
+       * 跟畫面上不一樣的順序，比擋下來更難懂。
+       */
       if (method === "PUT" && pathname === "/api/albums/reorder") {
+        if (!me.canManageOthers) return forbidden(headers, "相簿的排列順序是整站共用的，只有可以管理別人內容的帳號能調整");
         const body: { id: number; sort_order: number }[] = await request.json();
         const statements = body.map(item => env.DB.prepare("UPDATE Album SET sort_order = ? WHERE id = ?").bind(item.sort_order, item.id));
         if (statements.length > 0) await env.DB.batch(statements);
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
-      // 路由：重新排序照片
+      // 路由：重新排序照片。相簿裡面的順序是相簿主人的事，逐張驗
       if (method === "PUT" && pathname === "/api/photos/reorder") {
         const body: { id: number; sort_order: number }[] = await request.json();
+        if (!(await canTouchPhotos(body.map((i) => i.id)))) return forbidden(headers);
         const statements = body.map(item => env.DB.prepare("UPDATE Photo SET sort_order = ? WHERE id = ?").bind(item.sort_order, item.id));
         if (statements.length > 0) await env.DB.batch(statements);
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
-      // 路由：新增相簿
+      /*
+       * 路由：新增相簿。
+       *
+       * user_id 從此是**登入的那個人**，不再一律寫死 1（那個 'Admin' 佔位帳號
+       * 已經在 migrations/0008 改寫成站長本人）。這一欄就是後面所有
+       * 「這是不是我的相簿」判斷的依據。
+       */
       if (method === "POST" && pathname === "/api/albums") {
         const body: any = await request.json();
         if (!body.name) return new Response(JSON.stringify({ error: "Name is required" }), { status: 400, headers });
-        await env.DB.prepare("INSERT OR IGNORE INTO User (id, name, email) VALUES (1, 'Admin', 'admin@didadida.com')").run();
-        const { success } = await env.DB.prepare("INSERT INTO Album (name, description, user_id) VALUES (?, ?, 1)").bind(body.name, body.description || null).run();
+        // uid 為 null 只可能是「空資料庫 + 密碼登入」，退回站長那一列的 1
+        const ownerId = me.uid ?? 1;
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO User (id, name, email, role, can_manage_others, active) VALUES (1, '站長', 'owner@didadida.local', 'owner', 1, 1)"
+        ).run();
+        const { success } = await env.DB.prepare("INSERT INTO Album (name, description, user_id) VALUES (?, ?, ?)")
+          .bind(body.name, body.description || null, ownerId).run();
         return new Response(JSON.stringify({ success: success }), { headers });
       }
 
       // 路由：更新相簿設定 (封面照、封面文字等)
       if (method === "PUT" && pathname.startsWith("/api/albums/") && pathname.split("/").length === 4) {
         const albumId = pathname.split("/")[3];
+        if (!(await canTouchAlbum(albumId))) return forbidden(headers);
         const body: any = await request.json();
-        
+
         // Build the update query dynamically based on provided fields
         const updates: string[] = [];
         const values: any[] = [];
@@ -1358,6 +2028,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
       if (method === "POST" && pathname.startsWith("/api/albums/")
           && pathname.endsWith("/drive-folder") && pathname.split("/").length === 5) {
         const albumId = pathname.split("/")[3];
+        if (!(await canTouchAlbum(albumId))) return forbidden(headers);
         const body: any = await request.json();
         const folderId = typeof body?.folder_id === "string" ? body.folder_id : null;
         if (!folderId) {
@@ -1387,7 +2058,15 @@ if (method === "POST" && pathname === "/api/verify-password") {
       // 路由：刪除相簿 (連同底下的照片)
       if (method === "DELETE" && pathname.startsWith("/api/albums/") && pathname.split("/").length === 4) {
         const albumId = pathname.split("/")[3];
-        
+        if (!(await canTouchAlbum(albumId))) return forbidden(headers);
+
+        // 0. 這本相簿在 Drive 上的資料夾。整本刪掉時搬的是**資料夾**而不是裡面每一個檔
+        const albumRow = await env.DB.prepare(
+          "SELECT drive_folder_id FROM Album WHERE id = ?"
+        ).bind(albumId).first<any>();
+        const albumFolderId = typeof albumRow?.drive_folder_id === "string" && albumRow.drive_folder_id
+          ? albumRow.drive_folder_id : null;
+
         // 1. 抓出這本相簿所有的照片
         //    縮圖的網址也要撈：只刪 file_name 會把兩張縮圖永遠留在 R2 佔額度
         //    drive id 也要撈：Photo 列一刪就再也查不到該搬哪些 Drive 檔
@@ -1403,15 +2082,34 @@ if (method === "POST" && pathname === "/api/verify-password") {
             await env.BUCKET.delete(keys.slice(i, i + 1000));
           }
 
-          // 3. Drive 的檔案登記待搬（真正的搬移分批做，見 drainDriveTrash）
-          await queueDriveTrash(env, photos);
-          // 開頭幾個當場搬掉，剩下的交給 cron —— 整本相簿的量不可能一次搬完
-          ctx.waitUntil(drainDriveTrash(env, 10).catch((e) => console.error("Drive 待搬佇列", e)));
-
           // 4. 刪除所有這些照片的 Tag 關聯
           await env.DB.prepare(`DELETE FROM PhotoTag WHERE photo_id IN (SELECT id FROM Photo WHERE album_id = ?)`).bind(albumId).run();
         }
-        
+
+        /*
+         * 3. Drive 的清理。**整本相簿刪掉時搬的是資料夾本身**，不是裡面的每一個檔。
+         *
+         * 逐檔搬有兩個問題：一千張照片＝兩千個檔＝四千次 Drive 往返（每個檔要
+         * 讀 parents + PATCH），而且搬完 trash/ 底下會攤平成兩千個散檔 ——
+         * 備份有一半的價值來自「出事那天人打得開、看得懂」，攤平就沒了。
+         * 搬資料夾則永遠是一列、兩次往返，而且 trash/ 裡看到的就是原本那本相簿。
+         *
+         * 沒有資料夾 id 的（分資料夾之前上傳的舊照片）才退回逐檔登記。
+         * 兩條路都不呼叫 files.delete —— 見 queueDriveTrash 的說明。
+         */
+        if (albumFolderId) {
+          await env.DB.prepare(
+            "INSERT INTO DriveTrash (drive_id, photo_id) VALUES (?, NULL)"
+          ).bind(albumFolderId).run();
+        } else if (photos.length > 0) {
+          await queueDriveTrash(env, photos);
+        }
+        if (albumFolderId || photos.length > 0) {
+          // 開頭幾個當場搬掉，剩下的交給 cron —— 逐檔那條路不可能一次搬完
+          ctx.waitUntil(drainDriveTrash(env, 10).catch((e) => console.error("Drive 待搬佇列", e)));
+        }
+
+
         // 5. 刪除這些照片紀錄
         await env.DB.prepare("DELETE FROM Photo WHERE album_id = ?").bind(albumId).run();
 
@@ -1535,7 +2233,9 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!file || !albumId) {
           return new Response(JSON.stringify({ error: "File and album_id are required" }), { status: 400, headers });
         }
-        
+        // 往別人的相簿裡塞照片也是「動別人的相簿」
+        if (!(await canTouchAlbum(albumId))) return forbidden(headers, "沒有權限上傳到別人的相簿");
+
         const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic'];
         if (!allowedTypes.includes(file.type.toLowerCase())) {
           return new Response(JSON.stringify({ error: "Invalid file type. Only images are allowed." }), { status: 400, headers });
@@ -1640,13 +2340,13 @@ function hammingDistance(hex1: string, hex2: string): number {
           // random() & 0x7FFFFFFF 保證落在 JS 安全整數內，後端才算得出同樣的種子。
           `INSERT INTO Photo
              (title, file_name, album_id, url, thumb_url, thumb_sm_url, exif, taken_at, file_hash, phash,
-              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, shuffle_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by, shuffle_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
           file.name, fileName, albumId, fileUrl, thumbUrl, thumbSmUrl, exifData,
           uploadTakenAt, fileHash, clientPhash,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
-          uploadTimeSource,
+          uploadTimeSource, me.uid,
         ).run();
 
         const newPhotoId = Number(inserted.meta?.last_row_id ?? 0);
@@ -1669,6 +2369,7 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：更新照片資訊 (description, taken_at)
       if (method === "PUT" && pathname.startsWith("/api/photos/") && pathname.split("/").length === 4) {
         const photoId = pathname.split("/")[3];
+        if (!(await canTouchPhoto(photoId))) return forbidden(headers);
         const body: any = await request.json();
         // body.taken_at 是 UTC 瞬間。改了它就必須同步重算 taken_at_local，
         // 否則兩欄會各說各話（顯示與行程段比對用 local、排序與軌跡比對用 taken_at）。
@@ -1693,6 +2394,7 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：刪除照片
       if (method === "DELETE" && pathname.startsWith("/api/photos/") && pathname.split("/").length === 4) {
         const photoId = pathname.split("/")[3];
+        if (!(await canTouchPhoto(photoId))) return forbidden(headers);
         const photo = await env.DB.prepare(
           "SELECT id, file_name, url, thumb_url, thumb_sm_url, drive_file_id, drive_original_id FROM Photo WHERE id = ?"
         ).bind(photoId).first();
@@ -1725,6 +2427,7 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "POST" && pathname.startsWith("/api/photos/")
           && pathname.endsWith("/drive") && pathname.split("/").length === 5) {
         const photoId = pathname.split("/")[3];
+        if (!(await canTouchPhoto(photoId))) return forbidden(headers);
         const body = await request.json().catch(() => ({})) as {
           drive_file_id?: unknown; drive_original_id?: unknown;
         };
@@ -1751,6 +2454,7 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：新增照片標籤
       if (method === "POST" && pathname.startsWith("/api/photos/") && pathname.endsWith("/tags")) {
         const photoId = pathname.split("/")[3];
+        if (!(await canTouchPhoto(photoId))) return forbidden(headers);
         const { tagName } = await request.json() as { tagName: string };
         if (!tagName) return new Response(JSON.stringify({ error: "Tag name required" }), { status: 400, headers });
         
@@ -1768,6 +2472,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         const parts = pathname.split("/");
         const photoId = parts[3];
         const tagId = parts[5];
+        if (!(await canTouchPhoto(photoId))) return forbidden(headers);
         await env.DB.prepare("DELETE FROM PhotoTag WHERE photo_id = ? AND tag_id = ?").bind(photoId, tagId).run();
         // 清理完全沒有任何照片使用的孤立標籤
         await env.DB.prepare("DELETE FROM Tag WHERE id NOT IN (SELECT DISTINCT tag_id FROM PhotoTag)").run();
@@ -1857,6 +2562,13 @@ function hammingDistance(hex1: string, hex2: string): number {
 
         if (!code) return new Response("Missing code", { status: 400 });
 
+        // 優先使用傳過來的 redirectHost。往上提到換 token 之前，失敗時也才有地方可回
+        let baseFrontEndUrl = redirectHost || "https://didadida-frontend.pages.dev";
+        if (!redirectHost && (urlObj.hostname.includes("localhost") || urlObj.hostname.includes("127.0.0.1"))) {
+          baseFrontEndUrl = "http://localhost:3000";
+        }
+        const target = albumId ? `${baseFrontEndUrl}/album?id=${albumId}` : `${baseFrontEndUrl}/`;
+
         const clientId = env.GOOGLE_CLIENT_ID || "";
         const clientSecret = env.GOOGLE_CLIENT_SECRET || "";
         const redirectUri = new URL(request.url).origin + "/api/auth/google/callback";
@@ -1875,23 +2587,16 @@ function hammingDistance(hex1: string, hex2: string): number {
 
         const tokenData: any = await tokenRes.json();
 
+        /*
+         * 換不到 token。**這裡以前直接把 Google 的原始回應和 client_id 印成 HTML
+         * 給對方看** —— 那是開發期的除錯殘留。OAuth app 已經是發布狀態，這條回呼
+         * 網址誰都打得到（隨便帶個 code 就進得來），等於把後端設定攤給匿名訪客。
+         * 現在只回一個代碼，細節留給 Worker 的記錄檔。
+         */
         if (!tokenData.access_token) {
-          return new Response(`
-            <html><body>
-            <h2>Google OAuth Error</h2>
-            <pre>${JSON.stringify(tokenData, null, 2)}</pre>
-            <p>ClientId: ${clientId}</p>
-            </body></html>
-          `, { headers: { "Content-Type": "text/html" } });
+          console.error("google token exchange failed", tokenData?.error, tokenData?.error_description);
+          return Response.redirect(`${target}#authError=${encodeURIComponent("token_exchange_failed")}`, 302);
         }
-        
-        // 優先使用傳過來的 redirectHost
-        let baseFrontEndUrl = redirectHost || "https://didadida-frontend.pages.dev";
-        if (!redirectHost && (urlObj.hostname.includes("localhost") || urlObj.hostname.includes("127.0.0.1"))) {
-          baseFrontEndUrl = "http://localhost:3000";
-        }
-
-        const target = albumId ? `${baseFrontEndUrl}/album?id=${albumId}` : `${baseFrontEndUrl}/`;
 
         /*
          * 這條路現在同時是「管理員登入」，所以要驗身分再發自己的 JWT。
@@ -1911,7 +2616,7 @@ function hammingDistance(hex1: string, hex2: string): number {
          * 前端讀完會馬上把它從網址列擦掉，免得留在瀏覽器歷史裡。
          */
         const frag = new URLSearchParams({
-          token: await generateJWT(env),
+          token: await generateJWT(env, 'admin', admitted.user),
           googleToken: tokenData.access_token,
           googleExpiresIn: String(Number(tokenData.expires_in) || 3600),
         });
@@ -1927,9 +2632,9 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (mode === "drive_writer") {
           if (typeof tokenData.refresh_token === "string" && tokenData.refresh_token) {
             await setSetting(env, SETTING_DRIVE_REFRESH_TOKEN, tokenData.refresh_token);
-            await setSetting(env, SETTING_DRIVE_WRITER_EMAIL, admitted.email);
+            await setSetting(env, SETTING_DRIVE_WRITER_EMAIL, admitted.user.email);
             await setSetting(env, SETTING_DRIVE_LINKED_AT, new Date().toISOString());
-            frag.set("driveLinked", admitted.email);
+            frag.set("driveLinked", admitted.user.email);
           } else {
             frag.set("driveLinkError", "no_refresh_token");
           }
@@ -2033,6 +2738,8 @@ function hammingDistance(hex1: string, hex2: string): number {
           console.error("400 Bad Request - Missing googlePhotoUrl. Body received:", body);
           return new Response(JSON.stringify({ error: "Missing googlePhotoUrl" }), { status: 400, headers });
         }
+        // 跟本機上傳同一條規矩：目標相簿不是我的就別下載了，早退一步省掉整趟傳輸
+        if (!(await canTouchAlbum(targetAlbumId))) return forbidden(headers, "沒有權限上傳到別人的相簿");
         
         // 取得照片原始檔案 (Picker API 的 baseUrl 加上 =d 來下載原始解析度)
         let downloadUrl = googlePhotoUrl;
@@ -2173,13 +2880,14 @@ function hammingDistance(hex1: string, hex2: string): number {
           // shuffle_key 見 /api/upload 的說明：漏填會讓照片永遠不出現在相簿預覽
           `INSERT INTO Photo
              (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
-              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, shuffle_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by, shuffle_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
           tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
           tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash, tempPhoto.phash,
           tempPhoto.lat, tempPhoto.lng, tempPhoto.geo_source,
           tempPhoto.taken_at_local, tempPhoto.tz_offset_minutes, tempPhoto.time_source,
+          me.uid,
         ).run();
 
         const syncedId = Number(syncInserted.meta?.last_row_id ?? 0);
@@ -2192,6 +2900,11 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "POST" && pathname === "/api/google/resolve-conflict") {
         const body = await request.json() as any;
         const { decision, existingPhotos, tempPhoto, replacePhotoIds } = body;
+
+        // album_id 也是前端送回來的。這一支會刪既有照片，權限一定要再驗一次
+        if (tempPhoto?.album_id && !(await canTouchAlbum(tempPhoto.album_id))) {
+          return forbidden(headers);
+        }
 
         // tempPhoto 是由前端原樣送回來的，座標與來源標記都不能照單全收
         const tpLat = isValidLatLng(tempPhoto?.lat, tempPhoto?.lng) ? tempPhoto.lat : null;
@@ -2250,12 +2963,12 @@ function hammingDistance(hex1: string, hex2: string): number {
             // shuffle_key 見 /api/upload 的說明
             `INSERT INTO Photo
                (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
-                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, shuffle_key)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by, shuffle_key)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
           ).bind(
             tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
             tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash || null, tempPhoto.phash || null,
-            tpLat, tpLng, tpGeoSource, tpLocal, tpTz, tpTimeSource,
+            tpLat, tpLng, tpGeoSource, tpLocal, tpTz, tpTimeSource, me.uid,
           ).run();
         } else if (decision === "keep_both") {
           // 修改標題避免混淆
@@ -2265,12 +2978,12 @@ function hammingDistance(hex1: string, hex2: string): number {
             // shuffle_key 見 /api/upload 的說明
             `INSERT INTO Photo
                (title, file_name, album_id, url, taken_at, exif,
-                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, shuffle_key)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by, shuffle_key)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
           ).bind(
             newTitle, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
             tempPhoto.taken_at, tempPhoto.exif,
-            tpLat, tpLng, tpGeoSource, tpLocal, tpTz, tpTimeSource,
+            tpLat, tpLng, tpGeoSource, tpLocal, tpTz, tpTimeSource, me.uid,
           ).run();
         }
 
@@ -2287,6 +3000,13 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 舊資料若無 taken_at_local，由 LOCAL_TIME_EXPR 從 taken_at 加時區推回來再比對。
       if (method === "GET" && pathname === "/api/footprint") {
         const isAdmin = await isAuthorized(request, env);
+        /*
+         * 訪客要看足跡得站長先開。**這一關必須擋在 withEdgeCache 前面** ——
+         * 進到裡面就可能直接命中先前存下的 200，開關關掉也照樣把座標端出去。
+         */
+        if (!isAdmin && !(await guestCanViewMap(env))) {
+          return forbidden(headers, "站長沒有開放訪客瀏覽足跡地圖");
+        }
         // 這條的隱私過濾是寫在 SQL 的 WHERE 裡（不是 applyGeoPrivacy），但結果同樣
         // 依身分而異，一樣不能讓管理員的版本落進共用的邊緣快取
         return withEdgeCache(request, ctx,
@@ -2406,6 +3126,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!isValidLatLng(lat, lng)) {
           return new Response(JSON.stringify({ error: "Invalid lat/lng" }), { status: 400, headers });
         }
+        if (!(await canTouchPhotos(ids))) return forbidden(headers);
 
         const placeName = typeof body.placeName === 'string' ? body.placeName : null;
         const overwriteExif = body.overwriteExif === true;
@@ -2462,6 +3183,13 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "POST" && pathname === "/api/photos/geo/apply-segments") {
         const body: any = await request.json().catch(() => ({}));
         const albumId = Number.isFinite(body?.albumId) ? body.albumId : null;
+
+        // 不指定相簿就是「全站沒座標的照片都套一遍」，那會動到別人的
+        if (albumId === null) {
+          if (!me.canManageOthers) return forbidden(headers, "只能對自己的相簿套用行程段");
+        } else if (!(await canTouchAlbum(albumId))) {
+          return forbidden(headers);
+        }
 
         const { results: segments } = await env.DB.prepare(
           "SELECT * FROM TripSegment ORDER BY created_at ASC, id ASC"
@@ -2532,6 +3260,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (items.length === 0) {
           return new Response(JSON.stringify({ error: "items is required" }), { status: 400, headers });
         }
+        if (!(await canTouchPhotos(items.map((it: { photoId: number }) => it.photoId)))) return forbidden(headers);
 
         await env.DB.batch(items.map((it: { photoId: number; placeName: string }) =>
           env.DB.prepare("UPDATE Photo SET place_name = ? WHERE id = ?").bind(it.placeName, it.photoId)
@@ -2596,6 +3325,9 @@ function hammingDistance(hex1: string, hex2: string): number {
         const matches: any[] = Array.isArray(body?.matches) ? body.matches : [];
         if (matches.length === 0) {
           return new Response(JSON.stringify({ error: "matches is required" }), { status: 400, headers });
+        }
+        if (!(await canTouchPhotos(matches.map((m: any) => Number(m?.photoId)).filter(Number.isFinite)))) {
+          return forbidden(headers);
         }
 
         const overwriteExif = body?.overwriteExif === true;
@@ -2663,6 +3395,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (ids.length === 0) {
           return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
         }
+        if (!(await canTouchPhotos(ids))) return forbidden(headers);
         const value = body?.geoPrivate === 0 || body?.geoPrivate === false ? 0 : 1;
         const res = await env.DB.batch(
           chunkIds(ids, 1).map((c) => env.DB.prepare(
@@ -2676,6 +3409,7 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：切換相簿層級的地圖隱私
       if (method === "PUT" && pathname.startsWith("/api/albums/") && pathname.endsWith("/map-privacy")) {
         const albumId = pathname.split("/")[3];
+        if (!(await canTouchAlbum(albumId))) return forbidden(headers);
         const body: any = await request.json();
         const value = body?.mapPrivate === 0 || body?.mapPrivate === false ? 0 : 1;
         await env.DB.prepare("UPDATE Album SET map_private = ? WHERE id = ?").bind(value, albumId).run();
@@ -2685,6 +3419,12 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：刪除行程段
       if (method === "DELETE" && pathname.startsWith("/api/trip-segments/")) {
         const segId = pathname.split("/")[3];
+        if (!me.canManageOthers) {
+          // 沒綁相簿的行程段是全站共用的規則，只有能管別人內容的人動得了
+          const seg = await env.DB.prepare("SELECT album_id FROM TripSegment WHERE id = ?").bind(segId).first<any>();
+          if (!seg) return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });
+          if (seg.album_id == null || !(await canTouchAlbum(seg.album_id))) return forbidden(headers);
+        }
         await env.DB.prepare("DELETE FROM TripSegment WHERE id = ?").bind(segId).run();
         return new Response(JSON.stringify({ success: true }), { headers });
       }
@@ -2704,6 +3444,7 @@ function hammingDistance(hex1: string, hex2: string): number {
       //   兩者都送             → 牆上時間與時區都由使用者指定，taken_at = local − tz
       if (method === "PUT" && /^\/api\/photos\/\d+\/geo$/.test(pathname)) {
         const photoId = Number(pathname.split("/")[3]);
+        if (!(await canTouchPhoto(photoId))) return forbidden(headers);
         const body: any = await request.json().catch(() => ({}));
 
         const row = await env.DB.prepare(
@@ -2784,6 +3525,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!Number.isInteger(minutes) || minutes === 0 || Math.abs(minutes) > 366 * 24 * 60) {
           return new Response(JSON.stringify({ error: "Invalid minutes" }), { status: 400, headers });
         }
+        if (!(await canTouchPhotos(ids))) return forbidden(headers);
 
         const mod = minutesModifier(minutes);
         // 一句 UPDATE 做完，不逐張讀回來在 JS 算：D1 免費額度是按寫入列數計費的，
@@ -2819,6 +3561,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         if (!isValidTzOffset(body?.tzOffsetMinutes)) {
           return new Response(JSON.stringify({ error: "Invalid tzOffsetMinutes" }), { status: 400, headers });
         }
+        if (!(await canTouchPhotos(ids))) return forbidden(headers);
 
         const tz = body.tzOffsetMinutes;
         const res = await env.DB.batch(
