@@ -136,6 +136,72 @@
   word-break: break-all;
 }
 
+/* 「明細」那顆。長在 meta 那行的文字流裡，所以是按鈕的行為、連結的外觀 */
+.linkButton {
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  color: var(--text-light);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.linkButton:hover {
+  color: var(--text-color);
+}
+
+/* 展開後的貢獻明細。縮排 + 左側細線，一眼看得出是附屬於上面那個人的 */
+.detail {
+  margin-top: 0.5rem;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border-color);
+}
+
+.detailHead {
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-light);
+}
+
+.detailHead:first-child {
+  margin-top: 0;
+}
+
+.detailRow {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 0.15rem 0;
+  font-size: 0.78rem;
+}
+
+.detailName {
+  min-width: 0;
+  color: inherit;
+  text-decoration: none;
+  word-break: break-word;
+}
+
+.detailName:hover {
+  text-decoration: underline;
+}
+
+/* 張數不換行 —— 相簿名再長也不能把數字擠到下一行 */
+.detailNum {
+  flex: none;
+  color: var(--text-light);
+  white-space: nowrap;
+}
+
+.detailNote {
+  color: var(--text-light);
+  opacity: 0.75;
+}
+
 .tag {
   display: inline-block;
   margin-left: 0.4rem;

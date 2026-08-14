@@ -488,9 +488,16 @@ export interface WhitelistUser extends CurrentUser {
   active: number;
   last_login_at: string | null;
   created_at: string | null;
-  /** 他名下有多少東西。移除他之前要讓站長看得到這個數字 */
+  /** 他建了幾本相簿 */
   album_count: number;
+  /**
+   * 他建的那些相簿裡總共幾張，**含別人傳進去的**。
+   * 這是「刪掉他的相簿會連帶消失多少」，不是他的貢獻 —— 只給停權／刪除
+   * 的對話框用，別拿去當「他傳了幾張」印在畫面上（那是 uploaded_count）。
+   */
   photo_count: number;
+  /** 他自己傳了幾張，**含傳進別人相簿的**。畫面上該顯示的就是這個 */
+  uploaded_count: number;
   /** 他在地圖上的軌跡顏色（P2 才給他自己挑，這裡先讀得到） */
   track_color: string | null;
   /** 他那個 GPSLogger Drive 資料夾的 id。null ＝ 還沒綁，他同步不到任何東西 */
@@ -587,6 +594,34 @@ export async function removeWhitelistUser(
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.success) return { success: true, albumCount: data.album_count };
   return { success: false, message: data.error || '移除失敗' };
+}
+
+/**
+ * 一個人的貢獻明細：他在**每一本**相簿各傳了幾張。
+ *
+ * 清單上的兩個總數說不出「這幾張散在哪」，而家人本來就會互相往對方的相簿裡傳。
+ * 站長按下「明細」才會去要這份，不跟白名單清單一起回 —— 清單是每次進 /admin
+ * 都要付的 D1 讀取，明細是想看才付。
+ */
+export interface UserContributions {
+  id: number;
+  /** 他建的相簿。`uploaded` 是他自己傳的，`total - uploaded` 就是別人傳進來的 */
+  own_albums: { album_id: number; album_name: string; total: number; uploaded: number }[];
+  /** 他傳進**別人**相簿的。owner_name 是那本相簿的主人 */
+  elsewhere: {
+    album_id: number; album_name: string;
+    owner_id: number; owner_name: string | null; uploaded: number;
+  }[];
+  album_count: number;
+  uploaded_count: number;
+}
+
+export async function fetchUserContributions(id: number): Promise<UserContributions> {
+  const res = await fetch(`${API_BASE_URL}/admin/users/${id}/contributions`, {
+    headers: getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取失敗');
+  return await res.json();
 }
 
 /** 刪掉一個帳號**之前**先問清楚會少掉什麼。三個數字互相獨立，勾選才有意義 */
