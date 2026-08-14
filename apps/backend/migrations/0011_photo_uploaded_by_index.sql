@@ -1,0 +1,28 @@
+-- 讓「這個人傳了幾張」問得起。
+--
+-- 起因（使用者 2026-08-14）：/admin 上每個人顯示的「N 張照片」量錯了東西——
+-- 它算的是「他建的相簿裡有幾張」（含別人傳進去的），不是「他傳了幾張」。
+-- 站長在 DEV 建 1 本傳 1 張、dlinnrt 建 1 本傳 2 張（其中 1 張放進站長那本），
+-- 後台就顯示成站長 2 張、dlinnrt 1 張，兩個人都不對。
+--
+-- 要改成照 uploaded_by 算，就得掃這一欄。0008 加它的時候沒建索引，
+-- 既有的 purge preview 也早就在註解裡抱怨過（「那一欄沒有索引」）。
+-- 沒索引的話，白名單清單每列一個 COUNT 就是每列掃一遍整張 Photo——
+-- 開一次後台的 D1 讀取量 = 人數 × 總照片數，直接吃掉免費額度。
+--
+-- ## 為什麼帶 album_id
+--
+-- 「他在每本相簿各傳了幾張」是 GROUP BY album_id。第二欄放進索引之後
+-- 那句 group-by 完全走索引、碰不到主表（covering index），
+-- 只有要相簿名字時才去 JOIN Album（那是幾列的事）。
+--
+-- ## NULL 不是「沒人傳」
+--
+-- 0008 的規矩：uploaded_by IS NULL ＝ 這一層不表態，回頭看相簿主人
+-- （0008 之前的照片全是 NULL）。所以算歸屬一律是
+-- COALESCE(p.uploaded_by, a.user_id)，但**不要真的寫 COALESCE**——
+-- 那會讓索引用不上。拆成兩段 UNION 式的計算：
+--   uploaded_by = ?                              走這顆索引
+--   uploaded_by IS NULL AND a.user_id = ?        走既有的 album_id 索引
+-- SQLite 也會用這顆索引來找 NULL 那一段，不會退化成全表掃描。
+CREATE INDEX IF NOT EXISTS idx_photo_uploaded_by ON Photo(uploaded_by, album_id);

@@ -1269,7 +1269,25 @@ if (method === "POST" && pathname === "/api/verify-password") {
           return new Response(JSON.stringify({ error: "只有站長可以管理白名單" }), { status: 403, headers });
         }
 
-        // 路由：白名單清單。附上「他名下有多少東西」，站長才知道移除他會影響什麼
+        /*
+         * 路由：白名單清單。
+         *
+         * 這裡有**兩個意思完全不同的照片數**，別再把它們混為一談：
+         *
+         *   photo_count     他建的相簿裡總共幾張，**含別人傳進去的**。
+         *                   這是「刪掉他的相簿會連帶消失多少」，停權／刪帳號
+         *                   的對話框靠它講話，跟他本人的貢獻無關。
+         *   uploaded_count  他自己傳了幾張，**含傳進別人相簿的那些**。
+         *                   這才是畫面上該當成「這個人傳了多少」的數字。
+         *
+         * 之前列表印的是 photo_count，於是「站長建 1 本傳 1 張、家人往那本
+         * 傳 1 張」會顯示成站長 2 張、家人 1 張 —— 兩個人都不對（2026-08-14）。
+         *
+         * uploaded_count 拆成兩段而不是寫 COALESCE(p.uploaded_by, a.user_id)：
+         * 包在函式裡的欄位用不到索引，那會變成每列掃一遍整張 Photo。
+         * 拆開之後前段走 idx_photo_uploaded_by、後段走 album_id，語意一模一樣
+         * （NULL ＝ 回頭看相簿主人，見 migration 0008）。
+         */
         if (method === "GET" && pathname === "/api/admin/users") {
           const { results } = await env.DB.prepare(`
             SELECT u.id, u.name, u.email, u.role,
@@ -1277,7 +1295,10 @@ if (method === "POST" && pathname === "/api/verify-password") {
                    u.last_login_at, u.created_at,
                    u.track_color, u.track_drive_folder_id,
                    (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
-                   (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id WHERE a.user_id = u.id) AS photo_count
+                   (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id WHERE a.user_id = u.id) AS photo_count,
+                   (SELECT COUNT(*) FROM Photo p WHERE p.uploaded_by = u.id)
+                   + (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id
+                       WHERE p.uploaded_by IS NULL AND a.user_id = u.id) AS uploaded_count
               FROM User u
              ORDER BY (u.role = 'owner') DESC, u.active DESC, u.id
           `).all();
@@ -1374,6 +1395,80 @@ if (method === "POST" && pathname === "/api/verify-password") {
           return new Response(JSON.stringify({ success: true, folder_id: folderId }), { headers });
         }
 
+        /* ── 路由：某個人的貢獻明細（他在每本相簿各傳了幾張）───────────────────
+         *
+         * 清單上的兩個總數回答不了「這 5 張散在哪」，尤其家人本來就會互相往
+         * 對方的相簿裡傳。這一支把它攤開，分成兩疊：
+         *
+         *   own_albums  他建的相簿。每本印「他傳的 / 總共」兩個數字 ——
+         *               差額就是別人傳進來的，順便解釋了舊版那個數字是怎麼來的。
+         *               **傳 0 張的相簿也要列**（他建了但都是別人在傳，
+         *               或空相簿），所以是從 Album 出發而不是從 Photo 出發。
+         *   elsewhere   他傳進別人相簿的。uploaded_by IS NULL 的照片不可能
+         *               落在這一疊 —— NULL 的意思就是「算相簿主人的」。
+         *
+         * 站長按下「明細」才會打這一支，不跟著白名單清單一起回：
+         * 清單是每次進 /admin 都要付的錢，明細是想看才付。
+         */
+        const contribMatch = pathname.match(/^\/api\/admin\/users\/(\d+)\/contributions$/);
+        if (contribMatch && method === "GET") {
+          const targetId = Number(contribMatch[1]);
+          const target = await env.DB.prepare(
+            "SELECT id FROM User WHERE id = ?"
+          ).bind(targetId).first<any>();
+          if (!target) {
+            return new Response(JSON.stringify({ error: "找不到這個帳號" }), { status: 404, headers });
+          }
+
+          const [own, elsewhere] = await env.DB.batch<any>([
+            env.DB.prepare(`
+              SELECT a.id AS album_id, a.name AS album_name,
+                     (SELECT COUNT(*) FROM Photo p WHERE p.album_id = a.id) AS total,
+                     (SELECT COUNT(*) FROM Photo p WHERE p.album_id = a.id
+                        AND (p.uploaded_by = ? OR p.uploaded_by IS NULL)) AS uploaded
+                FROM Album a
+               WHERE a.user_id = ?
+               ORDER BY a.id DESC
+            `).bind(targetId, targetId),
+            env.DB.prepare(`
+              SELECT a.id AS album_id, a.name AS album_name,
+                     a.user_id AS owner_id, ou.name AS owner_name,
+                     COUNT(*) AS uploaded
+                FROM Photo p
+                JOIN Album a ON a.id = p.album_id
+                LEFT JOIN User ou ON ou.id = a.user_id
+               WHERE p.uploaded_by = ? AND a.user_id <> ?
+               GROUP BY a.id
+               ORDER BY uploaded DESC, a.id DESC
+            `).bind(targetId, targetId),
+          ]);
+
+          const ownAlbums = (own.results ?? []).map((r: any) => ({
+            album_id: Number(r.album_id),
+            album_name: r.album_name,
+            total: Number(r.total ?? 0),
+            uploaded: Number(r.uploaded ?? 0),
+          }));
+          const elsewhereAlbums = (elsewhere.results ?? []).map((r: any) => ({
+            album_id: Number(r.album_id),
+            album_name: r.album_name,
+            owner_id: Number(r.owner_id),
+            owner_name: r.owner_name ?? null,
+            uploaded: Number(r.uploaded ?? 0),
+          }));
+
+          return new Response(JSON.stringify({
+            id: targetId,
+            own_albums: ownAlbums,
+            elsewhere: elsewhereAlbums,
+            // 前端不必自己加總；這兩個數字要跟清單上那兩欄對得起來
+            album_count: ownAlbums.length,
+            uploaded_count:
+              ownAlbums.reduce((n: number, a: any) => n + a.uploaded, 0)
+              + elsewhereAlbums.reduce((n: number, a: any) => n + a.uploaded, 0),
+          }), { headers });
+        }
+
         /* ── 刪除帳號。跟「移出白名單」是完全不同的兩件事 ─────────────────────
          *
          * 移出白名單只是停權（active=0，列還在，隨時放他回來）。這裡是真的把
@@ -1409,9 +1504,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
 
           if (method === "GET") {
             /*
-             * photos_elsewhere 要掃 Photo.uploaded_by，而那一欄沒有索引 ——
-             * 所以這個數字**只在站長真的打開刪除視窗時才算**，不塞進白名單清單。
-             * 塞進去的話 /admin 每開一次就全表掃一遍，免費額度撐不住。
+             * uploaded_by 從 0011 起有索引（idx_photo_uploaded_by），所以這幾個
+             * COUNT 不再是全表掃描。仍然只在站長真的打開刪除視窗時才算 ——
+             * 這幾個數字只有這個視窗用得到，沒理由讓每次進 /admin 都付這筆錢。
              */
             const counts = await env.DB.prepare(`
               SELECT

@@ -4,9 +4,10 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import styles from "./admin.module.css";
 import {
-  PurgePreview, SharedDriveFolder, WhitelistUser, addWhitelistUser, fetchPurgePreview,
-  fetchSharedDriveFolders, fetchSiteSettings, fetchWhitelist, purgeWhitelistUser,
-  removeWhitelistUser, setUserTrackFolder, updateSiteSettings, updateWhitelistUser,
+  PurgePreview, SharedDriveFolder, UserContributions, WhitelistUser, addWhitelistUser,
+  fetchPurgePreview, fetchSharedDriveFolders, fetchSiteSettings, fetchUserContributions,
+  fetchWhitelist, purgeWhitelistUser, removeWhitelistUser, setUserTrackFolder,
+  updateSiteSettings, updateWhitelistUser,
 } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
@@ -42,6 +43,33 @@ export default function AdminPage() {
 
   /** 正在確認移除的那個人 */
   const [removing, setRemoving] = useState<WhitelistUser | null>(null);
+
+  /*
+   * 展開中的「明細」。key 是 user id：
+   *   沒有這個 key  ＝ 沒展開過
+   *   undefined     ＝ 正在載入
+   *   物件          ＝ 已經載到，再點只是收合，不重打
+   *
+   * 每個人各要一次請求，所以載過就留著。權限改了不影響這份（那是誰動得了什麼，
+   * 不是誰傳了什麼），只有刪照片／刪帳號才需要重讀 —— 那兩件事都會 load()。
+   */
+  const [details, setDetails] = useState<Record<number, UserContributions | undefined>>({});
+  const [openDetail, setOpenDetail] = useState<number | null>(null);
+  const [detailError, setDetailError] = useState<Record<number, string>>({});
+
+  const toggleDetail = async (user: WhitelistUser) => {
+    if (openDetail === user.id) { setOpenDetail(null); return; }
+    setOpenDetail(user.id);
+    if (user.id in details && details[user.id]) return;
+    setDetails((d) => ({ ...d, [user.id]: undefined }));
+    setDetailError((e) => { const next = { ...e }; delete next[user.id]; return next; });
+    try {
+      const data = await fetchUserContributions(user.id);
+      setDetails((d) => ({ ...d, [user.id]: data }));
+    } catch (err: any) {
+      setDetailError((e) => ({ ...e, [user.id]: err.message || "讀取失敗" }));
+    }
+  };
 
   /** 正在確認**刪除帳號**的那個人。跟 removing 是兩件事，所以兩個 state */
   const [purging, setPurging] = useState<WhitelistUser | null>(null);
@@ -334,13 +362,89 @@ export default function AdminPage() {
                     )}
                   </div>
                   <div className={styles.userMeta}>{user.email}</div>
+                  {/*
+                    * 「上傳」是照 uploaded_by 算的，含他傳進**別人**相簿的那些。
+                    * 這裡刻意不印 user.photo_count（他的相簿裡總共幾張）——
+                    * 那個數字含別人傳進來的，擺在人名底下會被讀成「他傳了這麼多」。
+                    * 它該出現的地方是刪除視窗，還有底下明細裡的「其中 X 張是別人傳的」。
+                    */}
                   <div className={styles.userMeta}>
-                    {user.album_count} 本相簿 · {user.photo_count} 張照片
+                    建立 {user.album_count} 本相簿 · 上傳 {user.uploaded_count} 張照片
                     {" · "}
                     {user.last_login_at
                       ? `最後登入 ${new Date(user.last_login_at.replace(" ", "T") + "Z").toLocaleString()}`
                       : "還沒登入過"}
+                    {(user.album_count > 0 || user.uploaded_count > 0) && (
+                      <>
+                        {" · "}
+                        <button
+                          type="button"
+                          className={styles.linkButton}
+                          onClick={() => toggleDetail(user)}
+                        >
+                          {openDetail === user.id ? "▾ 明細" : "▸ 明細"}
+                        </button>
+                      </>
+                    )}
                   </div>
+
+                  {openDetail === user.id && (
+                    <div className={styles.detail}>
+                      {detailError[user.id] ? (
+                        <p className={styles.hint}>{detailError[user.id]}</p>
+                      ) : !details[user.id] ? (
+                        <p className={styles.hint}>讀取中...</p>
+                      ) : (
+                        <>
+                          {details[user.id]!.own_albums.length > 0 && (
+                            <>
+                              <div className={styles.detailHead}>他建立的相簿</div>
+                              {details[user.id]!.own_albums.map((a) => (
+                                <div key={a.album_id} className={styles.detailRow}>
+                                  <Link href={`/album?id=${a.album_id}`} className={styles.detailName}>
+                                    {a.album_name}
+                                  </Link>
+                                  <span className={styles.detailNum}>
+                                    {a.uploaded} 張
+                                    {/* 差額就是別人傳進來的。不講的話「他建的相簿有 5 張
+                                        但他只傳了 1 張」看起來像算錯 */}
+                                    {a.total > a.uploaded && (
+                                      <span className={styles.detailNote}>
+                                        （另有 {a.total - a.uploaded} 張是別人傳的）
+                                      </span>
+                                    )}
+                                    {a.total === 0 && <span className={styles.detailNote}>（空相簿）</span>}
+                                  </span>
+                                </div>
+                              ))}
+                            </>
+                          )}
+
+                          {details[user.id]!.elsewhere.length > 0 && (
+                            <>
+                              <div className={styles.detailHead}>他傳進別人的相簿</div>
+                              {details[user.id]!.elsewhere.map((a) => (
+                                <div key={a.album_id} className={styles.detailRow}>
+                                  <Link href={`/album?id=${a.album_id}`} className={styles.detailName}>
+                                    {a.album_name}
+                                    <span className={styles.detailNote}>
+                                      （{a.owner_name || "未命名"} 的）
+                                    </span>
+                                  </Link>
+                                  <span className={styles.detailNum}>{a.uploaded} 張</span>
+                                </div>
+                              ))}
+                            </>
+                          )}
+
+                          {details[user.id]!.own_albums.length === 0
+                            && details[user.id]!.elsewhere.length === 0 && (
+                            <p className={styles.hint}>還沒有建過相簿，也還沒傳過照片。</p>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 <div className={styles.actions}>
@@ -516,8 +620,13 @@ export default function AdminPage() {
         isOpen={removing !== null}
         title={`移出白名單：${removing?.name || removing?.email || ""}`}
         message={
+          /*
+           * 這裡的 photo_count 是「他那幾本相簿裡總共幾張」（含別人傳進去的），
+           * 不是他上傳的數量 —— 講的是「移除他會碰到多少東西」，所以是對的。
+           * 用詞跟著改成「裡面共 X 張」，免得跟上面那行的「上傳 N 張」對不起來。
+           */
           removing && removing.album_count > 0
-            ? `${removing.email} 名下有 ${removing.album_count} 本相簿、${removing.photo_count} 張照片。移出白名單只會讓他登不進來，相簿與照片會原封不動留著，之後想讓他回來再加一次就好。`
+            ? `${removing.email} 名下有 ${removing.album_count} 本相簿、裡面共 ${removing.photo_count} 張照片。移出白名單只會讓他登不進來，相簿與照片會原封不動留著，之後想讓他回來再加一次就好。`
             : `${removing?.email} 之後就登不進來了。帳號會留在名單上標示為停權，想讓他回來再加一次就好。`
         }
         onConfirm={handleRemove}
