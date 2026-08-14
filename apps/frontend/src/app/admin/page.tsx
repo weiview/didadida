@@ -100,7 +100,13 @@ export default function AdminPage() {
     load();
   };
 
-  const patch = async (user: WhitelistUser, body: { can_manage_others?: boolean; active?: boolean }) => {
+  const patch = async (
+    user: WhitelistUser,
+    body: {
+      can_manage_others?: boolean; active?: boolean;
+      can_add_to_others?: boolean; can_reorder_others?: boolean;
+    },
+  ) => {
     setBusyId(user.id);
     setNotice(null);
     const result = await updateWhitelistUser(user.id, body);
@@ -348,6 +354,40 @@ export default function AdminPage() {
                       onChange={(e) => patch(user, { can_manage_others: e.target.checked })}
                     />
                     可管理全站內容
+                  </label>
+
+                  {/*
+                    * 「可管理全站」底下的兩格細項。勾了全站就一律全開（後端也是
+                    * 這樣算的），所以那時這兩顆顯示成打勾且不能動 —— 讓它們維持
+                    * 原本的樣子只會讓人以為關得掉。
+                    *
+                    * 加照片預設就是開的：家人本來就該傳得進彼此的相簿，
+                    * 這裡是為了「某個帳號要單獨關掉」而存在。
+                    */}
+                  <label
+                    className={styles.checkbox}
+                    title="可以把照片上傳／匯入到別人建的相簿。加進去的照片相簿主人隨時刪得掉"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={owner || user.can_manage_others === 1 || user.can_add_to_others === 1}
+                      disabled={owner || busy || user.active !== 1 || user.can_manage_others === 1}
+                      onChange={(e) => patch(user, { can_add_to_others: e.target.checked })}
+                    />
+                    可加照片到別人的相簿
+                  </label>
+
+                  <label
+                    className={styles.checkbox}
+                    title="可以拖曳調整別人相簿裡的照片順序。原本的順序沒有留底，改了救不回來"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={owner || user.can_manage_others === 1 || user.can_reorder_others === 1}
+                      disabled={owner || busy || user.active !== 1 || user.can_manage_others === 1}
+                      onChange={(e) => patch(user, { can_reorder_others: e.target.checked })}
+                    />
+                    可排序別人的相簿
                   </label>
 
                   {!owner && user.active !== 1 && (

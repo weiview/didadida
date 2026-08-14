@@ -79,13 +79,10 @@ export function clearGoogleToken(): void {
 export interface AuthHashResult {
   admin: boolean;
   error: string | null;
-  /** 這次跳轉是去連結 Drive 寫入帳號的：連結成功的信箱，或失敗代碼 */
-  driveLinked: string | null;
-  driveLinkError: string | null;
 }
 
 export function consumeAuthHash(): AuthHashResult {
-  const empty: AuthHashResult = { admin: false, error: null, driveLinked: null, driveLinkError: null };
+  const empty: AuthHashResult = { admin: false, error: null };
   if (typeof window === 'undefined') return empty;
   const raw = window.location.hash.replace(/^#/, '');
   if (!raw) return empty;
@@ -99,12 +96,7 @@ export function consumeAuthHash(): AuthHashResult {
   if (token) localStorage.setItem(SITE_TOKEN_KEY, token);
   if (googleToken) storeGoogleToken(googleToken, Number(p.get('googleExpiresIn')) || 3600);
   window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
-  return {
-    admin: !!token,
-    error,
-    driveLinked: p.get('driveLinked'),
-    driveLinkError: p.get('driveLinkError'),
-  };
+  return { admin: !!token, error };
 }
 
 export interface Album {
@@ -134,8 +126,9 @@ export interface Tag {
  *
  * `'sm'` 是小格子（首頁搜尋結果、選取面板、地圖泡泡），`'md'` 是相簿格線。
  * 一定要逐級退回而不是直接取單一欄位：Phase 2 之前上傳的照片沒有 thumb_sm_url，
- * Google 同步進來的連 thumb_url 都是 null —— 少寫一級就會安靜地掉到 2000px 原圖，
+ * Google 同步進來的連 thumb_url 都是 null —— 少寫一級就會安靜地掉到全尺寸原圖，
  * 一頁載幾十張的地方等於把 R2 流量放大幾十倍，而畫面看起來完全正常。
+ * （新照片的 `url` 已經就是 800px 那顆，退到底也不會變大，但舊資料還在。）
  */
 export function photoThumbSrc(
   photo: { url: string; thumb_url?: string; thumb_sm_url?: string },
@@ -165,11 +158,22 @@ export interface Photo {
   description?: string;
   file_name: string;
   album_id: number;
+  /**
+   * 本機上傳的照片：**這就是 800px 那顆**（`thumb_url` 的同一個網址）。
+   * R2 從 2026-08-14 起不再存 2000px 的中間版本。
+   * Google 同步進來的舊照片才是真的全尺寸原圖。
+   */
   url: string;
   /** 800px WebP，相簿格線用。Phase 2 之前上傳的是 400px JPEG */
   thumb_url?: string;
   /** 400px WebP，小格子與地圖標記用。Phase 2 之前上傳的照片是 null */
   thumb_sm_url?: string;
+  /**
+   * Drive 上那份 4K WebP 的 file id，燈箱大圖就是它（經 Worker 代理）。
+   * null ＝ 這張沒有 Drive 備份（沒接上、上傳當下失敗、或是舊資料），
+   * 燈箱會退回 800px 並在角落標示。補傳 Drive 之後就會有值。
+   */
+  drive_file_id?: string | null;
   sort_order: number;
   taken_at?: string;
   /** 牆上時間 'YYYY-MM-DD HH:MM:SS'，顯示與行程段比對都用這個 */
@@ -326,6 +330,19 @@ export interface CurrentUser {
   role: 'owner' | 'member';
   /** 1 = 可以新增／刪除別人的相簿與照片 */
   can_manage_others: number;
+  /**
+   * 1 = 可以把照片**加進**別人建的相簿（上傳／從 Google 相簿匯入）。**預設就是 1。**
+   *
+   * 跟 can_manage_others 是兩件事：加進去的照片主人自己刪得掉，改名／刪相簿
+   * 則救不回來（見後端 migrations/0010）。`can_manage_others=1` 的人後端一律
+   * 回 1，前端不必自己再 or 一次。
+   *
+   * 選填是為了舊後端 —— 讀不到就當作沒有這個能力，畫面少一顆按鈕比多一顆
+   * 按了 403 的好。
+   */
+  can_add_to_others?: number;
+  /** 1 = 可以調整別人相簿裡的照片順序。預設 0，站長在 /admin 給 */
+  can_reorder_others?: number;
   /**
    * 他的軌跡在地圖上的顏色（'#rrggbb'）。後端一律回**算好的值** ——
    * 沒挑過色的人也會拿到依 uid 分配的預設，所以正常情況下不會是 null。
@@ -539,7 +556,11 @@ export async function addWhitelistUser(
 }
 
 export async function updateWhitelistUser(
-  id: number, patch: { name?: string; can_manage_others?: boolean; active?: boolean },
+  id: number,
+  patch: {
+    name?: string; can_manage_others?: boolean; active?: boolean;
+    can_add_to_others?: boolean; can_reorder_others?: boolean;
+  },
 ): Promise<{ success: boolean; message?: string }> {
   const res = await fetch(`${API_BASE_URL}/admin/users/${id}`, {
     method: 'PUT',
@@ -947,20 +968,30 @@ export async function uploadPhoto(
   allowDuplicate = false,
 ): Promise<UploadResult> {
   const formData = new FormData();
-  formData.append('file', file);
   formData.append('album_id', albumId);
+  // 檔名要另外送：R2 只收縮圖，而縮圖的 blob 沒有原始檔名
+  formData.append('filename', file.name);
   if (allowDuplicate) formData.append('allow_duplicate', '1');
 
-  // 產生兩個尺寸的縮圖。任一個缺席後端都收得下（欄位留 NULL），
-  // 讀取端一律 COALESCE 逐級退回，所以這裡失敗不會擋住上傳
+  /*
+   * **只送兩張縮圖，不再送 2000px 那份**（2026-08-14）。
+   * R2 現在只存 800 + 400，全尺寸的版本在 Drive（4K + 原始檔）。
+   * 少傳一份 2000px 的 JPEG，手機上傳的流量也跟著省下來。
+   *
+   * 800px 那張是必要的 —— 它同時是相簿格線的圖、燈箱在沒有 Drive 時的退路，
+   * 沒有它後端會直接回 400，這張照片不會進資料庫。
+   */
+  let md: Blob | null = null;
+  let sm: Blob | null = null;
   try {
-    const { sm, md } = await generateThumbnails(file);
-    // R2 的物件鍵副檔名由後端依 blob.type 決定，這裡的檔名只是 FormData 的擺設
-    if (md) formData.append('thumb', md, 'thumb');
-    if (sm) formData.append('thumb_sm', sm, 'thumb_sm');
+    ({ sm, md } = await generateThumbnails(file));
   } catch (err) {
-    console.warn("縮圖產生失敗，這張照片只會有原圖", err);
+    console.warn("縮圖產生失敗，這張照片不會上傳", err);
   }
+  if (!md) return { status: 'error' };
+  // R2 的物件鍵副檔名由後端依 blob.type 決定，這裡的檔名只是 FormData 的擺設
+  formData.append('thumb', md, 'thumb');
+  if (sm) formData.append('thumb_sm', sm, 'thumb_sm');
 
   if (exifData) {
     try {
@@ -1031,22 +1062,24 @@ export interface DriveConfig {
   photos_folder_id: string | null;
   trash_folder_id: string | null;
   /**
-   * Drive 上唯一的寫入身分。**不是「現在登入的人」** —— 所有管理員上傳時都跟後端
-   * 換這個帳號的短效 token，這樣誰建的相簿都寫得進去（見 lib/drive.ts 檔頭）。
-   * null＝還沒連結過，誰都傳不了。
+   * 這個環境的根資料夾要叫什麼：local `local.didadida`／dev `dev.didadida`／
+   * prod `didadida`。三個環境共用站長同一個 Drive，名字是唯一的隔離手段。
+   * 由後端依部署環境回，前端不自己判斷。
+   */
+  root_folder_name: string | null;
+  /**
+   * Drive 上唯一的寫入身分＝**站長**，不是「現在登入的人」。所有管理員上傳時都跟
+   * 後端換這個帳號的短效 token，這樣誰建的相簿都寫得進去（見 lib/drive.ts 檔頭）。
+   *
+   * 授權來自環境 secret 或站長登入時後端自動收下的那份，站上沒有連結入口，
+   * 所以這一欄**可能是 null 但備份照樣正常**（走 secret 那條就沒有信箱可記）。
+   * 別拿它當「能不能上傳」的判斷。
    */
   writer_email: string | null;
-  /** 上次連結的時間（ISO）。同意畫面還在測試中的話 refresh token 只活 7 天，這欄是給人自己判斷用的 */
+  /** 站長那份授權是什麼時候收下的（ISO）。走 secret 的話是 null */
   writer_linked_at: string | null;
   /** client_id、sa_email、寫入帳號三樣都齊了才有辦法上傳 */
   ready: boolean;
-}
-
-/** 連結／重新連結 Drive 寫入帳號的入口。跳完會帶 `#driveLinked=` 或 `#driveLinkError=` 回來 */
-export function driveWriterLoginUrl(albumId?: string | number): string {
-  const params = new URLSearchParams({ mode: 'drive_writer' });
-  if (albumId) params.set('state', String(albumId));
-  return `${API_BASE_URL}/auth/google/login?${params.toString()}`;
 }
 
 export interface DriveWriterToken {
