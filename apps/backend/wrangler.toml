@@ -11,6 +11,11 @@ compatibility_date = "2024-05-29"
 # 放在設定而非程式碼裡是條款的明文要求 —— 清空這一行就等於關掉這個功能。
 VALHALLA_URL = "https://valhalla1.openstreetmap.de"
 
+# 這個環境在站長 Drive 裡的根資料夾名稱。三個環境都寫進同一個 Drive，
+# 名字不分開的話「照名字找自己建過的資料夾」會讓 prod 接管 local 那一個。
+# local 不看這裡（wrangler dev 讀的就是這份），由 hostname 判成 local.didadida。
+DRIVE_ROOT_FOLDER = "didadida"
+
 # 定期清 Drive 的待搬佇列（scheduled handler 在 src/index.ts 最下面）。
 # 刪照片當下就會搬掉前幾個，這裡只負責刪整本相簿留下的長尾，所以十分鐘一次夠了。
 # 一天 144 次，對免費版的 100K 請求／日沒有影響。
@@ -34,6 +39,7 @@ name = "didadida-api-dev"
 crons = ["*/10 * * * *"]
 [env.dev.vars]
 VALHALLA_URL = "https://valhalla1.openstreetmap.de"
+DRIVE_ROOT_FOLDER = "dev.didadida"
 
 # dev 使用獨立的 D1，與 production 完整切開（2026-07-27）
 [[env.dev.d1_databases]]

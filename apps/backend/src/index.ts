@@ -34,6 +34,22 @@ export interface Env {
   /** GPSLogger 上傳目的地資料夾的 Drive file id（只分享 Viewer 給 SA） */
   GOOGLE_DRIVE_FOLDER_ID?: string;
   /**
+   * 站長的 Drive refresh token，**照片備份的寫入身分**。
+   *
+   * 為什麼是 secret 而不是只存 D1（2026-08-14 使用者定調「不用再做任何身份連結，
+   * 後面直接用站長身份上傳」）：D1 那份是「站長在這個環境登入過一次」才會有的，
+   * 清庫或換環境就沒了，於是每個環境都要有人記得去點一次「連結」。
+   * 放進 secret 之後這件事變成部署設定的一部分 —— 一次 `wrangler secret put`，
+   * dev/prod 從第一秒就備份得進去，D1 被清也不受影響。
+   *
+   * refresh token 綁的是 **OAuth client_id 而不是環境**，所以同一份在
+   * local / dev / prod 都有效（三邊共用同一組 GOOGLE_CLIENT_ID）。
+   *
+   * 優先序是 D1 → 這裡：D1 有的話代表站長在這個環境親自登入過，那份比較新。
+   * 見 mintDriveWriterToken()。
+   */
+  DRIVE_WRITER_REFRESH_TOKEN?: string;
+  /**
    * 照片主檔資料夾 `didadida/` 的覆寫。**平常不必設** —— 正常情況是網頁第一次
    * 上傳時自己建資料夾、把 id 存進 AppSetting。設了就以這裡為準，
    * 用途是把某個環境臨時指到別的資料夾
@@ -41,6 +57,15 @@ export interface Env {
   GOOGLE_DRIVE_PHOTOS_FOLDER_ID?: string;
   /** `didadida/trash/` 的覆寫。同上 */
   GOOGLE_DRIVE_TRASH_FOLDER_ID?: string;
+  /**
+   * 這個環境在 Drive 上的根資料夾名稱（`wrangler.toml` 的 `[vars]`，不是機密）。
+   *
+   * 三個環境全都寫進**同一個** Drive（站長的），所以名字必須分開，
+   * 否則 `findOwnFolder` 會照名字找到別的環境那一個，資料就混在一起了：
+   * local `local.didadida` / dev `dev.didadida` / prod `didadida`。
+   * 沒設的話由 driveRootFolderName() 依請求的 hostname 判斷。
+   */
+  DRIVE_ROOT_FOLDER?: string;
   /**
    * map matching（軌跡貼路）用的 Valhalla 服務位址，例如
    * https://valhalla1.openstreetmap.de。放在設定裡而不是寫死在程式碼，
@@ -233,6 +258,15 @@ interface Actor {
   isOwner: boolean;
   canManageOthers: boolean;
   /**
+   * 可以把照片**加進**別人建的相簿（上傳／從 Google 相簿匯入）。預設開。
+   *
+   * 跟 canManageOthers 分開的理由見 migrations/0010：加一張照片主人自己刪得掉，
+   * 刪相簿、改名這些破壞性的動作不會因為這一欄而放行。
+   */
+  canAddToOthers: boolean;
+  /** 可以調整別人相簿裡的照片順序。預設關 —— 那是相簿主人的版面 */
+  canReorderOthers: boolean;
+  /**
    * 他自己那個 GPSLogger Drive 資料夾（見 migrations/0009）。
    * 跟著 Actor 一起帶出來是因為它就在同一列上 —— 另外查一次是白花讀取額度。
    */
@@ -274,30 +308,39 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
       return {
         uid: owner.id, email: owner.email, name: owner.name,
         isOwner: true, canManageOthers: true,
+        canAddToOthers: true, canReorderOthers: true,
         trackFolderId: owner.track_drive_folder_id ?? null,
         trackColor: trackColorFor(owner.id, owner.track_color),
       };
     }
     return {
       uid: null, email: identity.email, name: null,
-      isOwner: true, canManageOthers: true, trackFolderId: null,
+      isOwner: true, canManageOthers: true,
+      canAddToOthers: true, canReorderOthers: true, trackFolderId: null,
       trackColor: trackColorFor(null, null),
     };
   }
 
   const row = await env.DB.prepare(
-    "SELECT id, name, email, role, can_manage_others, active, track_color, track_drive_folder_id FROM User WHERE id = ?"
+    `SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others,
+            active, track_color, track_drive_folder_id
+       FROM User WHERE id = ?`
   ).bind(identity.uid).first<any>();
   // 列不見了或被移出白名單 —— 手上那張 token 立刻失效，不等它過期
   if (!row || Number(row.active) !== 1) return null;
 
   const isOwner = row.role === 'owner';
+  const canManageOthers = isOwner || Number(row.can_manage_others) === 1;
   return {
     uid: row.id,
     email: row.email,
     name: row.name,
     isOwner,
-    canManageOthers: isOwner || Number(row.can_manage_others) === 1,
+    canManageOthers,
+    // 全開的人不必再看細項；其餘照各自那一欄（0010 之前的舊列讀不到欄位＝NaN，
+    // 那時 migration 還沒套，整站的寫入本來就會壞，不在這裡補救）
+    canAddToOthers: canManageOthers || Number(row.can_add_to_others) === 1,
+    canReorderOthers: canManageOthers || Number(row.can_reorder_others) === 1,
     trackFolderId: row.track_drive_folder_id ?? null,
     trackColor: trackColorFor(row.id, row.track_color),
   };
@@ -679,13 +722,55 @@ async function guestCanViewMap(env: Env): Promise<boolean> {
 }
 
 /**
- * 拿存著的 refresh token 換一張短效 access token（Drive 的唯一寫入身分）。
+ * 站長的 Drive 授權從哪裡來。**這個站沒有「連結 Drive 帳號」這個步驟了**
+ * （2026-08-14），兩個來源都不需要任何人去點：
+ *
+ *   1. `DRIVE_WRITER_REFRESH_TOKEN` secret —— 部署設定的一部分，一個環境設一次
+ *   2. D1 的 `drive_writer_refresh_token` —— 站長用 Google 登入時**自動**收下的
+ *
+ * D1 那份優先：它是站長在這個環境親自登入留下的，secret 是搬過來的舊值。
+ */
+/**
+ * 這個環境的 Drive 根資料夾要叫什麼。
+ *
+ * 三個環境的備份都寫進站長同一個 Drive，名字不分開的話 `findOwnFolder`
+ * （照名字找自己建過的資料夾）會讓 prod 直接接管 local 建的那一個。
+ *
+ * **hostname 排在 var 前面**：`wrangler dev` 跑的是預設環境，會連帶讀到 prod 那份
+ * `DRIVE_ROOT_FOLDER = "didadida"`，只有從請求位址才看得出「這其實是本機」。
+ * 本機以外就照 `[vars]`，沒設就退回 `didadida`（＝prod）。
+ */
+function driveRootFolderName(env: Env, url: URL): string {
+  const host = url.hostname;
+  if (host === "localhost" || host === "127.0.0.1" || host === "[::1]") return "local.didadida";
+  return env.DRIVE_ROOT_FOLDER || "didadida";
+}
+
+async function driveWriterCredential(env: Env): Promise<{ token: string; fromDb: boolean } | null> {
+  /*
+   * **一定要 trim。** secret 是人（或指令稿）貼進去的，尾巴很容易多一個換行 ——
+   * 2026-08-14 就這樣炸過一次：`$v | wrangler secret put` 讓值變成 104 個字元，
+   * Google 回 `invalid_grant`，前端顯示的卻是「授權過期了，請站長重新登入」，
+   * 完全看不出是多了一個 \n。而且 secret 讀不回來，查起來特別費事。
+   */
+  const stored = (await getSetting(env, SETTING_DRIVE_REFRESH_TOKEN))?.trim();
+  if (stored) return { token: stored, fromDb: true };
+  const secret = (env.DRIVE_WRITER_REFRESH_TOKEN || "").trim();
+  return secret ? { token: secret, fromDb: false } : null;
+}
+
+/**
+ * 拿 refresh token 換一張短效 access token（Drive 的唯一寫入身分）。
  *
  * 回傳的 `reason` 是給前端分辨用的，三種要走完全不同的路：
- *   `not_linked`  還沒連結過 —— 管理員按一次「連結」就好
- *   `expired`     refresh token 失效（多半是同意畫面還在測試中，7 天到期），
- *                 要重新連結。**不要自動重試**，那只會一直撞同一面牆
+ *   `not_linked`  兩個來源都沒有 —— 站長用 Google 登入一次就會自己補上
+ *   `expired`     refresh token 失效（多半是同意畫面還在測試中，7 天到期）。
+ *                 **不要自動重試**，那只會一直撞同一面牆
  *   `failed`      其他錯誤（網路、Google 暫時性問題），可以重試
+ *
+ * D1 那份撞到 `invalid_grant` 時會**就地清掉**再退回 secret 試一次。這是自癒的關鍵：
+ * 清掉之後下一次站長登入才會重新被要求同意，也才拿得到新的 refresh token
+ * （見 /api/auth/google/login 的 prompt 判斷）。
  */
 async function mintDriveWriterToken(
   env: Env,
@@ -693,38 +778,53 @@ async function mintDriveWriterToken(
   | { ok: true; accessToken: string; expiresIn: number; email: string | null }
   | { ok: false; reason: "not_linked" | "expired" | "failed"; detail: string }
 > {
-  const refreshToken = await getSetting(env, SETTING_DRIVE_REFRESH_TOKEN);
-  if (!refreshToken) return { ok: false, reason: "not_linked", detail: "還沒有連結 Drive 寫入帳號" };
+  const cred = await driveWriterCredential(env);
+  if (!cred) return { ok: false, reason: "not_linked", detail: "後端還沒有站長的 Drive 授權" };
   if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
     return { ok: false, reason: "failed", detail: "後端缺 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET" };
   }
 
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: env.GOOGLE_CLIENT_ID,
-      client_secret: env.GOOGLE_CLIENT_SECRET,
-      refresh_token: refreshToken,
-      grant_type: "refresh_token",
-    }),
-  });
-  const data: any = await res.json().catch(() => null);
+  const exchange = async (refreshToken: string) => {
+    const res = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: env.GOOGLE_CLIENT_ID!,
+        client_secret: env.GOOGLE_CLIENT_SECRET!,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token",
+      }),
+    });
+    const data: any = await res.json().catch(() => null);
+    return { ok: res.ok && !!data?.access_token, status: res.status, data };
+  };
 
-  if (!res.ok || !data?.access_token) {
-    // invalid_grant＝被撤銷或過期，這種再試幾次都一樣，要人重新連結
-    const expired = data?.error === "invalid_grant";
+  let attempt = await exchange(cred.token);
+
+  // D1 那份掛了就丟掉它，改用 secret 那份。secret 也掛才是真的沒救
+  if (!attempt.ok && attempt.data?.error === "invalid_grant" && cred.fromDb) {
+    await env.DB.prepare("DELETE FROM AppSetting WHERE key IN (?, ?, ?)")
+      .bind(SETTING_DRIVE_REFRESH_TOKEN, SETTING_DRIVE_WRITER_EMAIL, SETTING_DRIVE_LINKED_AT)
+      .run();
+    settingMemo.delete(SETTING_DRIVE_REFRESH_TOKEN);
+    console.warn("drive writer refresh token 失效，已清掉 D1 那份，等站長下次登入重收");
+    if (env.DRIVE_WRITER_REFRESH_TOKEN) attempt = await exchange(env.DRIVE_WRITER_REFRESH_TOKEN);
+  }
+
+  if (!attempt.ok) {
+    // invalid_grant＝被撤銷或過期，這種再試幾次都一樣
+    const expired = attempt.data?.error === "invalid_grant";
     return {
       ok: false,
       reason: expired ? "expired" : "failed",
-      detail: String(data?.error_description || data?.error || `HTTP ${res.status}`),
+      detail: String(attempt.data?.error_description || attempt.data?.error || `HTTP ${attempt.status}`),
     };
   }
 
   return {
     ok: true,
-    accessToken: data.access_token,
-    expiresIn: Number(data.expires_in) || 3600,
+    accessToken: attempt.data.access_token,
+    expiresIn: Number(attempt.data.expires_in) || 3600,
     email: await getSetting(env, SETTING_DRIVE_WRITER_EMAIL),
   };
 }
@@ -809,7 +909,7 @@ async function drainDriveTrash(env: Env, limit: number): Promise<{
  */
 async function googleAdminCheck(
   env: Env, accessToken: string,
-): Promise<{ ok: true; user: { id: number; email: string; name: string } } | { ok: false; reason: string }> {
+): Promise<{ ok: true; user: { id: number; email: string; name: string; role: string } } | { ok: false; reason: string }> {
   if (!env.GOOGLE_CLIENT_ID) return { ok: false, reason: "not_configured" };
 
   const res = await fetch(
@@ -825,8 +925,9 @@ async function googleAdminCheck(
   if (!email) return { ok: false, reason: "not_admin" };
 
   // 大小寫不敏感比對：Google 回的一律小寫，但表裡的是人手打進去的
+  // role 要一起撈：回呼那邊靠它決定「這次登入要不要順手收下 Drive 寫入授權」
   const row = await env.DB.prepare(
-    "SELECT id, name, email, active FROM User WHERE lower(email) = ?"
+    "SELECT id, name, email, role, active FROM User WHERE lower(email) = ?"
   ).bind(email).first<any>();
 
   // 名單上沒有這個人 —— 到此為止，不建列、不放行
@@ -836,7 +937,7 @@ async function googleAdminCheck(
   if (Number(row.active) !== 1) return { ok: false, reason: "revoked" };
 
   await env.DB.prepare("UPDATE User SET last_login_at = datetime('now') WHERE id = ?").bind(row.id).run();
-  return { ok: true, user: { id: row.id, email: row.email, name: row.name } };
+  return { ok: true, user: { id: row.id, email: row.email, name: row.name, role: String(row.role || "member") } };
 }
 
 /**
@@ -1022,6 +1123,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
             id: actor.uid, name: actor.name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
             can_manage_others: actor.canManageOthers ? 1 : 0,
+            can_add_to_others: actor.canAddToOthers ? 1 : 0,
+            can_reorder_others: actor.canReorderOthers ? 1 : 0,
             track_color: actor.trackColor,
           } : null,
         }), { headers });
@@ -1087,6 +1190,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
             id: actor.uid, name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
             can_manage_others: actor.canManageOthers ? 1 : 0,
+            can_add_to_others: actor.canAddToOthers ? 1 : 0,
+            can_reorder_others: actor.canReorderOthers ? 1 : 0,
             track_color: trackColor,
           },
         }), { headers });
@@ -1167,7 +1272,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
         // 路由：白名單清單。附上「他名下有多少東西」，站長才知道移除他會影響什麼
         if (method === "GET" && pathname === "/api/admin/users") {
           const { results } = await env.DB.prepare(`
-            SELECT u.id, u.name, u.email, u.role, u.can_manage_others, u.active,
+            SELECT u.id, u.name, u.email, u.role,
+                   u.can_manage_others, u.can_add_to_others, u.can_reorder_others, u.active,
                    u.last_login_at, u.created_at,
                    u.track_color, u.track_drive_folder_id,
                    (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
@@ -1213,7 +1319,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             await env.DB.prepare(
               "UPDATE User SET active = 1, can_manage_others = ?, name = ?, track_color = COALESCE(track_color, ?) WHERE id = ?"
             ).bind(canManage, name, freeColor, existing.id).run();
-            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active, track_color FROM User WHERE id = ?")
+            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, active, track_color FROM User WHERE id = ?")
               .bind(existing.id).first();
             return new Response(JSON.stringify({ success: true, restored: Number(existing.active) !== 1, user: row }), { headers });
           }
@@ -1222,7 +1328,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             "INSERT INTO User (name, email, role, can_manage_others, active, track_color) VALUES (?, ?, 'member', ?, 1, ?)"
           ).bind(name, email, canManage, freeColor).run();
           const id = res.meta.last_row_id;
-          const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active, track_color FROM User WHERE id = ?")
+          const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, active, track_color FROM User WHERE id = ?")
             .bind(id).first();
           return new Response(JSON.stringify({ success: true, user: row }), { headers });
         }
@@ -1506,7 +1612,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (idMatch && (method === "PUT" || method === "DELETE")) {
           const targetId = Number(idMatch[1]);
           const target = await env.DB.prepare(
-            "SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?"
+            "SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, active FROM User WHERE id = ?"
           ).bind(targetId).first<any>();
           if (!target) {
             return new Response(JSON.stringify({ error: "找不到這個帳號" }), { status: 404, headers });
@@ -1521,7 +1627,10 @@ if (method === "POST" && pathname === "/api/verify-password") {
 
           // 路由：改權限／改名／停權復權
           if (method === "PUT") {
-            const body: { name?: string; can_manage_others?: any; active?: any } = await request.json();
+            const body: {
+              name?: string; can_manage_others?: any; active?: any;
+              can_add_to_others?: any; can_reorder_others?: any;
+            } = await request.json();
             const sets: string[] = [];
             const binds: any[] = [];
             if (typeof body.name === "string") {
@@ -1532,6 +1641,18 @@ if (method === "POST" && pathname === "/api/verify-password") {
             if (body.can_manage_others !== undefined) {
               sets.push("can_manage_others = ?"); binds.push(body.can_manage_others ? 1 : 0);
             }
+            /*
+             * 這兩欄是 can_manage_others 底下的細項（見 migrations/0010）。
+             * **關掉時照存不覆蓋** —— 勾了「可管理全站」的人這兩欄的值不會被讀到
+             * （currentActor 直接短路成全開），所以站長把全站權限收回來的時候，
+             * 這裡留著的還是他當初勾的那份設定，不會突然多給或少給。
+             */
+            if (body.can_add_to_others !== undefined) {
+              sets.push("can_add_to_others = ?"); binds.push(body.can_add_to_others ? 1 : 0);
+            }
+            if (body.can_reorder_others !== undefined) {
+              sets.push("can_reorder_others = ?"); binds.push(body.can_reorder_others ? 1 : 0);
+            }
             if (body.active !== undefined) {
               sets.push("active = ?"); binds.push(body.active ? 1 : 0);
             }
@@ -1539,7 +1660,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
               return new Response(JSON.stringify({ error: "沒有要改的東西" }), { status: 400, headers });
             }
             await env.DB.prepare(`UPDATE User SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, targetId).run();
-            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, active FROM User WHERE id = ?")
+            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, active FROM User WHERE id = ?")
               .bind(targetId).first();
             return new Response(JSON.stringify({ success: true, user: row }), { headers });
           }
@@ -1715,9 +1836,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
        * 這是唯一對外服務 Drive 內容的入口。Drive 的檔案沒有分享給任何人，只有
        * service account 讀得到，所以一定要經過 Worker 代理 —— 不能給前端 Drive 連結。
        *
-       * **任何一步失敗都退回 R2**，包含 drive_file_id 還是 NULL 的舊照片、SA 沒設定、
-       * Drive 當掉。燈箱永遠打得開，這是 [[縮圖成功就算數]] 那個決定的另一半：
-       * Drive 只是加分，不是照片存在的必要條件。
+       * **任何一步失敗都退回 R2 的 800px 縮圖**，包含 drive_file_id 還是 NULL 的照片、
+       * SA 沒設定、Drive 當掉。燈箱永遠打得開，只是會小一點 —— 前端在角落標示原因
+       * （看 drive_file_id 有沒有值，不看這條路由實際走了哪一邊）。
+       *
+       * 2026-08-14 起 R2 不再存 2000px 的中間版本，所以這裡的退路就是相簿格線那張。
        *
        * 快取分兩種，不能共用一套參數：
        *   - Drive 命中：那個 file id 的內容永遠不變 → 一年 immutable。
@@ -1733,7 +1856,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (hit) return hit;
 
         const photo = await env.DB.prepare(
-          "SELECT url, drive_file_id FROM Photo WHERE id = ?"
+          // url 現在跟 thumb_url 是同一顆物件，但舊照片（Google 同步進來的那批）
+          // 只有 url，所以還是照 COALESCE 的順序逐級退
+          "SELECT COALESCE(thumb_url, thumb_sm_url, url) AS fallback_url, drive_file_id FROM Photo WHERE id = ?"
         ).bind(photoId).first<any>();
         if (!photo) {
           return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
@@ -1742,7 +1867,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const fallback = () => new Response(null, {
           status: 302,
           headers: {
-            Location: photo.url,
+            Location: photo.fallback_url,
             "Access-Control-Allow-Origin": "*",
             "Cache-Control": "public, max-age=300",
           },
@@ -2006,11 +2131,18 @@ if (method === "POST" && pathname === "/api/verify-password") {
           sa_email: saEmail,
           photos_folder_id: folders.photos,
           trash_folder_id: folders.trash,
-          // 所有人的上傳都用這個帳號的身分寫進 Drive；null＝還沒連結，誰都傳不了
+          // 這個環境的根資料夾要叫什麼（見 driveRootFolderName）。網頁第一次
+          // 上傳時照這個名字去找／去建，不能寫死在前端 —— 三個環境不同名
+          root_folder_name: driveRootFolderName(env, url),
+          // 所有人的上傳都用這個帳號的身分寫進 Drive。**null 不代表不能傳**：
+          // 憑證可能來自 DRIVE_WRITER_REFRESH_TOKEN secret，那條路沒有 email 可記
           writer_email: writerEmail,
           writer_linked_at: linkedAt,
-          // 少任何一項都上傳不了，讓前端一眼看出是哪裡沒設好
-          ready: Boolean(env.GOOGLE_CLIENT_ID && saEmail && writerEmail),
+          // 少任何一項都上傳不了，讓前端一眼看出是哪裡沒設好。
+          // 憑證看的是「兩個來源有沒有其中一個」，不是 writer_email
+          ready: Boolean(
+            env.GOOGLE_CLIENT_ID && saEmail && (writerEmail || env.DRIVE_WRITER_REFRESH_TOKEN)
+          ),
         }), { headers });
       }
 
@@ -2078,6 +2210,23 @@ if (method === "POST" && pathname === "/api/verify-password") {
         return row ? actorOwns(me, row) : false;
       };
 
+      /**
+       * 可不可以把**新的照片放進**這本相簿。
+       *
+       * 跟 canTouchAlbum 分開：往別人的相簿裡加一張照片，最壞的情況是主人自己
+       * 刪掉它（那張照片的 uploaded_by 記著是誰放的）；改名、刪相簿則是別人的
+       * 東西直接消失。前者預設放行，後者維持原樣。開關在 User.can_add_to_others，
+       * 站長可以單獨對某個人關掉（見 migrations/0010）。
+       *
+       * 有 can_add_to_others 就一路放行、連相簿存不存在都不查 —— 跟
+       * canManageOthers 的短路同一個理由：上傳是逐張呼叫的，多一次讀取會乘上
+       * 一整批照片的張數。相簿不存在的話下面的 INSERT 自己會撞外鍵。
+       */
+      const canAddToAlbum = async (albumId: string | number): Promise<boolean> => {
+        if (me.canAddToOthers) return true;
+        return canTouchAlbum(albumId);
+      };
+
       /** 這張照片在不在我的管轄範圍 */
       const canTouchPhoto = async (photoId: string | number): Promise<boolean> => {
         if (me.canManageOthers) return true;
@@ -2120,19 +2269,21 @@ if (method === "POST" && pathname === "/api/verify-password") {
       };
 
       /*
-       * 全站共用的東西：Google 時間軸、Drive 資料夾設定、維護工具。
-       *
-       * 它們不屬於任何一本相簿，「只能動自己的」在這裡沒有意義 —— 那是站的資產。
+       * 全站共用的維護工具，只有管得動別人的帳號能碰。
        * （白名單那幾支更嚴，是站長限定，而且在上面就先回應了。）
        *
        * **GPS 軌跡與 Google 時間軸都不在這份清單裡**：每個成員各自上傳、
        * 各自擁有，擋在這裡會讓一般成員連自己的東西都寫不進來。
        * 軌跡改由各路由用 canTouchTrackDay() 逐日檢查 —— 那才問得出「這一天是誰的」；
        * 時間軸則是 R2 key 依 uid 分開（timelineIndexKey），寫入永遠只寫得到自己那一包。
+       *
+       * **`/api/config/drive-folders` 2026-08-14 移出這份清單**：它是第一次上傳的
+       * bootstrap，資料庫一清就會有人是「第一個上傳的人」，那個人不見得是站長。
+       * 擋著的話家人的第一次上傳會 403，照片進得了 R2 卻沒有 Drive 備份。
+       * 它本來就是**只寫得了一次**（第二次回 409），而且資料夾一定建在站長的
+       * Drive 裡（用的是寫入帳號的 token），開放給所有管理員是安全的。
        */
-      const isSharedResourceWrite =
-        pathname === "/api/config/drive-folders"
-        || pathname.startsWith("/api/admin/");
+      const isSharedResourceWrite = pathname.startsWith("/api/admin/");
       if (requiresAuth && isSharedResourceWrite && !me.canManageOthers) {
         return forbidden(headers, "這是全站共用的資料，只有可以管理別人內容的帳號能修改");
       }
@@ -2263,10 +2414,17 @@ if (method === "POST" && pathname === "/api/verify-password") {
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
-      // 路由：重新排序照片。相簿裡面的順序是相簿主人的事，逐張驗
+      /*
+       * 路由：重新排序照片。相簿裡面的順序是相簿主人的版面，逐張驗。
+       *
+       * 「可以加照片」不含這一支：加一張照片主人刪得掉，把整本重排他救不回來
+       * （原本的順序沒有留底）。要給就給 can_reorder_others（見 migrations/0010）。
+       */
       if (method === "PUT" && pathname === "/api/photos/reorder") {
         const body: { id: number; sort_order: number }[] = await request.json();
-        if (!(await canTouchPhotos(body.map((i) => i.id)))) return forbidden(headers);
+        if (!me.canReorderOthers && !(await canTouchPhotos(body.map((i) => i.id)))) {
+          return forbidden(headers, "沒有權限調整別人相簿裡的照片順序");
+        }
         const statements = body.map(item => env.DB.prepare("UPDATE Photo SET sort_order = ? WHERE id = ?").bind(item.sort_order, item.id));
         if (statements.length > 0) await env.DB.batch(statements);
         return new Response(JSON.stringify({ success: true }), { headers });
@@ -2350,7 +2508,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
       if (method === "POST" && pathname.startsWith("/api/albums/")
           && pathname.endsWith("/drive-folder") && pathname.split("/").length === 5) {
         const albumId = pathname.split("/")[3];
-        if (!(await canTouchAlbum(albumId))) return forbidden(headers);
+        /*
+         * 看的是 canAddToAlbum 而不是 canTouchAlbum：這支是上傳流程的水電，
+         * 「能往這本相簿加照片」的人一定會走到這裡（相簿還沒有 Drive 資料夾，
+         * 或記著的那個是舊帳號建的）。用「能不能動這本相簿」擋的話，家人往
+         * 別人的相簿上傳會拿到 403 —— 照片進得了 R2 但永遠沒有 Drive 備份。
+         * 這裡寫的只是一個資料夾 id，不是相簿內容，權限對齊上傳才合理。
+         */
+        if (!(await canAddToAlbum(albumId))) return forbidden(headers);
         const body: any = await request.json();
         const folderId = typeof body?.folder_id === "string" ? body.folder_id : null;
         if (!folderId) {
@@ -2537,14 +2702,19 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：處理 R2 照片上傳
       if (method === "POST" && pathname === "/api/upload") {
         const formData = await request.formData();
-        // 走 unknown：這個專案同時吃 workers-types 與 @types/node，FormData.get 的
-        // 回傳型別會解析到不含 File 的那一份，直接 as File 會被 TS 擋下來。
-        // 實際 runtime 是 Workers，取到的就是 File；下面仍有 !file 的檢查。
-        const file = formData.get('file') as unknown as File | null;
-        // thumb = 800px（相簿格線）、thumb_sm = 400px（首頁卡片與地圖標記）。
-        // 舊版前端只送 thumb，這裡兩個都允許缺席，缺的欄位留 NULL 讓讀取端 COALESCE 退回去。
-        const thumb = formData.get('thumb') as unknown as File | null;
-        const thumbSm = formData.get('thumb_sm') as unknown as File | null;
+        /*
+         * **R2 只收兩張縮圖**（2026-08-14 起）。以前還會收一張 2000px 當「燈箱退路」，
+         * 那是 R2 佔用最大的一份，而全尺寸的版本 Drive 上本來就有兩份（4K + 原始檔）。
+         * 現在燈箱沒有 Drive 可用時直接退回 800px，並在角落標示原因。
+         *
+         * 走 unknown：這個專案同時吃 workers-types 與 @types/node，FormData.get 的
+         * 回傳型別會解析到不含 File 的那一份，直接 as File 會被 TS 擋下來。
+         * 實際 runtime 是 Workers，取到的就是 File；下面仍有 !thumb 的檢查。
+         */
+        const thumb = formData.get('thumb') as unknown as File | null;      // 800px，兼任主檔
+        const thumbSm = formData.get('thumb_sm') as unknown as File | null; // 400px
+        // 原始檔名（Photo.title 與物件鍵都用它）。以前是從 file 欄位的 File.name 拿的
+        const originalName = (formData.get('filename') as string) || (thumb?.name ?? 'photo');
         const albumId = formData.get('album_id') as string;
         const exifData = formData.get('exif') as string || null;
         const takenAt = formData.get('taken_at') as string || null;
@@ -2552,18 +2722,26 @@ function hammingDistance(hex1: string, hex2: string): number {
         // 使用者在重複清單裡按了「照樣上傳」才會帶這個旗標
         const allowDuplicate = formData.get('allow_duplicate') === '1';
 
-        if (!file || !albumId) {
-          return new Response(JSON.stringify({ error: "File and album_id are required" }), { status: 400, headers });
+        if (!thumb || !albumId) {
+          // 縮圖產不出來就整張不收：沒有它 R2 這邊一個位元組都沒有，
+          // 存進 D1 只會得到一列點不開的照片
+          return new Response(JSON.stringify({ error: "thumb and album_id are required" }), { status: 400, headers });
         }
-        // 往別人的相簿裡塞照片也是「動別人的相簿」
-        if (!(await canTouchAlbum(albumId))) return forbidden(headers, "沒有權限上傳到別人的相簿");
+        // 往別人的相簿裡加照片是「貢獻」，不是「動別人的相簿」（見 canAddToAlbum）
+        if (!(await canAddToAlbum(albumId))) return forbidden(headers, "沒有權限上傳到別人的相簿");
 
-        const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic'];
-        if (!allowedTypes.includes(file.type.toLowerCase())) {
+        // 縮圖是前端 canvas 編出來的，只會是這兩種；不支援 WebP 編碼的瀏覽器退回 JPEG
+        const allowedTypes = ['image/jpeg', 'image/webp'];
+        const thumbType = (thumb.type || 'image/jpeg').toLowerCase();
+        if (!allowedTypes.includes(thumbType)) {
           return new Response(JSON.stringify({ error: "Invalid file type. Only images are allowed." }), { status: 400, headers });
         }
 
-        const buffer = await file.arrayBuffer();
+        /*
+         * 雜湊改算 800px 那張的位元組（以前算的是 2000px 那張）。
+         * 重複偵測的前提沒變 —— 同一台電腦重傳同一個檔，縮圖參數固定，位元組就一模一樣。
+         */
+        const buffer = await thumb.arrayBuffer();
         const fileHash = await calculateFileHash(buffer);
 
         // 由 EXIF 推導座標與時區。前端送來的 exif 已把時間欄位保留為原始字串，
@@ -2623,38 +2801,40 @@ function hammingDistance(hex1: string, hex2: string): number {
           }
         }
 
-        const fileName = `${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-        await env.BUCKET.put(fileName, buffer, {
-          httpMetadata: { contentType: file.type }
-        });
-        
         const host = new URL(request.url).origin;
 
         /*
-         * 兩個尺寸的縮圖各存一顆 R2 物件。
+         * 一張照片在 R2 只有兩顆物件：800px 與 400px 的 WebP q80（41.3 + 10.9 KB）。
          *
-         * 舊版只有一張 400px、而且是 `'image/jpeg', 1.0` 編碼的 —— q1.0 幾乎不壓縮，
-         * 實測平均 118 KB，光縮圖在 15 萬張時就要 18 GB，本身就會撐爆 10 GB 免費額度。
-         * 現在前端送 400px + 800px 的 WebP q80（10.9 + 41.3 KB），兩張加起來還不到舊版一張的一半。
+         * 舊版還有第三顆 2000px JPEG（`file_name` 指的那個），是三顆裡最大的一顆；
+         * 拿掉之後每張的 R2 佔用少掉九成以上。**`file_name` / `url` 現在指的就是 800px 那顆** ——
+         * 讀取端的 COALESCE(thumb_url, thumb_sm_url, url) 因此都還是對的，不必改。
          *
          * 物件鍵的副檔名跟著實際 content type 走：前端在不支援 WebP 編碼的瀏覽器上
          * 會退回 JPEG，寫死副檔名會讓 R2 上的鍵與內容不一致。
          */
-        const baseName = fileName.replace(/\.[^/.]+$/, '');
-        const putThumb = async (blob: File | null, prefix: string): Promise<string | null> => {
-          if (!blob) return null;
-          const contentType = blob.type || 'image/jpeg';
+        const baseName = `${Date.now()}_${originalName.replace(/[^a-zA-Z0-9.-]/g, '_')}`
+          .replace(/\.[^/.]+$/, '');
+        const putThumb = async (
+          body: ArrayBuffer | ReadableStream, contentType: string, prefix: string,
+        ): Promise<{ key: string; url: string }> => {
           const key = `${prefix}_${baseName}.${thumbExtFor(contentType)}`;
-          await env.BUCKET.put(key, blob.stream(), { httpMetadata: { contentType } });
-          return `${host}/api/photos/view/${encodeURIComponent(key)}`;
+          await env.BUCKET.put(key, body, { httpMetadata: { contentType } });
+          return { key, url: `${host}/api/photos/view/${encodeURIComponent(key)}` };
         };
-        // 兩顆物件互不相干，併發送出省掉一趟 R2 往返
-        const [thumbUrl, thumbSmUrl] = await Promise.all([
-          putThumb(thumb, 'thumb'),
-          putThumb(thumbSm, 'thumbsm'),
+        // 兩顆物件互不相干，併發送出省掉一趟 R2 往返。800px 那顆一定有（上面擋過了），
+        // 400px 缺席時讀取端會自己退回 800px
+        const [md, sm] = await Promise.all([
+          putThumb(buffer, thumbType, 'thumb'),
+          thumbSm
+            ? putThumb(thumbSm.stream(), (thumbSm.type || 'image/jpeg').toLowerCase(), 'thumbsm')
+            : Promise.resolve(null),
         ]);
 
-        const fileUrl = `${host}/api/photos/view/${encodeURIComponent(fileName)}`;
+        const fileName = md.key;
+        const thumbUrl = md.url;
+        const thumbSmUrl = sm?.url ?? null;
+        const fileUrl = md.url;
 
         const inserted = await env.DB.prepare(
           // shuffle_key 由 SQL 直接產生：ALTER TABLE 不接受非常數的 DEFAULT，
@@ -2665,7 +2845,7 @@ function hammingDistance(hex1: string, hex2: string): number {
               lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by, shuffle_key)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
-          file.name, fileName, albumId, fileUrl, thumbUrl, thumbSmUrl, exifData,
+          originalName, fileName, albumId, fileUrl, thumbUrl, thumbSmUrl, exifData,
           uploadTakenAt, fileHash, clientPhash,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
           uploadTimeSource, me.uid,
@@ -2814,8 +2994,9 @@ function hammingDistance(hex1: string, hex2: string): number {
        * Drive 備份」的來源。跳轉沒有這兩個問題。當初避開跳轉是怕把選好的檔案清單
        * 弄丟，但授權移到登入這一刻就完全不衝突了。
        *
-       * 沒有 access_type=offline：refresh token 我們不存（使用者選擇「過期就重新
-       * 登入」），跟 Google 要一個轉頭就丟掉的長期憑證沒有意義。
+       * `access_type=offline` 一律帶著：後端要的不是**這個人**的長期憑證，而是
+       * 「萬一登入的是站長、而且這個環境還沒有 Drive 寫入身分，就順手收下」。
+       * 一般成員帶回來的 refresh token 一律丟掉（見回呼那段），跟從前一樣不存。
        */
       if (method === "GET" && pathname === "/api/auth/google/login") {
         const urlObj = new URL(request.url);
@@ -2833,14 +3014,7 @@ function hammingDistance(hex1: string, hex2: string): number {
             if (ALLOWED_ORIGINS.includes(candidate)) redirectHost = candidate;
           } catch (e) {}
         }
-        /*
-         * `mode=drive_writer`：這一次登入的目的是**把這個帳號設成 Drive 的寫入身分**，
-         * 所以要 `access_type=offline` + `prompt=consent` 才拿得到 refresh token
-         * （Google 只在明確同意那一次給，之後同一個帳號再登入都不會再給）。
-         * 平常登入不帶這個參數，行為完全不變。
-         */
-        const mode = urlObj.searchParams.get("mode") === "drive_writer" ? "drive_writer" : "";
-        const combinedState = encodeURIComponent(JSON.stringify({ albumId, redirectHost, mode }));
+        const combinedState = encodeURIComponent(JSON.stringify({ albumId, redirectHost }));
         const clientId = env.GOOGLE_CLIENT_ID || "";
         const redirectUri = new URL(request.url).origin + "/api/auth/google/callback";
         const scope = [
@@ -2850,11 +3024,20 @@ function hammingDistance(hex1: string, hex2: string): number {
           "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
         ].join(" ");
 
-        // prompt 吃空白分隔的清單：consent 是為了拿 refresh token，
-        // select_account 是為了讓人挑「要當備份倉庫的是哪個帳號」而不是預設當下那個
-        const extra = mode === "drive_writer"
+        /*
+         * 什麼時候要強制跳同意畫面：**這個環境完全沒有 Drive 寫入身分的時候**。
+         *
+         * Google 只在「使用者明確按下同意」那一次給 refresh token，同一個帳號之後
+         * 再登入都不會再給。所以沒有憑證可用時只能請大家多按一次同意，換到之後
+         * 就自動退回原本的 `select_account`，誰都不會再看到那一頁。
+         *
+         * 這一步在驗身分之前，還不知道來的是不是站長 —— 所以是「沒憑證時所有人都
+         * 多一次同意」。反正拿回來的東西只有站長那份會被留下。
+         */
+        const needConsent = (await driveWriterCredential(env)) === null;
+        const extra = needConsent
           ? "&access_type=offline&prompt=" + encodeURIComponent("consent select_account") + "&include_granted_scopes=true"
-          : "&prompt=select_account";
+          : "&access_type=offline&prompt=select_account";
         const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}${extra}&state=${combinedState}`;
         return Response.redirect(url, 302);
       }
@@ -2866,12 +3049,10 @@ function hammingDistance(hex1: string, hex2: string): number {
         const rawState = urlObj.searchParams.get("state") || "";
         let albumId = rawState;
         let redirectHost = "";
-        let mode = "";
         try {
           const parsed = JSON.parse(decodeURIComponent(rawState));
           if (parsed && typeof parsed === "object") {
             albumId = parsed.albumId || "";
-            mode = parsed.mode === "drive_writer" ? "drive_writer" : "";
             /*
              * state 是我們自己包的，但它繞過 Google 才回來，**中間誰都能換掉** ——
              * 拿我們的 client_id 自己組一個授權網址、把 redirectHost 寫成自家網站，
@@ -2944,22 +3125,29 @@ function hammingDistance(hex1: string, hex2: string): number {
         });
 
         /*
-         * 這一次是來設定 Drive 寫入身分的：把 refresh token 收起來。
+         * **站長登入時自動收下 Drive 寫入身分**（2026-08-14，取代原本要人去點的
+         * 「連結 Drive 寫入帳號」）。三個條件缺一不可：
          *
-         * 只在 `mode=drive_writer` 時存，平常登入一律不存 —— 存一份長期憑證是有
-         * 代價的東西，不該因為某次登入剛好帶回來就默默留下。
-         * 拿不到 refresh_token 幾乎都是同一個原因：這個帳號先前已經同意過，
-         * Google 就不再給第二張。訊息要講清楚該去哪裡移除授權再來一次。
+         *   1. 來的是站長 —— 備份倉庫只能是他的 Drive，成員的一律不留。
+         *      存一份長期憑證是有代價的東西，不該因為某次登入剛好帶回來就默默留下。
+         *   2. Google 真的給了 refresh token —— 只有走過同意畫面那次才有，
+         *      也就是上面 `needConsent` 成立的那次。
+         *   3. 這個環境還沒有可用的憑證 —— 已經有就別覆蓋，免得站長每次重新同意
+         *      都換一把（舊的那把會立刻失效，同一個 client 同時只認得幾把）。
+         *
+         * 失敗沒有任何訊息要給前端：站上已經沒有「連結」這個動作了，
+         * 使用者不必知道這一步發生過。真的沒收到就等下一次登入，或設 secret。
          */
-        if (mode === "drive_writer") {
-          if (typeof tokenData.refresh_token === "string" && tokenData.refresh_token) {
-            await setSetting(env, SETTING_DRIVE_REFRESH_TOKEN, tokenData.refresh_token);
-            await setSetting(env, SETTING_DRIVE_WRITER_EMAIL, admitted.user.email);
-            await setSetting(env, SETTING_DRIVE_LINKED_AT, new Date().toISOString());
-            frag.set("driveLinked", admitted.user.email);
-          } else {
-            frag.set("driveLinkError", "no_refresh_token");
-          }
+        if (
+          admitted.user.role === "owner" &&
+          typeof tokenData.refresh_token === "string" &&
+          tokenData.refresh_token &&
+          (await driveWriterCredential(env)) === null
+        ) {
+          await setSetting(env, SETTING_DRIVE_REFRESH_TOKEN, tokenData.refresh_token);
+          await setSetting(env, SETTING_DRIVE_WRITER_EMAIL, admitted.user.email);
+          await setSetting(env, SETTING_DRIVE_LINKED_AT, new Date().toISOString());
+          console.log("已自動收下站長的 Drive 寫入授權", admitted.user.email);
         }
         return Response.redirect(`${target}#${frag.toString()}`, 302);
       }
@@ -3060,8 +3248,8 @@ function hammingDistance(hex1: string, hex2: string): number {
           console.error("400 Bad Request - Missing googlePhotoUrl. Body received:", body);
           return new Response(JSON.stringify({ error: "Missing googlePhotoUrl" }), { status: 400, headers });
         }
-        // 跟本機上傳同一條規矩：目標相簿不是我的就別下載了，早退一步省掉整趟傳輸
-        if (!(await canTouchAlbum(targetAlbumId))) return forbidden(headers, "沒有權限上傳到別人的相簿");
+        // 跟本機上傳同一條規矩（canAddToAlbum）：不能加就別下載了，早退一步省掉整趟傳輸
+        if (!(await canAddToAlbum(targetAlbumId))) return forbidden(headers, "沒有權限上傳到別人的相簿");
         
         // 取得照片原始檔案 (Picker API 的 baseUrl 加上 =d 來下載原始解析度)
         let downloadUrl = googlePhotoUrl;
@@ -3223,9 +3411,16 @@ function hammingDistance(hex1: string, hex2: string): number {
         const body = await request.json() as any;
         const { decision, existingPhotos, tempPhoto, replacePhotoIds } = body;
 
-        // album_id 也是前端送回來的。這一支會刪既有照片，權限一定要再驗一次
-        if (tempPhoto?.album_id && !(await canTouchAlbum(tempPhoto.album_id))) {
-          return forbidden(headers);
+        /*
+         * album_id 也是前端送回來的，權限一定要再驗一次。
+         *
+         * 這一支同時做兩件事，權限也分兩層：**放新照片進去**只要 canAddToAlbum，
+         * 但 decision='replace' 會**刪掉既有的照片**，那幾張得逐張驗過
+         * （下面 replace 分支開頭）—— 不然「可以加照片」等於可以拿一張新的
+         * 把別人的舊照片換掉。
+         */
+        if (tempPhoto?.album_id && !(await canAddToAlbum(tempPhoto.album_id))) {
+          return forbidden(headers, "沒有權限上傳到別人的相簿");
         }
 
         // tempPhoto 是由前端原樣送回來的，座標與來源標記都不能照單全收
@@ -3255,6 +3450,12 @@ function hammingDistance(hex1: string, hex2: string): number {
               if (existingPhoto) validIds.push(existingPhoto.id);
             }
             if (validIds.length > 0) {
+              // 要換掉的是別人的照片就到此為止（見這一支開頭的說明）。
+              // 新檔還暫存在 R2，順手清掉，不然它永遠不會被任何一列引用到
+              if (!(await canTouchPhotos(validIds))) {
+                await env.BUCKET.delete(tempPhoto.file_name);
+                return forbidden(headers, "沒有權限取代別人的照片");
+              }
               /*
                * 要刪的物件鍵一律回 D1 查，不要用前端送回來的 existingPhotos。
                * 那份是 sync-photo 當時回給前端、再由前端原樣送回來的，既不保證帶得到

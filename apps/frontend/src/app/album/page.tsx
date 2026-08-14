@@ -4,8 +4,8 @@ import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, getGoogleToken, googleLoginUrl, driveWriterLoginUrl, DriveWriterError, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
-import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive, resetDriveWriterToken } from "@/lib/drive";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, getGoogleToken, googleLoginUrl, DriveWriterError, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
+import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
@@ -14,7 +14,6 @@ import FixTimeModal from "@/components/FixTimeModal";
 import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import PlaceCheckinModal from "@/components/PlaceCheckinModal";
 import DriveBackfillModal from "@/components/DriveBackfillModal";
-import DriveAccessModal from "@/components/DriveAccessModal";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
@@ -50,7 +49,7 @@ function AlbumContent() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const { isAdmin, driveLink, canEdit } = useAdmin();
+  const { isAdmin, canEdit, canAddTo, canReorderIn } = useAdmin();
   /**
    * 這本相簿本身。留著它是為了 `canEditAlbum` —— 光有 isAdmin 不夠，
    * 一般成員只動得了自己建的相簿（跟後端 canTouchAlbum 同一條規則）。
@@ -61,6 +60,14 @@ function AlbumContent() {
    * 相簿還沒載進來時是 false，寧可晚半秒才長出按鈕，也不要先給再收回去。
    */
   const canEditAlbum = canEdit(album);
+  /**
+   * 「往這本相簿裡加照片」是另一格權限，不含改名、刪照片、設封面那些。
+   * 家人預設就有（站長可在 /admin 對個別帳號關掉），所以別人建的相簿也看得到
+   * 上傳入口。自己的相簿一定為 true —— canEditAlbum 成立時這個也一定成立。
+   */
+  const canAddToAlbum = canAddTo(album);
+  /** 拖曳排序動到的是相簿主人的版面，預設只有自己的相簿，其餘要站長另外給 */
+  const canReorderPhotos = canReorderIn(album);
   const [selectedPhotoIndex, setSelectedPhotoIndex] = useState<number | null>(null);
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
   const [visibleCount, setVisibleCount] = useState<number>(24);
@@ -69,12 +76,12 @@ function AlbumContent() {
   /** Drive 沒接上時的原因。照片照樣傳得上去，只是少了 4K 與原始檔備份 */
   const [driveError, setDriveError] = useState<string | null>(null);
   const [showDriveBackfill, setShowDriveBackfill] = useState(false);
-  const [showDriveAccess, setShowDriveAccess] = useState(false);
   /**
-   * 這次失敗是不是「Drive 寫入帳號沒接上」——沒連結過，或存著的授權過期了。
+   * 這次失敗是不是「後端手上沒有站長的 Drive 授權」——從來沒有，或那份過期了。
    *
-   * 這種要跳去 Google 重新連結一次，跟一般的上傳失敗（重試就好）完全兩回事，
-   * 按鈕的行為也不同，所以分開記。
+   * 站上**沒有任何按鈕**能修這件事（2026-08-14 拿掉了「連結 Drive 寫入帳號」）：
+   * 授權是站長用 Google 登入時後端自動收下的，或直接設在環境 secret 裡。
+   * 所以這個旗標現在只用來換一句「怎麼會這樣、該找誰」的說明，不是動作入口。
    */
   const [driveNeedsLink, setDriveNeedsLink] = useState(false);
   /**
@@ -397,6 +404,9 @@ function AlbumContent() {
   /**
    * 右下角浮動鈕展開後的那串動作。`actions[0]` 貼著 FAB，所以最常用的「上傳照片」擺第一。
    * 原本「上傳照片」是一顆點了會再展開下拉選單的按鈕，收進 FabMenu 之後直接攤平成兩項。
+   *
+   * **兩組權限**：上傳那一組看 `canAddToAlbum`（別人的相簿也給），其餘（地點、
+   * Drive、編輯照片）看 `canEditAlbum`。在別人的相簿裡就只剩上傳那一顆。
    */
   const buildFabActions = (): FabAction[] => {
     if (uploading || syncingGoogle) {
@@ -410,7 +420,7 @@ function AlbumContent() {
       }];
     }
 
-    return [
+    const uploadActions: FabAction[] = !canAddToAlbum ? [] : [
       {
         key: 'upload',
         label: '上傳照片',
@@ -441,6 +451,9 @@ function AlbumContent() {
           },
         ],
       },
+    ];
+
+    const ownerActions: FabAction[] = !canEditAlbum ? [] : [
       {
         key: 'place',
         label: '地點',
@@ -454,15 +467,10 @@ function AlbumContent() {
         title: '重選原始檔，補上缺的 4K 與原始檔備份',
         onClick: () => setShowDriveBackfill(true),
       },
-      // 連結寫入帳號的常駐入口，順便是「到底卡在哪一步」的診斷
-      {
-        key: 'drive-access',
-        label: 'Drive 寫入帳號',
-        title: '連結／重新連結備份用的 Google 帳號，並逐項檢查存取狀況',
-        onClick: () => setShowDriveAccess(true),
-      },
       { key: 'edit', label: '編輯照片', onClick: () => setIsEditingPhotos(true) },
     ];
+
+    return [...uploadActions, ...ownerActions];
   };
 
   /**
@@ -481,37 +489,11 @@ function AlbumContent() {
     setDriveError(
       needsLink
         ? (err as DriveWriterError).reason === 'not_linked'
-          ? '還沒連結 Drive 寫入帳號'
-          : 'Drive 寫入帳號的授權過期了（同意畫面還在測試中的話只有 7 天）'
+          ? '後端還沒有站長的 Drive 授權'
+          : '站長的 Drive 授權過期了（同意畫面還在測試中的話只有 7 天）'
         : err instanceof Error ? err.message : 'Google Drive 沒接上',
     );
   };
-
-  /*
-   * 剛從「連結 Drive 寫入帳號」跳轉回來。
-   *
-   * 成功就只是把狀態清乾淨（連結前那批照片的 File 早在跳轉時就沒了，
-   * 要補得走「補傳 Drive」重選檔案，這裡不假裝能自動處理）。
-   * 失敗最常見的是 Google 不再發第二張 refresh token，訊息要直接講怎麼解。
-   *
-   * 兩種情況都要丟掉這一頁的舊 token —— 換了帳號的話，抱著舊的會一路 404。
-   */
-  useEffect(() => {
-    if (!driveLink) return;
-    resetDriveWriterToken();
-    if (driveLink.error) {
-      setDriveNeedsLink(true);
-      setDriveError(
-        driveLink.error === 'no_refresh_token'
-          ? 'Google 沒有給長期授權 —— 到「Google 帳號 → 安全性 → 你的第三方應用程式」把這個網站的存取權移除，再連結一次'
-          : `連結失敗（${driveLink.error}）`,
-      );
-      return;
-    }
-    setDriveNeedsLink(false);
-    setDriveError(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [driveLink]);
 
   /**
    * 黃色橫幅那顆按鈕：把剛上傳那批的 4K 與原始檔補上去。
@@ -879,7 +861,7 @@ function AlbumContent() {
 
   // Drag and Drop handlers
   const handlePointerDown = (index: number) => {
-    if (!canEditAlbum) return;
+    if (!canReorderPhotos) return;
     timerRef.current = setTimeout(() => {
       setLongPressIndex(index);
     }, 1000);
@@ -1297,7 +1279,7 @@ function AlbumContent() {
             </div>
           </FilterBottomSheet>
           {/* 管理用的按鈕都收進右下角的 FabMenu，頁首只留搜尋與篩選 */}
-          {canEditAlbum && (
+          {canAddToAlbum && (
             <input
               type="file"
               ref={fileInputRef}
@@ -1331,17 +1313,15 @@ function AlbumContent() {
               補傳中... {driveBatchProgress.current} / {driveBatchProgress.total}
             </div>
           ) : driveNeedsLink ? (
-            // 連結是整頁跳轉，會把記憶體裡的 File 弄丟，所以要先講清楚回來要做什麼
-            <div style={{ marginTop: 8 }}>
-              <a
-                href={driveWriterLoginUrl(id ?? undefined)}
-                style={{
-                  display: 'inline-block', padding: '7px 14px', borderRadius: 7,
-                  background: '#b45309', color: '#fff', fontSize: 13.5, textDecoration: 'none',
-                }}
-              >
-                連結 Drive 寫入帳號（回來後用「補傳 Drive」重選檔案）
-              </a>
+            /*
+             * 這一格沒有按鈕，是刻意的。備份用的是站長的 Drive 授權，站上任何人
+             * （包含站長自己）按什麼都補不上 —— 那份授權只有兩個來源：站長重新用
+             * Google 登入一次，或後端補上 DRIVE_WRITER_REFRESH_TOKEN。
+             * 給一顆按了也沒用的按鈕比不給還糟。
+             */
+            <div style={{ marginTop: 8, fontSize: 13 }}>
+              這要站長處理：請站長登出後用 Google 重新登入一次，後端會自己把授權收回來。
+              之後回到這裡用「補傳 Drive」重選這批檔案就補得上。
             </div>
           ) : (
             <div style={{ marginTop: 8 }}>
@@ -1391,7 +1371,7 @@ function AlbumContent() {
                 else photoCardRefs.current.delete(index);
               }}
               className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
-              draggable={canEditAlbum && longPressIndex === index && sortBy === "custom"}
+              draggable={canReorderPhotos && longPressIndex === index && sortBy === "custom"}
               onClick={async () => {
                 if (longPressIndex !== null || draggingIndex !== null) return;
                 if (isEditingPhotos) {
@@ -1412,11 +1392,11 @@ function AlbumContent() {
                   e.preventDefault();
                   return;
                 }
-                if (canEditAlbum && sortBy === "custom") handleDragStart(index);
+                if (canReorderPhotos && sortBy === "custom") handleDragStart(index);
               }}
-              onDragEnter={() => canEditAlbum && sortBy === "custom" && handleDragEnter(index)}
-              onDragEnd={canEditAlbum && sortBy === "custom" ? handleDragEnd : undefined}
-              onDragOver={(e) => canEditAlbum && sortBy === "custom" && e.preventDefault()}
+              onDragEnter={() => canReorderPhotos && sortBy === "custom" && handleDragEnter(index)}
+              onDragEnd={canReorderPhotos && sortBy === "custom" ? handleDragEnd : undefined}
+              onDragOver={(e) => canReorderPhotos && sortBy === "custom" && e.preventDefault()}
             >
               {canEditAlbum && isEditingPhotos && (
                 <>
@@ -1505,8 +1485,12 @@ function AlbumContent() {
       {selectedPhotoIndex !== null && (
         <PhotoLightbox 
           photo={displayPhotos[selectedPhotoIndex]}
-          // 燈箱裡的編輯（改標題、改時間、刪這張）跟頁面上是同一組權限
-          isAdmin={canEditAlbum}
+          /*
+           * 燈箱是**逐張**判斷，不是看整本相簿：我放進別人相簿的那幾張，
+           * 後端本來就讓我改讓我刪（actorOwns 看 uploaded_by），
+           * 這裡跟著給，不然自己傳的照片打錯字都改不了。
+           */
+          isAdmin={canEdit(displayPhotos[selectedPhotoIndex])}
           availableTags={availableTags}
           onClose={() => setSelectedPhotoIndex(null)} 
           onUpdate={loadData}
@@ -1523,7 +1507,7 @@ function AlbumContent() {
 
       {/* 右下角浮動操作鈕。編輯模式下交棒給底部動作列，所以這裡給空陣列 */}
       <FabMenu
-        actions={!canEditAlbum || isEditingPhotos ? [] : buildFabActions()}
+        actions={(!canEditAlbum && !canAddToAlbum) || isEditingPhotos ? [] : buildFabActions()}
       />
 
       {/* 底部動作列 (編輯模式) */}
@@ -1640,12 +1624,6 @@ function AlbumContent() {
         }}
       />
 
-      {/* Drive 寫入帳號的連結與存取檢查 */}
-      <DriveAccessModal
-        isOpen={showDriveAccess}
-        albumId={id ? Number(id) : undefined}
-        onClose={() => setShowDriveAccess(false)}
-      />
 
       {/* 相簿層級的打卡補件。同樣不自己寫座標，挑完照片交給下面的 AssignPlaceModal */}
       <PlaceCheckinModal

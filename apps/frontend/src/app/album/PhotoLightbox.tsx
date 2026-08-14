@@ -184,8 +184,19 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           onTouchMove={onTouchMoveEvent}
           onTouchEnd={onTouchEndEvent}
         >
-          {/* 走 Worker 代理拿 Drive 的 4K；沒有 Drive 版本會自動退回 R2 的 2000px */}
+          {/* 走 Worker 代理拿 Drive 的 4K；沒有的話那條路由自己會退回 R2 的 800px */}
           <img src={photoFullSrc(photo)} alt={photo.title} className={styles.image} />
+          {/*
+            * R2 只存縮圖，大圖唯一的來源是 Drive。沒有 drive_file_id 就代表現在看到的
+            * 是 800px 的相簿縮圖 —— 不講的話使用者只會覺得「這張怎麼有點糊」。
+            * 判斷依據刻意用 D1 的欄位而不是圖片實際載到哪一版：Drive 暫時掛掉是幾分鐘的事，
+            * 沒有備份是永久的，後者才需要有人去補傳。
+            */}
+          {!photo.drive_file_id && (
+            <span className={styles.qualityNote}>
+              Drive 沒接上或缺這張備份，顯示的是 800px 縮圖
+            </span>
+          )}
           {hasPrev && (
             <button className={`${styles.navButton} ${styles.prevButton}`} onClick={(e) => { e.stopPropagation(); onPrev?.(); }}>
               &#10094;

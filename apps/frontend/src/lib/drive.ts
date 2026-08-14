@@ -14,13 +14,16 @@
  *    2026-08-10 實測結論：**根目錄的授權不會往下涵蓋別人建的子資料夾**，
  *    那條路走不通（Picker 的程式碼已經移除）。
  *
- *    現在的做法：管理員連結一次「Drive 寫入帳號」（後端存那個帳號的
- *    refresh token），任何人上傳時都跟後端換一張那個帳號的短效 access token，
- *    照片就都由同一個身分建檔。誰上傳的記在 D1，不看 Drive 的擁有者欄位。
- *    連結入口見 api.ts 的 driveWriterLoginUrl / fetchDriveWriterToken。
+ *    現在的做法：**那個帳號永遠是站長**，任何人上傳時都跟後端換一張站長的
+ *    短效 access token，照片就都由同一個身分建檔。誰上傳的記在 D1，
+ *    不看 Drive 的擁有者欄位。見 api.ts 的 fetchDriveWriterToken。
  *
- *    代價一：refresh token 會過期（同意畫面還在 Testing 的話 7 天），
- *    過期就得再連結一次，錯誤裡的 `expired` 就是在講這件事。
+ *    **站上沒有「連結 Drive 帳號」這個動作**（2026-08-14 拿掉）：站長的 refresh
+ *    token 來自環境 secret `DRIVE_WRITER_REFRESH_TOKEN`，或站長用 Google 登入時
+ *    後端自動收下的那份。誰都不必記得去點什麼。
+ *
+ *    代價一：refresh token 會過期（同意畫面還在 Testing 的話 7 天），錯誤裡的
+ *    `expired` 就是在講這件事 —— 站長重新登入一次後端就會自己收一份新的。
  *    代價二：舊做法留下的相簿資料夾是別的帳號建的，寫入身分看不見 ——
  *    探到 404 就在自己名下重建一個並改記（見 ensureAlbumFolder）。
  *
@@ -52,7 +55,13 @@ import { encode4kWebp } from './imageUtils';
 const DRIVE_FILES = 'https://www.googleapis.com/drive/v3/files';
 const DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
-const ROOT_FOLDER_NAME = 'didadida';
+/**
+ * 根資料夾的名字**由後端決定**（`root_folder_name`），不寫死在這裡：
+ * local / dev / prod 的備份全都寫進站長同一個 Drive，三邊同名的話
+ * findOwnFolder 會照名字找到別的環境那一個，資料就混在一起了。
+ * 拿不到就退回 `didadida`（＝prod 的名字，也是舊版的行為）。
+ */
+const FALLBACK_ROOT_FOLDER_NAME = 'didadida';
 const TRASH_FOLDER_NAME = 'trash';
 
 /**
@@ -76,12 +85,6 @@ async function requireToken(): Promise<string> {
   return minted.accessToken;
 }
 
-/** 重新連結之後要叫一次，不然這一頁會抱著舊帳號的 token 直到它過期 */
-export function resetDriveWriterToken(): void {
-  writerToken = null;
-  verifiedFolders.clear();
-}
-
 let cachedConfig: DriveConfig | null = null;
 
 async function getConfig(): Promise<DriveConfig> {
@@ -98,12 +101,6 @@ async function getConfig(): Promise<DriveConfig> {
  */
 export function prewarmDrive(): void {
   getConfig().catch(() => {});
-}
-
-/** 連結完寫入帳號要重抓 —— 快取裡的 writer_email 還是「還沒連結」 */
-export async function refreshDriveConfig(): Promise<DriveConfig | null> {
-  cachedConfig = null;
-  return await fetchDriveConfig().then((c) => (cachedConfig = c));
 }
 
 async function driveJson(token: string, url: string, init?: RequestInit): Promise<any> {
@@ -283,8 +280,9 @@ export async function ensureDriveFolders(): Promise<DriveFolders & { token: stri
     };
   }
 
+  const rootName = config.root_folder_name || FALLBACK_ROOT_FOLDER_NAME;
   const photosFolderId =
-    (await findOwnFolder(token, ROOT_FOLDER_NAME)) ?? (await createFolder(token, ROOT_FOLDER_NAME));
+    (await findOwnFolder(token, rootName)) ?? (await createFolder(token, rootName));
   const trashFolderId =
     (await findOwnFolder(token, TRASH_FOLDER_NAME, photosFolderId))
     ?? (await createFolder(token, TRASH_FOLDER_NAME, photosFolderId));
@@ -433,174 +431,10 @@ export async function pushPhotoToDrive(
   return await recordPhotoDrive(photoId, { driveFileId, driveOriginalId });
 }
 
-/* ---- 診斷 ---- */
-
-/** 列出某個資料夾底下這個帳號看得見的子資料夾名字。看得見幾個是關鍵訊號，不是裝飾 */
-async function listChildFolders(token: string, parentId: string): Promise<string[]> {
-  const params = new URLSearchParams({
-    q: `'${parentId}' in parents and mimeType = '${FOLDER_MIME}' and trashed = false`,
-    fields: 'files(id,name)',
-    pageSize: '100',
-  });
-  const data = await driveJson(token, `${DRIVE_FILES}?${params}`);
-  return (data?.files ?? []).map((f: any) => String(f?.name ?? '?'));
-}
-
-/**
- * 丟進垃圾桶，不是刪除。
+/* ---- 診斷（已移除）----
  *
- * 這個專案有一條不變量：**程式碼永遠不呼叫 `files.delete`**（原本是為了防止
- * service account 誤刪，見後端 drive.ts）。診斷用的測試檔也照這條走 ——
- * 例外開一次，下次就會有人照抄。
+ * 這裡原本有 diagnoseDriveAccess()：逐項回答「Drive 寫入帳號到底卡在哪」，
+ * 掛在「Drive 寫入帳號」那顆 FAB 底下。2026-08-14 連同那顆按鈕一起拿掉 ——
+ * 站上已經沒有任何跟 Drive 授權有關的動作可做，一個只能看不能修的檢查表
+ * 沒有意義。真的要查就看 `wrangler tail` 的 /api/drive/token 回應。
  */
-async function trashDriveFile(token: string, fileId: string): Promise<void> {
-  await driveJson(token, `${DRIVE_FILES}/${fileId}?fields=id`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ trashed: true }),
-  });
-}
-
-export interface DriveCheck {
-  label: string;
-  /** null＝這一項不適用（例如相簿還沒有資料夾），不是失敗 */
-  ok: boolean | null;
-  detail: string;
-}
-
-/**
- * 把「Drive 寫入帳號到底碰得到哪些部分」一次問清楚。
- *
- * 存在的理由：靠上傳照片去試的話，症狀是「照片傳上去了但沒有 Drive 備份」，
- * 看不出是沒連結、token 過期、權限不足還是編碼失敗。這裡直接分項回答，
- * 最後一項還真的寫一個測試檔進去（寫完丟垃圾桶）。
- *
- * 讀取檢查沒有副作用；寫入檢查會在 Drive 上留一個垃圾桶裡的小檔案。
- */
-export async function diagnoseDriveAccess(albumId?: number): Promise<DriveCheck[]> {
-  const checks: DriveCheck[] = [];
-  const add = (label: string, ok: boolean | null, detail: string) => checks.push({ label, ok, detail });
-  const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
-  let config: DriveConfig;
-  try {
-    config = await getConfig();
-  } catch (e) {
-    add('後端 Drive 設定', false, errText(e));
-    return checks;
-  }
-
-  add(
-    'Drive 寫入帳號',
-    !!config.writer_email,
-    config.writer_email
-      ? `${config.writer_email}${config.writer_linked_at ? `（${new Date(config.writer_linked_at).toLocaleString('zh-TW')} 連結）` : ''}`
-      : '還沒連結 —— 所有人都上傳不了 Drive 備份，按上面那顆按鈕連結一次',
-  );
-
-  let token: string;
-  try {
-    token = await requireToken();
-  } catch (e) {
-    add(
-      '換得到寫入用的 token',
-      false,
-      e instanceof DriveWriterError && e.reason === 'expired'
-        ? `${e.message} —— 同意畫面還在測試中的話 refresh token 只活 7 天，重新連結一次`
-        : errText(e),
-    );
-    return checks;
-  }
-  add('換得到寫入用的 token', true, '後端用存著的授權換到了短效 token');
-
-  add(
-    '後端 Drive 設定',
-    !!config.photos_folder_id && !!config.sa_email,
-    `didadida 資料夾 id：${config.photos_folder_id ?? '（還沒建）'}｜service account：${config.sa_email ?? '（沒設 GOOGLE_DRIVE_SA_KEY）'}`,
-  );
-
-  const rootId = config.photos_folder_id;
-  if (!rootId) {
-    add('共用資料夾', null, '後端還沒有資料夾 id，第一次上傳時才會建起來');
-    return checks;
-  }
-
-  const root = await probeFolder(token, rootId);
-  add(
-    '讀得到 didadida 根目錄',
-    root.ok,
-    root.ok
-      ? `看得到，名字是「${root.name ?? '?'}」`
-      : `HTTP ${root.status} —— 寫入帳號碰不到它。資料夾被刪／被搬走，或現在連結的是另一個帳號`,
-  );
-  if (root.ok) {
-    add(
-      '根目錄可以新增子項',
-      root.canAddChildren,
-      root.canAddChildren ? 'Drive 上是編輯者' : '只有檢視權限 —— 請資料夾擁有者改成「編輯者」',
-    );
-
-    // 看得見幾個子資料夾＝有幾本相簿是這個寫入帳號建的。
-    // 少於實際相簿數不是壞事：舊做法留下的那幾本會在下次上傳時自動重建
-    try {
-      const names = await listChildFolders(token, rootId);
-      add(
-        '看得見根目錄底下的相簿子資料夾',
-        names.length > 0,
-        names.length > 0
-          ? `看得到 ${names.length} 個：${names.slice(0, 8).join('、')}${names.length > 8 ? ' …' : ''}`
-          : '一個都看不到（還沒有任何相簿由這個寫入帳號建過資料夾）',
-      );
-    } catch (e) {
-      add('看得見根目錄底下的相簿子資料夾', false, errText(e));
-    }
-  }
-
-  // 相簿子資料夾：真正的上傳目的地
-  let albumFolderId: string | null = null;
-  if (albumId) {
-    const album = await fetchAlbum(String(albumId)).catch(() => null);
-    albumFolderId = album?.drive_folder_id ?? null;
-    if (!albumFolderId) {
-      add('這本相簿的 Drive 資料夾', null, '還沒建（第一次成功上傳時才會建）');
-    } else {
-      const sub = await probeFolder(token, albumFolderId);
-      add(
-        '讀得到這本相簿的資料夾',
-        sub.ok,
-        sub.ok
-          ? `看得到，名字是「${sub.name ?? '?'}」`
-          : `HTTP ${sub.status} —— 這個子資料夾是另一個帳號建的（舊做法留下的），下次上傳會自動在寫入帳號名下重建一個`,
-      );
-      if (sub.ok) {
-        add('相簿資料夾可以新增子項', sub.canAddChildren, sub.canAddChildren ? '可以' : '只有檢視權限');
-      } else {
-        albumFolderId = null;
-      }
-    }
-  }
-
-  // 寫入實測。能寫進相簿資料夾才是真的能備份照片，寫得進根目錄只是及格邊緣
-  const writeTarget = albumFolderId ?? (root.ok ? rootId : null);
-  if (!writeTarget) {
-    add('寫入實測', null, '前面就卡住了，沒有可以測的目標資料夾');
-    return checks;
-  }
-  const where = albumFolderId ? '相簿資料夾' : 'didadida 根目錄';
-  try {
-    const name = `.didadida-access-test-${Date.now()}.txt`;
-    const blob = new Blob(['didadida drive access test'], { type: 'text/plain' });
-    const fileId = await uploadToDrive(token, blob, name, writeTarget);
-    let cleanup = '，已丟進垃圾桶';
-    try {
-      await trashDriveFile(token, fileId);
-    } catch (e) {
-      cleanup = `，但清不掉（${errText(e)}），Drive 上會留下 ${name}`;
-    }
-    add('寫入實測', true, `成功在${where}建了一個測試檔${cleanup}`);
-  } catch (e) {
-    add('寫入實測', false, `在${where}建檔失敗：${errText(e)}`);
-  }
-
-  return checks;
-}

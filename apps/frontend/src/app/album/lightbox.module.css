@@ -107,12 +107,32 @@
   align-items: center;
   justify-content: center;
   padding: 15px;
+  /* qualityNote 是絕對定位的，錨點要是這一格而不是整頁 */
+  position: relative;
 }
 
 .image {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
+}
+
+/*
+ * 「這張沒有 Drive 大圖」的角落提示。刻意做得很輕：它是狀態說明，不是錯誤，
+ * 照片本身沒有任何問題。左下角是因為右邊留給下一張的箭頭。
+ */
+.qualityNote {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  z-index: 3100;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.7rem;
+  line-height: 1.4;
+  pointer-events: none;
 }
 
 .detailsContainer {

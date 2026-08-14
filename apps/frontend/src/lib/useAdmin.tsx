@@ -49,6 +49,16 @@ interface AuthValue {
    * 不等於改得動，這裡擋掉也不代表資料是安全的。
    */
   canEdit: (target: { user_id?: number | null; uploaded_by?: number | null } | null | undefined) => boolean;
+  /**
+   * 可不可以把照片**加進**這本相簿（上傳／從 Google 相簿匯入）。
+   *
+   * 跟 canEdit 分開是這一版的重點：家人本來連別人相簿的上傳鈕都看不到。
+   * 現在「往裡面加」預設就有（站長可在 /admin 對個別帳號關掉），
+   * 「改名／刪相簿／編輯別人的照片」照舊看 canEdit。
+   */
+  canAddTo: (target: { user_id?: number | null } | null | undefined) => boolean;
+  /** 可不可以調整這本相簿裡的照片順序。預設只有自己的相簿，其餘要站長給 */
+  canReorderIn: (target: { user_id?: number | null } | null | undefined) => boolean;
   /** 進站密碼 → 訪客身分 */
   unlock: (password: string) => Promise<{ success: boolean; message?: string; notConfigured?: boolean }>;
   /** 後路：管理員密碼登入 */
@@ -60,14 +70,6 @@ interface AuthValue {
    * 常見的是 `not_admin`（信箱不在白名單，得先請站長加）與 `revoked`（在名單上但被停權）。
    */
   authError: string | null;
-  /**
-   * 這一次載入是從「連結 Drive 寫入帳號」回來的：成功就是那個信箱，
-   * 失敗是代碼（目前只有 `no_refresh_token`）。相簿頁靠它回報結果。
-   *
-   * 放在這裡而不是各頁自己讀 fragment：fragment 只能被收走一次，
-   * 而收走它的人是這個 Provider（見上面的說明）。
-   */
-  driveLink: { email: string | null; error: string | null } | null;
   /** 改自己的顯示名稱，成功會同步更新這裡的 user */
   renameSelf: (name: string) => Promise<{ success: boolean; message?: string }>;
   /**
@@ -85,7 +87,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AuthState>({ admin: false, guest: false, canViewMap: false, user: null });
   const [checking, setChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [driveLink, setDriveLink] = useState<AuthValue['driveLink']>(null);
 
   useEffect(() => {
     let alive = true;
@@ -94,9 +95,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // 一定要排在 checkAuth() 前面，不然剛登入回來的那一次會被判成沒登入
     const back = consumeAuthHash();
     if (back.error) setAuthError(back.error);
-    if (back.driveLinked || back.driveLinkError) {
-      setDriveLink({ email: back.driveLinked, error: back.driveLinkError });
-    }
     /*
      * 剛從 Google 回來。token 已經在 localStorage 裡了，但**還是要打一次
      * /auth/me** —— 「我是誰、能不能管別人」只有後端知道，fragment 裡沒有。
@@ -161,7 +159,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     clearTokens();
     setState({ admin: false, guest: false, canViewMap: false, user: null });
     setAuthError(null);
-    setDriveLink(null);
   }, []);
 
   const canManageOthers = state.user
@@ -178,6 +175,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return target.user_id === uid || target.uploaded_by === uid;
   }, [state.admin, state.user, canManageOthers]);
 
+  const canAddTo = useCallback((target: { user_id?: number | null } | null | undefined) => {
+    if (!state.admin) return false;
+    if (canManageOthers) return true;
+    // 自己的相簿本來就進得去，不必靠這個權限
+    const uid = state.user?.id;
+    if (uid != null && target?.user_id === uid) return true;
+    return state.user?.can_add_to_others === 1;
+  }, [state.admin, state.user, canManageOthers]);
+
+  const canReorderIn = useCallback((target: { user_id?: number | null } | null | undefined) => {
+    if (!state.admin) return false;
+    if (canManageOthers) return true;
+    const uid = state.user?.id;
+    if (uid != null && target?.user_id === uid) return true;
+    return state.user?.can_reorder_others === 1;
+  }, [state.admin, state.user, canManageOthers]);
+
   const value = useMemo<AuthValue>(() => ({
     isAdmin: state.admin,
     isGuest: state.guest,
@@ -188,16 +202,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     canManageOthers,
     canViewMap: state.canViewMap,
     canEdit,
+    canAddTo,
+    canReorderIn,
     unlock,
     login,
     loginWithGoogle,
     authError,
-    driveLink,
     renameSelf,
     recolorSelf,
     logout,
-  }), [state, checking, canManageOthers, canEdit, unlock, login, loginWithGoogle,
-       authError, driveLink, renameSelf, recolorSelf, logout]);
+  }), [state, checking, canManageOthers, canEdit, canAddTo, canReorderIn, unlock, login, loginWithGoogle,
+       authError, renameSelf, recolorSelf, logout]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
