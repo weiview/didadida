@@ -1360,9 +1360,12 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * 防呆，站長自己那一列一律 400（權限不能自己改掉）。但資料夾是要綁的，
          * 站長自己也得綁得了，所以拆開來。
          *
-         * folder_id 送 null／空字串＝解除綁定。這裡不驗證資料夾在 Drive 上
-         * 存不存在 —— 驗證交給 shared-folders 那條列出來的清單，站長是從
-         * 下拉選單挑的，不是自己打 id。
+         * folder_id 送 null／空字串＝解除綁定。這裡不驗證資料夾在 Drive 上存不存在。
+         *
+         * ⚠️ 後台已經**沒有畫面在打這一條**了 —— 綁定改成
+         * `POST /api/tracks/drive/sync-folders` 照信箱自動配對。留著它是唯一的
+         * 人工覆寫路徑：家人手機上的 Google 帳號跟他登入本站的帳號不同時，
+         * 自動配對永遠對不到，只能直接打這一條（或改 D1）把他綁上去。
          */
         const folderMatch = pathname.match(/^\/api\/admin\/users\/(\d+)\/track-folder$/);
         if (folderMatch && method === "PUT") {
@@ -4269,13 +4272,24 @@ function hammingDistance(hex1: string, hex2: string): number {
       }
 
       /*
-       * 路由：列出「分享給服務帳號」的 Drive 資料夾，給站長在後台挑來綁。
+       * 路由：掃一遍分享給服務帳號的 Drive 資料夾，**自動**綁到人身上。
        *
-       * 站長限定：清單裡有別人的 Google 信箱與資料夾名稱。
-       * ownerEmail 有對上站上帳號的話一併回傳 suggestedUserId，後台就能
-       * 直接把「小明的 GPSLogger」擺到小明那一列旁邊，不用人工比對。
+       * 規矩只有一條：登入本站用哪個 Google 帳號，就得用那個帳號的 Drive
+       * 分享資料夾。所以「資料夾的擁有者信箱 == User.email」是唯一的對應依據，
+       * 站長不必也不能人工指定 —— 對不上就是那個人還沒設定好，訊息會叫他去設。
+       * （`User.email` 是 UNIQUE NOT NULL，所以一個信箱不可能對出兩個人。）
+       *
+       * 是 POST 不是 GET，因為它會寫 D1。舊的 `GET /shared-folders` 只是把清單
+       * 吐出來讓站長從下拉挑，整個拿掉了。
+       *
+       * 三個「寧可不動也不要亂綁」的地方：
+       *   - 對到兩個以上 → 不綁，回 ambiguous 請對方只留一個。要自動選就得再
+       *     打 Drive 看哪個資料夾裡面有 .gpx，為了這種罕見狀況不值得那趟往返。
+       *   - 一個都對不到 → **不動他現有的綁定**。Drive 允許不揭露擁有者，
+       *     信箱可能只是這一次沒拿到，把還在運作的綁定清掉才是災難。
+       *   - 站長不綁。他走 GOOGLE_DRIVE_FOLDER_ID 那條，見 trackFolderFor()。
        */
-      if (method === "GET" && pathname === "/api/tracks/drive/shared-folders") {
+      if (method === "POST" && pathname === "/api/tracks/drive/sync-folders") {
         const actor = await currentActor(request, env);
         if (!actor) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
@@ -4288,18 +4302,67 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
 
         const folders = await listSharedFolders(env.GOOGLE_DRIVE_SA_KEY);
+        /*
+         * 比對要用**全部**帳號（含站長與已停權的），綁定只做 active 的一般成員。
+         * 差別在 unmatched：站長那顆照片備份資料夾（`didadida/`，上傳時會把 SA
+         * 加成 writer，所以它也算 sharedWithMe）跟停權者的資料夾都對得到人，
+         * 就不會被當成「對不到任何帳號」報給站長看，省掉每次都要解釋一次。
+         */
         const { results: users } = await env.DB.prepare(
-          "SELECT id, lower(email) AS email FROM User WHERE email IS NOT NULL"
-        ).all();
-        const byEmail = new Map((users as any[]).map(u => [String(u.email), Number(u.id)]));
+          "SELECT id, name, email, role, active, track_drive_folder_id FROM User"
+        ).all<any>();
+
+        const byUser = new Map<number, typeof folders>();
+        const matched = new Set<string>();
+        for (const f of folders) {
+          if (!f.ownerEmail) continue;
+          const email = f.ownerEmail.toLowerCase();
+          const u = users.find((x: any) => String(x.email ?? "").toLowerCase() === email);
+          if (!u) continue;
+          matched.add(f.id);
+          byUser.set(Number(u.id), [...(byUser.get(Number(u.id)) ?? []), f]);
+        }
+
+        const writes: D1PreparedStatement[] = [];
+        const results: any[] = [];
+        for (const u of users) {
+          if (u.role === "owner" || u.active !== 1) continue;
+          const mine = byUser.get(Number(u.id)) ?? [];
+          const current: string | null = u.track_drive_folder_id ?? null;
+          const base = { user_id: Number(u.id), name: u.name, email: u.email };
+
+          if (mine.length === 1) {
+            const f = mine[0];
+            if (current !== f.id) {
+              /*
+               * 這個資料夾如果還掛在別人身上（以前人工綁的殘留），先拆掉再綁。
+               * 一個資料夾綁兩個人 → 兩人同步到同一批 GPX，而 day_key 帶各自的
+               * 前綴，同一天會憑空多出一份「不是他的」軌跡。
+               */
+              writes.push(env.DB.prepare(
+                "UPDATE User SET track_drive_folder_id = NULL WHERE track_drive_folder_id = ? AND id != ?"
+              ).bind(f.id, u.id));
+              writes.push(env.DB.prepare(
+                "UPDATE User SET track_drive_folder_id = ? WHERE id = ?"
+              ).bind(f.id, u.id));
+            }
+            results.push({ ...base, status: current === f.id ? "bound" : "updated", folder_name: f.name });
+          } else if (mine.length === 0) {
+            results.push({ ...base, status: "missing", still_bound: current != null });
+          } else {
+            results.push({ ...base, status: "ambiguous", folder_names: mine.map(f => f.name) });
+          }
+        }
+        if (writes.length) await env.DB.batch(writes);
 
         return new Response(JSON.stringify({
           // 站長要把資料夾分享給誰，畫面上得看得到這個信箱
           serviceAccount: serviceAccountEmail(env.GOOGLE_DRIVE_SA_KEY),
-          folders: folders.map(f => ({
-            ...f,
-            suggestedUserId: f.ownerEmail ? byEmail.get(f.ownerEmail.toLowerCase()) ?? null : null,
-          })),
+          folderCount: folders.length,
+          results,
+          // 分享過來卻對不到任何帳號的。「我明明分享了怎麼沒反應」只能靠這個查
+          unmatched: folders.filter(f => !matched.has(f.id))
+            .map(f => ({ name: f.name, ownerEmail: f.ownerEmail })),
         }), { headers });
       }
 

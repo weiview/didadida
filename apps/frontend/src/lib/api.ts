@@ -504,32 +504,50 @@ export interface WhitelistUser extends CurrentUser {
   track_drive_folder_id: string | null;
 }
 
-/** 分享給服務帳號的一個 Drive 資料夾。站長從這份清單挑來綁人 */
-export interface SharedDriveFolder {
-  id: string;
+/** 掃描結果裡某一個人的狀態 */
+export interface TrackFolderSyncRow {
+  user_id: number;
   name: string;
-  /** 分享者的 Google 信箱。用它自動猜出這是誰的資料夾 */
-  ownerEmail: string | null;
-  modifiedTime: string | null;
-  /** 信箱對得上站上帳號時的建議人選，對不上是 null */
-  suggestedUserId: number | null;
+  email: string;
+  /**
+   * bound     本來就綁對了，這次沒動
+   * updated   這次自動綁上（或換掉了對不上信箱的舊綁定）
+   * missing   找不到用他的信箱分享過來的資料夾
+   * ambiguous 他分享了兩個以上，不猜
+   */
+  status: 'bound' | 'updated' | 'missing' | 'ambiguous';
+  folder_name?: string;
+  folder_names?: string[];
+  /** missing 專用：他之前綁的還留著（我們不會因為這次沒對到就清掉） */
+  still_bound?: boolean;
 }
 
-/**
- * 列出所有分享給服務帳號的 Drive 資料夾。站長限定。
- *
- * `serviceAccount` 是要請家人分享給誰的那個信箱 —— 畫面上一定要顯示，
- * 不然沒有人知道資料夾該分享給誰。
- */
-export async function fetchSharedDriveFolders(): Promise<{
-  serviceAccount: string; folders: SharedDriveFolder[];
-}> {
-  const res = await fetch(`${API_BASE_URL}/tracks/drive/shared-folders`, { headers: getAuthHeaders() });
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取分享資料夾失敗');
+export interface TrackFolderSync {
+  /** 要請家人分享給誰的那個信箱 —— 畫面上一定要顯示，不然沒人知道要分享給誰 */
+  serviceAccount: string;
+  /** 這次總共看到幾個分享過來的資料夾 */
+  folderCount: number;
+  results: TrackFolderSyncRow[];
+  /** 分享過來卻對不到任何帳號的。用來查「我明明分享了怎麼沒反應」 */
+  unmatched: { name: string; ownerEmail: string | null }[];
+}
+
+/** 掃一遍分享給服務帳號的 Drive 資料夾，照信箱自動綁到人身上。站長限定 */
+export async function syncTrackFolders(): Promise<TrackFolderSync> {
+  const res = await fetch(`${API_BASE_URL}/tracks/drive/sync-folders`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '掃描分享資料夾失敗');
   return await res.json();
 }
 
-/** 綁定（或用 null 解除）某個人的 GPSLogger 資料夾。站長限定 */
+/**
+ * 綁定（或用 null 解除）某個人的 GPSLogger 資料夾。站長限定。
+ *
+ * ⚠️ 後台已經沒有畫面在用這一支了（改成 syncTrackFolders 自動配對）。
+ * 留著是給「手機帳號 ≠ 登入帳號」那種自動配不到的例外，從 console 手動叫。
+ */
 export async function setUserTrackFolder(
   id: number, folderId: string | null,
 ): Promise<{ success: boolean; message?: string }> {
