@@ -43,3 +43,24 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 .gstack/
+
+# 編輯器 / 直譯器產物
+.idea/
+__pycache__/
+*.pyc
+
+# 查資料用的一次性 SQL 與腳本。正式的 schema 變更一律放
+# apps/backend/migrations/ 或 database/，那兩處不受這裡影響
+apps/backend/*.sql
+apps/backend/*.js
+apps/backend/*.ts
+!apps/backend/*.config.ts
+
+# 開發過程倒出來的暫存檔（diff / 歷史 / 備份 / 一次性測試腳本）
+*_history.txt
+history.txt
+git_diff.txt
+*_backup.txt
+modify_backend*.py
+diff_match_patch.py
+test-upload.js
