@@ -224,15 +224,88 @@
   flex-wrap: wrap;
 }
 
-/* 軌跡資料夾的下拉。跟 .field input 同一套外觀，select 沒辦法共用選擇器 */
-.select {
-  padding: 0.5rem 0.6rem;
-  border: 1px solid var(--border-color);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.7);
-  font-size: 0.88rem;
-  color: inherit;
-  max-width: 260px;
+/* 軌跡資料夾的設定說明。預設收合，展開後是一整篇步驟 —— 靠左側細線跟
+   縮排跟上面的段落分開，看得出是「附加說明」而不是又一個設定區 */
+.guide {
+  margin: 0.75rem 0 1rem;
+  font-size: 0.82rem;
+  color: var(--text-light);
+  line-height: 1.9;
+}
+
+.guideSummary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-light);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  list-style-position: outside;
+}
+
+.guideSummary:hover {
+  color: var(--text-color);
+}
+
+.guideBody {
+  margin-top: 0.6rem;
+  padding-left: 0.9rem;
+  border-left: 2px solid var(--border-color);
+}
+
+.guideBody p {
+  margin: 0 0 0.7rem;
+}
+
+.guideHead {
+  margin: 1rem 0 0.4rem;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text-color);
+}
+
+.guideHead:first-child {
+  margin-top: 0;
+}
+
+/* 數字要留在文字左邊而不是被切掉，所以 padding 而非 list-style-position */
+.guideList {
+  margin: 0 0 0.7rem;
+  padding-left: 1.3rem;
+}
+
+.guideList li {
+  margin-bottom: 0.45rem;
+}
+
+/* 狀況對照。用 dl 而不是表格 —— 表格在手機上一定會爆版（同 .userRow 的理由） */
+.guideFaq {
+  margin: 0;
+}
+
+.guideFaq dt {
+  font-weight: 500;
+  color: var(--text-color);
+  margin-top: 0.6rem;
+}
+
+.guideFaq dt:first-child {
+  margin-top: 0;
+}
+
+.guideFaq dd {
+  margin: 0;
+}
+
+/* App 裡的設定項名稱。跟 .mono 分開：那個是「要整串複製走的值」（所以
+   user-select: all ＋ 框線），這個只是夾在句子裡讀的專有名詞，
+   套上框線會把整段話切得七零八落 */
+.code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95em;
+  color: var(--text-color);
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: 4px;
+  padding: 0 0.25em;
 }
 
 /* 要請家人分享給哪個信箱。是要被複製走的東西，所以等寬字＋可選取 */

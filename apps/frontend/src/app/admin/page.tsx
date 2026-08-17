@@ -4,9 +4,9 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import styles from "./admin.module.css";
 import {
-  PurgePreview, SharedDriveFolder, UserContributions, WhitelistUser, addWhitelistUser,
-  fetchPurgePreview, fetchSharedDriveFolders, fetchSiteSettings, fetchUserContributions,
-  fetchWhitelist, purgeWhitelistUser, removeWhitelistUser, setUserTrackFolder,
+  PurgePreview, TrackFolderSync, UserContributions, WhitelistUser, addWhitelistUser,
+  fetchPurgePreview, fetchSiteSettings, fetchUserContributions,
+  fetchWhitelist, purgeWhitelistUser, removeWhitelistUser, syncTrackFolders,
   updateSiteSettings, updateWhitelistUser,
 } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
@@ -84,13 +84,12 @@ export default function AdminPage() {
   const [savingGuestMap, setSavingGuestMap] = useState(false);
 
   /*
-   * GPS 軌跡資料夾。**刻意不在開頁時就抓** —— 那是一次 Google Drive API 往返，
-   * 而這一頁大多數時候是來加人或改權限的，資料夾綁一次之後幾年不會再動。
+   * GPS 軌跡資料夾的掃描結果。**刻意不在開頁時就跑** —— 那是一次 Google Drive
+   * API 往返，而這一頁大多數時候是來加人或改權限的，資料夾設好之後幾年不會再動。
    * null ＝ 還沒按過那顆按鈕。
    */
-  const [folders, setFolders] = useState<SharedDriveFolder[] | null>(null);
-  const [saEmail, setSaEmail] = useState<string | null>(null);
-  const [loadingFolders, setLoadingFolders] = useState(false);
+  const [scan, setScan] = useState<TrackFolderSync | null>(null);
+  const [scanning, setScanning] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -144,31 +143,23 @@ export default function AdminPage() {
     load();
   };
 
-  const loadFolders = async () => {
-    setLoadingFolders(true);
+  const runScan = async () => {
+    setScanning(true);
     setNotice(null);
     try {
-      const data = await fetchSharedDriveFolders();
-      setFolders(data.folders);
-      setSaEmail(data.serviceAccount);
+      const data = await syncTrackFolders();
+      setScan(data);
       setError(null);
+      const changed = data.results.filter((r) => r.status === "updated");
+      setNotice(changed.length
+        ? `已自動綁定 ${changed.length} 人：${changed.map((r) => `${r.name}（${r.folder_name}）`).join("、")}。他們在地圖上按「從 Drive 同步」就讀得到自己的軌跡了。`
+        : "掃完了，沒有需要變更的綁定。");
+      // 綁定寫在 User 上，重讀白名單才不會讓下面那些列停在舊值
+      load();
     } catch (e: any) {
-      setError(e.message || "讀取分享資料夾失敗");
+      setError(e.message || "掃描分享資料夾失敗");
     }
-    setLoadingFolders(false);
-  };
-
-  const bindFolder = async (user: WhitelistUser, folderId: string | null) => {
-    setBusyId(user.id);
-    setNotice(null);
-    const result = await setUserTrackFolder(user.id, folderId);
-    setBusyId(null);
-    if (!result.success) return setError(result.message || "綁定失敗");
-    setError(null);
-    setNotice(folderId
-      ? `${user.name || user.email} 的軌跡資料夾綁好了，他在地圖上按「從 Drive 同步」就會讀到自己的 GPX。`
-      : `已解除 ${user.name || user.email} 的軌跡資料夾綁定，他暫時同步不到東西。`);
-    load();
+    setScanning(false);
   };
 
   const toggleGuestMap = async (next: boolean) => {
@@ -243,6 +234,14 @@ export default function AdminPage() {
     setNotice(parts.join(""));
     load();
   };
+
+  /*
+   * 要綁資料夾的人 —— 站長自己不在裡面。他沒綁的時候後端會退回
+   * GOOGLE_DRIVE_FOLDER_ID 那顆環境變數（見 trackFolderFor），所以對他寫
+   * 「還沒綁定，他同步不到任何軌跡」是錯的，他同步得到。這一段是拿來對
+   * 家人的資料夾的，站長不該出現在自己的待辦清單裡。
+   */
+  const trackTargets = users.filter((u) => u.active === 1 && u.role !== "owner");
 
   if (checking) return <div className={styles.container} />;
 
@@ -546,13 +545,122 @@ export default function AdminPage() {
         <p className={styles.hint}>
           每個人的 GPSLogger 都是傳進他自己的 Google Drive（手機 App 只碰得到自己建的資料夾，
           沒辦法直接傳到你這邊）。請他把那個資料夾<strong>分享</strong>給下面這個服務帳號，
-          再回來這裡把資料夾對上人 —— 之後他在地圖上按「從 Drive 同步」就讀得到自己的軌跡。
+          你再按一次掃描 —— 對得上信箱的會自動綁好，之後他在地圖上按「從 Drive 同步」
+          就讀得到自己的軌跡。
+        </p>
+        <p className={styles.hint}>
+          配對只認一件事：<strong>分享過來的資料夾，擁有者要是他登入本站的那個 Google 帳號</strong>。
+          手機上如果是用另一個帳號設定 GPSLogger，這裡永遠對不到他。
         </p>
 
-        {saEmail && (
+        {/*
+          完整說明預設收起來。這一頁平常是來加人、改權限的，資料夾綁一次之後
+          幾年不會再動 —— 一整篇步驟攤在這裡只會擋路。真的要設定的那一天才展開。
+        */}
+        <details className={styles.guide}>
+          <summary className={styles.guideSummary}>設定步驟與疑難排解</summary>
+          <div className={styles.guideBody}>
+            <h3 className={styles.guideHead}>為什麼要一個人一個資料夾</h3>
+            <p>
+              GPSLogger 只拿得到「自己建立的檔案」這種權限，看不到也寫不進別人的資料夾，
+              所以「全家都傳進站長的 Drive」做不到。每個人只能傳進自己的 Drive，
+              各自把那個資料夾分享給站上的服務帳號，再由你在這裡對上人。
+            </p>
+
+            <h3 className={styles.guideHead}>請家人做的事（只做一次）</h3>
+            <ol className={styles.guideList}>
+              <li>
+                從 <strong>F-Droid</strong> 安裝 GPSLogger（mendhak 版，v122 以上）。
+                不要用 GitHub 下載的 APK —— 簽章對不上，Drive 授權會失敗；
+                Play 商店那個同名的 BasicAirData GPS Logger 是另一套軟體，沒有自動上傳，不能用。
+              </li>
+              <li>
+                <span className={styles.code}>Auto send, email and upload</span> →
+                開啟 Allow auto sending → 目標選 Google Drive → 授權。
+                <strong>授權時要選他登入這個站的那個 Google 帳號</strong> ——
+                這裡選錯，後面就永遠自動對不上他。
+                資料夾填<strong>單層名稱</strong>（例如 <span className={styles.code}>GPSLogger</span>），不要填路徑。
+              </li>
+              <li>
+                三個一定要改：關掉 <span className={styles.code}>Send zip file</span>（預設是開的）、
+                關掉 <span className={styles.code}>Prefix unique string to the file name</span>、
+                <span className={styles.code}>New file creation</span> 選 <strong>Once a day</strong>。
+              </li>
+              <li>
+                傳送頻率設 <strong>15 分鐘</strong>。auto-send 每次只送「當下那個檔」，
+                跨過午夜就換成新的一天了，間隔太長會讓前一天最後那段永遠傳不上來。
+              </li>
+              <li>
+                用設定頁裡的 <span className={styles.code}>Test upload</span> 按一下，確認 Drive 上真的長出那個資料夾。
+              </li>
+              <li>
+                到 Google Drive 對那個資料夾按「共用」，加入下面那個服務帳號信箱，
+                權限給<strong>檢視者</strong>就夠 —— 服務帳號只讀不寫，也刪不掉任何東西。
+              </li>
+            </ol>
+
+            <h3 className={styles.guideHead}>你在這裡做的事</h3>
+            <ol className={styles.guideList}>
+              <li>按一次掃描，服務帳號信箱就會出現，可以複製給家人。</li>
+              <li>
+                家人分享完，再按一次。<strong>沒有東西要挑</strong> ——
+                資料夾的擁有者信箱等於誰的帳號，就自動綁給誰，下面每一列會寫清楚結果。
+              </li>
+              <li>
+                綁好立刻生效，不用重新部署。之後他在地圖上按「從 Drive 同步」就讀得到自己的軌跡。
+              </li>
+            </ol>
+            <p>
+              一個資料夾<strong>只會綁一個人</strong>：綁重了兩個人會同步到同一批檔案，
+              同一天會多出一份不是他的軌跡。信箱是唯一的，所以自動配對不可能配出這種狀況；
+              舊的人工綁定如果卡在別人身上，掃描時會直接拆掉換人。
+            </p>
+
+            <h3 className={styles.guideHead}>狀況對照</h3>
+            <dl className={styles.guideFaq}>
+              <dt>某個人一直是「還沒設定共享資料夾」</dt>
+              <dd>
+                最常見的是他手機上授權 Drive 用的 Google 帳號，跟他登入這個站的帳號不是同一個 ——
+                那就要請他在 GPSLogger 裡改用正確的帳號重新授權。其次才是根本還沒分享：
+                Test upload 成功不代表已經分享，那是兩件事。
+              </dd>
+
+              <dt>畫面說有資料夾對不到任何帳號</dt>
+              <dd>
+                通常就是上一條那個帳號不對，訊息裡會寫出那個資料夾是哪個信箱分享的 ——
+                把它跟白名單上的信箱對一下就知道差在哪。也可能是 Drive 沒告訴我們擁有者是誰
+                （對方帳號設定不揭露），那種情況自動配對救不了，要跟我說一聲手動綁。
+              </dd>
+
+              <dt>顯示「分享了 2 個以上，請只留一個」</dt>
+              <dd>同一個帳號分享了不只一個資料夾，我們不猜哪個是 GPSLogger 的。請他在 Drive 上把多餘的取消共用，再掃一次。</dd>
+
+              <dt>本來綁好的人變成「還沒設定」</dt>
+              <dd>
+                對方取消分享或把資料夾丟進垃圾桶了，同步會失敗，要請他重新分享一次。
+                舊的綁定會刻意留著不清掉，所以重新分享後掃一次就恢復。
+              </dd>
+
+              <dt>綁好了，但同步是空的</dt>
+              <dd>資料夾裡沒有 .gpx。我們只認副檔名 .gpx，Test upload 產生的 gpslogger_test.xml 會被跳過，那是正常的。</dd>
+
+              <dt>清單裡沒有你自己</dt>
+              <dd>
+                站長不用在這裡綁。你的軌跡讀的是部署時設好的
+                <span className={styles.code}>GOOGLE_DRIVE_FOLDER_ID</span>，
+                要換資料夾是去改那顆環境變數，不是在這一頁。
+              </dd>
+
+              <dt>掃描回「尚未設定 GOOGLE_DRIVE_SA_KEY」</dt>
+              <dd>這個環境的 Worker 還沒灌那顆 secret，整段功能都不會動。</dd>
+            </dl>
+          </div>
+        </details>
+
+        {scan && (
           <p className={styles.hint}>
             要分享給這個信箱（唯讀就夠了）：<br />
-            <span className={styles.mono}>{saEmail}</span>
+            <span className={styles.mono}>{scan.serviceAccount}</span>
           </p>
         )}
 
@@ -560,56 +668,58 @@ export default function AdminPage() {
           <button
             type="button"
             className={styles.button}
-            onClick={loadFolders}
-            disabled={loadingFolders}
+            onClick={runScan}
+            disabled={scanning}
           >
-            {loadingFolders ? "讀取中..." : folders ? "重新讀取分享的資料夾" : "讀取分享給我的資料夾"}
+            {scanning ? "掃描中..." : scan ? "重新掃描 Drive" : "掃描 Drive 並自動綁定"}
           </button>
         </div>
 
-        {folders !== null && folders.length === 0 && (
+        {/*
+          分享過來卻對不到任何帳號的資料夾。自動配對沒得挑，所以「我明明分享了
+          怎麼沒反應」只剩這一段能查 —— 信箱印出來，跟白名單一比就知道差在哪。
+        */}
+        {scan && scan.unmatched.length > 0 && (
           <p className={styles.hint}>
-            目前沒有任何資料夾分享給這個服務帳號。請家人先在 Drive 上把 GPSLogger 的資料夾分享過來。
+            另外有 {scan.unmatched.length} 個資料夾分享過來，但對不到任何帳號：
+            {scan.unmatched.map((f) => `${f.name}（${f.ownerEmail || "拿不到擁有者"}）`).join("、")}。
+            這些信箱不在白名單裡，或跟白名單上的寫法不一樣。
           </p>
         )}
 
-        {users.filter((u) => u.active === 1).map((user) => {
-          const busy = busyId === user.id;
-          const bound = user.track_drive_folder_id;
-          const known = folders?.find((f) => f.id === bound) ?? null;
+        {trackTargets.length === 0 && (
+          <p className={styles.hint}>白名單裡目前只有你自己，你的軌跡不用在這裡設定。</p>
+        )}
+
+        {trackTargets.map((user) => {
+          const r = scan?.results.find((x) => x.user_id === user.id) ?? null;
           return (
             <div key={user.id} className={styles.userRow}>
               <div className={styles.userMain}>
                 <div className={styles.userName}>{user.name || user.email}</div>
                 <div className={styles.userMeta}>
-                  {bound
-                    ? `目前綁定：${known ? known.name : bound}`
-                    : "還沒綁定，他同步不到任何軌跡"}
+                  {/* 還沒掃過：只知道 D1 有沒有存 id，不知道那個資料夾叫什麼名字
+                      （名字在 Drive 上，沒存進來），所以這裡只能講狀態不能講名字 */}
+                  {!r && (user.track_drive_folder_id
+                    ? "已綁定資料夾。按上面掃描可以確認現在還通不通。"
+                    : "還沒設定共享資料夾。")}
+                  {r?.status === "bound" && `目前綁定：${r.folder_name}`}
+                  {r?.status === "updated" && `已自動綁定：${r.folder_name}`}
+                  {r?.status === "missing" && (
+                    <>
+                      還沒設定共享資料夾 —— 找不到用 <span className={styles.code}>{r.email}</span>{" "}
+                      分享過來的資料夾。
+                      {r.still_bound && "（之前綁的還留著，沒有動它）"}
+                    </>
+                  )}
+                  {r?.status === "ambiguous" && (
+                    <>
+                      {r.email} 分享了 {r.folder_names?.length} 個資料夾（
+                      {r.folder_names?.join("、")}），無法判斷哪一個是 GPSLogger 的，
+                      這次沒有綁。請他只留一個再掃一次。
+                    </>
+                  )}
                 </div>
-              </div>
-              <div className={styles.actions}>
-                {folders === null ? (
-                  <span className={styles.userMeta}>先按上面那顆按鈕讀取資料夾</span>
-                ) : (
-                  <select
-                    className={styles.select}
-                    value={bound ?? ""}
-                    disabled={busy}
-                    onChange={(e) => bindFolder(user, e.target.value || null)}
-                  >
-                    <option value="">（未綁定）</option>
-                    {/* 已經綁著、但現在沒出現在分享清單裡的資料夾（對方取消分享了）。
-                        不補這一項的話 select 會顯示成「未綁定」，看起來像資料掉了 */}
-                    {bound && !known && <option value={bound}>{bound}（已不在分享清單）</option>}
-                    {folders.map((f) => (
-                      <option key={f.id} value={f.id}>
-                        {f.name}
-                        {f.ownerEmail ? `　—　${f.ownerEmail}` : ""}
-                        {f.suggestedUserId === user.id ? "　✓ 信箱對得上" : ""}
-                      </option>
-                    ))}
-                  </select>
-                )}
               </div>
             </div>
           );
