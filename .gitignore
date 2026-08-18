@@ -29,6 +29,8 @@ out/
 .mf/
 .dev.vars
 .dev.vars.*
+# 只列 key、不含值的範本要進 repo，不然新環境不知道要填什麼
+!.dev.vars.example
 
 # 非 .local 結尾的 env 檔也要擋，這些同樣含機密
 .env.development
