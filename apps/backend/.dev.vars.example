@@ -1,0 +1,22 @@
+# 複製成 .dev.vars（已被 .gitignore 擋住）再填值。這份只列 key，不放任何真實祕密。
+# .dev.vars 只餵本機 wrangler dev；遠端 dev/prod 要各自 `wrangler secret put`。
+
+# JWT 簽章金鑰。缺了整個認證掛掉
+APP_PASSWORD=
+
+# 訪客密碼。缺了 /api/verify-guest 回 503，除了 Google 登入沒人進得了站
+GUEST_PASSWORD=
+
+# Google OAuth（成員登入）。缺了登入整條掛掉
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+
+# Google Drive service account 的 JSON 金鑰（整包貼成一行）。
+# 缺了燈箱取大圖、搬 trash、讀 GPSLogger 軌跡全掛
+GOOGLE_DRIVE_SA_KEY=
+
+# 站長（uid 1）的 GPSLogger 資料夾 id；其他成員各自綁在 User.track_drive_folder_id
+GOOGLE_DRIVE_FOLDER_ID=
+
+# 選配。沒設不會壞，只是站長第一次用 Google 登入之前沒有 Drive 備份
+DRIVE_WRITER_REFRESH_TOKEN=

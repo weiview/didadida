@@ -1,0 +1,32 @@
+{
+  "name": "didadida",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:1-20-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "forwardPorts": [3000, 8787],
+  "portsAttributes": {
+    "3000": { "label": "frontend (next dev)", "onAutoForward": "notify" },
+    "8787": { "label": "backend (wrangler dev)", "onAutoForward": "notify" }
+  },
+  "postCreateCommand": "npm install",
+  "remoteEnv": {
+    // wrangler 在容器裡開不了瀏覽器做 OAuth，要部署就得給 API token。
+    // Codespaces secret 設 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID 之後才會有值。
+    "CLOUDFLARE_API_TOKEN": "${localEnv:CLOUDFLARE_API_TOKEN}",
+    "CLOUDFLARE_ACCOUNT_ID": "${localEnv:CLOUDFLARE_ACCOUNT_ID}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode"
+      ],
+      "settings": {
+        // repo 行尾是混的（見 CLAUDE.md 坑 #6），別讓編輯器順手統一
+        "files.eol": "auto",
+        "files.trimTrailingWhitespace": false
+      }
+    }
+  }
+}
