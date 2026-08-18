@@ -897,7 +897,9 @@ export function renderCommentBody(
     const at = m.index ?? 0;
     if (at > last) out.push({ type: 'text', value: body.slice(last, at) });
     const id = Number(m[1]);
-    out.push({ type: 'mention', id, value: `@${users.get(id)?.name ?? '?'}` });
+    // 只有名字，**前面不加 @** —— 貼出去的留言靠粗體與重音色就看得出是提到某個人，
+    // 多一個 @ 只是雜訊（FB 也是這樣）。輸入框那邊的晶片同理
+    out.push({ type: 'mention', id, value: users.get(id)?.name ?? '?' });
     last = at + m[0].length;
   }
   if (last < body.length) out.push({ type: 'text', value: body.slice(last) });

@@ -40,6 +40,90 @@ function Avatar({ name, color }: { name: string | null; color: string }) {
   );
 }
 
+/*
+ * ── 輸入框是 contenteditable，不是 textarea ───────────────────────────────
+ *
+ * @ 到的人在輸入框裡是一顆**不可分割的晶片**（粗體、重音色、看不到 @），
+ * 純文字的 textarea 做不到這件事。代價是底下這幾個 DOM 手術函式。
+ *
+ * 為什麼晶片非做不可：`@` 原本身兼二職 —— 給人看的記號，以及送出時
+ * 「這段是 mention」的唯一標記。把 @ 拿掉之後就得靠 DOM 節點來記，
+ * 否則內文裡剛好打到同名的字會被誤判成提到某個人。
+ */
+
+/** 一顆人。contentEditable=false → 游標跳過它，退格一次整顆消失 */
+function makeChip(id: number, name: string | null): HTMLSpanElement {
+  const chip = document.createElement('span');
+  chip.className = styles.mentionChip;
+  chip.setAttribute('data-uid', String(id));
+  chip.contentEditable = 'false';
+  chip.textContent = name ?? `#${id}`;
+  return chip;
+}
+
+/**
+ * 插晶片時墊在後面的空白。用**不斷行空白**：一般空白排在結尾會被瀏覽器摺疊掉，
+ * 游標就黏在晶片右邊出不來。
+ *
+ * 用 fromCharCode 而不是直接在字串裡打一個 —— 原始碼裡看不出它跟一般空白的差別，
+ * 被誰順手「清掉怪空白」就整個壞了。（附帶一提 JS 的 `\s` 本來就含 U+00A0，
+ * 底下比對「@ 查詢字」的字元類別不必特別把它列出來。）
+ */
+const NBSP = String.fromCharCode(0xa0);
+
+/** 把游標移到某個節點後面 */
+function caretAfter(node: Node) {
+  const sel = window.getSelection();
+  if (!sel) return;
+  const range = document.createRange();
+  range.setStartAfter(node);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+/** 把輸入框的 DOM 讀成後端要的字串：晶片變 `@[uid]`，其餘照抄 */
+function serializeEditor(root: HTMLElement | null): string {
+  if (!root) return '';
+  let out = '';
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      out += node.textContent ?? '';
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node as HTMLElement;
+    const uid = el.getAttribute('data-uid');
+    if (uid) {
+      out += `@[${uid}]`;
+      return;
+    }
+    if (el.tagName === 'BR') {
+      out += '\n';
+      return;
+    }
+    // 貼上時瀏覽器可能塞 div/p 進來，當成換行處理
+    if ((el.tagName === 'DIV' || el.tagName === 'P') && out && !out.endsWith('\n')) out += '\n';
+    for (let i = 0; i < el.childNodes.length; i++) walk(el.childNodes[i]);
+  };
+  for (let i = 0; i < root.childNodes.length; i++) walk(root.childNodes[i]);
+  return out.split(NBSP).join(' ');
+}
+
+/** 游標前面那段還沒結束的 `@查詢字`。不在輸入框裡、或選取了一段字就回 null */
+function mentionAtCaret(
+  root: HTMLElement | null,
+): { node: Text; start: number; end: number; query: string } | null {
+  const sel = window.getSelection();
+  if (!root || !sel || sel.rangeCount === 0 || !sel.isCollapsed) return null;
+  const node = sel.anchorNode;
+  if (!node || node.nodeType !== Node.TEXT_NODE || !root.contains(node)) return null;
+  const end = sel.anchorOffset;
+  const m = (node.textContent ?? '').slice(0, end).match(/@([^@\s]*)$/);
+  if (!m) return null;
+  return { node: node as Text, start: end - m[0].length, end, query: m[1] };
+}
+
 export default function PhotoComments({ photoId }: { photoId: number }) {
   const { canViewComments, canComment, isAdmin, user } = useAdmin();
 
@@ -50,27 +134,28 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
   /** 這串留言裡已經被 @ 到的人（顯示用）。跟著留言一起回來，訪客也有 */
   const [mentionedPeople, setMentionedPeople] = useState<MentionableUser[]>([]);
 
+  /**
+   * 輸入框內容的**副本**（已經序列化成 `@[uid]` 的形式）。
+   * 真正的內容在 DOM 裡，這份只拿來判斷「空不空」——placeholder 要不要出現、
+   * 送出鈕要不要變灰。所以每次動 DOM 之後都要 syncDraft() 補一下。
+   */
   const [draft, setDraft] = useState('');
   const [replyTo, setReplyTo] = useState<PhotoComment | null>(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const inputRef = useRef<HTMLTextAreaElement>(null);
   /*
-   * 從選單挑過的人：顯示名稱 → uid。
-   *
-   * 輸入框裡放的是**看得懂的 `@名字`**，送出前才用這份對照換成後端要的 `@[uid]`。
-   * 直接把 `@[3]` 放進輸入框最單純，但使用者打字打到一半會看到自己寫的東西變成
-   * 一串編號，那太怪了。
-   *
-   * ⚠️ 已知的邊界：**兩個人的顯示名稱一模一樣時，後挑的那個會蓋掉前一個**
-   *    （這份對照是以名字為鍵）。白名單的名字由站長掌握，重名本來就會讓人分不清，
-   *    不值得為此把輸入框做成 contenteditable 的晶片。
+   * 輸入框。**它的內容由 DOM 自己管，不是 React 的受控元件** ——
+   * 每次打字都重畫子節點的話游標會被打回開頭。React 只負責掛上這個 div，
+   * 裡面的文字與晶片一律用原生 API 動。
    */
-  const mentionMap = useRef<Map<string, number>>(new Map());
+  const editorRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   // @ 選單：null = 沒開；有值 = 使用者正在打 `@` 後面那串字
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  /** 鍵盤上下鍵選到第幾個 */
+  const [mentionIndex, setMentionIndex] = useState(0);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -80,15 +165,26 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
     setLoading(false);
   }, [photoId]);
 
+  /** DOM 是真相，把它讀進 draft。動完輸入框的 DOM 就要叫一次 */
+  const syncDraft = useCallback(() => {
+    setDraft(serializeEditor(editorRef.current));
+  }, []);
+
+  /** 清空輸入框（送出成功、換照片）。innerHTML 直接歸零，晶片也一起沒了 */
+  const clearEditor = useCallback(() => {
+    if (editorRef.current) editorRef.current.innerHTML = '';
+    setDraft('');
+    setMentionQuery(null);
+  }, []);
+
   useEffect(() => {
     if (!canViewComments) return;
     // 換一張照片就換一串留言，草稿也一起清掉（回覆對象已經不存在了）
-    setDraft('');
+    clearEditor();
     setReplyTo(null);
     setError(null);
-    mentionMap.current = new Map();
     load();
-  }, [photoId, canViewComments, load]);
+  }, [photoId, canViewComments, load, clearEditor]);
 
   // 可以 @ 的人。訪客打這支會 401，所以只有成員去拿。整站不變，載一次就好
   useEffect(() => {
@@ -122,22 +218,6 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
     return roots.map((root) => ({ root, replies: byParent.get(root.id) ?? [] }));
   }, [comments]);
 
-  const insertMention = (person: MentionableUser) => {
-    const name = person.name ?? `#${person.id}`;
-    mentionMap.current.set(name, person.id);
-    // 把使用者正在打的 `@xxx` 整段換掉，而不是往後面追加
-    setDraft((prev) => prev.replace(/@[^@\s]*$/, '') + `@${name} `);
-    setMentionQuery(null);
-    inputRef.current?.focus();
-  };
-
-  const onDraftChange = (value: string) => {
-    setDraft(value);
-    // 游標所在的那個字尾如果是 `@` 開頭且還沒遇到空白，就是正在挑人
-    const m = value.match(/@([^@\s]*)$/);
-    setMentionQuery(m ? m[1] : null);
-  };
-
   const mentionCandidates = useMemo(() => {
     if (mentionQuery == null || !people.length) return [];
     const q = mentionQuery.toLowerCase();
@@ -146,31 +226,117 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
       .slice(0, 6);
   }, [mentionQuery, people, user?.id]);
 
+  // 換一批候選人就回到第一個。不重設的話上一輪停在第 5 個、這一輪只有 2 個人，
+  // 就會選到不存在的那一格
+  useEffect(() => {
+    setMentionIndex(0);
+  }, [mentionQuery]);
+
+  // 選到的那一列要留在看得到的地方（選單有 max-height，六個人就會超出去）
+  useEffect(() => {
+    const el = menuRef.current?.children[mentionIndex] as HTMLElement | undefined;
+    el?.scrollIntoView({ block: 'nearest' });
+  }, [mentionIndex]);
+
+  /** 游標所在位置有沒有正在打的 `@查詢字`，有就開選單 */
+  const refreshMentionQuery = useCallback(() => {
+    const hit = mentionAtCaret(editorRef.current);
+    setMentionQuery(hit ? hit.query : null);
+  }, []);
+
+  /**
+   * 把游標前面那段 `@查詢字` 換成一顆晶片。
+   *
+   * 刻意不用 execCommand 之類的整段替換 —— 要精準地只吃掉那幾個字，
+   * 不能碰到使用者已經打好的其他內容。
+   */
+  const insertMention = (person: MentionableUser) => {
+    const editor = editorRef.current;
+    const hit = mentionAtCaret(editor);
+    if (!editor || !hit) return;
+
+    const range = document.createRange();
+    range.setStart(hit.node, hit.start);
+    range.setEnd(hit.node, hit.end);
+    range.deleteContents();
+
+    // 晶片後面墊一個不斷行空白，游標才停得進去、下一個字也不會黏在晶片上
+    const tail = document.createTextNode(NBSP);
+    const frag = document.createDocumentFragment();
+    frag.appendChild(makeChip(person.id, person.name));
+    frag.appendChild(tail);
+    range.insertNode(frag);
+
+    caretAfter(tail);
+    setMentionQuery(null);
+    syncDraft();
+    editor.focus();
+  };
+
+  const onEditorKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    /*
+     * 注音／拼音組字中間按 Enter 是「選這個字」，不是送出留言。
+     * 沒有這一行，中文使用者每打一個詞就會不小心送出一則半截的留言。
+     */
+    if ((e.nativeEvent as unknown as { isComposing?: boolean }).isComposing) return;
+
+    if (mentionCandidates.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setMentionIndex((i) => (i + 1) % mentionCandidates.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setMentionIndex((i) => (i - 1 + mentionCandidates.length) % mentionCandidates.length);
+        return;
+      }
+      // Enter 與 Tab 都是「就選這個」。選單開著時 Enter 不送出留言
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        insertMention(mentionCandidates[Math.min(mentionIndex, mentionCandidates.length - 1)]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        // 先關選單就好，別讓 Esc 冒泡上去被燈箱當成「關閉」
+        e.preventDefault();
+        e.stopPropagation();
+        setMentionQuery(null);
+        return;
+      }
+    }
+
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submit();
+    }
+  };
+
+  /** 貼上一律轉成純文字。不擋的話會把來源網站的樣式與標籤整包搬進來 */
+  const onEditorPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    document.execCommand('insertText', false, e.clipboardData.getData('text/plain'));
+    syncDraft();
+    refreshMentionQuery();
+  };
+
   const submit = async () => {
-    const text = draft.trim();
+    // 直接讀 DOM 而不是讀 draft —— draft 是 state，剛插完晶片那一瞬間可能還沒更新
+    const text = serializeEditor(editorRef.current).trim();
     if (!text || sending) return;
+    if (text.length > 1000) {
+      setError('留言太長了，上限 1000 字');
+      return;
+    }
     setSending(true);
     setError(null);
 
-    /*
-     * 把 `@名字` 換回 `@[uid]`。**長的名字先換** —— 「小明」與「小明媽」同時
-     * 存在時，先換短的會把「小明媽」啃掉半個名字，剩下一個孤零零的「媽」。
-     */
-    let payload = text;
-    // Array.from 而不是展開運算子：前端 tsconfig 的 target 是 ES5，
-    // 直接展開 Map 的迭代器會被 TS2802 擋下來
-    const names = Array.from(mentionMap.current.keys()).sort((a, b) => b.length - a.length);
-    for (const name of names) {
-      const uid = mentionMap.current.get(name)!;
-      payload = payload.split(`@${name}`).join(`@[${uid}]`);
-    }
-
-    const result = await postComment(photoId, payload, replyTo ? (replyTo.parent_id ?? replyTo.id) : null);
+    // 不必再換算什麼 —— 晶片序列化出來就已經是後端要的 `@[uid]`
+    const result = await postComment(photoId, text, replyTo ? (replyTo.parent_id ?? replyTo.id) : null);
     if (result.success && result.comment) {
       setComments((prev) => [...prev, result.comment!]);
-      setDraft('');
+      clearEditor();
       setReplyTo(null);
-      mentionMap.current = new Map();
     } else {
       setError(result.message ?? '留言失敗');
     }
@@ -187,12 +353,19 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
 
   const beginReply = (target: PhotoComment) => {
     setReplyTo(target);
-    // FB 的行為：按回覆就先幫你 @ 好對方。回覆自己的話不必 @
-    if (target.user_id !== user?.id && target.user_name) {
-      mentionMap.current.set(target.user_name, target.user_id);
-      setDraft((prev) => (prev.includes(`@${target.user_name}`) ? prev : `@${target.user_name} ${prev}`));
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.focus();
+
+    // FB 的行為：按回覆就先幫你 @ 好對方。回覆自己的話不必 @，已經 @ 過也不再插一次
+    const already = editor.querySelector(`[data-uid="${target.user_id}"]`);
+    if (target.user_id !== user?.id && !already) {
+      const tail = document.createTextNode(NBSP);
+      editor.insertBefore(tail, editor.firstChild);
+      editor.insertBefore(makeChip(target.user_id, target.user_name), tail);
+      caretAfter(tail);
+      syncDraft();
     }
-    inputRef.current?.focus();
   };
 
   const renderBody = (body: string) => (
@@ -254,21 +427,27 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
             </div>
           )}
           <div className={styles.composerRow}>
-            <textarea
-              ref={inputRef}
-              className={styles.commentInput}
-              value={draft}
-              onChange={(e) => onDraftChange(e.target.value)}
-              onKeyDown={(e) => {
-                // Enter 送出、Shift+Enter 換行。@ 選單開著時 Enter 是要選人，不能送出
-                if (e.key === 'Enter' && !e.shiftKey && !mentionCandidates.length) {
-                  e.preventDefault();
-                  submit();
-                }
-              }}
-              placeholder="留個言…　打 @ 可以提到某個人"
-              rows={2}
-              maxLength={1000}
+            {/*
+              * ⚠️ 這個 div **永遠不要給它 React 子節點**。裡面的東西是原生 DOM 在動，
+              *    React 一旦重畫子節點，游標會被打回開頭、打到一半的字也會亂跳。
+              *    className 之類的屬性可以隨便換，那不會碰到子節點。
+              */}
+            <div
+              ref={editorRef}
+              className={`${styles.commentInput} ${draft.trim() ? '' : styles.commentInputEmpty}`}
+              contentEditable
+              suppressContentEditableWarning
+              role="textbox"
+              aria-multiline="true"
+              aria-label="留言"
+              data-placeholder="留個言…　打 @ 可以提到某個人"
+              onInput={() => { syncDraft(); refreshMentionQuery(); }}
+              onKeyDown={onEditorKeyDown}
+              // 游標被鍵盤或滑鼠移走時，@ 選單也該跟著關掉／重算
+              onKeyUp={refreshMentionQuery}
+              onMouseUp={refreshMentionQuery}
+              onCompositionEnd={() => { syncDraft(); refreshMentionQuery(); }}
+              onPaste={onEditorPaste}
             />
             <button
               type="button"
@@ -281,9 +460,22 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
           </div>
 
           {mentionCandidates.length > 0 && (
-            <div className={styles.mentionMenu}>
-              {mentionCandidates.map((p) => (
-                <button key={p.id} type="button" onClick={() => insertMention(p)}>
+            <div className={styles.mentionMenu} ref={menuRef} role="listbox">
+              {mentionCandidates.map((p, i) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  role="option"
+                  aria-selected={i === mentionIndex}
+                  className={i === mentionIndex ? styles.mentionItemActive : undefined}
+                  // 滑鼠移過去就當作選到它，鍵盤與滑鼠共用同一個「現在選誰」
+                  onMouseEnter={() => setMentionIndex(i)}
+                  /*
+                   * 用 mouseDown 而不是 click：click 之前輸入框會先失焦，
+                   * 游標位置一沒了就找不到要換掉的那段 `@查詢字`，晶片插不進去。
+                   */
+                  onMouseDown={(e) => { e.preventDefault(); insertMention(p); }}
+                >
                   <Avatar name={p.name} color={p.color} />
                   <span>{p.name}</span>
                 </button>

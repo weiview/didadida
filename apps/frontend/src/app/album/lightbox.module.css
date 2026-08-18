@@ -135,6 +135,29 @@
   pointer-events: none;
 }
 
+/*
+ * 燈箱分兩塊：`.mainPane` 是照片＋照片資訊（Story／標籤／地點／EXIF），
+ * `.commentsPane` 只有留言。
+ *
+ * 手機（也就是這裡的基礎樣式）是一路往下堆：照片 → 資訊 → 留言。
+ * 桌機在檔案最後面的 `min-width: 769px` 翻成左右兩欄，留言獨立成右欄。
+ */
+.mainPane {
+  display: flex;
+  flex-direction: column;
+}
+
+.commentsPane {
+  background: #111;
+  /* 上面接的是 detailsContainer，同底色連成一片，只補一段跟它內部一樣的間距 */
+  padding: 20px 5% 30px;
+}
+
+/* 沒有看留言的權限時 PhotoComments 回 null，這一塊就是個空 div —— 別讓它留下 padding */
+.commentsPane:empty {
+  display: none;
+}
+
 .detailsContainer {
   width: 100%;
   padding: 30px 5%;
@@ -487,9 +510,10 @@ input:checked + .slider:before {
   white-space: pre-wrap;
 }
 
+/* 貼出去的留言裡被提到的人。前面**沒有 @**，靠粗體與重音色辨識 */
 .mention {
   color: var(--accent-color);
-  font-weight: 600;
+  font-weight: 700;
 }
 
 .commentMeta {
@@ -528,6 +552,10 @@ input:checked + .slider:before {
   align-items: flex-start;
 }
 
+/*
+ * 留言輸入框。**這是 contenteditable 的 div 不是 textarea** —— @ 到的人要變成
+ * 一顆不可分割的晶片（`.mentionChip`），純文字輸入框做不到。
+ */
 .commentInput {
   flex: 1;
   background: rgba(255, 255, 255, 0.06);
@@ -538,7 +566,16 @@ input:checked + .slider:before {
   font-size: 0.85rem;
   font-family: inherit;
   line-height: 1.5;
-  resize: vertical;
+  /* 兩行起跳，長留言自己長高到上限之後才捲 */
+  min-height: 46px;
+  max-height: 30vh;
+  overflow-y: auto;
+  /* 換行與長網址：contenteditable 預設會把連續空白吃掉，pre-wrap 才留得住 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  cursor: text;
+  /* placeholder 是絕對定位的 ::before，錨點要是這一格 */
+  position: relative;
 }
 
 .commentInput:focus {
@@ -546,8 +583,30 @@ input:checked + .slider:before {
   border-color: var(--accent-color);
 }
 
-.commentInput::placeholder {
+/*
+ * contenteditable 沒有 placeholder 屬性，自己畫一個。
+ * 用絕對定位而不是行內 content —— 行內的話游標會被擠到提示字後面。
+ * 空不空由 React 掛 class 決定，不用 :empty：Chrome 會在裡面留一顆 <br>，
+ * :empty 會失效。
+ */
+.commentInputEmpty::before {
+  content: attr(data-placeholder);
+  position: absolute;
+  left: 12px;
+  top: 8px;
   color: #666;
+  pointer-events: none;
+}
+
+/* 輸入框裡的「一顆人」。整顆是 contenteditable=false，退格一次整顆消失 */
+.mentionChip {
+  color: var(--accent-color);
+  font-weight: 700;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  padding: 0 3px;
+  user-select: none;
+  white-space: nowrap;
 }
 
 .replyBanner {
@@ -607,6 +666,11 @@ input:checked + .slider:before {
   background: rgba(255, 255, 255, 0.08);
 }
 
+/* 鍵盤上下鍵選到的那一列。滑鼠 hover 是同一個底色，兩者不必分辨 */
+.mentionItemActive {
+  background: rgba(255, 255, 255, 0.14);
+}
+
 .commentHint {
   font-size: 0.8rem;
   color: #777;
@@ -629,10 +693,13 @@ input:checked + .slider:before {
   }
 }
 
-/* ── 桌機：照片在左，黑色資訊欄在右 ────────────────────────────────────────
+/* ── 桌機：照片＋照片資訊在左，留言獨立成右欄 ──────────────────────────────
  *
- * 基礎樣式（檔案最上面）是**手機優先**的上下堆疊：`.content` 是 column、
- * `.imageContainer` 整寬 80vh，資訊欄接在照片下面。桌機在這裡翻成兩欄。
+ * 基礎樣式（檔案最上面）是**手機優先**的上下堆疊：`.content` 是 column，
+ * 照片 → 資訊 → 留言一路往下。桌機在這裡翻成兩欄。
+ *
+ * 左欄（`.mainPane`）自己捲：照片佔 80vh，往下捲才是 Story／標籤／地點／EXIF，
+ * 跟手機的順序一致。右欄（`.commentsPane`）只有留言，也自己捲。
  *
  * ⚠️ 這一段**必須留在檔案最後面**。上面那兩個 `max-width: 768px` 的 media
  *    query 位置比部分基礎樣式早，把桌機規則寫進檔案前段會被後面的基礎樣式蓋掉
@@ -645,40 +712,40 @@ input:checked + .slider:before {
     overflow: hidden;
   }
 
-  .imageContainer {
+  .mainPane {
     /* 吃掉右欄以外的所有寬度。min-width: 0 是 flex 子項的老問題：
        不寫的話 flex-basis 會被內容（圖片）撐大，右欄就被擠出畫面 */
     flex: 1 1 auto;
     min-width: 0;
-    width: auto;
-    /* 不再是 80vh —— 兩欄之後照片區就是整個燈箱的高度。
-       寫死 100% 而不是靠 align-self: stretch，`.image` 的 max-height: 100%
-       才有明確的參照高度可以算 */
-    height: 100%;
-  }
-
-  .detailsContainer {
-    flex: 0 0 clamp(340px, 28vw, 440px);
-    /* 同上：有確定高度，overflow-y 才會真的產生捲軸而不是把欄位撐長 */
     height: 100%;
     overflow-y: auto;
-    /* 上下堆疊時是上邊框，並排之後改成左邊框 */
-    border-top: none;
+    scrollbar-width: thin;
+    scrollbar-color: var(--accent-color) #111;
+  }
+
+  .commentsPane {
+    flex: 0 0 clamp(340px, 28vw, 440px);
+    /* 有確定高度，overflow-y 才會真的產生捲軸而不是把欄位撐長 */
+    height: 100%;
+    overflow-y: auto;
     border-left: 1px solid rgba(255, 255, 255, 0.06);
     /* 關閉鈕是 position: fixed 停在右上角，正好蓋在這一欄的頂端。
-       上緣多留一段，標題才不會被壓在按鈕底下 */
+       上緣多留一段，「留言」標題才不會被壓在按鈕底下 */
     padding: 60px 24px 32px;
     scrollbar-width: thin;
     scrollbar-color: var(--accent-color) #111;
   }
 
-  .detailsContainer::-webkit-scrollbar {
+  .mainPane::-webkit-scrollbar,
+  .commentsPane::-webkit-scrollbar {
     width: 8px;
   }
-  .detailsContainer::-webkit-scrollbar-track {
+  .mainPane::-webkit-scrollbar-track,
+  .commentsPane::-webkit-scrollbar-track {
     background: #111;
   }
-  .detailsContainer::-webkit-scrollbar-thumb {
+  .mainPane::-webkit-scrollbar-thumb,
+  .commentsPane::-webkit-scrollbar-thumb {
     background-color: var(--accent-color);
     border-radius: 10px;
   }
@@ -691,8 +758,7 @@ input:checked + .slider:before {
     padding-right: 0;
   }
 
-  /* 「下一張」原本貼在畫面右緣，兩欄之後會壓在資訊欄上（正好是留言的位置）。
-     推到資訊欄左邊，跟照片區的右緣對齊 */
+  /* 「下一張」原本貼在畫面右緣，兩欄之後會壓在留言上。推到右欄左邊 */
   .nextButton {
     right: calc(clamp(340px, 28vw, 440px) + 20px);
   }
