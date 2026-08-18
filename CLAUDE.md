@@ -171,19 +171,16 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0011）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0012）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
-活著的表：`User`／`Album`／`Photo`／`PhotoFts`(FTS5, bigram)／`Tag`／`PhotoTag`／`Favorite`／
-`TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`。
+現有表：`User`／`Album`／`Photo`／`PhotoFts`(FTS5, bigram)／`Tag`／`PhotoTag`／`Favorite`／
+`TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`。**沒有多餘的表**——
+`ShareLink`（從沒實作的分享連結）與 `TrackSegment`（拿掉的逐段交通工具）已由 0012 刪除。
 
-**兩張死表，看到不要以為有功能**（表還在，但程式一行都沒讀寫，別照著它們推論行為）：
-
-| 死表 | 狀況 |
-|---|---|
-| `ShareLink` | `index.ts` 出現 **0 次**。分享連結從來沒實作過 |
-| `TrackSegment` | 只剩一句講 CASCADE 的註解提到它。逐段交通工具那條路連同 `GET/PUT /api/tracks/segments` 一起拿掉了 |
+⚠️ **`database/schema.sql` 裡還看得到那兩張表的 `CREATE TABLE`**，那是歷史起點的原貌、刻意不動。
+新環境建庫是 `schema.sql` **再套完所有 migration**，跑完就沒有它們了 —— 不要照 schema.sql 推論現況。
 
 - `Photo.taken_at`（UTC 瞬間）／`taken_at_local`（牆上時間）／`tz_offset_minutes`，
   不變量是 **`taken_at = taken_at_local − tz`**。
@@ -193,8 +190,8 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - `LOCAL_TIME_EXPR` = `COALESCE(p.taken_at_local, …)`，用到它的 SQL **必須把 Photo 別名為 `p`**。
 - `geo_source` 權威由高而低：`manual` > `exif` > `track` > `timeline` > `segment` > `interpolated`。
 - `TrackDay.day_key` 是**不透明字串**（多身分之後還帶使用者前綴），**不要拿去解析日期**。
-- **DROP TABLE 要由子表往父表**：`Favorite→PhotoTag→ShareLink→TripSegment→Photo→Album→
-  TrackPoint→TrackSegment→TrackDay→Tag→DriveTrash→AppSetting→User`。開著外鍵時照字母序刪
+- **DROP TABLE 要由子表往父表**：`Favorite→PhotoTag→TripSegment→Photo→Album→
+  TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→User`。開著外鍵時照字母序刪
   會 FK failed，而且是**跑到一半才炸**（`d1 execute --file` 是單一交易，會整包回滾）。
 
 ## 身分與權限
