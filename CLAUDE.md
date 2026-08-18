@@ -223,6 +223,15 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - `@` 某人在內文裡存 `@[uid]`（改名後舊留言跟著更新）。**mention 一律由後端 `parseMentions()`
   解析**，不收前端傳的名單。顯示要用的名字跟著 `GET /api/photos/:id/comments` 的 `people` 回來
   —— 不要改叫前端去打 `/api/users/mentionable`，訪客打不到那一支。
+  貼出去的留言裡**名字前面不加 @**，只有粗體＋重音色。
+- ⚠️ **留言輸入框是 contenteditable 的 div，不是 textarea**，@ 到的人是一顆 `[data-uid]` 晶片。
+  **那個 div 永遠不能有 React 子節點、也不能改回受控元件** —— React 一重畫子節點游標就回開頭。
+  內容一律用原生 DOM API 動，動完叫 `syncDraft()`；`serializeEditor()` 把晶片讀成 `@[uid]`。
+  晶片後面墊的是 U+00A0（一般空白在結尾會被摺疊），挑人要用 `mouseDown`（`click` 之前就失焦了），
+  Enter 要先看 `isComposing`（注音組字中按 Enter 會送出半截留言）。
+- 燈箱分 `.mainPane`（照片＋Story／標籤／地點／EXIF）與 `.commentsPane`（只有留言），
+  桌機左右兩欄、手機往下堆。**桌機那段 media query 必須留在 `lightbox.module.css` 最後面**，
+  寫前面會被後面的基礎樣式蓋掉。
 - 通知：`CommentNotify(comment_id, user_id, reason)` ＋ `User.notif_seen_at` **一個時間戳，
   沒有逐則已讀**。未讀數搭 `/api/auth/me` 回來（紅點零額外請求）；fan-out 用 `INSERT OR IGNORE`
   打 PK，語句順序 mention→reply→photo→album，同一個人只收一則、理由取最貼切的那個。
