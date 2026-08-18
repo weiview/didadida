@@ -171,7 +171,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0013）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0014）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
@@ -208,6 +208,11 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   （包在函式裡吃不到索引），要拆成 `uploaded_by = ?` 與 `uploaded_by IS NULL AND a.user_id = ?` 兩段。
 - `photo_count`（他的相簿裡總共幾張，含別人傳的）與 `uploaded_count`（他自己傳了幾張，
   含傳進別人相簿的）**意思完全不同**，別混。
+- 足跡地圖有兩層各自獨立的開關：成員看 `User.can_view_map`（每人一欄，預設開，
+  **不被 `can_manage_others` 短路**），訪客看 `AppSetting.guest_can_view_map`（全站一格，預設關）。
+  後端所有 `/api/tracks/*`、`/api/timeline/*` 都走 `guardTrackAccess()`：**沒登入 401、沒權限 403，
+  而且刻意不看訪客那個開關** —— 軌跡是「誰什麼時候在哪裡」的連續紀錄，比照片座標敏感，一律要成員身分。
+  `/api/footprint`（照片座標）才是兩層都認的那一支。
 
 ## 留言
 
