@@ -171,16 +171,16 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0012）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0013）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
 現有表：`User`／`Album`／`Photo`／`PhotoFts`(FTS5, bigram)／`Tag`／`PhotoTag`／`Favorite`／
-`TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`。**沒有多餘的表**——
-`ShareLink`（從沒實作的分享連結）與 `TrackSegment`（拿掉的逐段交通工具）已由 0012 刪除。
+`TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`／`Comment`／`CommentNotify`。
+**沒有多餘的表**—— `ShareLink`（從沒實作的分享連結）與 `TrackSegment`（拿掉的逐段交通工具）
+已由 0012 刪除，`database/schema.sql` 裡那兩塊 `CREATE TABLE` 也一併移除了。
 
-⚠️ **`database/schema.sql` 裡還看得到那兩張表的 `CREATE TABLE`**，那是歷史起點的原貌、刻意不動。
-新環境建庫是 `schema.sql` **再套完所有 migration**，跑完就沒有它們了 —— 不要照 schema.sql 推論現況。
+新環境建庫是 `schema.sql` **再套完所有 migration**，**不要照 schema.sql 推論現況**。
 
 - `Photo.taken_at`（UTC 瞬間）／`taken_at_local`（牆上時間）／`tz_offset_minutes`，
   不變量是 **`taken_at = taken_at_local − tz`**。
@@ -190,8 +190,9 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - `LOCAL_TIME_EXPR` = `COALESCE(p.taken_at_local, …)`，用到它的 SQL **必須把 Photo 別名為 `p`**。
 - `geo_source` 權威由高而低：`manual` > `exif` > `track` > `timeline` > `segment` > `interpolated`。
 - `TrackDay.day_key` 是**不透明字串**（多身分之後還帶使用者前綴），**不要拿去解析日期**。
-- **DROP TABLE 要由子表往父表**：`Favorite→PhotoTag→TripSegment→Photo→Album→
-  TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→User`。開著外鍵時照字母序刪
+- `Comment`／`CommentNotify` 見「留言」一節。
+- **DROP TABLE 要由子表往父表**：`CommentNotify→Comment→Favorite→PhotoTag→TripSegment→
+  Photo→Album→TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→User`。開著外鍵時照字母序刪
   會 FK failed，而且是**跑到一半才炸**（`d1 execute --file` 是單一交易，會整包回滾）。
 
 ## 身分與權限
@@ -207,6 +208,25 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   （包在函式裡吃不到索引），要拆成 `uploaded_by = ?` 與 `uploaded_by IS NULL AND a.user_id = ?` 兩段。
 - `photo_count`（他的相簿裡總共幾張，含別人傳的）與 `uploaded_count`（他自己傳了幾張，
   含傳進別人相簿的）**意思完全不同**，別混。
+
+## 留言
+
+燈箱右側的留言區（`app/album/PhotoComments.tsx`）。表是 `Comment` ＋ `CommentNotify`。
+
+- **訪客留不了言，而且那不是開關** —— `Comment.user_id NOT NULL → User`，訪客沒有那一列。
+  站長後台只有「訪客能不能**看**」一格（`AppSetting.guest_can_view_comments`，預設關）。
+- 成員各自兩欄：`User.can_comment`／`can_view_comments`（預設都開）。
+  **這兩格不被 `can_manage_others` 短路**，各自獨立；只有站長永遠全開。
+- 看不到留言的人，燈箱裡**整塊不出現**（元件自己回 `null`），不是端出來再說沒權限。
+- **回覆只有一層**，後端擋（parent 必須是同一張照片上的主留言）。刪留言＝作者本人或站長，
+  硬刪、回覆走 FK CASCADE，沒有墓碑。
+- `@` 某人在內文裡存 `@[uid]`（改名後舊留言跟著更新）。**mention 一律由後端 `parseMentions()`
+  解析**，不收前端傳的名單。顯示要用的名字跟著 `GET /api/photos/:id/comments` 的 `people` 回來
+  —— 不要改叫前端去打 `/api/users/mentionable`，訪客打不到那一支。
+- 通知：`CommentNotify(comment_id, user_id, reason)` ＋ `User.notif_seen_at` **一個時間戳，
+  沒有逐則已讀**。未讀數搭 `/api/auth/me` 回來（紅點零額外請求）；fan-out 用 `INSERT OR IGNORE`
+  打 PK，語句順序 mention→reply→photo→album，同一個人只收一則、理由取最貼切的那個。
+- ⚠️ 留言那幾條路由**都不可以包 `withEdgeCache`** —— 回應裡有家人的顯示名稱。
 
 ## 儲存模型
 
