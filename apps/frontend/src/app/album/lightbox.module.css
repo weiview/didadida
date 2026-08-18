@@ -628,3 +628,72 @@ input:checked + .slider:before {
     max-height: none;
   }
 }
+
+/* ── 桌機：照片在左，黑色資訊欄在右 ────────────────────────────────────────
+ *
+ * 基礎樣式（檔案最上面）是**手機優先**的上下堆疊：`.content` 是 column、
+ * `.imageContainer` 整寬 80vh，資訊欄接在照片下面。桌機在這裡翻成兩欄。
+ *
+ * ⚠️ 這一段**必須留在檔案最後面**。上面那兩個 `max-width: 768px` 的 media
+ *    query 位置比部分基礎樣式早，把桌機規則寫進檔案前段會被後面的基礎樣式蓋掉
+ *    （`.commentReply` 踩過一次）。兩邊斷點互斥（768/769），不會互相干擾。
+ */
+@media (min-width: 769px) {
+  .content {
+    flex-direction: row;
+    /* 兩欄各自捲，外層不再整頁捲 —— 否則右欄捲到底會帶著整個燈箱一起動 */
+    overflow: hidden;
+  }
+
+  .imageContainer {
+    /* 吃掉右欄以外的所有寬度。min-width: 0 是 flex 子項的老問題：
+       不寫的話 flex-basis 會被內容（圖片）撐大，右欄就被擠出畫面 */
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
+    /* 不再是 80vh —— 兩欄之後照片區就是整個燈箱的高度。
+       寫死 100% 而不是靠 align-self: stretch，`.image` 的 max-height: 100%
+       才有明確的參照高度可以算 */
+    height: 100%;
+  }
+
+  .detailsContainer {
+    flex: 0 0 clamp(340px, 28vw, 440px);
+    /* 同上：有確定高度，overflow-y 才會真的產生捲軸而不是把欄位撐長 */
+    height: 100%;
+    overflow-y: auto;
+    /* 上下堆疊時是上邊框，並排之後改成左邊框 */
+    border-top: none;
+    border-left: 1px solid rgba(255, 255, 255, 0.06);
+    /* 關閉鈕是 position: fixed 停在右上角，正好蓋在這一欄的頂端。
+       上緣多留一段，標題才不會被壓在按鈕底下 */
+    padding: 60px 24px 32px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--accent-color) #111;
+  }
+
+  .detailsContainer::-webkit-scrollbar {
+    width: 8px;
+  }
+  .detailsContainer::-webkit-scrollbar-track {
+    background: #111;
+  }
+  .detailsContainer::-webkit-scrollbar-thumb {
+    background-color: var(--accent-color);
+    border-radius: 10px;
+  }
+
+  /* 右欄自己就是捲動區了，留言列表不要再套一層捲軸 —— 兩層捲軸疊在一起，
+     滑鼠停在留言上時捲不動外面那層，看起來像卡住 */
+  .commentList {
+    max-height: none;
+    overflow-y: visible;
+    padding-right: 0;
+  }
+
+  /* 「下一張」原本貼在畫面右緣，兩欄之後會壓在資訊欄上（正好是留言的位置）。
+     推到資訊欄左邊，跟照片區的右緣對齊 */
+  .nextButton {
+    right: calc(clamp(340px, 28vw, 440px) + 20px);
+  }
+}
