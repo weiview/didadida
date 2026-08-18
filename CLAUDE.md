@@ -42,6 +42,36 @@ database/
   schema.sql         歷史起點的基礎 schema ＋ 一堆 migrate_*.sql（**舊路徑，別再往這加**）
 ```
 
+## 後端的請求流程
+
+`src/index.ts` 沒有 router，一個 `fetch` 由上往下比對。順序是：
+
+```
+OPTIONS 直接回（快取一天）
+  → 非 TW 來源 403
+  → 進站閘門：白名單以外沒 token 一律 401 {"error":"locked"}
+  → withEdgeCache（⚠️ 閘門一定要在它前面）
+  → 一長串 if (method === … && pathname === …)
+```
+
+閘門白名單只有兩類，**不要隨手加第三類**：換 token 的入口
+（`/api/verify-password`、`/api/verify-guest`、`/api/auth/me`、`/api/auth/google/*`），
+以及圖片（`/api/photos/view/*`、`/api/photos/:id/full`）—— 圖片是 `<img src>`，
+瀏覽器不會幫忙帶 Authorization，而 R2 的物件鍵要先拿到（鎖著的）相簿 JSON 才知道。
+**新路由預設就是關的**，這是刻意的。
+
+身分用 `currentActor(request, env)` 拿，它有 `WeakMap<Request>` 快取 ——
+同一個請求裡問幾次都只查一次 D1，**不要自己再 `SELECT … FROM User`**，那是白花讀取額度。
+
+### 已移除、不要再呼叫
+
+| 沒了的 | 改用 |
+|---|---|
+| `GET /api/tracks/drive/shared-folders` | `POST /api/tracks/drive/sync-folders`（照信箱自動綁，不再人工挑） |
+| `GET/PUT /api/tracks/segments` | 沒有替代品，逐段交通工具整個功能拿掉了 |
+| `ADMIN_EMAILS` 環境變數 | D1 的 `User` 表 |
+| `GOOGLE_PICKER_API_KEY` | Picker 那條路已移除，程式不再讀它 |
+
 ## 三個環境
 
 | | 本機 | dev | prod |
@@ -145,12 +175,21 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
-現有表：`User`／`Album`／`Photo`／`PhotoFts`(FTS5)／`Tag`／`PhotoTag`／`Favorite`／
-`TripSegment`／`TrackDay`／`TrackPoint`／`TrackSegment`／`AppSetting`／`DriveTrash`／
-`ShareLink`（**只有表，程式完全沒實作**）。
+活著的表：`User`／`Album`／`Photo`／`PhotoFts`(FTS5, bigram)／`Tag`／`PhotoTag`／`Favorite`／
+`TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`。
+
+**兩張死表，看到不要以為有功能**（表還在，但程式一行都沒讀寫，別照著它們推論行為）：
+
+| 死表 | 狀況 |
+|---|---|
+| `ShareLink` | `index.ts` 出現 **0 次**。分享連結從來沒實作過 |
+| `TrackSegment` | 只剩一句講 CASCADE 的註解提到它。逐段交通工具那條路連同 `GET/PUT /api/tracks/segments` 一起拿掉了 |
 
 - `Photo.taken_at`（UTC 瞬間）／`taken_at_local`（牆上時間）／`tz_offset_minutes`，
   不變量是 **`taken_at = taken_at_local − tz`**。
+- `Photo` 除了基本欄位還有：`drive_file_id`／`drive_original_id`（Drive 上的 4K 與原始檔）、
+  `thumb_url`／`thumb_sm_url`（R2 的 800／400 WebP）、`uploaded_by`（誰傳的，見「身分與權限」）、
+  `file_hash`／`phash`（去重）、`shuffle_key`（隨機排序用的固定亂數）。
 - `LOCAL_TIME_EXPR` = `COALESCE(p.taken_at_local, …)`，用到它的 SQL **必須把 Photo 別名為 `p`**。
 - `geo_source` 權威由高而低：`manual` > `exif` > `track` > `timeline` > `segment` > `interpolated`。
 - `TrackDay.day_key` 是**不透明字串**（多身分之後還帶使用者前綴），**不要拿去解析日期**。
@@ -181,7 +220,18 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   ⚠️ `findOwnFolder` **照名字找**，Drive 裡留著同名舊資料夾會被直接接管。
 - GPS 軌跡：家人把自己的 GPSLogger 資料夾分享給 service account，`/admin` 按「掃描並自動綁定」，
   後端用**資料夾擁有者信箱對 `User.email`** 自動綁（`POST /api/tracks/drive/sync-folders`）。
-  對不到不會清掉現有綁定；對到 2 個以上不猜。原始 GPX 存 R2 不進 D1。
+  對不到不會清掉現有綁定；對到 2 個以上不猜。
+
+**大塊的東西一律進 R2，不進 D1**（超過 D1 單列上限就直接寫不進去，而且會拖慢每次列表查詢）：
+
+| R2 key | 是什麼 |
+|---|---|
+| `tracks/<day_key>.gpx` | GPSLogger 的原始 GPX。`TrackDay.raw_key` 指過來，NULL＝沒留存＝沒有「還原原始軌跡」按鈕 |
+| `tracks/<day_key>.matched.json` | Valhalla 貼路後的形狀（`POST /api/tracks/match`） |
+| timeline index／month | **Google 時間軸＝唯讀紀念層**，`GET/PUT /api/timeline/index`、`/api/timeline/month/:m`。
+  刻意只存 R2、**完全不進 D1**，也不參與 `geo_source` 那套權威排序 |
+
+⚠️ Google 時間軸的原始檔**在瀏覽器裡解析完才上傳結果**（`lib/googleTimeline.ts`），原始檔不經過後端。
 
 ## 一進來就該知道的坑
 
@@ -194,7 +244,9 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 5. 路由靠 `pathname.split("/").length` 分辨，**新增巢狀路徑前先算長度**（`/api/photos/1/geo` 是 5，不撞 4）。
 6. `core.autocrlf=true` 且無 `.gitattributes` → 行尾混用（`index.ts`/`api.ts`/`FootprintMap.tsx` 是 CRLF，
    `gpx.ts`/`map/page.tsx`/`schema.sql` 是 LF）。**純外觀，不要順手統一**，會炸出整檔 diff。
-7. **`functions/_middleware.ts` 會把非台灣來源擋成 403** —— 從國外（含大多數雲端 runner）測站會以為壞掉。
+7. **非台灣來源會被擋成 403，而且有兩道**：前端 `functions/_middleware.ts`、後端 `index.ts`
+   （看 `cf.country`，放行 `TW`/`XX`/`T1`）。從國外或雲端 runner 測會以為整站壞了。
+   關掉一道沒用，兩道都要處理。
 8. `lib/gpx.ts` 管線順序不可顛倒：`collapseStays`（60m／300s）→ `simplifyTrack`（Douglas-Peucker 5m，上限 8000 點）。
 9. FootprintMap 的 emoji 一律 canvas → `addImage`，**不可進 `text-field`**（底圖 SDF 字型沒有 emoji 字符）。
 10. `apps/backend/` 根目錄躺著幾十個 `check_*.sql` / `print_*.js` 之類的一次性查詢腳本，
