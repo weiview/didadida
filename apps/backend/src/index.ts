@@ -1642,8 +1642,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
            * 5b. GPS 軌跡。跟相簿同一套語意：勾了就連 R2 上的原始 GPX
            *     與貼路結果一起清，沒勾就在下一步改掛站長。
            *
-           *     TrackPoint / TrackSegment 有 ON DELETE CASCADE，刪 TrackDay
-           *     會一起帶走；但 **R2 的物件沒有外鍵**，不在這裡清就永遠是孤兒
+           *     TrackPoint 有 ON DELETE CASCADE，刪 TrackDay 會一起帶走；
+           *     但 **R2 的物件沒有外鍵**，不在這裡清就永遠是孤兒
            *     （key 由 day_key 推得，列一刪就再也算不出來）。
            */
           let deletedTrackDays = 0;
