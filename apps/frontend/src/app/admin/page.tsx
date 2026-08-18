@@ -139,7 +139,7 @@ export default function AdminPage() {
     body: {
       can_manage_others?: boolean; active?: boolean;
       can_add_to_others?: boolean; can_reorder_others?: boolean;
-      can_comment?: boolean; can_view_comments?: boolean;
+      can_comment?: boolean; can_view_comments?: boolean; can_view_map?: boolean;
     },
   ) => {
     setBusyId(user.id);
@@ -559,6 +559,26 @@ export default function AdminPage() {
                       onChange={(e) => patch(user, { can_comment: e.target.checked })}
                     />
                     可留言
+                  </label>
+
+                  {/*
+                    * 足跡也是同一類的獨立開關（`can_view_map`，見 migrations/0014）。
+                    * 關掉的人首頁不會出現地圖入口，直接打網址會看到「找不到這一頁」，
+                    * 後端所有軌跡路由也一律 403 —— 不是只把畫面藏起來。
+                    *
+                    * 訪客那一層是上面的全站開關（guest_can_view_map），兩者互不相干。
+                    */}
+                  <label
+                    className={styles.checkbox}
+                    title="關掉之後他看不到足跡地圖（連自己的軌跡也看不到），首頁不會出現地圖入口"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={owner || user.can_view_map === 1}
+                      disabled={owner || busy || user.active !== 1}
+                      onChange={(e) => patch(user, { can_view_map: e.target.checked })}
+                    />
+                    可看足跡
                   </label>
 
                   {!owner && user.active !== 1 && (

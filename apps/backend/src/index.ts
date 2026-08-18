@@ -284,6 +284,13 @@ interface Actor {
   /** 看得到留言。預設開。關掉的人燈箱裡整塊留言區都不會出現，理由同上不短路 */
   canViewComments: boolean;
   /**
+   * 看得到足跡地圖（照片座標＋家人的 GPS 軌跡）。預設開（見 migrations/0014）。
+   *
+   * 一樣**不受 canManageOthers 短路** —— 管不管得動別人的相簿，跟該不該看到
+   * 家人「誰什麼時候在哪裡」的連續紀錄是兩回事。只有站長永遠是開的。
+   */
+  canViewMap: boolean;
+  /**
    * 他自己那個 GPSLogger Drive 資料夾（見 migrations/0009）。
    * 跟著 Actor 一起帶出來是因為它就在同一列上 —— 另外查一次是白花讀取額度。
    */
@@ -326,7 +333,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
         uid: owner.id, email: owner.email, name: owner.name,
         isOwner: true, canManageOthers: true,
         canAddToOthers: true, canReorderOthers: true,
-        canComment: true, canViewComments: true,
+        canComment: true, canViewComments: true, canViewMap: true,
         trackFolderId: owner.track_drive_folder_id ?? null,
         trackColor: trackColorFor(owner.id, owner.track_color),
       };
@@ -335,14 +342,14 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
       uid: null, email: identity.email, name: null,
       isOwner: true, canManageOthers: true,
       canAddToOthers: true, canReorderOthers: true,
-      canComment: true, canViewComments: true, trackFolderId: null,
+      canComment: true, canViewComments: true, canViewMap: true, trackFolderId: null,
       trackColor: trackColorFor(null, null),
     };
   }
 
   const row = await env.DB.prepare(
     `SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others,
-            can_comment, can_view_comments, notif_seen_at,
+            can_comment, can_view_comments, can_view_map, notif_seen_at,
             active, track_color, track_drive_folder_id
        FROM User WHERE id = ?`
   ).bind(identity.uid).first<any>();
@@ -365,6 +372,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
     // 站長自己是例外 —— 他要看得到、也要講得了話，不然沒人管得動留言區
     canComment: isOwner || Number(row.can_comment) === 1,
     canViewComments: isOwner || Number(row.can_view_comments) === 1,
+    canViewMap: isOwner || Number(row.can_view_map) === 1,
     trackFolderId: row.track_drive_folder_id ?? null,
     trackColor: trackColorFor(row.id, row.track_color),
   };
@@ -743,6 +751,26 @@ async function getSettingCached(env: Env, key: string): Promise<string | null> {
 /** 訪客看不看得到足跡地圖。沒設定過＝關 */
 async function guestCanViewMap(env: Env): Promise<boolean> {
   return (await getSettingCached(env, SETTING_GUEST_MAP)) === "1";
+}
+
+/**
+ * 足跡相關路由的共同守門。回 `null` ＝放行，回 Response ＝直接把它送出去。
+ *
+ * ⚠️ **軌跡不吃 guest_can_view_map**：那個全站開關管的是 `/api/footprint`
+ *    （照片落點），GPS 軌跡是連續的行蹤紀錄，敏感度差一級，一律限成員。
+ *    所以這裡是「先要是成員（401），再看他那一欄（403）」兩段。
+ *
+ * currentActor 有 WeakMap 快取，同一個請求裡叫幾次都只查一次 D1。
+ */
+async function guardTrackAccess(
+  request: Request, env: Env, headers: Record<string, string>,
+): Promise<Response | null> {
+  const actor = await currentActor(request, env);
+  if (!actor) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+  }
+  if (!actor.canViewMap) return forbidden(headers, "站長沒有開放你瀏覽足跡地圖");
+  return null;
 }
 
 async function guestCanViewComments(env: Env): Promise<boolean> {
@@ -1158,8 +1186,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
         // 管理員才查 D1（也才有東西可查）。訪客走這裡是每次進站都會發生的事，
         // 多一次讀取乘上每個家人的每次重整，不值得
         const actor = identity.role === 'admin' ? await currentActor(request, env) : null;
-        // 足跡地圖對訪客開不開。管理員一律看得到，不必問設定
-        const canViewMap = actor !== null || await guestCanViewMap(env);
+        // 足跡地圖看不看得到：成員照自己那一欄（0014），訪客看站長的全站開關
+        const canViewMap = actor !== null ? actor.canViewMap : await guestCanViewMap(env);
         /*
          * 留言看不看得到：成員照自己那一欄，訪客看站長的全站開關。
          *
@@ -1195,6 +1223,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             can_reorder_others: actor.canReorderOthers ? 1 : 0,
             can_comment: actor.canComment ? 1 : 0,
             can_view_comments: actor.canViewComments ? 1 : 0,
+            can_view_map: actor.canViewMap ? 1 : 0,
             track_color: actor.trackColor,
           } : null,
         }), { headers });
@@ -1367,7 +1396,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           const { results } = await env.DB.prepare(`
             SELECT u.id, u.name, u.email, u.role,
                    u.can_manage_others, u.can_add_to_others, u.can_reorder_others,
-                   u.can_comment, u.can_view_comments, u.active,
+                   u.can_comment, u.can_view_comments, u.can_view_map, u.active,
                    u.last_login_at, u.created_at,
                    u.track_color, u.track_drive_folder_id,
                    (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
@@ -1804,7 +1833,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             const body: {
               name?: string; can_manage_others?: any; active?: any;
               can_add_to_others?: any; can_reorder_others?: any;
-              can_comment?: any; can_view_comments?: any;
+              can_comment?: any; can_view_comments?: any; can_view_map?: any;
             } = await request.json();
             const sets: string[] = [];
             const binds: any[] = [];
@@ -1829,7 +1858,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
               sets.push("can_reorder_others = ?"); binds.push(body.can_reorder_others ? 1 : 0);
             }
             /*
-             * 留言那兩欄跟上面兩欄不同：**「可管理全站」不會蓋過它們**
+             * 留言那兩欄與足跡那一欄跟上面兩欄不同：**「可管理全站」不會蓋過它們**
              * （見 Actor 的註解）。所以這裡沒有「勾了全站就別管細項」那種關係，
              * 站長勾什麼就是什麼。
              */
@@ -1839,6 +1868,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
             if (body.can_view_comments !== undefined) {
               sets.push("can_view_comments = ?"); binds.push(body.can_view_comments ? 1 : 0);
             }
+            if (body.can_view_map !== undefined) {
+              sets.push("can_view_map = ?"); binds.push(body.can_view_map ? 1 : 0);
+            }
             if (body.active !== undefined) {
               sets.push("active = ?"); binds.push(body.active ? 1 : 0);
             }
@@ -1846,7 +1878,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
               return new Response(JSON.stringify({ error: "沒有要改的東西" }), { status: 400, headers });
             }
             await env.DB.prepare(`UPDATE User SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, targetId).run();
-            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, can_comment, can_view_comments, active FROM User WHERE id = ?")
+            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, can_comment, can_view_comments, can_view_map, active FROM User WHERE id = ?")
               .bind(targetId).first();
             return new Response(JSON.stringify({ success: true, user: row }), { headers });
           }
@@ -3991,13 +4023,18 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 時間篩選一律用當地牆上時間 —— 使用者說「3/1 我在京都」指的是當地時間。
       // 舊資料若無 taken_at_local，由 LOCAL_TIME_EXPR 從 taken_at 加時區推回來再比對。
       if (method === "GET" && pathname === "/api/footprint") {
-        const isAdmin = await isAuthorized(request, env);
+        const actor = await currentActor(request, env);
+        const isAdmin = actor !== null;
         /*
-         * 訪客要看足跡得站長先開。**這一關必須擋在 withEdgeCache 前面** ——
-         * 進到裡面就可能直接命中先前存下的 200，開關關掉也照樣把座標端出去。
+         * 誰看得到：成員照自己的 can_view_map（0014），訪客看站長的全站開關。
+         *
+         * **這一關必須擋在 withEdgeCache 前面** —— 進到裡面就可能直接命中
+         * 先前存下的 200，開關關掉也照樣把座標端出去。
          */
-        if (!isAdmin && !(await guestCanViewMap(env))) {
-          return forbidden(headers, "站長沒有開放訪客瀏覽足跡地圖");
+        if (actor ? !actor.canViewMap : !(await guestCanViewMap(env))) {
+          return forbidden(headers, actor
+            ? "站長沒有開放你瀏覽足跡地圖"
+            : "站長沒有開放訪客瀏覽足跡地圖");
         }
         // 這條的隱私過濾是寫在 SQL 的 WHERE 裡（不是 applyGeoPrivacy），但結果同樣
         // 依身分而異，一樣不能讓管理員的版本落進共用的邊緣快取
@@ -4581,10 +4618,10 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：列出 Drive 上的 GPX 檔與各自的同步狀態
       // 會暴露檔名（＝出門的日期），僅管理者可讀
       if (method === "GET" && pathname === "/api/tracks/drive/files") {
-        const viewer = await currentActor(request, env);
-        if (!viewer) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
+        // guardTrackAccess 已經擋掉 null，這裡是 WeakMap 快取命中，不會再查一次 D1
+        const viewer = (await currentActor(request, env)) as Actor;
         if (!env.GOOGLE_DRIVE_SA_KEY) {
           return new Response(JSON.stringify({
             error: "尚未設定 GOOGLE_DRIVE_SA_KEY",
@@ -4739,9 +4776,8 @@ function hammingDistance(hex1: string, hex2: string): number {
 
       // 路由：代理單一 GPX 檔的原始 bytes 給前端解析
       if (method === "GET" && pathname.startsWith("/api/tracks/drive/file/")) {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         if (!env.GOOGLE_DRIVE_SA_KEY) {
           return new Response(JSON.stringify({ error: "尚未設定 GOOGLE_DRIVE_SA_KEY" }), { status: 503, headers });
         }
@@ -4762,9 +4798,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 跟那條的差別：這裡問的是「D1 裡有什麼」，不需要 Drive 設定，
       // 所以就算 Drive 壞了或檔案被清掉，還原介面仍然打得開。
       if (method === "GET" && pathname === "/api/tracks/days") {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         // drive_file_id / md5 也一起給：還原是走 ingest，而 ingest 會把這兩欄
         // 整個覆蓋掉，前端得原封不動送回來，否則下次同步會誤判成「檔案有變」
         // first_local_day / last_local_day：這批軌跡點實際落在哪一天（當地）。
@@ -4799,9 +4834,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：讀回某一天的原始 GPX（給「恢復原始軌跡」用）
       // 原文就是完整的一日行蹤，比軌跡點更敏感，只給管理者
       if (method === "GET" && pathname.startsWith("/api/tracks/raw/")) {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const dayKey = decodeURIComponent(pathname.slice("/api/tracks/raw/".length));
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
@@ -4835,6 +4869,8 @@ function hammingDistance(hex1: string, hex2: string): number {
          * 這正好符合真實流程 —— 前端一律是 ingest 成功之後才呼叫這支。
          * 反過來讓它先建檔的話，等於任何成員都能往別人未來的 day_key 塞內容。
          */
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         if (!(await canTouchTrackDay(dayKey))) {
           return forbidden(headers, "這一天的軌跡不是你的，或還沒有同步過");
         }
@@ -4867,9 +4903,8 @@ function hammingDistance(hex1: string, hex2: string): number {
        * 速率限制（每秒 1 次）由前端負責排隊 —— 那裡才知道總共要跑幾段。
        */
       if (method === "POST" && pathname === "/api/tracks/match") {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         if (!env.VALHALLA_URL) {
           return new Response(JSON.stringify({
             error: "尚未設定 VALHALLA_URL，軌跡貼路功能未啟用",
@@ -4944,9 +4979,8 @@ function hammingDistance(hex1: string, hex2: string): number {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
         }
         // 軌跡一律要登入，貼路結果也是 —— 它就是從那些點推出來的
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const object = await env.BUCKET.get(matchedKey(dayKey));
         if (!object) {
           return new Response(JSON.stringify({ error: "這一天還沒有貼路軌跡" }), { status: 404, headers });
@@ -4957,9 +4991,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       }
 
       if (method === "PUT" && pathname.startsWith("/api/tracks/matched/")) {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const dayKey = decodeURIComponent(pathname.slice("/api/tracks/matched/".length));
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
@@ -4979,9 +5012,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       }
 
       if (method === "DELETE" && pathname.startsWith("/api/tracks/matched/")) {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const dayKey = decodeURIComponent(pathname.slice("/api/tracks/matched/".length));
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
@@ -4996,6 +5028,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：寫入解析後的軌跡點
       // 冪等：同一個 day_key 重灌就是整批換掉，所以重複同步不會長出重複的點
       if (method === "POST" && pathname === "/api/tracks/ingest") {
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const body: any = await request.json().catch(() => ({}));
         const requestedKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
         if (!requestedKey) {
@@ -5105,9 +5139,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       // TrackDay.is_private 因此不再影響對外可見性（欄位留著，只當管理端的標記）。
       // 擋在這裡而不是前端不畫 —— 後者按 F12 就能從 JSON 看到經緯度。
       if (method === "GET" && pathname === "/api/tracks") {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const conds: string[] = [];
         const binds: any[] = [];
 
@@ -5158,6 +5191,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 兩個點（進入、離開）」，跟匯入時的停留點濃縮產生的形狀完全一樣。
       // 質心與時間由前端算好送過來 —— Worker 只做 I/O，跟 GPX 解析放在瀏覽器同一個理由。
       if (method === "POST" && pathname === "/api/tracks/points/edit") {
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const body: any = await request.json().catch(() => ({}));
         const dayKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
         if (!dayKey) {
@@ -5245,9 +5280,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       };
 
       if (method === "GET" && pathname === "/api/timeline/index") {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const uid = await timelineViewerUid();
         if (uid === undefined) {
           return new Response(JSON.stringify({ error: "user_id 必須是正整數" }), { status: 400, headers });
@@ -5263,9 +5297,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       }
 
       if (method === "PUT" && pathname === "/api/timeline/index") {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const body: any = await request.json().catch(() => null);
         if (!body || !Array.isArray(body.months)) {
           return new Response(JSON.stringify({ error: "months 必須是陣列" }), { status: 400, headers });
@@ -5289,9 +5322,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       }
 
       if (method === "GET" && pathname.startsWith("/api/timeline/month/")) {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const month = pathname.slice("/api/timeline/month/".length);
         if (!TIMELINE_MONTH_RE.test(month)) {
           return new Response(JSON.stringify({ error: "月份格式必須是 YYYY-MM" }), { status: 400, headers });
@@ -5315,9 +5347,8 @@ function hammingDistance(hex1: string, hex2: string): number {
        * 重上傳就是同一個 key 再 put 一次。
        */
       if (method === "PUT" && pathname.startsWith("/api/timeline/month/")) {
-        if (!(await isAuthorized(request, env))) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
+        const denied = await guardTrackAccess(request, env, headers);
+        if (denied) return denied;
         const month = pathname.slice("/api/timeline/month/".length);
         if (!TIMELINE_MONTH_RE.test(month)) {
           return new Response(JSON.stringify({ error: "月份格式必須是 YYYY-MM" }), { status: 400, headers });
