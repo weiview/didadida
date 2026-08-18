@@ -3,7 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useAdmin } from "@/lib/useAdmin";
-import { fetchTrackMembers, type TrackMember } from "@/lib/api";
+import {
+  fetchNotifications, fetchTrackMembers,
+  type NotificationItem, type TrackMember,
+} from "@/lib/api";
 import { TRACK_PALETTE } from "@/lib/trackColors";
 
 /**
@@ -27,6 +30,7 @@ const BADGE = 40;
 export default function AccountBadge() {
   const {
     isAdmin, isGuest, checking, user, isOwner, canManageOthers,
+    canViewComments, unreadNotifications, markNotificationsRead,
     renameSelf, recolorSelf, logout,
   } = useAdmin();
 
@@ -46,13 +50,42 @@ export default function AccountBadge() {
   const [members, setMembers] = useState<TrackMember[] | null>(null);
   // 正在存的那個顏色。整排一起鎖住，不然連點兩下會有兩個請求互相覆蓋
   const [savingColor, setSavingColor] = useState<string | null>(null);
+  /*
+   * 通知。**沒有另外做一顆鈴鐺** —— 右上角這顆圓鈕已經是全站唯一的個人角落，
+   * 再擺一個浮動按鈕只會跟 FAB／回到頂端那疊搶位置（見 cornerStack.ts）。
+   * 未讀數量畫成圓鈕上的紅點，內容就掛在這張卡裡。
+   *
+   * null ＝ 這次還沒問過。跟顏色那份不同的是**每次點開都重問**：
+   * 未讀通知的重點就是新，快取一份舊的沒有意義。
+   */
+  const [notifs, setNotifs] = useState<NotificationItem[] | null>(null);
 
   // 面板收起來時把改名的狀態一起重置，下次點開不會停在上次的半途
   useEffect(() => {
     if (open) return;
     setEditing(false);
     setError(null);
+    setNotifs(null);
   }, [open]);
+
+  /*
+   * 點開就抓通知，順手全部標成已讀（後端只有一個時間戳，沒有逐則已讀）。
+   *
+   * 標已讀排在抓完之後：`unread` 旗標是抓下來那一刻的快照，先標的話這一次
+   * 打開會看到一片「都已讀」，使用者根本不知道哪幾則是新的。
+   */
+  useEffect(() => {
+    if (!open || !isAdmin || !canViewComments || user?.id == null) return;
+    let alive = true;
+    fetchNotifications().then(({ items }) => {
+      if (!alive) return;
+      setNotifs(items);
+      if (unreadNotifications > 0) markNotificationsRead();
+    });
+    return () => { alive = false; };
+    // unreadNotifications 刻意不進相依：標成已讀會把它歸零，進去就會再跑一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, isAdmin, canViewComments, user?.id]);
 
   useEffect(() => {
     if (editing) inputRef.current?.focus();
@@ -178,9 +211,28 @@ export default function AccountBadge() {
             fontSize: "1rem",
             fontWeight: 600,
             pointerEvents: "auto",
+            position: "relative",
           }}
         >
           {initial}
+          {/* 未讀紅點。**不寫數字**：家裡幾個人的留言不會多到需要計數，
+              一顆點就足夠說「有新的東西」，也不會把 40px 的圓鈕塞爆 */}
+          {unreadNotifications > 0 && (
+            <span
+              aria-label={`有 ${unreadNotifications} 則新通知`}
+              style={{
+                position: "absolute",
+                top: 1,
+                right: 1,
+                width: 10,
+                height: 10,
+                borderRadius: "50%",
+                background: "#e53e3e",
+                border: "2px solid rgba(255, 255, 255, 0.9)",
+                boxSizing: "content-box",
+              }}
+            />
+          )}
         </button>
 
         <div
@@ -235,6 +287,25 @@ export default function AccountBadge() {
               )}
               {roleLabel && (
                 <div style={{ fontSize: 12, opacity: 0.75, marginTop: 8 }}>{roleLabel}</div>
+              )}
+
+              {/* 通知。看得到留言才看得到通知 —— 被關掉留言權限的人收到一則
+                  「有人回覆你」卻點不進去看，只是白白讓人著急 */}
+              {isAdmin && canViewComments && user?.id != null && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>通知</div>
+                  {notifs === null ? (
+                    <div style={{ fontSize: 12, opacity: 0.55 }}>載入中…</div>
+                  ) : notifs.length === 0 ? (
+                    <div style={{ fontSize: 12, opacity: 0.55 }}>還沒有通知</div>
+                  ) : (
+                    <div style={{ maxHeight: 240, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
+                      {notifs.map((n) => (
+                        <NotificationRow key={n.comment_id} item={n} onGo={() => setOpen(false)} />
+                      ))}
+                    </div>
+                  )}
+                </div>
               )}
 
               {/* 沒有帳號列的管理員（舊 token 或密碼登入時站長列不見了）改不了名字，
@@ -322,6 +393,76 @@ export default function AccountBadge() {
     </>
   );
 }
+
+/** 通知的一行。整行是連結，點下去開到那張照片的燈箱 */
+function NotificationRow({ item, onGo }: { item: NotificationItem; onGo: () => void }) {
+  const who = item.actor_name || "有人";
+  const what = REASON_TEXT[item.reason] ?? "留言了";
+  /*
+   * 預覽裡不留 `@[uid]` 這種原始標記 —— 這裡沒有名字對照表（那要另外打一支
+   * /users/mentionable），而理由那一行本來就已經講了「提到了你」，
+   * 標記留著只是雜訊。直接拿掉。
+   */
+  const preview = item.body.replace(/@\[\d+\]\s*/g, "").trim();
+
+  const inner = (
+    <>
+      {item.thumb ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={item.thumb} alt="" width={34} height={34}
+             style={{ borderRadius: 6, objectFit: "cover", flexShrink: 0 }} />
+      ) : (
+        <span style={{
+          width: 34, height: 34, borderRadius: 6, flexShrink: 0,
+          background: item.color, display: "inline-block",
+        }} />
+      )}
+      <span style={{ minWidth: 0 }}>
+        <span style={{ fontSize: 12, lineHeight: 1.5, display: "block" }}>
+          <strong style={{ fontWeight: 600 }}>{who}</strong> {what}
+        </span>
+        {preview && (
+          <span style={{
+            fontSize: 12, opacity: 0.6, lineHeight: 1.5, display: "block",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          }}>
+            {preview}
+          </span>
+        )}
+      </span>
+    </>
+  );
+
+  const style: React.CSSProperties = {
+    display: "flex",
+    gap: 8,
+    alignItems: "center",
+    padding: "6px 8px",
+    borderRadius: 10,
+    textDecoration: "none",
+    color: "inherit",
+    // 未讀那幾則墊一層底色。旗標是「抓下來那一刻」的快照，
+    // 標成已讀之後這一次打開還是看得出哪些是新的
+    background: item.unread ? "rgba(var(--glass-tint-accent), 0.55)" : "transparent",
+  };
+
+  // 相簿被刪掉了就沒地方可去。整行照樣顯示（通知本來就可能比內容活得久），
+  // 只是不做成連結
+  if (item.album_id == null) return <div style={{ ...style, opacity: 0.6 }}>{inner}</div>;
+
+  return (
+    <Link href={`/album?id=${item.album_id}&photo=${item.photo_id}`} onClick={onGo} style={style}>
+      {inner}
+    </Link>
+  );
+}
+
+const REASON_TEXT: Record<string, string> = {
+  mention: "提到了你",
+  reply: "回覆了你的留言",
+  photo: "在你傳的照片下留言",
+  album: "在你的相簿裡留言",
+};
 
 const plainBtn: React.CSSProperties = {
   padding: "8px 12px",

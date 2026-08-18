@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import styles from "./lightbox.module.css";
+import PhotoComments from "./PhotoComments";
 import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc } from "@/lib/api";
 import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
@@ -78,11 +79,27 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
       else if (e.key === "ArrowRight" && hasNext && onNext) onNext();
     };
 
-    window.addEventListener("keydown", handleKeyDown);
+    /*
+     * 在輸入框裡打字時左右鍵是移動游標，不是換照片。滾輪那邊本來就有這個防護
+     * （handleWheel），鍵盤這邊漏了 —— 留言框進來之後這件事會天天發生：
+     * 打錯字想按左鍵回去改，結果整張照片換掉、打到一半的留言也沒了。
+     */
+    const guarded = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === "TEXTAREA" || tag === "INPUT" || el?.isContentEditable) {
+        // Esc 仍然要能關掉燈箱，但在輸入框裡先讓它把焦點吐出來就好
+        if (e.key === "Escape") (el as HTMLElement).blur();
+        return;
+      }
+      handleKeyDown(e);
+    };
+
+    window.addEventListener("keydown", guarded);
 
     return () => {
       document.body.style.overflow = originalStyle;
-      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keydown", guarded);
     };
   }, [hasPrev, hasNext, onPrev, onNext, onClose]);
 
@@ -320,6 +337,10 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               <span className={styles.exifValue}>{photo.place_name || '尚未指定地點'}</span>
             </div>
           )}
+
+          {/* 留言。看不看得到、留不留得了都在元件裡自己判斷（沒權限就整塊不出現），
+              所以這裡不必再包一層條件 */}
+          <PhotoComments photoId={photo.id} />
 
           <div className={styles.exifToggleRow}>
             <div className={styles.switchWrapper}>

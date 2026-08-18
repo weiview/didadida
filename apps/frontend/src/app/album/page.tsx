@@ -288,6 +288,31 @@ function AlbumContent() {
     });
   }, [photos, searchQuery, selectedTags, sortBy]);
 
+  /**
+   * `?photo=<id>` 直接開燈箱。通知列表點過來的就是這種網址。
+   *
+   * 只認一次（`deepLinkDone`）：這串要等照片載完才有得找，而 displayPhotos
+   * 會隨篩選與排序一直變 —— 不記一筆的話，使用者關掉燈箱、改個排序，
+   * 它就會自己再跳出來。
+   *
+   * 找不到（照片被刪了、或不在這本相簿裡）就什麼都不做，不要跳錯誤 ——
+   * 通知本來就可能比內容活得久。
+   */
+  const deepLinkDone = useRef(false);
+  useEffect(() => {
+    if (deepLinkDone.current || loading || displayPhotos.length === 0) return;
+    const want = Number(searchParams.get("photo"));
+    if (!Number.isFinite(want) || want <= 0) return;
+    deepLinkDone.current = true;
+    const index = displayPhotos.findIndex((p) => p.id === want);
+    if (index >= 0) {
+      // 燈箱吃的是 displayPhotos 的索引，所以那一張也得在「已載入」的範圍內，
+      // 否則往前翻幾張就撞到還沒 render 的區段
+      setVisibleCount((prev) => Math.max(prev, index + 12));
+      setSelectedPhotoIndex(index);
+    }
+  }, [loading, displayPhotos, searchParams]);
+
   // 整理時間軸標籤列表 (依年月或年份分類)
   const timelineGroup = useMemo(() => {
     if (displayPhotos.length === 0) return [];
