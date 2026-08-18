@@ -145,17 +145,7 @@ CREATE INDEX IF NOT EXISTS idx_trackpoint_day ON TrackPoint(day_key, t_utc);
 CREATE INDEX IF NOT EXISTS idx_trackpoint_time ON TrackPoint(t_utc);
 CREATE INDEX IF NOT EXISTS idx_trackday_user ON TrackDay(user_id);
 
--- TrackSegment Table：每一段軌跡的交通工具。段的身分是 (day_key, seg)。
--- 不放進 TrackPoint 會讓同一個值重複幾千列；不放進 TrackDay 是因為
--- 一天之內可以先走路再搭車。沒有列 = 沒指定，前端依速度猜。
-CREATE TABLE IF NOT EXISTS TrackSegment (
-  day_key TEXT NOT NULL,
-  seg INTEGER NOT NULL,
-  -- 'walk' | 'bike' | 'motorbike' | 'car' | 'bus' | 'train' | 'plane' | 'boat'
-  vehicle TEXT,
-  PRIMARY KEY (day_key, seg),
-  FOREIGN KEY (day_key) REFERENCES TrackDay(day_key) ON DELETE CASCADE
-);
+-- （TrackSegment 逐段交通工具已由 migration 0012 刪除，這裡不再建）
 
 -- Tag Table
 CREATE TABLE IF NOT EXISTS Tag (
@@ -172,15 +162,7 @@ CREATE TABLE IF NOT EXISTS PhotoTag (
   FOREIGN KEY (tag_id) REFERENCES Tag(id) ON DELETE CASCADE
 );
 
--- ShareLink Table
-CREATE TABLE IF NOT EXISTS ShareLink (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  album_id INTEGER NOT NULL,
-  token TEXT UNIQUE NOT NULL,
-  expires_at DATETIME,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (album_id) REFERENCES Album(id) ON DELETE CASCADE
-);
+-- （ShareLink 分享連結從沒實作過，已由 migration 0012 刪除，這裡不再建）
 
 -- Favorite Table
 CREATE TABLE IF NOT EXISTS Favorite (
