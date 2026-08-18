@@ -3,7 +3,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
   AuthState, CurrentUser, checkAuth, consumeAuthHash, googleLoginUrl,
-  logout as clearTokens, updateMyName, updateMyTrackColor, verifyGuest, verifyLogin,
+  logout as clearTokens, markNotificationsSeen, updateMyName, updateMyTrackColor,
+  verifyGuest, verifyLogin,
 } from './api';
 
 /**
@@ -41,6 +42,20 @@ interface AuthValue {
    * 沒有就不端出首頁那個連結，`/map` 本身也會擋（後端 403，這裡只是不讓人白跑）。
    */
   canViewMap: boolean;
+  /**
+   * 看不看得到留言。成員照自己那一欄，訪客要站長在後台開了才有（預設關）。
+   * false 時燈箱裡**整塊留言區都不出現** —— 不是端出來再說「你沒權限」。
+   */
+  canViewComments: boolean;
+  /** 留得了言嗎。訪客永遠 false（資料模型上就沒有訪客這個作者） */
+  canComment: boolean;
+  /** 右上角紅點上的數字。跟著 /auth/me 一起回來，不另外打一支 */
+  unreadNotifications: number;
+  /**
+   * 把通知全部標成已讀（後端只有一個時間戳，沒有逐則已讀）。
+   * 成功就順手把 unreadNotifications 歸零，不必等下一次 /auth/me。
+   */
+  markNotificationsRead: () => Promise<void>;
   /**
    * 這本相簿／這張照片是不是「我的」，也就是畫面上該不該出現編輯與刪除。
    *
@@ -84,7 +99,10 @@ interface AuthValue {
 const AuthContext = createContext<AuthValue | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [state, setState] = useState<AuthState>({ admin: false, guest: false, canViewMap: false, user: null });
+  const [state, setState] = useState<AuthState>({
+    admin: false, guest: false, canViewMap: false,
+    canViewComments: false, canComment: false, unreadNotifications: 0, user: null,
+  });
   const [checking, setChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
 
@@ -101,7 +119,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
      * 先樂觀把 admin 設成 true 讓畫面立刻可用，帳號資料隨後補上。
      */
     if (back.admin) {
-      setState({ admin: true, guest: false, canViewMap: true, user: null });
+      // 留言那兩項不跟著樂觀開放：它們是每人一欄的權限，猜錯會端出一個
+      // 送出必定 403 的輸入框。等 checkAuth() 回來再說
+      setState({
+        admin: true, guest: false, canViewMap: true,
+        canViewComments: false, canComment: false, unreadNotifications: 0, user: null,
+      });
       checkAuth().then((next) => {
         if (!alive) return;
         setState(next);
@@ -157,7 +180,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(() => {
     clearTokens();
-    setState({ admin: false, guest: false, canViewMap: false, user: null });
+    setState({
+      admin: false, guest: false, canViewMap: false,
+      canViewComments: false, canComment: false, unreadNotifications: 0, user: null,
+    });
     setAuthError(null);
   }, []);
 
@@ -192,6 +218,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return state.user?.can_reorder_others === 1;
   }, [state.admin, state.user, canManageOthers]);
 
+  const markNotificationsRead = useCallback(async () => {
+    if (await markNotificationsSeen()) {
+      setState((prev) => ({ ...prev, unreadNotifications: 0 }));
+    }
+  }, []);
+
   const value = useMemo<AuthValue>(() => ({
     isAdmin: state.admin,
     isGuest: state.guest,
@@ -201,6 +233,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     isOwner: state.user?.role === 'owner',
     canManageOthers,
     canViewMap: state.canViewMap,
+    canViewComments: state.canViewComments,
+    canComment: state.canComment,
+    unreadNotifications: state.unreadNotifications,
+    markNotificationsRead,
     canEdit,
     canAddTo,
     canReorderIn,
@@ -212,7 +248,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     recolorSelf,
     logout,
   }), [state, checking, canManageOthers, canEdit, canAddTo, canReorderIn, unlock, login, loginWithGoogle,
-       authError, renameSelf, recolorSelf, logout]);
+       authError, renameSelf, recolorSelf, logout, markNotificationsRead]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

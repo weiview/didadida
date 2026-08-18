@@ -344,6 +344,15 @@ export interface CurrentUser {
   /** 1 = 可以調整別人相簿裡的照片順序。預設 0，站長在 /admin 給 */
   can_reorder_others?: number;
   /**
+   * 1 = 可以留言／回覆。**預設 1。**
+   *
+   * 跟 can_manage_others 沒有從屬關係（後端不短路）：留言不是「動別人的內容」，
+   * 是自己發言。站長可以把某個帳號單獨閉麥而不動他的管理權。
+   */
+  can_comment?: number;
+  /** 1 = 看得到留言。預設 1。關掉的人燈箱裡整塊留言區都不會出現 */
+  can_view_comments?: number;
+  /**
    * 他的軌跡在地圖上的顏色（'#rrggbb'）。後端一律回**算好的值** ——
    * 沒挑過色的人也會拿到依 uid 分配的預設，所以正常情況下不會是 null。
    * （舊後端沒有這一欄，所以型別上仍然可能缺。）
@@ -360,6 +369,15 @@ export interface AuthState {
    * 沒開的話首頁不會出現那個連結，直接打 /map 也會被擋。
    */
   canViewMap: boolean;
+  /**
+   * 看不看得到留言。成員照自己那一欄；訪客要站長在後台開了才有（預設關）。
+   * 關著的話燈箱裡整塊留言區都不出現 —— 不是端出來再說「你沒權限」。
+   */
+  canViewComments: boolean;
+  /** 留得了言嗎。訪客永遠 false（後端資料模型上就沒有訪客這個作者） */
+  canComment: boolean;
+  /** 通知紅點上的數字。跟著 /auth/me 一起回，不另外打一支 */
+  unreadNotifications: number;
   user: CurrentUser | null;
 }
 
@@ -376,7 +394,10 @@ export interface AuthState {
  * 使用者只會看到一個空相簿列表，完全不知道是網路斷了。
  */
 export async function checkAuth(): Promise<AuthState> {
-  const locked: AuthState = { admin: false, guest: false, canViewMap: false, user: null };
+  const locked: AuthState = {
+    admin: false, guest: false, canViewMap: false,
+    canViewComments: false, canComment: false, unreadNotifications: 0, user: null,
+  };
   if (typeof window === 'undefined') return locked;
   // 舊版把明文密碼存在這個 key。清掉已經留在使用者瀏覽器裡的那一份，
   // 否則它會一直躺在那裡。等所有裝置都開過一次站之後這行就可以刪了。
@@ -391,6 +412,11 @@ export async function checkAuth(): Promise<AuthState> {
         guest: !!data.guest,
         // 舊後端不回這個欄位 —— 管理員照樣看得到，訪客則保守地當成沒開
         canViewMap: data.can_view_map != null ? !!data.can_view_map : !!data.admin,
+        // 舊後端沒有這兩個欄位 —— 一律當成關的。整塊留言區不出現，
+        // 好過端出一個送出必定 404 的輸入框
+        canViewComments: !!data.can_view_comments,
+        canComment: !!data.can_comment,
+        unreadNotifications: Number(data.unread_notifications ?? 0),
         user: data.user ?? null,
       };
     }
@@ -585,6 +611,9 @@ export async function updateWhitelistUser(
   patch: {
     name?: string; can_manage_others?: boolean; active?: boolean;
     can_add_to_others?: boolean; can_reorder_others?: boolean;
+    // 留言那兩格**不跟著「可管理全站」走**：能不能管內容跟該不該看得到
+    // 家人的對話是兩回事，所以後端也沒有短路，各自獨立
+    can_comment?: boolean; can_view_comments?: boolean;
   },
 ): Promise<{ success: boolean; message?: string }> {
   const res = await fetch(`${API_BASE_URL}/admin/users/${id}`, {
@@ -701,10 +730,16 @@ export async function purgeWhitelistUser(
   return { success: false, message: data.error || '刪除失敗' };
 }
 
-/** 站台開關。目前只有一個，之後要加就往這裡放 */
+/** 站台開關。訪客能看到什麼一律放這裡（全站一份，訪客共用同一把密碼） */
 export interface SiteSettings {
   /** 訪客能不能看足跡地圖。預設 0 */
   guest_can_view_map: number;
+  /**
+   * 訪客能不能看照片留言。預設 0。
+   * 開了就等於把家人的顯示名稱給任何知道訪客密碼的人 —— 這是預設關的理由。
+   * **訪客永遠寫不了留言**，那不是開關（見後端 migrations/0013）。
+   */
+  guest_can_view_comments: number;
 }
 
 export async function fetchSiteSettings(): Promise<SiteSettings> {
@@ -723,9 +758,150 @@ export async function updateSiteSettings(
   });
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.success) {
-    return { success: true, settings: { guest_can_view_map: data.guest_can_view_map ?? 0 } };
+    return {
+      success: true,
+      settings: {
+        guest_can_view_map: data.guest_can_view_map ?? 0,
+        guest_can_view_comments: data.guest_can_view_comments ?? 0,
+      },
+    };
   }
   return { success: false, message: data.error || '修改失敗' };
+}
+
+/* ── 照片留言 ────────────────────────────────────────────────────────────── */
+
+export interface PhotoComment {
+  id: number;
+  /** null = 主留言。有值 = 回覆，而且那一則保證是主留言（後端只允許一層） */
+  parent_id: number | null;
+  user_id: number;
+  user_name: string | null;
+  /** 頭像圓圈的顏色。沿用他在地圖上的軌跡色，同一個人到哪裡都同一色 */
+  color: string;
+  /** 內文。@ 某人是 `@[uid]` 標記，要用 renderCommentBody 換成名字才顯示 */
+  body: string;
+  created_at: string;
+  /** 端不端出刪除鈕。規則跟後端一致：作者本人或站長 */
+  can_delete: boolean;
+}
+
+export interface CommentThread {
+  comments: PhotoComment[];
+  /**
+   * 這串留言裡被 @ 到的人。**這是顯示 @ 名字的唯一來源**，不要改用
+   * /users/mentionable —— 訪客打不到那一支，而且被 @ 的人可能已經停權。
+   */
+  people: MentionableUser[];
+  can_comment: number;
+  /** 我是誰（訪客是 null）。判斷「這則是不是我講的」用它 */
+  me: number | null;
+}
+
+export interface MentionableUser {
+  id: number;
+  name: string | null;
+  color: string;
+}
+
+export async function fetchComments(photoId: number): Promise<CommentThread> {
+  const res = await fetch(`${API_BASE_URL}/photos/${photoId}/comments`, { headers: getAuthHeaders() });
+  // 403 = 沒有看留言的權限。這不是錯誤，是「這塊不該出現」，所以回空的而不是丟例外
+  if (!res.ok) return { comments: [], people: [], can_comment: 0, me: null };
+  const data = await res.json();
+  // people 是後來才加的欄位，補一個空陣列免得舊後端讓渲染炸掉
+  return { people: [], ...data };
+}
+
+export async function postComment(
+  photoId: number,
+  body: string,
+  parentId?: number | null,
+): Promise<{ success: boolean; comment?: PhotoComment; message?: string }> {
+  const res = await fetch(`${API_BASE_URL}/photos/${photoId}/comments`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ body, parent_id: parentId ?? null }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.success) return { success: true, comment: data.comment };
+  return { success: false, message: data.error || '留言失敗' };
+}
+
+export async function deleteComment(commentId: number): Promise<boolean> {
+  const res = await fetch(`${API_BASE_URL}/comments/${commentId}`, {
+    method: 'DELETE',
+    headers: getAuthHeaders(),
+  });
+  return res.ok;
+}
+
+/** 可以 @ 的人。訪客打這支會 401，所以只在成員身上呼叫 */
+export async function fetchMentionableUsers(): Promise<MentionableUser[]> {
+  const res = await fetch(`${API_BASE_URL}/users/mentionable`, { headers: getAuthHeaders() });
+  if (!res.ok) return [];
+  return await res.json();
+}
+
+/* ── 通知 ────────────────────────────────────────────────────────────────── */
+
+export interface NotificationItem {
+  comment_id: number;
+  /** 'mention' | 'reply' | 'photo' | 'album'。一則留言對同一個人只會有一個理由 */
+  reason: string;
+  created_at: string;
+  unread: boolean;
+  photo_id: number;
+  album_id: number | null;
+  album_name: string | null;
+  photo_title: string | null;
+  thumb: string | null;
+  body: string;
+  actor_id: number;
+  actor_name: string | null;
+  color: string;
+}
+
+export async function fetchNotifications(): Promise<{ items: NotificationItem[]; seen_at: string | null }> {
+  const res = await fetch(`${API_BASE_URL}/notifications`, { headers: getAuthHeaders() });
+  if (!res.ok) return { items: [], seen_at: null };
+  return await res.json();
+}
+
+/**
+ * 全部標成已讀。**沒有逐則已讀** —— 後端只存一個時間戳（見 migrations/0013）。
+ */
+export async function markNotificationsSeen(): Promise<boolean> {
+  const res = await fetch(`${API_BASE_URL}/notifications/seen`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+  });
+  return res.ok;
+}
+
+/**
+ * 把內文裡的 `@[uid]` 換成可以渲染的片段。
+ *
+ * 存 uid 不存名字是為了讓改名之後舊留言跟著更新（見後端 migrations/0013），
+ * 代價就是顯示前一定要過這一手。查不到那個人（被 purge 掉了）就顯示 `@?`，
+ * 不要把原始標記漏給使用者看。
+ */
+export function renderCommentBody(
+  body: string,
+  users: Map<number, MentionableUser>,
+): Array<{ type: 'text'; value: string } | { type: 'mention'; value: string; id: number }> {
+  const out: Array<{ type: 'text'; value: string } | { type: 'mention'; value: string; id: number }> = [];
+  let last = 0;
+  // Array.from 包一層：target 是 ES5，直接 for…of 迭代器會被 TS2802 擋下來
+  for (const m of Array.from(body.matchAll(/@\[(\d+)\]/g))) {
+    const at = m.index ?? 0;
+    if (at > last) out.push({ type: 'text', value: body.slice(last, at) });
+    const id = Number(m[1]);
+    out.push({ type: 'mention', id, value: `@${users.get(id)?.name ?? '?'}` });
+    last = at + m[0].length;
+  }
+  if (last < body.length) out.push({ type: 'text', value: body.slice(last) });
+  return out;
 }
 
 /** 分頁查詢的共用參數。q 與 tags 交給後端做，前端不再自己過濾 */

@@ -99,6 +99,14 @@ const SETTING_DRIVE_LINKED_AT = "drive_writer_linked_at";
  * 根本沒有「這個訪客」這種東西可以掛設定。
  */
 const SETTING_GUEST_MAP = "guest_can_view_map";
+/**
+ * 訪客看不看得到照片留言。**預設關**，理由同上面那個開關，再加一條隱私：
+ * 留言一定帶著留言者的顯示名稱，開了就等於把家人的名字給任何知道訪客密碼的人。
+ *
+ * 訪客**永遠寫不了**留言，那不是開關 —— Comment.user_id 是 NOT NULL 指向 User，
+ * 訪客在 D1 裡沒有對應的列（見 migrations/0013）。
+ */
+const SETTING_GUEST_COMMENTS = "guest_can_view_comments";
 
 /**
  * token 裡的身分。兩層，沒有第三層：
@@ -267,6 +275,15 @@ interface Actor {
   /** 可以調整別人相簿裡的照片順序。預設關 —— 那是相簿主人的版面 */
   canReorderOthers: boolean;
   /**
+   * 可以留言／回覆。預設開（見 migrations/0013）。
+   *
+   * **不受 canManageOthers 短路**，跟上面那兩欄不一樣：留言不是「動別人的內容」，
+   * 是自己發言。站長要能把一個嘴巴很吵的帳號單獨閉麥，而不必連帶收回他的管理權。
+   */
+  canComment: boolean;
+  /** 看得到留言。預設開。關掉的人燈箱裡整塊留言區都不會出現，理由同上不短路 */
+  canViewComments: boolean;
+  /**
    * 他自己那個 GPSLogger Drive 資料夾（見 migrations/0009）。
    * 跟著 Actor 一起帶出來是因為它就在同一列上 —— 另外查一次是白花讀取額度。
    */
@@ -309,6 +326,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
         uid: owner.id, email: owner.email, name: owner.name,
         isOwner: true, canManageOthers: true,
         canAddToOthers: true, canReorderOthers: true,
+        canComment: true, canViewComments: true,
         trackFolderId: owner.track_drive_folder_id ?? null,
         trackColor: trackColorFor(owner.id, owner.track_color),
       };
@@ -316,13 +334,15 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
     return {
       uid: null, email: identity.email, name: null,
       isOwner: true, canManageOthers: true,
-      canAddToOthers: true, canReorderOthers: true, trackFolderId: null,
+      canAddToOthers: true, canReorderOthers: true,
+      canComment: true, canViewComments: true, trackFolderId: null,
       trackColor: trackColorFor(null, null),
     };
   }
 
   const row = await env.DB.prepare(
     `SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others,
+            can_comment, can_view_comments, notif_seen_at,
             active, track_color, track_drive_folder_id
        FROM User WHERE id = ?`
   ).bind(identity.uid).first<any>();
@@ -341,6 +361,10 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
     // 那時 migration 還沒套，整站的寫入本來就會壞，不在這裡補救）
     canAddToOthers: canManageOthers || Number(row.can_add_to_others) === 1,
     canReorderOthers: canManageOthers || Number(row.can_reorder_others) === 1,
+    // 留言那兩欄**不吃 canManageOthers 的短路**（見 Actor 的註解）。
+    // 站長自己是例外 —— 他要看得到、也要講得了話，不然沒人管得動留言區
+    canComment: isOwner || Number(row.can_comment) === 1,
+    canViewComments: isOwner || Number(row.can_view_comments) === 1,
     trackFolderId: row.track_drive_folder_id ?? null,
     trackColor: trackColorFor(row.id, row.track_color),
   };
@@ -719,6 +743,29 @@ async function getSettingCached(env: Env, key: string): Promise<string | null> {
 /** 訪客看不看得到足跡地圖。沒設定過＝關 */
 async function guestCanViewMap(env: Env): Promise<boolean> {
   return (await getSettingCached(env, SETTING_GUEST_MAP)) === "1";
+}
+
+async function guestCanViewComments(env: Env): Promise<boolean> {
+  return (await getSettingCached(env, SETTING_GUEST_COMMENTS)) === "1";
+}
+
+/** 留言內文上限。比 Story 的 200 寬，但別讓人在燈箱側欄貼一篇文章 */
+const COMMENT_MAX_LEN = 1000;
+
+/**
+ * 從內文裡把 `@[123]` 挑出來。
+ *
+ * **刻意由後端自己解析，不收前端送來的 mentions 陣列** —— 那等於讓瀏覽器決定
+ * 要通知誰，隨手改一下就能對全家人洗版。畫面上看得到的 @ 與實際發出的通知
+ * 必須是同一個來源，這裡就是那個來源。
+ */
+function parseMentions(body: string): number[] {
+  const ids = new Set<number>();
+  for (const m of body.matchAll(/@\[(\d+)\]/g)) {
+    const id = Number(m[1]);
+    if (Number.isFinite(id) && id > 0) ids.add(id);
+  }
+  return [...ids];
 }
 
 /**
@@ -1113,18 +1160,41 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const actor = identity.role === 'admin' ? await currentActor(request, env) : null;
         // 足跡地圖對訪客開不開。管理員一律看得到，不必問設定
         const canViewMap = actor !== null || await guestCanViewMap(env);
+        /*
+         * 留言看不看得到：成員照自己那一欄，訪客看站長的全站開關。
+         *
+         * 未讀數也在這裡一起回。**刻意不另開一支端點** —— 這一條前端每次進站
+         * 都會打，右上角的紅點跟著它回來就是零額外請求。看不到留言的人直接給 0，
+         * 連查都不必查（他點不開通知清單，那個數字沒有意義）。
+         */
+        const canViewComments = actor !== null ? actor.canViewComments : await guestCanViewComments(env);
+        let unread = 0;
+        if (actor?.uid != null && actor.canViewComments) {
+          const row = await env.DB.prepare(`
+            SELECT COUNT(*) AS n FROM CommentNotify
+             WHERE user_id = ?
+               AND created_at > COALESCE((SELECT notif_seen_at FROM User WHERE id = ?), '')
+          `).bind(actor.uid, actor.uid).first<any>();
+          unread = Number(row?.n ?? 0);
+        }
         return new Response(JSON.stringify({
           // 白名單被撤掉的人 token 還沒過期 —— 這裡就要說 admin:false，
           // 不然前端會端出一整套按下去全是 403 的編輯介面
           admin: actor !== null,
           guest: identity.role === 'guest' || (identity.role === 'admin' && actor === null),
           can_view_map: canViewMap ? 1 : 0,
+          can_view_comments: canViewComments ? 1 : 0,
+          // 訪客永遠是 0：不是設定，是資料模型上就沒有訪客這個作者
+          can_comment: actor?.canComment ? 1 : 0,
+          unread_notifications: unread,
           user: actor ? {
             id: actor.uid, name: actor.name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
             can_manage_others: actor.canManageOthers ? 1 : 0,
             can_add_to_others: actor.canAddToOthers ? 1 : 0,
             can_reorder_others: actor.canReorderOthers ? 1 : 0,
+            can_comment: actor.canComment ? 1 : 0,
+            can_view_comments: actor.canViewComments ? 1 : 0,
             track_color: actor.trackColor,
           } : null,
         }), { headers });
@@ -1240,17 +1310,22 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (method === "GET") {
           return new Response(JSON.stringify({
             guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
+            guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
           }), { headers });
         }
 
         if (method === "PUT") {
-          const body: { guest_can_view_map?: any } = await request.json();
+          const body: { guest_can_view_map?: any; guest_can_view_comments?: any } = await request.json();
           if (body.guest_can_view_map !== undefined) {
             await setSetting(env, SETTING_GUEST_MAP, body.guest_can_view_map ? "1" : "0");
+          }
+          if (body.guest_can_view_comments !== undefined) {
+            await setSetting(env, SETTING_GUEST_COMMENTS, body.guest_can_view_comments ? "1" : "0");
           }
           return new Response(JSON.stringify({
             success: true,
             guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
+            guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
           }), { headers });
         }
       }
@@ -1291,7 +1366,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (method === "GET" && pathname === "/api/admin/users") {
           const { results } = await env.DB.prepare(`
             SELECT u.id, u.name, u.email, u.role,
-                   u.can_manage_others, u.can_add_to_others, u.can_reorder_others, u.active,
+                   u.can_manage_others, u.can_add_to_others, u.can_reorder_others,
+                   u.can_comment, u.can_view_comments, u.active,
                    u.last_login_at, u.created_at,
                    u.track_color, u.track_drive_folder_id,
                    (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
@@ -1728,6 +1804,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             const body: {
               name?: string; can_manage_others?: any; active?: any;
               can_add_to_others?: any; can_reorder_others?: any;
+              can_comment?: any; can_view_comments?: any;
             } = await request.json();
             const sets: string[] = [];
             const binds: any[] = [];
@@ -1751,6 +1828,17 @@ if (method === "POST" && pathname === "/api/verify-password") {
             if (body.can_reorder_others !== undefined) {
               sets.push("can_reorder_others = ?"); binds.push(body.can_reorder_others ? 1 : 0);
             }
+            /*
+             * 留言那兩欄跟上面兩欄不同：**「可管理全站」不會蓋過它們**
+             * （見 Actor 的註解）。所以這裡沒有「勾了全站就別管細項」那種關係，
+             * 站長勾什麼就是什麼。
+             */
+            if (body.can_comment !== undefined) {
+              sets.push("can_comment = ?"); binds.push(body.can_comment ? 1 : 0);
+            }
+            if (body.can_view_comments !== undefined) {
+              sets.push("can_view_comments = ?"); binds.push(body.can_view_comments ? 1 : 0);
+            }
             if (body.active !== undefined) {
               sets.push("active = ?"); binds.push(body.active ? 1 : 0);
             }
@@ -1758,7 +1846,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
               return new Response(JSON.stringify({ error: "沒有要改的東西" }), { status: 400, headers });
             }
             await env.DB.prepare(`UPDATE User SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, targetId).run();
-            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, active FROM User WHERE id = ?")
+            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, can_comment, can_view_comments, active FROM User WHERE id = ?")
               .bind(targetId).first();
             return new Response(JSON.stringify({ success: true, user: row }), { headers });
           }
@@ -3077,6 +3165,289 @@ function hammingDistance(hex1: string, hex2: string): number {
         // 清理完全沒有任何照片使用的孤立標籤
         await env.DB.prepare("DELETE FROM Tag WHERE id NOT IN (SELECT DISTINCT tag_id FROM PhotoTag)").run();
         await syncFtsForPhotos(env.DB, [Number(photoId)]);
+        return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      /* ══ 照片留言 ══════════════════════════════════════════════════════════
+       *
+       * 三層身分在這裡的差別：
+       *
+       *   站長／成員  照自己的 can_view_comments、can_comment 兩欄
+       *   訪客        看：站長的全站開關 guest_can_view_comments（預設關）
+       *               寫：**永遠不行**。不是開關，是 Comment.user_id 指向 User
+       *               而訪客沒有那一列（見 migrations/0013）
+       *
+       * ⚠️ 這幾條**都不可以包 withEdgeCache**。留言是即時的，而且回應裡帶著
+       *    家人的顯示名稱 —— 進了共用邊緣快取就等於外流給下一個匿名請求。
+       */
+
+      // 路由：讀一張照片的留言。回傳攤平的清單（回覆只有一層，前端自己收攏），
+      // 順序照 id 遞增 —— created_at 只有到秒，同一秒內的兩則會排不穩
+      if (method === "GET" && pathname.startsWith("/api/photos/")
+          && pathname.endsWith("/comments") && pathname.split("/").length === 5) {
+        const photoId = Number(pathname.split("/")[3]);
+        const actor = await currentActor(request, env);
+        const canView = actor ? actor.canViewComments : await guestCanViewComments(env);
+        if (!canView) {
+          return new Response(JSON.stringify({ error: "沒有權限看留言", reason: "forbidden" }), { status: 403, headers });
+        }
+        const { results } = await env.DB.prepare(`
+          SELECT c.id, c.parent_id, c.user_id, c.body, c.created_at,
+                 u.name AS user_name, u.track_color
+            FROM Comment c
+            JOIN User u ON u.id = c.user_id
+           WHERE c.photo_id = ?
+           ORDER BY c.id ASC
+        `).bind(photoId).all();
+        const comments = (results as any[]).map((r) => ({
+          id: Number(r.id),
+          parent_id: r.parent_id == null ? null : Number(r.parent_id),
+          user_id: Number(r.user_id),
+          user_name: r.user_name,
+          // 頭像圓圈的顏色沿用他的軌跡色 —— 已經是「這個人的顏色」了，
+          // 再挑一套只會讓同一個人在地圖上與留言區長得不一樣
+          color: trackColorFor(Number(r.user_id), r.track_color),
+          body: r.body,
+          created_at: r.created_at,
+          // 前端據此決定要不要端出刪除鈕。規則跟底下的 DELETE 一致：作者本人或站長
+          can_delete: !!actor && (actor.isOwner || actor.uid === Number(r.user_id)),
+        }));
+        /*
+         * 這串留言裡被 @ 到的人。內文存的是 `@[uid]`，要有名字才顯示得出來。
+         *
+         * 為什麼不叫前端去打 /users/mentionable：**訪客打不到那一支**（那是全家人的
+         * 名單，沒理由給訪客），可是訪客看得到留言 —— 少了這一份，他看到的每個
+         * @ 都會變成「@?」。而且被 @ 的人可能已經停權，本來就不在那份名單裡。
+         */
+        const mentioned = new Set<number>();
+        for (const c of comments) for (const uid of parseMentions(c.body)) mentioned.add(uid);
+        const people: Array<{ id: number; name: string | null; color: string }> = [];
+        // D1 綁定參數上限 100，照慣例先切塊再查
+        for (const chunk of chunkIds(Array.from(mentioned))) {
+          const { results: us } = await env.DB.prepare(
+            `SELECT id, name, track_color FROM User WHERE id IN (${chunk.map(() => "?").join(",")})`
+          ).bind(...chunk).all();
+          for (const u of us as any[]) {
+            people.push({
+              id: Number(u.id),
+              name: u.name,
+              color: trackColorFor(Number(u.id), u.track_color),
+            });
+          }
+        }
+
+        return new Response(JSON.stringify({
+          comments,
+          people,
+          can_comment: actor?.canComment ? 1 : 0,
+          me: actor?.uid ?? null,
+        }), { headers });
+      }
+
+      // 路由：留言／回覆
+      if (method === "POST" && pathname.startsWith("/api/photos/")
+          && pathname.endsWith("/comments") && pathname.split("/").length === 5) {
+        const photoId = Number(pathname.split("/")[3]);
+        const actor = await currentActor(request, env);
+        if (!actor || actor.uid == null) {
+          return new Response(JSON.stringify({ error: "訪客不能留言，請用 Google 登入", reason: "guest" }), { status: 403, headers });
+        }
+        if (!actor.canComment) {
+          return new Response(JSON.stringify({ error: "站長關掉了你的留言權限", reason: "forbidden" }), { status: 403, headers });
+        }
+
+        const payload: { body?: string; parent_id?: any } = await request.json();
+        const text = String(payload.body ?? "").trim();
+        if (!text) {
+          return new Response(JSON.stringify({ error: "留言不能空白" }), { status: 400, headers });
+        }
+        if (text.length > COMMENT_MAX_LEN) {
+          return new Response(JSON.stringify({ error: `留言最多 ${COMMENT_MAX_LEN} 字` }), { status: 400, headers });
+        }
+
+        const photo = await env.DB.prepare(`
+          SELECT p.id, p.uploaded_by, p.album_id, a.user_id AS album_owner
+            FROM Photo p LEFT JOIN Album a ON a.id = p.album_id
+           WHERE p.id = ?
+        `).bind(photoId).first<any>();
+        if (!photo) {
+          return new Response(JSON.stringify({ error: "找不到這張照片" }), { status: 404, headers });
+        }
+
+        /*
+         * 回覆只有一層：parent 必須是同一張照片上的**主留言**。
+         * 擋在這裡而不是靠前端不端出按鈕 —— 巢狀一旦寫進資料就回不去了。
+         */
+        let parentId: number | null = null;
+        let parentAuthor: number | null = null;
+        if (payload.parent_id != null) {
+          const parent = await env.DB.prepare(
+            "SELECT id, user_id, parent_id, photo_id FROM Comment WHERE id = ?"
+          ).bind(Number(payload.parent_id)).first<any>();
+          if (!parent || Number(parent.photo_id) !== photoId) {
+            return new Response(JSON.stringify({ error: "找不到要回覆的留言" }), { status: 404, headers });
+          }
+          if (parent.parent_id != null) {
+            return new Response(JSON.stringify({ error: "回覆只有一層，請回覆最上層那一則" }), { status: 400, headers });
+          }
+          parentId = Number(parent.id);
+          parentAuthor = Number(parent.user_id);
+        }
+
+        const res = await env.DB.prepare(
+          "INSERT INTO Comment (photo_id, user_id, parent_id, body) VALUES (?, ?, ?, ?)"
+        ).bind(photoId, actor.uid, parentId, text).run();
+        const commentId = Number(res.meta.last_row_id);
+
+        /*
+         * 通知 fan-out。四個理由由高而低排，**INSERT OR IGNORE 讓先寫的贏** ——
+         * PK 是 (comment_id, user_id)，所以同一個人只會拿到一則，而且是最貼切的
+         * 那個理由（你同時是相簿主人、上傳者又被 @ 的時候，說的是「提到了你」）。
+         *
+         * SELECT … FROM User WHERE id = ? AND active = 1 一句同時做掉三件事：
+         * 帳號存不存在、有沒有被停權、以及不必為此多跑一趟查詢。
+         * 自己講的話不通知自己，這在 notify() 裡擋掉。
+         */
+        const stmts: D1PreparedStatement[] = [];
+        const notify = (uid: any, reason: string) => {
+          const n = Number(uid);
+          if (!Number.isFinite(n) || n <= 0 || n === actor.uid) return;
+          stmts.push(env.DB.prepare(
+            `INSERT OR IGNORE INTO CommentNotify (comment_id, user_id, reason)
+             SELECT ?, id, ? FROM User WHERE id = ? AND active = 1`
+          ).bind(commentId, reason, n));
+        };
+        for (const uid of parseMentions(text)) notify(uid, "mention");
+        if (parentAuthor != null) notify(parentAuthor, "reply");
+        // uploaded_by 是 NULL 的舊照片算相簿主人的，剛好就是下一行那個人
+        notify(photo.uploaded_by, "photo");
+        notify(photo.album_owner, "album");
+        if (stmts.length) await env.DB.batch(stmts);
+
+        return new Response(JSON.stringify({
+          success: true,
+          comment: {
+            id: commentId,
+            parent_id: parentId,
+            user_id: actor.uid,
+            user_name: actor.name,
+            color: trackColorFor(actor.uid, actor.trackColor),
+            body: text,
+            created_at: new Date().toISOString().slice(0, 19).replace("T", " "),
+            can_delete: true,
+          },
+        }), { headers });
+      }
+
+      /*
+       * 路由：刪留言。**作者本人或站長**，沒有第三種人（使用者拍板）。
+       *
+       * 硬刪，回覆跟著 FK CASCADE 一起消失，不留「此留言已刪除」的墓碑 ——
+       * 那需要多一個狀態欄位與一套顯示規則，而這個站不需要保留刪除痕跡。
+       */
+      if (method === "DELETE" && pathname.startsWith("/api/comments/")
+          && pathname.split("/").length === 4) {
+        const commentId = Number(pathname.split("/")[3]);
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const row = await env.DB.prepare("SELECT id, user_id FROM Comment WHERE id = ?")
+          .bind(commentId).first<any>();
+        if (!row) {
+          return new Response(JSON.stringify({ error: "找不到這則留言" }), { status: 404, headers });
+        }
+        if (!actor.isOwner && actor.uid !== Number(row.user_id)) {
+          return forbidden(headers, "只能刪自己的留言");
+        }
+        await env.DB.prepare("DELETE FROM Comment WHERE id = ?").bind(commentId).run();
+        return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      /*
+       * 路由：可以 @ 誰。只有成員打得到 —— 訪客留不了言，自然也不需要這份名單，
+       * 而這份名單就是全家人的顯示名稱，沒理由多給。
+       */
+      if (method === "GET" && pathname === "/api/users/mentionable") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const { results } = await env.DB.prepare(
+          "SELECT id, name, track_color FROM User WHERE active = 1 ORDER BY (role = 'owner') DESC, name"
+        ).all();
+        return new Response(JSON.stringify((results as any[]).map((u) => ({
+          id: Number(u.id),
+          name: u.name,
+          color: trackColorFor(Number(u.id), u.track_color),
+        }))), { headers });
+      }
+
+      /* ── 通知 ──────────────────────────────────────────────────────────────
+       *
+       * 未讀**數**不在這裡，在 /api/auth/me（那一條每次進站都會打，紅點跟著它
+       * 回來就是零額外請求）。這一條是點開清單才打的。
+       */
+      if (method === "GET" && pathname === "/api/notifications") {
+        const actor = await currentActor(request, env);
+        if (!actor || actor.uid == null) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.canViewComments) {
+          return new Response(JSON.stringify({ items: [], seen_at: null }), { headers });
+        }
+        const me = await env.DB.prepare("SELECT notif_seen_at FROM User WHERE id = ?")
+          .bind(actor.uid).first<any>();
+        const seenAt: string | null = me?.notif_seen_at ?? null;
+        const { results } = await env.DB.prepare(`
+          SELECT n.comment_id, n.reason, n.created_at,
+                 c.photo_id, c.body, c.parent_id,
+                 au.id AS actor_id, au.name AS actor_name, au.track_color,
+                 p.album_id, p.title,
+                 COALESCE(p.thumb_sm_url, p.thumb_url, p.url) AS thumb,
+                 al.name AS album_name
+            FROM CommentNotify n
+            JOIN Comment c  ON c.id  = n.comment_id
+            JOIN User au    ON au.id = c.user_id
+            JOIN Photo p    ON p.id  = c.photo_id
+            LEFT JOIN Album al ON al.id = p.album_id
+           WHERE n.user_id = ?
+           ORDER BY n.created_at DESC, n.comment_id DESC
+           LIMIT 30
+        `).bind(actor.uid).all();
+        return new Response(JSON.stringify({
+          seen_at: seenAt,
+          items: (results as any[]).map((r) => ({
+            comment_id: Number(r.comment_id),
+            reason: r.reason,
+            created_at: r.created_at,
+            unread: seenAt == null || String(r.created_at) > seenAt,
+            photo_id: Number(r.photo_id),
+            album_id: r.album_id == null ? null : Number(r.album_id),
+            album_name: r.album_name ?? null,
+            photo_title: r.title ?? null,
+            thumb: r.thumb ?? null,
+            body: r.body,
+            actor_id: Number(r.actor_id),
+            actor_name: r.actor_name,
+            color: trackColorFor(Number(r.actor_id), r.track_color),
+          })),
+        }), { headers });
+      }
+
+      /*
+       * 路由：把通知全部標成已讀。**一個時間戳，沒有逐則已讀**（見 migrations/0013）。
+       *
+       * 已知的邊界：跟按下這一鍵**同一秒**內產生的留言會被算成已讀
+       * （created_at 只到秒）。家族站規模下不值得為此加毫秒欄位。
+       */
+      if (method === "POST" && pathname === "/api/notifications/seen") {
+        const actor = await currentActor(request, env);
+        if (!actor || actor.uid == null) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        await env.DB.prepare("UPDATE User SET notif_seen_at = datetime('now') WHERE id = ?")
+          .bind(actor.uid).run();
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 

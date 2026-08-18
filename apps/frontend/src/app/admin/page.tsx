@@ -82,6 +82,12 @@ export default function AdminPage() {
   /** 站台開關：訪客看不看得到足跡地圖。null = 還沒讀到 */
   const [guestMap, setGuestMap] = useState<boolean | null>(null);
   const [savingGuestMap, setSavingGuestMap] = useState(false);
+  /**
+   * 站台開關：訪客看不看得到留言。**預設關**。
+   * 訪客永遠寫不了（資料模型上就沒有訪客這個作者），所以只有「看」這一格。
+   */
+  const [guestComments, setGuestComments] = useState<boolean | null>(null);
+  const [savingGuestComments, setSavingGuestComments] = useState(false);
 
   /*
    * GPS 軌跡資料夾的掃描結果。**刻意不在開頁時就跑** —— 那是一次 Google Drive
@@ -97,6 +103,7 @@ export default function AdminPage() {
       const [list, settings] = await Promise.all([fetchWhitelist(), fetchSiteSettings()]);
       setUsers(list);
       setGuestMap(settings.guest_can_view_map === 1);
+      setGuestComments(settings.guest_can_view_comments === 1);
       setError(null);
     } catch (e: any) {
       setError(e.message || "讀取白名單失敗");
@@ -132,6 +139,7 @@ export default function AdminPage() {
     body: {
       can_manage_others?: boolean; active?: boolean;
       can_add_to_others?: boolean; can_reorder_others?: boolean;
+      can_comment?: boolean; can_view_comments?: boolean;
     },
   ) => {
     setBusyId(user.id);
@@ -173,6 +181,19 @@ export default function AdminPage() {
     setNotice(next
       ? "訪客現在看得到足跡地圖了。"
       : "訪客看不到足跡地圖了，首頁那個連結也會消失。");
+  };
+
+  const toggleGuestComments = async (next: boolean) => {
+    setSavingGuestComments(true);
+    setNotice(null);
+    const result = await updateSiteSettings({ guest_can_view_comments: next });
+    setSavingGuestComments(false);
+    if (!result.success) return setError(result.message || "修改失敗");
+    setError(null);
+    setGuestComments(result.settings!.guest_can_view_comments === 1);
+    setNotice(next
+      ? "訪客現在看得到照片底下的留言了（還是留不了言）。"
+      : "訪客看不到留言了，燈箱裡那一塊會整個消失。");
   };
 
   const handleRemove = async () => {
@@ -293,6 +314,20 @@ export default function AdminPage() {
           />
           讓訪客看足跡地圖
         </label>
+
+        <label className={styles.checkbox}>
+          <input
+            type="checkbox"
+            checked={guestComments === true}
+            disabled={guestComments === null || savingGuestComments}
+            onChange={(e) => toggleGuestComments(e.target.checked)}
+          />
+          讓訪客看照片底下的留言
+        </label>
+        <p className={styles.hint}>
+          訪客<strong>永遠留不了言</strong>，這格只管看不看得到。家人之間的對話會連名字一起被
+          訪客看見，開之前先想一下留言區裡都講了些什麼。
+        </p>
       </section>
 
       <section className={`glass-panel ${styles.card}`}>
@@ -491,6 +526,39 @@ export default function AdminPage() {
                       onChange={(e) => patch(user, { can_reorder_others: e.target.checked })}
                     />
                     可排序別人的相簿
+                  </label>
+
+                  {/*
+                    * 留言的兩格。**刻意不掛在「可管理全站」底下** —— 那格講的是
+                    * 動不動得了別人的東西，跟看不看得到家人的對話沒有關係，
+                    * 所以這兩顆在勾了全站的人身上照樣按得動。
+                    *
+                    * 看留言關掉的人，燈箱裡整塊留言區直接不出現。
+                    */}
+                  <label
+                    className={styles.checkbox}
+                    title="關掉之後他在燈箱裡看不到留言區（連別人的留言也看不到）"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={owner || user.can_view_comments === 1}
+                      disabled={owner || busy || user.active !== 1}
+                      onChange={(e) => patch(user, { can_view_comments: e.target.checked })}
+                    />
+                    可看留言
+                  </label>
+
+                  <label
+                    className={styles.checkbox}
+                    title="關掉之後他還是看得到留言，只是沒有輸入框"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={owner || user.can_comment === 1}
+                      disabled={owner || busy || user.active !== 1}
+                      onChange={(e) => patch(user, { can_comment: e.target.checked })}
+                    />
+                    可留言
                   </label>
 
                   {!owner && user.active !== 1 && (
