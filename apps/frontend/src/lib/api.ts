@@ -353,6 +353,13 @@ export interface CurrentUser {
   /** 1 = 看得到留言。預設 1。關掉的人燈箱裡整塊留言區都不會出現 */
   can_view_comments?: number;
   /**
+   * 1 = 看得到足跡地圖。**預設 1。**
+   *
+   * 跟留言那兩欄同一類：`can_manage_others` 不會蓋過它。關掉的人首頁不出現地圖
+   * 入口，直接打 `/map` 會看到「找不到這一頁」，後端的軌跡路由也一律 403。
+   */
+  can_view_map?: number;
+  /**
    * 他的軌跡在地圖上的顏色（'#rrggbb'）。後端一律回**算好的值** ——
    * 沒挑過色的人也會拿到依 uid 分配的預設，所以正常情況下不會是 null。
    * （舊後端沒有這一欄，所以型別上仍然可能缺。）
@@ -611,9 +618,9 @@ export async function updateWhitelistUser(
   patch: {
     name?: string; can_manage_others?: boolean; active?: boolean;
     can_add_to_others?: boolean; can_reorder_others?: boolean;
-    // 留言那兩格**不跟著「可管理全站」走**：能不能管內容跟該不該看得到
-    // 家人的對話是兩回事，所以後端也沒有短路，各自獨立
-    can_comment?: boolean; can_view_comments?: boolean;
+    // 留言那兩格與足跡**不跟著「可管理全站」走**：能不能管內容跟該不該看得到
+    // 家人的對話、家人的行蹤是兩回事，所以後端也沒有短路，各自獨立
+    can_comment?: boolean; can_view_comments?: boolean; can_view_map?: boolean;
   },
 ): Promise<{ success: boolean; message?: string }> {
   const res = await fetch(`${API_BASE_URL}/admin/users/${id}`, {

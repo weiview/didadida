@@ -666,9 +666,17 @@ input:checked + .slider:before {
   background: rgba(255, 255, 255, 0.08);
 }
 
-/* 鍵盤上下鍵選到的那一列。滑鼠 hover 是同一個底色，兩者不必分辨 */
-.mentionItemActive {
-  background: rgba(255, 255, 255, 0.14);
+/*
+ * 鍵盤上下鍵選到的那一列。
+ *
+ * ⚠️ 選擇器一定要是 `.mentionMenu button.mentionItemActive`，只寫
+ *    `.mentionItemActive` 沒有用 —— 上面 `.mentionMenu button` 的
+ *    `background: none` 是 (0,1,1)，單一個 class 只有 (0,1,0)，**比它弱**，
+ *    結果是上下鍵其實有在動、畫面上卻完全看不出來。
+ */
+.mentionMenu button.mentionItemActive {
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
 }
 
 .commentHint {
