@@ -194,8 +194,18 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
       <button className={styles.closeBtn} onClick={(e) => { e.stopPropagation(); onClose(); }} title="關閉">×</button>
       
       <div className={styles.content} onClick={e => e.stopPropagation()}>
-        
-        <div 
+
+        {/*
+          * 照片與照片資訊（Story／標籤／地點／EXIF）是同一塊，留言是另一塊。
+          * 桌機時這兩塊左右並排、各自捲；手機時一路往下堆。分欄全靠 CSS，
+          * 這裡不判斷螢幕寬度。
+          *
+          * ⚠️ 底下這一大段沒有跟著 mainPane 縮排 —— 純粹是為了讓當初那次
+          *    「把留言搬到右邊」的 diff 只有幾行，不要整檔重排。
+          */}
+        <div className={styles.mainPane}>
+
+        <div
           className={styles.imageContainer}
           onTouchStart={onTouchStartEvent}
           onTouchMove={onTouchMoveEvent}
@@ -338,10 +348,6 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             </div>
           )}
 
-          {/* 留言。看不看得到、留不留得了都在元件裡自己判斷（沒權限就整塊不出現），
-              所以這裡不必再包一層條件 */}
-          <PhotoComments photoId={photo.id} />
-
           <div className={styles.exifToggleRow}>
             <div className={styles.switchWrapper}>
               <span>顯示照片資訊 (EXIF)</span>
@@ -384,6 +390,14 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             </div>
           )}
 
+        </div>
+
+        </div>
+
+        {/* 留言。看不看得到、留不留得了都在元件裡自己判斷（沒權限就整塊不出現，
+            外面這層有 :empty 的規則跟著收掉），所以這裡不必再包一層條件 */}
+        <div className={styles.commentsPane}>
+          <PhotoComments photoId={photo.id} />
         </div>
       </div>
     </div>
