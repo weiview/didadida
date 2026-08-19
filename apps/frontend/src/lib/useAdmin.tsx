@@ -92,6 +92,11 @@ interface AuthValue {
    * 顏色是**每個人自己的**，所以在帳號牌上改，不在站長後台。
    */
   recolorSelf: (color: string) => Promise<{ success: boolean; message?: string }>;
+  /**
+   * 換完自己的頭像之後同步這裡的 user。上傳本身由 <AvatarPicker> 打
+   * （那個元件也給站長代設別人用），這裡只負責讓右上角那顆圓鈕立刻換圖。
+   */
+  setMyAvatar: (avatar: string | null) => void;
   /** 登出：清掉站上與 Google 的 token，回到進站畫面 */
   logout: () => void;
 }
@@ -178,6 +183,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return { success: result.success, message: result.message };
   }, []);
 
+  const setMyAvatar = useCallback((avatar: string | null) => {
+    setState((prev) => (prev.user ? { ...prev, user: { ...prev.user, avatar } } : prev));
+  }, []);
+
   const logout = useCallback(() => {
     clearTokens();
     setState({
@@ -246,9 +255,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     authError,
     renameSelf,
     recolorSelf,
+    setMyAvatar,
     logout,
   }), [state, checking, canManageOthers, canEdit, canAddTo, canReorderIn, unlock, login, loginWithGoogle,
-       authError, renameSelf, recolorSelf, logout, markNotificationsRead]);
+       authError, renameSelf, recolorSelf, setMyAvatar, logout, markNotificationsRead]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

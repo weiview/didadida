@@ -343,6 +343,13 @@ export default function MapPage() {
     return out;
   }, [members]);
 
+  /** user_id → 頭像。播放時坐在車上的那顆大頭 */
+  const trackAvatars = useMemo(() => {
+    const out: Record<number, string | null> = {};
+    for (const m of members) out[m.id] = m.avatar ?? null;
+    return out;
+  }, [members]);
+
   /** 我自己的顏色。Google 紀念層永遠是我自己的時間軸，跟著我的顏色走 */
   const myColor = user?.track_color || DEFAULT_TRACK_COLOR;
   const myUserId = user?.id ?? null;
@@ -688,7 +695,7 @@ export default function MapPage() {
           let kept = 0;
           for (const s of data.segments) {
             // s.vehicle 存在 R2 裡（貼路當下用的 costing），這裡不讀 ——
-            // 地圖上只有一個飛碟，不再需要「這趟是什麼車」來挑圖示
+            // 地圖上只有一台車，不再需要「這趟是什麼車」來挑圖示
             for (const [lng, lat, t] of s.points) {
               if (!(t >= tMin && t <= tMax)) continue;
               out.push({
@@ -1365,6 +1372,7 @@ export default function MapPage() {
         showTrackLine={SHOW_TRACK_LINE}
         animateOn={ANIMATE_ON}
         trackColors={trackColors}
+        trackAvatars={trackAvatars}
         timelineColor={myColor}
         // 我自己被篩掉時，我的 Google 紀念層也跟著收 —— 那一層畫的就是我
         timelineLines={showTimeline && !meHidden ? timelineLines : undefined}

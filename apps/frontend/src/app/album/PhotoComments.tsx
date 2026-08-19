@@ -32,10 +32,20 @@ function timeAgo(iso: string): string {
   return new Date(t).toLocaleDateString('zh-TW');
 }
 
-function Avatar({ name, color }: { name: string | null; color: string }) {
+/**
+ * 留言人的小圓頭。有自訂頭像就畫圖，沒有就是「名字首字 ＋ 他的軌跡色」。
+ *
+ * 去背 PNG 底下墊一層很淡的同色 —— 透明的圖直接貼在深色留言區上會像浮在半空中。
+ * （這裡不共用 components/Avatar.tsx：那支是行內樣式的通用版，
+ * 燈箱裡的尺寸與陰影跟著 lightbox.module.css 走。）
+ */
+function Avatar({ name, color, src }: { name: string | null; color: string; src?: string | null }) {
   return (
-    <span className={styles.avatar} style={{ background: color }} aria-hidden>
-      {(name ?? '?').trim().charAt(0) || '?'}
+    <span className={styles.avatar} style={{ background: src ? `${color}33` : color }} aria-hidden>
+      {src
+        // eslint-disable-next-line @next/next/no-img-element
+        ? <img className={styles.avatarImg} src={src} alt="" />
+        : (name ?? '?').trim().charAt(0) || '?'}
     </span>
   );
 }
@@ -380,7 +390,7 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
 
   const Row = ({ c, isReply }: { c: PhotoComment; isReply: boolean }) => (
     <div className={isReply ? styles.commentReply : styles.commentRow}>
-      <Avatar name={c.user_name} color={c.color} />
+      <Avatar name={c.user_name} color={c.color} src={c.avatar} />
       <div className={styles.commentBubbleWrap}>
         <div className={styles.commentBubble}>
           <span className={styles.commentAuthor}>{c.user_name ?? '（已離開）'}</span>
@@ -476,7 +486,7 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
                    */
                   onMouseDown={(e) => { e.preventDefault(); insertMention(p); }}
                 >
-                  <Avatar name={p.name} color={p.color} />
+                  <Avatar name={p.name} color={p.color} src={p.avatar} />
                   <span>{p.name}</span>
                 </button>
               ))}

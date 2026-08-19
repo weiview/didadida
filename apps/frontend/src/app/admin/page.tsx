@@ -11,6 +11,8 @@ import {
 } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
+import Avatar from "@/components/Avatar";
+import AvatarPicker from "@/components/AvatarPicker";
 
 /**
  * 站長後台：誰能用 Google 登入進來當管理員，以及他們各自能動到什麼。
@@ -26,7 +28,7 @@ import SlideConfirmModal from "@/components/SlideConfirmModal";
  * 沒有環境變數之類的第二條路。
  */
 export default function AdminPage() {
-  const { isOwner, checking, isAdmin } = useAdmin();
+  const { isOwner, checking, isAdmin, user: me, setMyAvatar } = useAdmin();
 
   const [users, setUsers] = useState<WhitelistUser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -70,6 +72,12 @@ export default function AdminPage() {
       setDetailError((e) => ({ ...e, [user.id]: err.message || "讀取失敗" }));
     }
   };
+
+  /**
+   * 展開換頭像的那個人。**站長代設**用的 —— 家人自己在右上角的帳號牌就能換，
+   * 這裡是給「他自己弄不來」的情況（跟明細一樣一次只開一個，整排都攤開會很吵）。
+   */
+  const [openAvatar, setOpenAvatar] = useState<number | null>(null);
 
   /** 正在確認**刪除帳號**的那個人。跟 removing 是兩件事，所以兩個 state */
   const [purging, setPurging] = useState<WhitelistUser | null>(null);
@@ -387,6 +395,12 @@ export default function AdminPage() {
             const busy = busyId === user.id;
             return (
               <div key={user.id} className={styles.userRow}>
+                <Avatar
+                  src={user.avatar}
+                  name={user.name || user.email}
+                  color={user.track_color ?? "#8a7f72"}
+                  size={38}
+                />
                 <div className={styles.userMain}>
                   <div className={styles.userName}>
                     {user.name || "（未命名）"}
@@ -420,7 +434,31 @@ export default function AdminPage() {
                         </button>
                       </>
                     )}
+                    {" · "}
+                    <button
+                      type="button"
+                      className={styles.linkButton}
+                      onClick={() => setOpenAvatar((v) => (v === user.id ? null : user.id))}
+                    >
+                      {openAvatar === user.id ? "▾ 頭像" : "▸ 頭像"}
+                    </button>
                   </div>
+
+                  {openAvatar === user.id && (
+                    <div className={styles.detail}>
+                      <AvatarPicker
+                        userId={user.id}
+                        current={user.avatar}
+                        name={user.name || user.email}
+                        color={user.track_color ?? "#8a7f72"}
+                        onChange={(avatar) => {
+                          setUsers((prev) => prev.map((u) => (u.id === user.id ? { ...u, avatar } : u)));
+                          // 站長在這裡換自己的，右上角那顆圓鈕也要跟著換
+                          if (user.id === me?.id) setMyAvatar(avatar);
+                        }}
+                      />
+                    </div>
+                  )}
 
                   {openDetail === user.id && (
                     <div className={styles.detail}>

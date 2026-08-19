@@ -477,6 +477,15 @@ input:checked + .slider:before {
   /* 深色頭像上的白字要看得見，淺色軌跡色上也要 */
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
   user-select: none;
+  overflow: hidden;
+}
+
+/* 有自訂頭像的人。圖已經是正方形（見 lib/avatar.ts），cover 不會裁到臉 */
+.avatarImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .commentBubbleWrap {

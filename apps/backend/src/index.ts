@@ -300,7 +300,37 @@ interface Actor {
    * 見 trackColorFor），所以拿到的一定不是 null。同一列上，理由同 trackFolderId。
    */
   trackColor: string;
+  /**
+   * 頭像的 R2 檔名（見 migrations/0015）。null ＝ 沒設過。
+   * 要給前端的是網址，用 avatarUrl() 換 —— 這裡存的是檔名，同一列上順手帶出來。
+   */
+  avatarKey: string | null;
 }
+
+/* ── 頭像 ──────────────────────────────────────────────────────────────────
+ *
+ * 一張圖兩用（使用者定調）：留言區的圓形頭像 ＋ 地圖上坐在小車上的大頭。
+ * 所以它是去背圖，前端縮到 256px 見方、保 alpha 之後才上傳（見 lib/avatar.ts）。
+ *
+ * D1 只存檔名，R2 鍵與對外網址都由這兩個函式拼 —— 檔名帶亂數尾碼，
+ * 那是這條白名單路由唯一的護欄（詳見 migrations/0015 的註解）。
+ */
+
+/** R2 上的物件鍵 */
+const avatarR2Key = (name: string) => `avatars/${name}`;
+
+/** 對外網址。沒設頭像回 null，前端據此退回預設頭像 */
+const avatarUrl = (host: string, name: string | null | undefined): string | null =>
+  name ? `${host}/api/users/avatar/${name}` : null;
+
+/**
+ * 頭像檔名的白名單。**路徑穿越的唯一防線** —— 這個值會被接到 R2 鍵上，
+ * 不擋的話 `../` 之類的東西可以撈到桶子裡的任何物件。
+ */
+const AVATAR_NAME_RE = /^[A-Za-z0-9_-]+\.(webp|png)$/;
+
+/** 上傳上限。256px 見方的 WebP 通常 10～30KB，PNG 退路也不該超過這個數 */
+const AVATAR_MAX_BYTES = 512 * 1024;
 
 /**
  * 同一個 request 只查一次 D1。
@@ -326,7 +356,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
   // 沒有 uid 的舊 token／密碼登入：當站長（見 Identity 的註解）
   if (identity.uid == null) {
     const owner = await env.DB.prepare(
-      "SELECT id, name, email, track_color, track_drive_folder_id FROM User WHERE role = 'owner' AND active = 1 ORDER BY id LIMIT 1"
+      "SELECT id, name, email, track_color, avatar_key, track_drive_folder_id FROM User WHERE role = 'owner' AND active = 1 ORDER BY id LIMIT 1"
     ).first<any>();
     if (owner) {
       return {
@@ -336,6 +366,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
         canComment: true, canViewComments: true, canViewMap: true,
         trackFolderId: owner.track_drive_folder_id ?? null,
         trackColor: trackColorFor(owner.id, owner.track_color),
+        avatarKey: owner.avatar_key ?? null,
       };
     }
     return {
@@ -344,13 +375,14 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
       canAddToOthers: true, canReorderOthers: true,
       canComment: true, canViewComments: true, canViewMap: true, trackFolderId: null,
       trackColor: trackColorFor(null, null),
+      avatarKey: null,
     };
   }
 
   const row = await env.DB.prepare(
     `SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others,
             can_comment, can_view_comments, can_view_map, notif_seen_at,
-            active, track_color, track_drive_folder_id
+            active, track_color, avatar_key, track_drive_folder_id
        FROM User WHERE id = ?`
   ).bind(identity.uid).first<any>();
   // 列不見了或被移出白名單 —— 手上那張 token 立刻失效，不等它過期
@@ -375,6 +407,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
     canViewMap: isOwner || Number(row.can_view_map) === 1,
     trackFolderId: row.track_drive_folder_id ?? null,
     trackColor: trackColorFor(row.id, row.track_color),
+    avatarKey: row.avatar_key ?? null,
   };
 }
 
@@ -1079,6 +1112,8 @@ const origin = request.headers.get("Origin") || "";
      *      要擋就只能改用跨網域 cookie（SameSite=None），Safari／Chrome 的第三方
      *      cookie 封鎖會直接讓圖片全破。使用者已決定不走那條路：R2 的物件鍵
      *      要先拿到相簿 JSON 才知道，而相簿 JSON 現在是鎖著的。
+     *      **頭像也在這一類**（0015）：一樣是 <img src>，護欄一樣是猜不到的檔名
+     *      （`<uid>-<亂數>.webp`）。所以那條路由絕對不可以改成吃 user id。
      *
      * 位置很重要：**必須排在 withEdgeCache 之前**。閘門若放在各路由裡面，
      * 訪客的回應會先進共用的邊緣快取，之後匿名請求就直接命中那份快取拿到 200。
@@ -1089,7 +1124,9 @@ const origin = request.headers.get("Origin") || "";
       || pathname === "/api/auth/me"
       || pathname.startsWith("/api/auth/google/")
       || pathname.startsWith("/api/photos/view/")
-      || /^\/api\/photos\/\d+\/full$/.test(pathname);
+      || /^\/api\/photos\/\d+\/full$/.test(pathname)
+      // 只開 GET。上傳／刪除頭像照樣要 token，不能因為圖片要放行就整條路徑打開
+      || (method === "GET" && pathname.startsWith("/api/users/avatar/"));
 
     if (!isOpenPath && !(await tokenIdentity(request, env))) {
       return new Response(JSON.stringify({ error: "locked" }), { status: 401, headers });
@@ -1225,6 +1262,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             can_view_comments: actor.canViewComments ? 1 : 0,
             can_view_map: actor.canViewMap ? 1 : 0,
             track_color: actor.trackColor,
+            avatar: avatarUrl(url.origin, actor.avatarKey),
           } : null,
         }), { headers });
       }
@@ -1292,7 +1330,109 @@ if (method === "POST" && pathname === "/api/verify-password") {
             can_add_to_others: actor.canAddToOthers ? 1 : 0,
             can_reorder_others: actor.canReorderOthers ? 1 : 0,
             track_color: trackColor,
+            avatar: avatarUrl(url.origin, actor.avatarKey),
           },
+        }), { headers });
+      }
+
+      /* ── 頭像 ────────────────────────────────────────────────────────────
+       *
+       * 一張圖兩用：留言區的圓形頭像 ＋ 地圖上坐在小車上的大頭（飛碟已退休）。
+       * 縮圖、去背判斷、圓形遮罩全在前端做完才上傳（見 frontend/lib/avatar.ts）——
+       * Worker 不碰像素，跟照片縮圖同一套分工。
+       */
+
+      /*
+       * 路由：看頭像。**在進站閘門的白名單裡**（<img src> 帶不了 Authorization）。
+       *
+       * 護欄是猜不到的檔名，所以這裡只認 AVATAR_NAME_RE ——
+       * 那個值會被接到 R2 鍵上，不擋等於把整個桶子開放給人翻。
+       *
+       * 換頭像一定是換一個新檔名（不就地覆寫），所以可以給 immutable 的一年。
+       */
+      if (method === "GET" && pathname.startsWith("/api/users/avatar/")) {
+        const name = decodeURIComponent(pathname.split("/")[4] ?? "");
+        if (!AVATAR_NAME_RE.test(name)) {
+          return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });
+        }
+        return withEdgeCache(request, ctx,
+          { browserMaxAge: 31536000, edgeMaxAge: 31536000, skip: false },
+          async () => {
+            const object = await env.BUCKET.get(avatarR2Key(name));
+            if (object === null) {
+              return new Response(JSON.stringify({ error: "Avatar not found" }), { status: 404, headers });
+            }
+            const h = new Headers();
+            object.writeHttpMetadata(h);
+            h.set("etag", object.httpEtag);
+            h.set("Access-Control-Allow-Origin", "*");
+            return new Response(object.body, { headers: h });
+          });
+      }
+
+      /*
+       * 路由：換掉／移除某個人的頭像。**本人或站長**，沒有第三種。
+       *
+       * 刻意不吃 canManageOthers —— 那一欄講的是「動得了別人的相簿與照片」，
+       * 頭像是那個人自己的臉，能改它的只有他本人跟站長（站長那條是為了幫
+       * 不會用的家人代設，也是為了能把不合適的圖拿掉）。
+       *
+       * body 是原始的圖檔位元組，不是 multipart —— 只有一個檔案，包一層 FormData
+       * 兩邊都變麻煩。舊檔在更新完 D1 之後才刪，而且是 best-effort：
+       * 刪失敗只是留一顆孤兒物件，讓整個請求失敗才是真的壞事。
+       */
+      if ((method === "POST" || method === "DELETE") && pathname.startsWith("/api/users/")
+          && pathname.endsWith("/avatar") && pathname.split("/").length === 5) {
+        const targetId = Number(pathname.split("/")[3]);
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!Number.isInteger(targetId) || targetId <= 0) {
+          return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });
+        }
+        if (!actor.isOwner && actor.uid !== targetId) {
+          return forbidden(headers, "只能換自己的頭像");
+        }
+        const target = await env.DB.prepare("SELECT id, avatar_key FROM User WHERE id = ?")
+          .bind(targetId).first<any>();
+        if (!target) {
+          return new Response(JSON.stringify({ error: "找不到這個帳號" }), { status: 404, headers });
+        }
+        const oldKey: string | null = target.avatar_key ?? null;
+
+        if (method === "DELETE") {
+          await env.DB.prepare("UPDATE User SET avatar_key = NULL WHERE id = ?").bind(targetId).run();
+          if (oldKey) ctx.waitUntil(env.BUCKET.delete(avatarR2Key(oldKey)).catch(() => {}));
+          return new Response(JSON.stringify({ success: true, avatar: null }), { headers });
+        }
+
+        const contentType = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+        // WebP 是常態，PNG 是「這個瀏覽器編不出 WebP」的退路（見前端 canEncodeWebp）。
+        // JPEG 沒有 alpha，去背圖進不來，所以刻意不收
+        const ext = contentType === "image/webp" ? "webp" : contentType === "image/png" ? "png" : null;
+        if (!ext) {
+          return new Response(JSON.stringify({ error: "頭像只收 WebP 或 PNG（要留得住去背的透明背景）" }), { status: 400, headers });
+        }
+        const buffer = await request.arrayBuffer();
+        if (buffer.byteLength === 0) {
+          return new Response(JSON.stringify({ error: "沒有收到圖片" }), { status: 400, headers });
+        }
+        if (buffer.byteLength > AVATAR_MAX_BYTES) {
+          return new Response(JSON.stringify({ error: "頭像檔案太大" }), { status: 413, headers });
+        }
+
+        // 亂數尾碼就是這條白名單路由的護欄，不能拿 uid 或時間戳充數
+        const rand = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+          .map((b) => b.toString(16).padStart(2, "0")).join("");
+        const name = `${targetId}-${rand}.${ext}`;
+        await env.BUCKET.put(avatarR2Key(name), buffer, { httpMetadata: { contentType } });
+        await env.DB.prepare("UPDATE User SET avatar_key = ? WHERE id = ?").bind(name, targetId).run();
+        if (oldKey && oldKey !== name) {
+          ctx.waitUntil(env.BUCKET.delete(avatarR2Key(oldKey)).catch(() => {}));
+        }
+        return new Response(JSON.stringify({
+          success: true, avatar: avatarUrl(url.origin, name),
         }), { headers });
       }
 
@@ -1312,13 +1452,15 @@ if (method === "POST" && pathname === "/api/verify-password") {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
         const { results } = await env.DB.prepare(
-          "SELECT id, name, track_color FROM User WHERE active = 1 ORDER BY id"
+          "SELECT id, name, track_color, avatar_key FROM User WHERE active = 1 ORDER BY id"
         ).all();
         return new Response(JSON.stringify((results as any[]).map((u) => ({
           id: Number(u.id),
           name: u.name,
           // 算好的顏色，理由同 Actor.trackColor：退讓規則只寫在後端一處
           track_color: trackColorFor(Number(u.id), u.track_color),
+          // 地圖要拿它畫車上的大頭 —— 沒設就是 null，那個人坐上去的是小外星人
+          avatar: avatarUrl(url.origin, u.avatar_key),
         }))), { headers });
       }
 
@@ -1398,7 +1540,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
                    u.can_manage_others, u.can_add_to_others, u.can_reorder_others,
                    u.can_comment, u.can_view_comments, u.can_view_map, u.active,
                    u.last_login_at, u.created_at,
-                   u.track_color, u.track_drive_folder_id,
+                   u.track_color, u.avatar_key, u.track_drive_folder_id,
                    (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
                    (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id WHERE a.user_id = u.id) AS photo_count,
                    (SELECT COUNT(*) FROM Photo p WHERE p.uploaded_by = u.id)
@@ -1407,7 +1549,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
               FROM User u
              ORDER BY (u.role = 'owner') DESC, u.active DESC, u.id
           `).all();
-          return new Response(JSON.stringify(results), { headers });
+          // avatar_key 是 R2 檔名，前端要的是網址（見 avatarUrl）。整列照樣往外送，
+          // 站長後台本來就看得到這些欄位
+          return new Response(JSON.stringify((results as any[]).map((u) => ({
+            ...u, avatar: avatarUrl(url.origin, u.avatar_key),
+          }))), { headers });
         }
 
         // 路由：加一個人進白名單。只需要信箱 —— 他第一次 Google 登入就自動對上
@@ -1790,7 +1936,13 @@ if (method === "POST" && pathname === "/api/verify-password") {
             "UPDATE TrackDay SET user_id = ? WHERE user_id = ?"
           ).bind(actor.uid, targetId).run();
 
-          // 7. 人本身
+          // 7. 人本身。他的頭像跟軌跡檔一樣沒有外鍵，列一刪就再也算不出鍵，
+          //    所以要在這裡順手清掉（best-effort，失敗頂多留一顆孤兒物件）
+          const avatarRow = await env.DB.prepare("SELECT avatar_key FROM User WHERE id = ?")
+            .bind(targetId).first<any>();
+          if (avatarRow?.avatar_key) {
+            ctx.waitUntil(env.BUCKET.delete(avatarR2Key(avatarRow.avatar_key)).catch(() => {}));
+          }
           await env.DB.prepare("DELETE FROM User WHERE id = ?").bind(targetId).run();
 
           if (folderRows.length > 0 || loosePhotos.length > 0) {
@@ -3225,7 +3377,7 @@ function hammingDistance(hex1: string, hex2: string): number {
         }
         const { results } = await env.DB.prepare(`
           SELECT c.id, c.parent_id, c.user_id, c.body, c.created_at,
-                 u.name AS user_name, u.track_color
+                 u.name AS user_name, u.track_color, u.avatar_key
             FROM Comment c
             JOIN User u ON u.id = c.user_id
            WHERE c.photo_id = ?
@@ -3239,6 +3391,8 @@ function hammingDistance(hex1: string, hex2: string): number {
           // 頭像圓圈的顏色沿用他的軌跡色 —— 已經是「這個人的顏色」了，
           // 再挑一套只會讓同一個人在地圖上與留言區長得不一樣
           color: trackColorFor(Number(r.user_id), r.track_color),
+          // 沒設頭像就是 null，前端畫回名字首字的色圓
+          avatar: avatarUrl(url.origin, r.avatar_key),
           body: r.body,
           created_at: r.created_at,
           // 前端據此決定要不要端出刪除鈕。規則跟底下的 DELETE 一致：作者本人或站長
@@ -3253,17 +3407,18 @@ function hammingDistance(hex1: string, hex2: string): number {
          */
         const mentioned = new Set<number>();
         for (const c of comments) for (const uid of parseMentions(c.body)) mentioned.add(uid);
-        const people: Array<{ id: number; name: string | null; color: string }> = [];
+        const people: Array<{ id: number; name: string | null; color: string; avatar: string | null }> = [];
         // D1 綁定參數上限 100，照慣例先切塊再查
         for (const chunk of chunkIds(Array.from(mentioned))) {
           const { results: us } = await env.DB.prepare(
-            `SELECT id, name, track_color FROM User WHERE id IN (${chunk.map(() => "?").join(",")})`
+            `SELECT id, name, track_color, avatar_key FROM User WHERE id IN (${chunk.map(() => "?").join(",")})`
           ).bind(...chunk).all();
           for (const u of us as any[]) {
             people.push({
               id: Number(u.id),
               name: u.name,
               color: trackColorFor(Number(u.id), u.track_color),
+              avatar: avatarUrl(url.origin, u.avatar_key),
             });
           }
         }
@@ -3406,12 +3561,13 @@ function hammingDistance(hex1: string, hex2: string): number {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
         const { results } = await env.DB.prepare(
-          "SELECT id, name, track_color FROM User WHERE active = 1 ORDER BY (role = 'owner') DESC, name"
+          "SELECT id, name, track_color, avatar_key FROM User WHERE active = 1 ORDER BY (role = 'owner') DESC, name"
         ).all();
         return new Response(JSON.stringify((results as any[]).map((u) => ({
           id: Number(u.id),
           name: u.name,
           color: trackColorFor(Number(u.id), u.track_color),
+          avatar: avatarUrl(url.origin, u.avatar_key),
         }))), { headers });
       }
 
