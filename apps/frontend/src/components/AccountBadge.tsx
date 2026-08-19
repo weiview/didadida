@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useAdmin } from "@/lib/useAdmin";
+import AvatarPicker from "./AvatarPicker";
 import {
   fetchNotifications, fetchTrackMembers,
   type NotificationItem, type TrackMember,
@@ -31,7 +32,7 @@ export default function AccountBadge() {
   const {
     isAdmin, isGuest, checking, user, isOwner, canManageOthers,
     canViewComments, unreadNotifications, markNotificationsRead,
-    renameSelf, recolorSelf, logout,
+    renameSelf, recolorSelf, setMyAvatar, logout,
   } = useAdmin();
 
   const [open, setOpen] = useState(false);
@@ -214,7 +215,23 @@ export default function AccountBadge() {
             position: "relative",
           }}
         >
-          {initial}
+          {/* 有頭像就蓋掉首字。圖是正方形的（見 lib/avatar.ts），
+              去背的部分會透出底下那層 glass，看起來就是一顆貼在按鈕上的頭 */}
+          {user?.avatar ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={user.avatar}
+              alt=""
+              style={{
+                position: "absolute",
+                inset: 0,
+                width: "100%",
+                height: "100%",
+                borderRadius: "50%",
+                objectFit: "cover",
+              }}
+            />
+          ) : initial}
           {/* 未讀紅點。**不寫數字**：家裡幾個人的留言不會多到需要計數，
               一顆點就足夠說「有新的東西」，也不會把 40px 的圓鈕塞爆 */}
           {unreadNotifications > 0 && (
@@ -305,6 +322,22 @@ export default function AccountBadge() {
                       ))}
                     </div>
                   )}
+                </div>
+              )}
+
+              {/* 頭像。跟顏色一樣是**每個人自己的**東西，所以放這裡不放後台
+                  （站長要代設在 /admin 也有一份，同一個元件）。 */}
+              {isAdmin && user?.id != null && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>頭像</div>
+                  <AvatarPicker
+                    userId={user.id}
+                    current={user.avatar}
+                    name={displayName}
+                    color={myColor ?? "#8a7f72"}
+                    size={56}
+                    onChange={setMyAvatar}
+                  />
                 </div>
               )}
 

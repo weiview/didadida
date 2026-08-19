@@ -365,6 +365,11 @@ export interface CurrentUser {
    * （舊後端沒有這一欄，所以型別上仍然可能缺。）
    */
   track_color?: string | null;
+  /**
+   * 他的頭像網址（見後端 migrations/0015）。null ＝ 沒設過，畫面上退回
+   * 「名字首字 + track_color 的圓」。**同一張圖也是地圖上那顆大頭**。
+   */
+  avatar?: string | null;
 }
 
 /** 進站狀態。admin 與 guest 都是 false 代表連門都還沒進，該顯示進站畫面 */
@@ -484,6 +489,49 @@ export function updateMyTrackColor(color: string | null) {
   return updateMe({ track_color: color }, '換色失敗');
 }
 
+/* ── 頭像 ──────────────────────────────────────────────────────────────────
+ *
+ * 誰改得動：本人，或站長（代設）。所以這兩支都吃 userId 而不是寫死 me ——
+ * 同一個 <AvatarPicker> 元件在帳號牌與 /admin 兩邊共用。
+ *
+ * 送的是**原始的圖檔位元組**，不是 FormData：只有一個檔案，包一層兩邊都變麻煩。
+ * Content-Type 要照實填，後端靠它決定副檔名（也只收 WebP／PNG —— JPEG 沒有 alpha）。
+ */
+
+export async function uploadAvatar(
+  userId: number, blob: Blob, type: string,
+): Promise<{ success: boolean; avatar?: string | null; message?: string }> {
+  try {
+    const token = typeof window !== 'undefined' ? localStorage.getItem(SITE_TOKEN_KEY) : '';
+    const res = await fetch(`${API_BASE_URL}/users/${userId}/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': type, 'Authorization': `Bearer ${token}` },
+      body: blob,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) return { success: true, avatar: data.avatar ?? null };
+    return { success: false, message: data.error || '頭像上傳失敗' };
+  } catch (error: any) {
+    return { success: false, message: `連線錯誤: ${error.message}` };
+  }
+}
+
+export async function removeAvatar(
+  userId: number,
+): Promise<{ success: boolean; message?: string }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/users/${userId}/avatar`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) return { success: true };
+    return { success: false, message: data.error || '移除頭像失敗' };
+  } catch (error: any) {
+    return { success: false, message: `連線錯誤: ${error.message}` };
+  }
+}
+
 /**
  * 站上的一個家人。只有畫地圖與色票列需要的三欄 ——
  * 信箱、權限那些是 /api/admin/users（站長專屬）的事。
@@ -493,6 +541,8 @@ export interface TrackMember {
   name: string | null;
   /** 後端算好的顏色，一定有值 */
   track_color: string;
+  /** 頭像網址。**地圖上車頂那顆大頭就是它**，null 就換小外星人上車 */
+  avatar?: string | null;
 }
 
 /**
@@ -784,8 +834,10 @@ export interface PhotoComment {
   parent_id: number | null;
   user_id: number;
   user_name: string | null;
-  /** 頭像圓圈的顏色。沿用他在地圖上的軌跡色，同一個人到哪裡都同一色 */
+  /** 沒設頭像時那顆圓的顏色。沿用他在地圖上的軌跡色，同一個人到哪裡都同一色 */
   color: string;
+  /** 頭像網址。null ＝ 沒設過，畫成 color 底加名字首字 */
+  avatar?: string | null;
   /** 內文。@ 某人是 `@[uid]` 標記，要用 renderCommentBody 換成名字才顯示 */
   body: string;
   created_at: string;
@@ -809,6 +861,7 @@ export interface MentionableUser {
   id: number;
   name: string | null;
   color: string;
+  avatar?: string | null;
 }
 
 export async function fetchComments(photoId: number): Promise<CommentThread> {

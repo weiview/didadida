@@ -8,7 +8,10 @@ import {
 import 'maplibre-gl/dist/maplibre-gl.css';
 import type { Album, FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
-import { createUfoImage, UFO_PIXEL_RATIO } from '@/lib/ufo';
+import {
+  buildAvatarHead, createAlienHead, createCarImage,
+  CAR_NEUTRAL, CAR_PIXEL_RATIO, CAR_SEAT_Y, HEAD_PIXEL_RATIO,
+} from '@/lib/car';
 import { DEFAULT_TRACK_COLOR } from '@/lib/trackColors';
 
 // OpenFreeMap：免費、免 API key、無流量上限的向量圖磚。
@@ -104,6 +107,13 @@ interface Props {
    */
   trackColors?: Record<number, string>;
   /**
+   * 每個家人的頭像網址（`{ [user_id]: url | null }`，同樣來自 `/api/track-members`）。
+   *
+   * 播放時坐在車上的那顆大頭就是它。沒設頭像（或這張表裡沒有他）的人坐外星人，
+   * 不是不畫 —— 車上空著看起來像資料掉了。
+   */
+  trackAvatars?: Record<number, string | null>;
+  /**
    * Google 紀念層要用的顏色。那一層的線是頁面切好的座標陣列，帶不了 user_id，
    * 而它的內容永遠是**當下這個人自己的**時間軸（R2 key 依 uid 分開），
    * 所以直接給一個色就夠了。
@@ -191,22 +201,35 @@ const CONVOY_PART_MS = 180 * 1000;
 const HEAD_HIDE_GAP_MS = 30 * 60 * 1000;
 
 /*
- * 合體之後的母船與小飛碟。
+ * 車上那幾顆頭怎麼排。
  *
- * 母船就是同一台飛碟畫大一號（不是換成交通工具圖示 —— 理由見 vehicles.ts 開頭：
- * 依速度猜出來的交通工具常常猜錯，畫成真的車等於把猜測當事實展示）。
- * 小飛碟是各人顏色的圓點，繞著母船的碟身轉，這樣才看得出「這台上面有誰」。
+ * 合體（同行）時是**同一台車上冒出好幾顆頭**，不是好幾台車 —— 一起出門的人
+ * 本來就在同一台車上，畫成三台各走各的反而看不出他們在一起。人多車就寬一點，
+ * 頭則往兩邊排開、高低錯開，免得後面的人被前面的人整顆擋住。
  *
- * 這幾個數字是螢幕像素，所以每一幀都要用 map.project／unproject 換算回經緯度 ——
- * 縮放地圖時小飛碟才會維持一樣的繞行半徑，而不是隨著比例尺飛走。
+ * 下面全是**螢幕像素**，所以每一幀都要 map.project／unproject 換算回經緯度 ——
+ * 縮放地圖時頭才會一直好好坐在車上，而不是隨著比例尺飛走。
  */
-const MOTHERSHIP_SCALE = 1.5;
-/** 碟身中心相對於「光束落地點」的螢幕位移。圖是 icon-anchor: bottom，碟身在上面 */
-const SAUCER_ORBIT_CY = -52;
-const SAUCER_ORBIT_RX = 44;
-/** 壓扁成橢圓才像在繞圈，不是在畫面上平移 */
-const SAUCER_ORBIT_RY_RATIO = 0.4;
-const SAUCER_ORBIT_SEC = 7;
+/** 兩顆頭的水平間距。比頭本身窄，讓他們稍微擠在一起，像擠在同一排座位上 */
+const HEAD_STEP = 30;
+/** 錯開的高度。奇數位的人坐低一點（後座），才不會兩顆頭完全重疊 */
+const HEAD_TIER = 6;
+/** 人多的時候頭縮小一點，不然四個人的頭會比整台車還寬 */
+const HEAD_CROWD_SCALE = 0.85;
+/** 車至少要有多寬（CSS px）才裝得下這幾顆頭。算車身縮放用 */
+const CAR_BASE_W = 100;
+/** 頭在車上的上下浮動幅度。每個人相位錯開，看起來就是各自在晃 */
+const HEAD_BOB = 2.5;
+
+/**
+ * 判斷車頭朝哪邊時，往回看多久（毫秒的軌跡時間）。
+ *
+ * 太短會在停等紅燈時抖成一片（位移是零，方向由雜訊決定），
+ * 太長則轉彎之後車頭要等很久才轉過來。
+ */
+const FACING_LOOKBACK_MS = 60 * 1000;
+/** 螢幕上位移超過這麼多像素才改變朝向。低於它就維持上一次的決定 */
+const FACING_HYSTERESIS_PX = 6;
 
 // 地圖上最多同時保留幾張縮圖。超過就退回圓點 ——
 // 每張都是一塊要留在 GPU 上的貼圖，不設上限的話大相簿會把記憶體吃光。
@@ -819,6 +842,7 @@ export default function FootprintMap({
   animateOn = 'track',
   timelineLines,
   trackColors,
+  trackAvatars,
   timelineColor = DEFAULT_TRACK_COLOR,
   focusPoint,
 }: Props) {
@@ -840,7 +864,7 @@ export default function FootprintMap({
   const editingRef = useRef(false);
   // shift 連選的起點（tracks 陣列裡的索引）
   const anchorIdxRef = useRef<number | null>(null);
-  // 飛碟自己的動畫迴圈讀這個決定要不要繼續要下一幀。地圖只建立一次，讀不到 state
+  // 車與頭的動畫迴圈讀這個決定要不要繼續要下一幀。地圖只建立一次，讀不到 state
   const playingRef = useRef(false);
 
   const [ready, setReady] = useState(false);
@@ -890,6 +914,70 @@ export default function FootprintMap({
     (userId: number | null) => (userId != null && trackColors?.[userId]) || DEFAULT_TRACK_COLOR,
     [trackColors],
   );
+
+  /** 某個人的頭像網址。沒有就是 null —— 那他在地圖上坐的是外星人 */
+  const avatarFor = useCallback(
+    (userId: number | null) => (userId != null && trackAvatars?.[userId]) || null,
+    [trackAvatars],
+  );
+
+  /** 已經開始做的頭像貼圖。同一張只做一次（每張都要下載、描邊、讀回像素） */
+  const headPending = useRef<Set<string>>(new Set());
+  /**
+   * 頭像貼圖做好一張就 +1，逼那個每幀重算的效果再跑一次 ——
+   * 不然暫停中做好的頭要等下次播放才換得上去，畫面會卡在外星人。
+   */
+  const [headTick, setHeadTick] = useState(0);
+  /** 每台車現在車頭朝哪。key 是「車上有誰」，見 FACING_HYSTERESIS_PX */
+  const facingRef = useRef<Map<string, 1 | -1>>(new Map());
+
+  /** 這個顏色、這個朝向的車。沒有就現做一台 */
+  const ensureCar = useCallback((map: MapLibreMap, color: string, flip: boolean) => {
+    const id = `car:${color}:${flip ? 'l' : 'r'}`;
+    if (!map.hasImage(id)) {
+      map.addImage(
+        id,
+        // 只有播放中才要求下一幀：暫停時地圖不該一直重畫
+        createCarImage(() => map.triggerRepaint(), () => playingRef.current, color, flip) as any,
+        { pixelRatio: CAR_PIXEL_RATIO },
+      );
+    }
+    return id;
+  }, []);
+
+  /**
+   * 這個人的頭。有頭像就用他的頭像，**還沒做好或做不出來就先坐外星人** ——
+   * icon-image 指到不存在的圖只會什麼都不畫，車上空一格看起來像壞掉。
+   */
+  const ensureHead = useCallback((map: MapLibreMap, userId: number | null, color: string) => {
+    const alien = `head:alien:${color}`;
+    if (!map.hasImage(alien)) {
+      map.addImage(
+        alien,
+        createAlienHead(() => map.triggerRepaint(), () => playingRef.current, color) as any,
+        { pixelRatio: HEAD_PIXEL_RATIO },
+      );
+    }
+    const url = avatarFor(userId);
+    if (!url) return alien;
+
+    // 顏色也進 id：肩膀是那個人的軌跡色，換色就得重做一張
+    const id = `head:${color}:${url}`;
+    if (map.hasImage(id)) return id;
+    if (!headPending.current.has(id)) {
+      headPending.current.add(id);
+      buildAvatarHead(url, color)
+        .then((img) => {
+          // 地圖可能已經被拆掉（換頁）——那就什麼都別做
+          if (mapRef.current !== map) return;
+          if (!map.hasImage(id)) map.addImage(id, img as any, { pixelRatio: HEAD_PIXEL_RATIO });
+          setHeadTick((v) => v + 1);
+        })
+        // 載不下來（檔案沒了、跨網域被擋）就一直坐外星人，不要一直重試
+        .catch(() => {});
+    }
+    return alien;
+  }, [avatarFor]);
 
   const trackLines = useMemo(() => groupLines(tracks, ownerByDay), [tracks, ownerByDay]);
 
@@ -1475,51 +1563,51 @@ export default function FootprintMap({
         },
       });
 
-      // 移動圖示。畫在最上層，它是動畫的主角。
-      // 只有一個圖示，不隨交通工具改變 —— 理由見 vehicles.ts 開頭
-      if (!map.hasImage('mover')) {
-        map.addImage(
-          'mover',
-          // 只有播放中才要求下一幀：暫停時地圖不該一直重畫
-          createUfoImage(() => map.triggerRepaint(), () => playingRef.current) as any,
-          { pixelRatio: UFO_PIXEL_RATIO },
-        );
-      }
+      /*
+       * 移動圖示：小小的車 ＋ 大大的頭。畫在最上層，它是動畫的主角。
+       *
+       * 車與頭是**兩層**，每一幀各自定位（見底下 project／unproject 那段）——
+       * 合成一張圖的話，每一種人數 × 每一組頭像都要各做一張貼圖。
+       * 圖本身是現做的（見 lib/car.ts），車身色與頭像不同就是另一張，
+       * 所以這裡不預先加，等真的有人上場再 ensureCarImage／ensureHeadImage。
+       */
       map.addSource('vehicle', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
       map.addLayer({
         id: 'vehicle-marker',
         type: 'symbol',
         source: 'vehicle',
         layout: {
-          'icon-image': 'mover',
-          // 母船（同行合體）比獨行的大一號，見 MOTHERSHIP_SCALE
+          // 每個 feature 自己指定要哪張車（顏色 × 朝左朝右）
+          'icon-image': ['get', 'img'],
+          // 人多的時候車要寬一點才裝得下那幾顆頭，見 CAR_BASE_W
           'icon-size': ['get', 'scale'],
           'icon-allow-overlap': true,
           'icon-ignore-placement': true,
-          // 圖的底部中央是光束落地點，錨在那裡才會「碟身浮在上面、光束打在軌跡上」
+          // 圖的底部中央是輪子接地點，錨在那裡車才會停在軌跡上
           'icon-anchor': 'bottom',
-          // 刻意不隨行進方向旋轉：飛碟沒有明確的頭尾，轉了只是抖動
+          // 朝向靠左右兩張圖切換，不靠旋轉 —— 車轉起來會變成側翻
           'icon-rotation-alignment': 'viewport',
         },
       });
 
       /*
-       * 母船上的小碟：合體時，每個人一顆自己顏色的圓點繞著碟身轉。
+       * 車上的人。一個人一顆頭，加在 vehicle-marker 後面才會疊在車身上。
        *
-       * 加在 vehicle-marker 後面，才會疊在碟身上而不是被它蓋掉。
-       * 用圓點而不是縮小的飛碟圖：那個圖是 80 CSS px 的動畫 canvas，縮到十幾 px
-       * 只會糊成一團色塊，反而看不出是幾個人。
+       * 「今天誰跟誰在一起」全靠這一層：合體時同一台車上有幾顆頭就是幾個人。
        */
       map.addSource('heads', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
       map.addLayer({
-        id: 'head-dots',
-        type: 'circle',
+        id: 'rider-heads',
+        type: 'symbol',
         source: 'heads',
-        paint: {
-          'circle-radius': 5,
-          'circle-color': ['get', 'color'],
-          'circle-stroke-width': 1.6,
-          'circle-stroke-color': '#ffffff',
+        layout: {
+          'icon-image': ['get', 'img'],
+          'icon-size': ['get', 'scale'],
+          'icon-allow-overlap': true,
+          'icon-ignore-placement': true,
+          // 錨在下緣：那裡是小身體的底部，正好坐進座位
+          'icon-anchor': 'bottom',
+          'icon-rotation-alignment': 'viewport',
         },
       });
 
@@ -1978,7 +2066,6 @@ export default function FootprintMap({
     const headsSrc = map.getSource('heads') as GeoJSONSource | undefined;
     if (!src) return;
 
-    const multi = memberPaths.length > 1;
     const lineFeatures: any[] = [];
     /** 每個人現在在哪。null＝這個時候他不該出現（沒資料／中斷中） */
     const pos: ([number, number] | null)[] = [];
@@ -2020,16 +2107,71 @@ export default function FootprintMap({
     src.setData({ type: 'FeatureCollection', features: lineFeatures });
 
     /*
-     * 飛碟：同行的人合體成一台大的，各自走的各開各的。
+     * 車與頭：同行的人擠同一台車，各自走的各開各的。
      *
-     * 合體時碟身畫在那一群人的形心上，每人一顆自己顏色的小圓點繞著碟身轉 ——
-     * 「大飛碟帶小飛碟」。單人時這整段會退化成「一台 scale 1 的飛碟」，
-     * 也就是改版前的樣子，一個人的站台完全看不出差別。
+     * 一台車 ＝ 一群人。車畫在那一群人的形心上，每個人一顆大頭坐在車頂 ——
+     * 一個人的時候就退化成「一顆頭一台車」，看不出這裡有處理多人的事。
      */
-    const ufoFeatures: any[] = [];
-    const dotFeatures: any[] = [];
+    const carFeatures: any[] = [];
+    const headFeatures: any[] = [];
     const inConvoy = new Set<number>();
-    const orbitAngle = (performance.now() / 1000 / SAUCER_ORBIT_SEC) * Math.PI * 2;
+    const now = performance.now() / 1000;
+
+    /** 這台車往哪開。位移太小就沿用上次的答案，不然停等時車頭會左右亂甩 */
+    const facingOf = (key: string, cur: [number, number], prev: [number, number] | null) => {
+      const last = facingRef.current.get(key) ?? 1;
+      if (!prev) return last;
+      const dx = map.project(cur).x - map.project(prev).x;
+      if (Math.abs(dx) < FACING_HYSTERESIS_PX) return last;
+      const next: 1 | -1 = dx < 0 ? -1 : 1;
+      facingRef.current.set(key, next);
+      return next;
+    };
+
+    /**
+     * 擺一台車與車上的人。
+     *
+     * 頭的位置只能用螢幕座標算：符號圖層沒有「每個 feature 各自位移」的辦法
+     * （icon-translate 是整層共用的），所以把車的位置投影成像素、在像素上排好，
+     * 再投影回經緯度。反正播放中本來就每幀重畫一次，不多花什麼。
+     */
+    const placeCar = (idx: number[], center: [number, number], prev: [number, number] | null) => {
+      const n = idx.length;
+      const key = idx.map((i) => memberPaths[i].userId ?? 'x').join(',');
+      const flip = facingOf(key, center, prev) < 0;
+      // 獨行的人開自己顏色的車；合體那台不屬於任何一個人，用中性色
+      const carColor = n === 1 ? colorFor(memberPaths[idx[0]].userId) : CAR_NEUTRAL;
+      const headScale = n > 1 ? HEAD_CROWD_SCALE : 1;
+      const step = HEAD_STEP * headScale;
+      // 車至少要跟這排頭一樣寬，不然頭會掛在車外面
+      const carScale = Math.max(1, ((n - 1) * step + CAR_BASE_W * 0.5) / CAR_BASE_W);
+
+      carFeatures.push({
+        type: 'Feature',
+        properties: { img: ensureCar(map, carColor, flip), scale: carScale },
+        geometry: { type: 'Point', coordinates: center },
+      });
+
+      const cpx = map.project(center);
+      const seatY = cpx.y + CAR_SEAT_Y * carScale;
+      idx.forEach((i, k) => {
+        const color = colorFor(memberPaths[i].userId);
+        const ll = map.unproject([
+          cpx.x + (k - (n - 1) / 2) * step,
+          // 奇數位的人坐低一點（後座），加上各自錯開相位的上下晃動
+          seatY + (k % 2) * HEAD_TIER + Math.sin(now * 3 + k * 1.3) * HEAD_BOB,
+        ]);
+        headFeatures.push({
+          type: 'Feature',
+          // 後排的先畫，前排的才蓋得住他 —— 這一層的疊放順序就是 feature 的順序
+          properties: { img: ensureHead(map, memberPaths[i].userId, color), scale: headScale },
+          geometry: { type: 'Point', coordinates: [ll.lng, ll.lat] },
+        });
+      });
+    };
+
+    /** 往回看一小段，用來判斷車頭朝哪邊 */
+    const prevOf = (i: number) => posAt(memberPaths[i].nodes, cursorT - FACING_LOOKBACK_MS);
 
     for (const group of convoyAt(convoys, cursorT)) {
       const present = group.filter((i) => pos[i]);
@@ -2040,72 +2182,47 @@ export default function FootprintMap({
       let lat = 0;
       for (const i of present) { lng += pos[i]![0]; lat += pos[i]![1]; }
       const center: [number, number] = [lng / present.length, lat / present.length];
-      ufoFeatures.push({
-        type: 'Feature',
-        properties: { scale: MOTHERSHIP_SCALE },
-        geometry: { type: 'Point', coordinates: center },
-      });
 
-      /*
-       * 小碟的位置只能用螢幕座標算：圓點圖層沒有「每個 feature 各自位移」的辦法
-       * （icon-translate 是整層共用的），所以把形心投影成像素、在像素上排一圈、
-       * 再投影回經緯度。反正播放中本來就每幀重畫一次，不多花什麼。
-       */
-      const cpx = map.project(center);
-      present.forEach((i, k) => {
-        const ang = orbitAngle + (k / present.length) * Math.PI * 2;
-        const ll = map.unproject([
-          cpx.x + Math.cos(ang) * SAUCER_ORBIT_RX * MOTHERSHIP_SCALE,
-          cpx.y + SAUCER_ORBIT_CY * MOTHERSHIP_SCALE
-            + Math.sin(ang) * SAUCER_ORBIT_RX * SAUCER_ORBIT_RY_RATIO * MOTHERSHIP_SCALE,
-        ]);
-        dotFeatures.push({
-          type: 'Feature',
-          properties: { color: colorFor(memberPaths[i].userId) },
-          geometry: { type: 'Point', coordinates: [ll.lng, ll.lat] },
-        });
-      });
+      // 上一刻的形心。只算「剛剛也在」的那幾個人，不然有人中途加入會讓
+      // 形心跳一大步，車頭跟著亂轉
+      const prevs = present.map(prevOf).filter((p): p is [number, number] => p != null);
+      const prev: [number, number] | null = prevs.length
+        ? [
+            prevs.reduce((s, p) => s + p[0], 0) / prevs.length,
+            prevs.reduce((s, p) => s + p[1], 0) / prevs.length,
+          ]
+        : null;
+
+      placeCar(present, center, prev);
     }
 
     for (let i = 0; i < memberPaths.length; i++) {
       const p = pos[i];
       if (!p || inConvoy.has(i)) continue;
-      ufoFeatures.push({
-        type: 'Feature',
-        properties: { scale: 1 },
-        geometry: { type: 'Point', coordinates: p },
-      });
-      // 只有一個人在場時不必標色點 —— 那顆點不回答任何問題，只是擋住光束落地處
-      if (multi) {
-        dotFeatures.push({
-          type: 'Feature',
-          properties: { color: colorFor(memberPaths[i].userId) },
-          geometry: { type: 'Point', coordinates: p },
-        });
-      }
+      placeCar([i], p, prevOf(i));
     }
 
-    vehicleSrc?.setData({ type: 'FeatureCollection', features: ufoFeatures });
-    headsSrc?.setData({ type: 'FeatureCollection', features: dotFeatures });
+    vehicleSrc?.setData({ type: 'FeatureCollection', features: carFeatures });
+    headsSrc?.setData({ type: 'FeatureCollection', features: headFeatures });
 
     /*
-     * 跟拍：每一幀都把鏡頭對到飛碟目前的位置，讓它固定在畫面正中央。
+     * 跟拍：每一幀都把鏡頭對到車目前的位置，讓它固定在畫面正中央。
      *
      * 用 setCenter 而不是 easeTo —— easeTo 是「用 N 毫秒滑過去」，每幀都下一次
-     * 新的 easeTo 會不斷打斷上一次的補間，鏡頭永遠追在飛碟後面，飛碟就會飄到
+     * 新的 easeTo 會不斷打斷上一次的補間，鏡頭永遠追在車後面，車就會飄到
      * 畫面邊緣（原本每 600ms 才對準一次節點，正是這個症狀）。時間游標本身已經是
      * 連續內插出來的，直接設中心就已經是平滑的移動。
      *
-     * 多台飛碟時對準它們的形心：跟著其中一台跑的話，其他人隨時會被甩出畫面，
+     * 好幾台車時對準它們的形心：跟著其中一台跑的話，其他人隨時會被甩出畫面，
      * 而「大家分頭在哪」正是多身分播放要看的東西。
      */
-    if (playing && ufoFeatures.length > 0) {
+    if (playing && carFeatures.length > 0) {
       let cx = 0;
       let cy = 0;
-      for (const f of ufoFeatures) { cx += f.geometry.coordinates[0]; cy += f.geometry.coordinates[1]; }
-      map.setCenter([cx / ufoFeatures.length, cy / ufoFeatures.length]);
+      for (const f of carFeatures) { cx += f.geometry.coordinates[0]; cy += f.geometry.coordinates[1]; }
+      map.setCenter([cx / carFeatures.length, cy / carFeatures.length]);
     }
-  }, [cursorT, memberPaths, convoys, colorFor, ready, playing]);
+  }, [cursorT, memberPaths, convoys, colorFor, ensureCar, ensureHead, headTick, ready, playing]);
 
   // --- 播放迴圈 ---
   useEffect(() => {
