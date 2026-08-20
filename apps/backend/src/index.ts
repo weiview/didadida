@@ -831,6 +831,20 @@ async function guardTrackAccess(
   return null;
 }
 
+/*
+ * 「這個人算不算足跡的參與者」的 SQL 片段（`u` 是 User 的別名）。
+ *
+ * 沒有工具權限的人**整個不出現在地圖上** —— 名字、篩選列、圖例、軌跡線、
+ * 動畫上的車全都沒有（使用者定調 2026-08-20）。理由：他既然放不進東西，
+ * 名字掛在圖例上只會讓人問「這條線是誰的」；而且他自己看到的畫面要跟
+ * 別人看到的一樣，不然同一張地圖兩個人看到不同結果，日後很難解釋。
+ *
+ * ⚠️ **一定要在 SQL 裡濾**，不能撈回來再挑（同座標那條坑）—— 濾掉的是別人的
+ * 行蹤，回應裡根本不該出現。
+ * ⚠️ `d.user_id` 可能是 NULL（0009 之前的舊列，那些是站長的），**要放行**。
+ */
+const TRACK_MEMBER_COND = "(u.role = 'owner' OR u.can_use_tools = 1)";
+
 /**
  * 會**動到軌跡資料**的路由再多擋一道（見 migrations/0016）。
  *
@@ -1515,8 +1529,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (!(await isAuthorized(request, env))) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
+        // 沒有工具權限的人不列（見 TRACK_MEMBER_COND）。這一支同時餵地圖的
+        // 圖例、成員篩選列、軌跡顏色與車上的大頭 —— 從源頭拿掉，四個地方一起乾淨
         const { results } = await env.DB.prepare(
-          "SELECT id, name, track_color, avatar_key FROM User WHERE active = 1 ORDER BY id"
+          `SELECT u.id, u.name, u.track_color, u.avatar_key FROM User u
+           WHERE u.active = 1 AND ${TRACK_MEMBER_COND} ORDER BY u.id`
         ).all();
         return new Response(JSON.stringify((results as any[]).map((u) => ({
           id: Number(u.id),
@@ -5075,6 +5092,7 @@ function hammingDistance(hex1: string, hex2: string): number {
                  ) AS last_local_day
           FROM TrackDay d
           LEFT JOIN User u ON u.id = d.user_id
+          WHERE d.user_id IS NULL OR ${TRACK_MEMBER_COND}
           ORDER BY d.day_key DESC
         `).all();
         return new Response(JSON.stringify(results), { headers });
@@ -5426,6 +5444,11 @@ function hammingDistance(hex1: string, hex2: string): number {
           binds.push(...qUsers.slice(0, 50));
         }
 
+        // 沒有工具權限的人的軌跡整條不出（見 TRACK_MEMBER_COND）。
+        // 放在 conds 裡是因為它同時要吃到底下那個 LIMIT —— 先濾再取 N 點，
+        // 不然「最近 20000 點」會被畫不出來的人佔掉名額
+        conds.push(`(d.user_id IS NULL OR ${TRACK_MEMBER_COND})`);
+
         const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
         // 一定要有上限。軌跡一天就好幾百點，不設限的話「不選日期直接進地圖頁」
         // 會把好幾年份一次讀出來，D1 免費額度的每日讀取列數撐不住。
@@ -5435,6 +5458,7 @@ function hammingDistance(hex1: string, hex2: string): number {
                  d.user_id
           FROM TrackPoint p
           JOIN TrackDay d ON d.day_key = p.day_key
+          LEFT JOIN User u ON u.id = d.user_id
           ${where}
           ORDER BY p.t_utc DESC
           LIMIT ?
