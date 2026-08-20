@@ -42,6 +42,11 @@ export default function AdminPage() {
   const [newEmail, setNewEmail] = useState("");
   const [newName, setNewName] = useState("");
   const [newCanManage, setNewCanManage] = useState(false);
+  /*
+   * 新加入的人**預設不給**足跡工具（見 migrations/0016）。
+   * 欄位本身是 DEFAULT 1，那是為了不動到現有成員；「新增時決定給不給」是這裡。
+   */
+  const [newCanUseTools, setNewCanUseTools] = useState(false);
   const [adding, setAdding] = useState(false);
 
   /** 正在確認移除的那個人 */
@@ -144,7 +149,7 @@ export default function AdminPage() {
     if (!email || adding) return;
     setAdding(true);
     setNotice(null);
-    const result = await addWhitelistUser(email, newName.trim(), newCanManage);
+    const result = await addWhitelistUser(email, newName.trim(), newCanManage, newCanUseTools);
     setAdding(false);
     if (!result.success) return setError(result.message || "新增失敗");
     setError(null);
@@ -154,6 +159,7 @@ export default function AdminPage() {
     setNewEmail("");
     setNewName("");
     setNewCanManage(false);
+    setNewCanUseTools(false);
     load();
   };
 
@@ -163,6 +169,7 @@ export default function AdminPage() {
       can_manage_others?: boolean; active?: boolean;
       can_add_to_others?: boolean; can_reorder_others?: boolean;
       can_comment?: boolean; can_view_comments?: boolean; can_view_map?: boolean;
+      can_use_tools?: boolean;
     },
   ) => {
     setBusyId(user.id);
@@ -442,6 +449,14 @@ export default function AdminPage() {
             />
             可管理全站內容
           </label>
+          <label className={styles.checkbox} title="給了才動得了足跡：同步 Drive、上傳 GPX、匯入 Google 時間軸">
+            <input
+              type="checkbox"
+              checked={newCanUseTools}
+              onChange={(e) => setNewCanUseTools(e.target.checked)}
+            />
+            可用足跡工具
+          </label>
           <button
             type="button"
             className={`${styles.button} ${styles.primary}`}
@@ -687,6 +702,28 @@ export default function AdminPage() {
                       onChange={(e) => patch(user, { can_view_map: e.target.checked })}
                     />
                     可看足跡
+                  </label>
+
+                  {/*
+                    * 「看得到」跟「寫得進去」是兩件事（`can_use_tools`，見 migrations/0016）。
+                    * 這格關掉的人照樣看得到地圖與自己的軌跡，只是 /map 上那塊工具區
+                    * 整塊不出現，進頁面的自動同步與自動貼路也不跑，後端那 10 支
+                    * 寫入路由一律 403。
+                    *
+                    * 現有成員一律是開的（migration DEFAULT 1），**新加入的預設不給** ——
+                    * 上面新增表單那顆勾勾預設不勾。
+                    */}
+                  <label
+                    className={styles.checkbox}
+                    title="關掉之後他還是看得到地圖，只是不能同步 Drive、上傳 GPX、匯入 Google 時間軸"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={owner || user.can_use_tools === 1}
+                      disabled={owner || busy || user.active !== 1}
+                      onChange={(e) => patch(user, { can_use_tools: e.target.checked })}
+                    />
+                    可用足跡工具
                   </label>
 
                   {!owner && user.active !== 1 && (

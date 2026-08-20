@@ -307,6 +307,14 @@ interface Actor {
    */
   canViewMap: boolean;
   /**
+   * 動得了軌跡資料的管理工具（見 migrations/0016）：Google 時間軸匯入、
+   * Drive 同步足跡、手動上傳 GPX、貼路、改軌跡點。預設開，新加入的人由站長決定。
+   *
+   * **看與寫是兩件事** —— canViewMap 管的是看得到地圖，這一欄管的是寫得進去。
+   * 一樣不受 canManageOthers 短路，只有站長永遠是開的。
+   */
+  canUseTools: boolean;
+  /**
    * 他自己那個 GPSLogger Drive 資料夾（見 migrations/0009）。
    * 跟著 Actor 一起帶出來是因為它就在同一列上 —— 另外查一次是白花讀取額度。
    */
@@ -379,7 +387,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
         uid: owner.id, email: owner.email, name: owner.name,
         isOwner: true, canManageOthers: true,
         canAddToOthers: true, canReorderOthers: true,
-        canComment: true, canViewComments: true, canViewMap: true,
+        canComment: true, canViewComments: true, canViewMap: true, canUseTools: true,
         trackFolderId: owner.track_drive_folder_id ?? null,
         trackColor: trackColorFor(owner.id, owner.track_color),
         avatarKey: owner.avatar_key ?? null,
@@ -389,7 +397,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
       uid: null, email: identity.email, name: null,
       isOwner: true, canManageOthers: true,
       canAddToOthers: true, canReorderOthers: true,
-      canComment: true, canViewComments: true, canViewMap: true, trackFolderId: null,
+      canComment: true, canViewComments: true, canViewMap: true, canUseTools: true, trackFolderId: null,
       trackColor: trackColorFor(null, null),
       avatarKey: null,
     };
@@ -397,7 +405,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
 
   const row = await env.DB.prepare(
     `SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others,
-            can_comment, can_view_comments, can_view_map, notif_seen_at,
+            can_comment, can_view_comments, can_view_map, can_use_tools, notif_seen_at,
             active, track_color, avatar_key, track_drive_folder_id
        FROM User WHERE id = ?`
   ).bind(identity.uid).first<any>();
@@ -421,6 +429,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
     canComment: isOwner || Number(row.can_comment) === 1,
     canViewComments: isOwner || Number(row.can_view_comments) === 1,
     canViewMap: isOwner || Number(row.can_view_map) === 1,
+    canUseTools: isOwner || Number(row.can_use_tools) === 1,
     trackFolderId: row.track_drive_folder_id ?? null,
     trackColor: trackColorFor(row.id, row.track_color),
     avatarKey: row.avatar_key ?? null,
@@ -819,6 +828,26 @@ async function guardTrackAccess(
     return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
   }
   if (!actor.canViewMap) return forbidden(headers, "站長沒有開放你瀏覽足跡地圖");
+  return null;
+}
+
+/**
+ * 會**動到軌跡資料**的路由再多擋一道（見 migrations/0016）。
+ *
+ * 用法是接在 guardTrackAccess 後面 —— 看不到地圖的人連這一關都走不到，
+ * 而看得到的人不代表寫得進去。currentActor 是同一個請求的 WeakMap 快取，不多查 D1。
+ *
+ * 蓋到的是：Drive 掃描與同步、手動上傳 GPX、貼路、覆蓋／刪除貼路結果、
+ * 改軌跡點、上傳 Google 時間軸。純讀取的那幾支（列出天數、拿軌跡、拿貼路結果）不擋。
+ */
+async function guardTrackTools(
+  request: Request, env: Env, headers: Record<string, string>,
+): Promise<Response | null> {
+  const actor = await currentActor(request, env);
+  if (!actor) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+  }
+  if (!actor.canUseTools) return forbidden(headers, "站長沒有開放你使用足跡的管理工具");
   return null;
 }
 
@@ -1277,6 +1306,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
           can_view_comments: canViewComments ? 1 : 0,
           // 訪客永遠是 0：不是設定，是資料模型上就沒有訪客這個作者
           can_comment: actor?.canComment ? 1 : 0,
+          // 訪客也永遠是 0：工具區整塊只給成員（見 migrations/0016）
+          can_use_tools: actor?.canUseTools ? 1 : 0,
           unread_notifications: unread,
           /*
            * 同遊判定的門檻。**刻意跟著這一條回來**，理由跟未讀數一樣：
@@ -1293,6 +1324,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             can_comment: actor.canComment ? 1 : 0,
             can_view_comments: actor.canViewComments ? 1 : 0,
             can_view_map: actor.canViewMap ? 1 : 0,
+            can_use_tools: actor.canUseTools ? 1 : 0,
             track_color: actor.trackColor,
             avatar: avatarUrl(url.origin, actor.avatarKey),
           } : null,
@@ -1585,7 +1617,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           const { results } = await env.DB.prepare(`
             SELECT u.id, u.name, u.email, u.role,
                    u.can_manage_others, u.can_add_to_others, u.can_reorder_others,
-                   u.can_comment, u.can_view_comments, u.can_view_map, u.active,
+                   u.can_comment, u.can_view_comments, u.can_view_map, u.can_use_tools, u.active,
                    u.last_login_at, u.created_at,
                    u.track_color, u.avatar_key, u.track_drive_folder_id,
                    (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
@@ -1605,13 +1637,19 @@ if (method === "POST" && pathname === "/api/verify-password") {
 
         // 路由：加一個人進白名單。只需要信箱 —— 他第一次 Google 登入就自動對上
         if (method === "POST" && pathname === "/api/admin/users") {
-          const body: { email?: string; name?: string; can_manage_others?: any } = await request.json();
+          const body: { email?: string; name?: string; can_manage_others?: any; can_use_tools?: any } = await request.json();
           const email = String(body.email ?? "").trim().toLowerCase();
           if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
             return new Response(JSON.stringify({ error: "請填一個看起來像信箱的東西" }), { status: 400, headers });
           }
           const name = String(body.name ?? "").trim() || email.split("@")[0];
           const canManage = body.can_manage_others ? 1 : 0;
+          /*
+           * 管理工具**預設不給**（見 migrations/0016）。欄位本身是 DEFAULT 1
+           * ——那是為了不動到現有成員——所以這裡一定要明寫，不能靠預設值。
+           * 使用者要的正是「新增白名單時決定給不給」。
+           */
+          const canUseTools = body.can_use_tools ? 1 : 0;
 
           /*
            * 配一個還沒被用到的顏色。
@@ -1636,18 +1674,18 @@ if (method === "POST" && pathname === "/api/verify-password") {
             // 曾經被移出白名單的人再加回來 —— 就是把 active 打開，他的相簿都還在。
             // 顏色只在他從來沒有過的時候才補（COALESCE）：以前挑過什麼就還他什麼
             await env.DB.prepare(
-              "UPDATE User SET active = 1, can_manage_others = ?, name = ?, track_color = COALESCE(track_color, ?) WHERE id = ?"
-            ).bind(canManage, name, freeColor, existing.id).run();
-            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, active, track_color FROM User WHERE id = ?")
+              "UPDATE User SET active = 1, can_manage_others = ?, can_use_tools = ?, name = ?, track_color = COALESCE(track_color, ?) WHERE id = ?"
+            ).bind(canManage, canUseTools, name, freeColor, existing.id).run();
+            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, can_use_tools, active, track_color FROM User WHERE id = ?")
               .bind(existing.id).first();
             return new Response(JSON.stringify({ success: true, restored: Number(existing.active) !== 1, user: row }), { headers });
           }
 
           const res = await env.DB.prepare(
-            "INSERT INTO User (name, email, role, can_manage_others, active, track_color) VALUES (?, ?, 'member', ?, 1, ?)"
-          ).bind(name, email, canManage, freeColor).run();
+            "INSERT INTO User (name, email, role, can_manage_others, can_use_tools, active, track_color) VALUES (?, ?, 'member', ?, ?, 1, ?)"
+          ).bind(name, email, canManage, canUseTools, freeColor).run();
           const id = res.meta.last_row_id;
-          const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, active, track_color FROM User WHERE id = ?")
+          const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, can_use_tools, active, track_color FROM User WHERE id = ?")
             .bind(id).first();
           return new Response(JSON.stringify({ success: true, user: row }), { headers });
         }
@@ -2033,6 +2071,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
               name?: string; can_manage_others?: any; active?: any;
               can_add_to_others?: any; can_reorder_others?: any;
               can_comment?: any; can_view_comments?: any; can_view_map?: any;
+              can_use_tools?: any;
             } = await request.json();
             const sets: string[] = [];
             const binds: any[] = [];
@@ -2070,6 +2109,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
             if (body.can_view_map !== undefined) {
               sets.push("can_view_map = ?"); binds.push(body.can_view_map ? 1 : 0);
             }
+            if (body.can_use_tools !== undefined) {
+              sets.push("can_use_tools = ?"); binds.push(body.can_use_tools ? 1 : 0);
+            }
             if (body.active !== undefined) {
               sets.push("active = ?"); binds.push(body.active ? 1 : 0);
             }
@@ -2077,7 +2119,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
               return new Response(JSON.stringify({ error: "沒有要改的東西" }), { status: 400, headers });
             }
             await env.DB.prepare(`UPDATE User SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, targetId).run();
-            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, can_comment, can_view_comments, can_view_map, active FROM User WHERE id = ?")
+            const row = await env.DB.prepare("SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others, can_comment, can_view_comments, can_view_map, can_use_tools, active FROM User WHERE id = ?")
               .bind(targetId).first();
             return new Response(JSON.stringify({ success: true, user: row }), { headers });
           }
@@ -4823,6 +4865,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "GET" && pathname === "/api/tracks/drive/files") {
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         // guardTrackAccess 已經擋掉 null，這裡是 WeakMap 快取命中，不會再查一次 D1
         const viewer = (await currentActor(request, env)) as Actor;
         if (!env.GOOGLE_DRIVE_SA_KEY) {
@@ -4981,6 +5025,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "GET" && pathname.startsWith("/api/tracks/drive/file/")) {
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         if (!env.GOOGLE_DRIVE_SA_KEY) {
           return new Response(JSON.stringify({ error: "尚未設定 GOOGLE_DRIVE_SA_KEY" }), { status: 503, headers });
         }
@@ -5074,6 +5120,8 @@ function hammingDistance(hex1: string, hex2: string): number {
          */
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         if (!(await canTouchTrackDay(dayKey))) {
           return forbidden(headers, "這一天的軌跡不是你的，或還沒有同步過");
         }
@@ -5108,6 +5156,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "POST" && pathname === "/api/tracks/match") {
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         if (!env.VALHALLA_URL) {
           return new Response(JSON.stringify({
             error: "尚未設定 VALHALLA_URL，軌跡貼路功能未啟用",
@@ -5196,6 +5246,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "PUT" && pathname.startsWith("/api/tracks/matched/")) {
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         const dayKey = decodeURIComponent(pathname.slice("/api/tracks/matched/".length));
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
@@ -5217,6 +5269,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "DELETE" && pathname.startsWith("/api/tracks/matched/")) {
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         const dayKey = decodeURIComponent(pathname.slice("/api/tracks/matched/".length));
         if (!dayKey) {
           return new Response(JSON.stringify({ error: "dayKey is required" }), { status: 400, headers });
@@ -5233,6 +5287,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "POST" && pathname === "/api/tracks/ingest") {
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         const body: any = await request.json().catch(() => ({}));
         const requestedKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
         if (!requestedKey) {
@@ -5396,6 +5452,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "POST" && pathname === "/api/tracks/points/edit") {
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         const body: any = await request.json().catch(() => ({}));
         const dayKey = typeof body?.dayKey === 'string' ? body.dayKey.trim() : '';
         if (!dayKey) {
@@ -5502,6 +5560,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "PUT" && pathname === "/api/timeline/index") {
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         const body: any = await request.json().catch(() => null);
         if (!body || !Array.isArray(body.months)) {
           return new Response(JSON.stringify({ error: "months 必須是陣列" }), { status: 400, headers });
@@ -5552,6 +5612,8 @@ function hammingDistance(hex1: string, hex2: string): number {
       if (method === "PUT" && pathname.startsWith("/api/timeline/month/")) {
         const denied = await guardTrackAccess(request, env, headers);
         if (denied) return denied;
+        const noTools = await guardTrackTools(request, env, headers);
+        if (noTools) return noTools;
         const month = pathname.slice("/api/timeline/month/".length);
         if (!TIMELINE_MONTH_RE.test(month)) {
           return new Response(JSON.stringify({ error: "月份格式必須是 YYYY-MM" }), { status: 400, headers });

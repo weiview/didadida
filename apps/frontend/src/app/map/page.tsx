@@ -94,7 +94,10 @@ export default function MapPage() {
    * 都是**全站共用**的一份資料，後端只放行 can_manage_others 的人。一般成員看得到
    * 軌跡（GET 沒擋），但不該端出那些按鈕 —— 按了只會拿到 403。
    */
-  const { isAdmin, canManageOthers, canViewMap, convoyOverlapPct, checking: checkingAuth, user } = useAdmin();
+  const {
+    isAdmin, canManageOthers, canViewMap, canUseTools, convoyOverlapPct,
+    checking: checkingAuth, user,
+  } = useAdmin();
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [showTimelineImport, setShowTimelineImport] = useState(false);
@@ -1055,8 +1058,10 @@ export default function MapPage() {
    */
   useEffect(() => {
     // isAdmin（任何登入的成員）而不是 canManageOthers：軌跡是各自的，
-    // 每個人都要貼得了自己那幾天。後端 saveTrackMatched 仍逐日擋
-    if (!isAdmin || matching || matchedLoading || unmatchedKeys.length === 0) return;
+    // 每個人都要貼得了自己那幾天。後端 saveTrackMatched 仍逐日擋。
+    // canUseTools 則是站長給不給他寫入 —— 沒給的人這條路整條不跑（不然
+    // 只會安靜地被後端 403，畫面上顯示成「一直貼不出來」）
+    if (!isAdmin || !canUseTools || matching || matchedLoading || unmatchedKeys.length === 0) return;
 
     const todo = unmatchedKeys.filter(k => !attemptedMatch.current.has(k));
     if (todo.length === 0) return;
@@ -1086,7 +1091,7 @@ export default function MapPage() {
     // trackDays 只是拿來查 has_raw/md5，它變動時 rawDayKeys 也會跟著變並重讀一輪，
     // 不需要它自己觸發這個 effect
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAdmin, matching, matchedLoading, unmatchedKeys, runMatch]);
+  }, [isAdmin, canUseTools, matching, matchedLoading, unmatchedKeys, runMatch]);
 
   /*
    * 開頁自動同步。取代 cron 的作法（見 runSync 的註解為什麼不做 cron）。
@@ -1102,7 +1107,9 @@ export default function MapPage() {
    * 只同步不貼的話你隔天打開地圖會發現紫線無故消失。
    */
   useEffect(() => {
-    if (!isAdmin || autoSyncStarted.current) return;
+    // 沒有工具權限的人不自動同步：那支路由後端擋 403，跑了只會在畫面右上角
+    // 留一行「同步失敗」嚇人
+    if (!isAdmin || !canUseTools || autoSyncStarted.current) return;
     autoSyncStarted.current = true;
 
     const last = Number(localStorage.getItem(AUTO_SYNC_KEY) ?? 0);
@@ -1121,7 +1128,7 @@ export default function MapPage() {
       const requests = await runMatch(ingested, { quiet: true });
       setAutoStatus(`已同步 ${ingested.length} 天，貼路 ${requests} 趟`);
     })();
-  }, [isAdmin, runSync, runMatch]);
+  }, [isAdmin, canUseTools, runSync, runMatch]);
 
   const currentAlbum = albums.find(a => a.id === albumId);
 
@@ -1408,8 +1415,12 @@ export default function MapPage() {
         同步自己的 Drive 資料夾、手動上傳自己的 GPX、貼自己的路，後端都只讓他
         動到自己那幾天（canTouchTrackDay）。區塊內真正全站共用的東西（行程段）
         才另外用 canManageOthers 收起來。訪客沒有 isAdmin，整區看不到。
+
+        再往上還有一層 canUseTools（見後端 migrations/0016）：站長可以對個別成員
+        關掉「寫」而保留「看」。關掉的人這一整區不出現 —— 端出來再讓每顆按鈕
+        403，比不端出來難懂得多。
       */}
-      {isAdmin && (
+      {isAdmin && canUseTools && (
         <div style={{ marginTop: 30 }}>
           {/* 整區收合。平常來這一頁是要看地圖的，貼路與同步也都自動化了，
               工具區留在展開狀態只是把地圖往上擠 */}
