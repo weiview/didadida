@@ -745,9 +745,13 @@ function buildJointTrips(
   // 不然指標會停在長的那一段上，把短的那一段整個跳過
   for (const list of Array.from(out.values())) {
     list.sort((p, q) => p.t0 - q.t0 || p.t1 - q.t1);
+    // ⚠️ 一定要**正向**掃：list 照 t0 由小到大排，end 要是「前一段」的結束時間。
+    // 反過來從尾巴掃的話 end 會變成最後一段的結束時間，於是每一段更早的區間都
+    // 滿足 t1 <= end 而被刪光 —— 一整天只會剩最後一趟是同遊。
     let end = -Infinity;
-    for (let k = list.length - 1; k >= 0; k--) {
-      if (list[k].t1 <= end) list.splice(k, 1); else end = Math.max(end, list[k].t1);
+    for (let k = 0; k < list.length; ) {
+      if (list[k].t1 <= end) list.splice(k, 1);
+      else { end = list[k].t1; k += 1; }
     }
   }
   return out;
