@@ -94,7 +94,7 @@ export default function MapPage() {
    * 都是**全站共用**的一份資料，後端只放行 can_manage_others 的人。一般成員看得到
    * 軌跡（GET 沒擋），但不該端出那些按鈕 —— 按了只會拿到 403。
    */
-  const { isAdmin, canManageOthers, canViewMap, checking: checkingAuth, user } = useAdmin();
+  const { isAdmin, canManageOthers, canViewMap, convoyOverlapPct, checking: checkingAuth, user } = useAdmin();
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [showTimelineImport, setShowTimelineImport] = useState(false);
@@ -1371,6 +1371,7 @@ export default function MapPage() {
         showMatchedLine={SHOW_MATCHED_LINE}
         showTrackLine={SHOW_TRACK_LINE}
         animateOn={ANIMATE_ON}
+        convoyOverlapPct={convoyOverlapPct}
         trackColors={trackColors}
         trackAvatars={trackAvatars}
         timelineColor={myColor}

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import styles from "./admin.module.css";
 import {
+  CONVOY_PCT_DEFAULT, CONVOY_PCT_MAX, CONVOY_PCT_MIN,
   PurgePreview, TrackFolderSync, UserContributions, WhitelistUser, addWhitelistUser,
   fetchPurgePreview, fetchSiteSettings, fetchUserContributions,
   fetchWhitelist, purgeWhitelistUser, removeWhitelistUser, syncTrackFolders,
@@ -98,6 +99,18 @@ export default function AdminPage() {
   const [savingGuestComments, setSavingGuestComments] = useState(false);
 
   /*
+   * 同遊門檻。拉桿有兩份值：`convoyPct` 是手指現在拖到哪（每動一格就變），
+   * `savedConvoyPct` 是後端真正存著的那個。
+   *
+   * 分成兩份是為了**不要邊拖邊送** —— range 的 onChange 一次拖曳會觸發幾十次，
+   * 每次都 PUT 等於幾十次 D1 寫入。放手（pointerup／鍵盤放開）才送，
+   * 而且只在兩份值不同時送，避免只是點一下拉桿也白寫一次。
+   */
+  const [convoyPct, setConvoyPct] = useState<number | null>(null);
+  const [savedConvoyPct, setSavedConvoyPct] = useState<number | null>(null);
+  const [savingConvoy, setSavingConvoy] = useState(false);
+
+  /*
    * GPS 軌跡資料夾的掃描結果。**刻意不在開頁時就跑** —— 那是一次 Google Drive
    * API 往返，而這一頁大多數時候是來加人或改權限的，資料夾設好之後幾年不會再動。
    * null ＝ 還沒按過那顆按鈕。
@@ -112,6 +125,8 @@ export default function AdminPage() {
       setUsers(list);
       setGuestMap(settings.guest_can_view_map === 1);
       setGuestComments(settings.guest_can_view_comments === 1);
+      setConvoyPct(settings.convoy_overlap_pct);
+      setSavedConvoyPct(settings.convoy_overlap_pct);
       setError(null);
     } catch (e: any) {
       setError(e.message || "讀取白名單失敗");
@@ -189,6 +204,26 @@ export default function AdminPage() {
     setNotice(next
       ? "訪客現在看得到足跡地圖了。"
       : "訪客看不到足跡地圖了，首頁那個連結也會消失。");
+  };
+
+  /** 放手才送。值沒變就什麼都不做 —— 點一下拉桿不該產生一次寫入 */
+  const commitConvoyPct = async () => {
+    if (convoyPct === null || savingConvoy || convoyPct === savedConvoyPct) return;
+    const next = convoyPct;
+    setSavingConvoy(true);
+    setNotice(null);
+    const result = await updateSiteSettings({ convoy_overlap_pct: next });
+    setSavingConvoy(false);
+    if (!result.success) {
+      // 存不進去就把拉桿彈回後端真正的值，不要讓畫面顯示一個沒生效的數字
+      setConvoyPct(savedConvoyPct);
+      return setError(result.message || "修改失敗");
+    }
+    setError(null);
+    const saved = result.settings!.convoy_overlap_pct;
+    setConvoyPct(saved);
+    setSavedConvoyPct(saved);
+    setNotice(`同遊門檻改成 ${saved}%。大家下次重整地圖就會用新的判定。`);
   };
 
   const toggleGuestComments = async (next: boolean) => {
@@ -335,6 +370,41 @@ export default function AdminPage() {
         <p className={styles.hint}>
           訪客<strong>永遠留不了言</strong>，這格只管看不看得到。家人之間的對話會連名字一起被
           訪客看見，開之前先想一下留言區裡都講了些什麼。
+        </p>
+      </section>
+
+      <section className={`glass-panel ${styles.card}`}>
+        <h2 className={styles.sectionTitle}>足跡地圖：一起出遊的判定</h2>
+        <p className={styles.hint}>
+          播放足跡時，一起出遊的人會合體成同一台車。判定的方式是拿兩個人
+          <strong>貼路之後的移動路線</strong>逐趟比對：同一趟裡，走在對方那條路上
+          （相隔五分鐘以內經過）的比例超過這個門檻，整趟就算一起出遊，
+          動畫預設是合併的，只有中途真的分頭走一段才會拆開。
+        </p>
+        <div className={styles.sliderRow}>
+          <input
+            type="range"
+            min={CONVOY_PCT_MIN}
+            max={CONVOY_PCT_MAX}
+            step={5}
+            value={convoyPct ?? CONVOY_PCT_DEFAULT}
+            disabled={convoyPct === null || savingConvoy}
+            onChange={(e) => setConvoyPct(Number(e.target.value))}
+            // 放手才送，理由見 commitConvoyPct。鍵盤（左右鍵）也要有一份，
+            // 只綁 pointerup 的話用鍵盤調完永遠不會存
+            onPointerUp={commitConvoyPct}
+            onKeyUp={commitConvoyPct}
+            aria-label="一起出遊的重疊率門檻"
+          />
+          <span className={styles.sliderValue}>
+            {convoyPct === null ? "…" : `${convoyPct}%`}
+          </span>
+        </div>
+        <p className={styles.hint}>
+          真的同車的兩份軌跡貼完路通常重疊九成以上，
+          <strong>預設 {CONVOY_PCT_DEFAULT}%</strong> 已經留了不少餘裕給停車場、路口岔開。
+          調低會讓「順路載一段」也算成一起出遊；調高則只有整趟幾乎一模一樣才合體。
+          改完不必重貼路，家人下次開地圖就是新的判定。
         </p>
       </section>
 

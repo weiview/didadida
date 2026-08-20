@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
-  AuthState, CurrentUser, checkAuth, consumeAuthHash, googleLoginUrl,
+  AuthState, CONVOY_PCT_DEFAULT, CurrentUser, checkAuth, consumeAuthHash, googleLoginUrl,
   logout as clearTokens, markNotificationsSeen, updateMyName, updateMyTrackColor,
   verifyGuest, verifyLogin,
 } from './api';
@@ -51,6 +51,11 @@ interface AuthValue {
   canComment: boolean;
   /** 右上角紅點上的數字。跟著 /auth/me 一起回來，不另外打一支 */
   unreadNotifications: number;
+  /**
+   * 地圖上「兩個人這一趟算不算一起出遊」的貼路重疊率門檻（%）。站長在 /admin 用拉桿調。
+   * 只有 `/map` 用得到，但走 /auth/me 就是零額外請求，所以放在這裡而不是另開一支。
+   */
+  convoyOverlapPct: number;
   /**
    * 把通知全部標成已讀（後端只有一個時間戳，沒有逐則已讀）。
    * 成功就順手把 unreadNotifications 歸零，不必等下一次 /auth/me。
@@ -106,7 +111,8 @@ const AuthContext = createContext<AuthValue | null>(null);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AuthState>({
     admin: false, guest: false, canViewMap: false,
-    canViewComments: false, canComment: false, unreadNotifications: 0, user: null,
+    canViewComments: false, canComment: false, unreadNotifications: 0,
+    convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
   });
   const [checking, setChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -128,7 +134,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // 送出必定 403 的輸入框。等 checkAuth() 回來再說
       setState({
         admin: true, guest: false, canViewMap: true,
-        canViewComments: false, canComment: false, unreadNotifications: 0, user: null,
+        canViewComments: false, canComment: false, unreadNotifications: 0,
+        convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
       });
       checkAuth().then((next) => {
         if (!alive) return;
@@ -191,7 +198,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     clearTokens();
     setState({
       admin: false, guest: false, canViewMap: false,
-      canViewComments: false, canComment: false, unreadNotifications: 0, user: null,
+      canViewComments: false, canComment: false, unreadNotifications: 0,
+      convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
     });
     setAuthError(null);
   }, []);
@@ -245,6 +253,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     canViewComments: state.canViewComments,
     canComment: state.canComment,
     unreadNotifications: state.unreadNotifications,
+    convoyOverlapPct: state.convoyOverlapPct,
     markNotificationsRead,
     canEdit,
     canAddTo,

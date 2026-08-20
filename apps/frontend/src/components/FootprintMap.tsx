@@ -7,6 +7,7 @@ import {
 } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import type { Album, FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
+import { CONVOY_PCT_DEFAULT } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 import {
   buildAvatarHead, createAlienHead, createCarImage,
@@ -91,6 +92,13 @@ interface Props {
   showTrackLine?: boolean;
   /** 動畫沿著哪一份軌跡跑。選到的那份沒資料時自動退回 'track' */
   animateOn?: 'track' | 'raw' | 'matched';
+  /**
+   * 一起出遊的判定門檻（%）：兩個人的一趟移動重疊到這個比例就算同遊，動畫預設合體。
+   *
+   * 站長在 /admin 調，跟著 `GET /api/auth/me` 回來。**判定與繪製都在瀏覽器裡算**，
+   * 改這個數字不會多打任何一次 API。
+   */
+  convoyOverlapPct?: number;
   /**
    * Google 時間軸的紀念層，已經切好可以連的線段（[lng, lat][][]）。
    *
@@ -188,6 +196,67 @@ const PLAY_SECONDS = 25;
 const CONVOY_RADIUS_M = 80;
 const CONVOY_JOIN_MS = 120 * 1000;
 const CONVOY_PART_MS = 180 * 1000;
+
+/*
+ * ── 同遊判定（趟層）────────────────────────────────────────────────────────
+ *
+ * 上面那三個參數判的是「此刻兩顆頭離多近」，它有個治不好的毛病：80 公尺在時速 60
+ * 只有 4.8 秒。兩個人的 GPSLogger 取樣間隔不一樣（1 秒 vs 60 秒），貼路之後的時間
+ * 是沿線內插出來的 —— 同一台車上的兩支手機，內插位置沿著路差兩三百公尺很正常，
+ * 於是明明同車卻判成沒同行。要靠放大半徑救就得放到 300m 以上，那在夜市、園區、
+ * 住宅區又會把根本沒同行的人硬湊成一台。
+ *
+ * 所以改成兩層：**先用「兩條路重疊多少」判定整趟是不是一起出遊**（這一組參數），
+ * 判定成立的區間裡「合體是預設」，只有真的分頭走一段才拆開（下一組參數）。
+ * 沒被判成同遊的時候，仍然走上面那套逐時刻的近距離規則 —— 那一套管的是停留、
+ * 在家、在餐廳這些「不是一趟移動」的靠近，拿掉會退步。
+ *
+ * 為什麼用貼路軌跡：貼完路的線落在道路中心線上，「同一條路」變成幾何上的重合，
+ * 比兩點直線距離乾淨得多。而且貼路結果本來就照速度切成一趟一趟的移動
+ * （見 map/page.tsx 的 extractTrips），停留的雜訊已經被剃掉，那正是「有效軌跡」。
+ */
+
+/** 每一趟重新等距取樣的步長。比對是逐樣本做的，等距才等於「距離加權」 */
+const TRIP_SAMPLE_M = 25;
+/** 兩條貼路線多近算「走在同一條路上」。道路寬度 ＋ 貼路誤差的量級 */
+const TRIP_MATCH_M = 50;
+/**
+ * 時間容差。**沒有它，每天同一條路上下班就會被判成天天一起出遊**，
+ * 去程回程走同一條路也會。5 分鐘夠寬，吸收得掉取樣密度造成的沿路偏移。
+ */
+const TRIP_TIME_TOL_MS = 5 * 60 * 1000;
+/** 比這短的趟不判定 —— 幾百公尺的路誰都會重疊，比例沒有意義 */
+const TRIP_MIN_LEN_M = 300;
+/** 兩趟的時間至少要交疊這麼久才拿來比。擦身而過不算 */
+const TRIP_MIN_OVERLAP_MS = 120 * 1000;
+/** 保險絲：再長的一趟也不會取樣超過這個數量（步長自動放大） */
+const TRIP_MAX_SAMPLES = 20000;
+/**
+ * 格網邊長。**刻意等於下面的分開距離**，這樣「找 50 公尺內」與「找 150 公尺內」
+ * 兩種查詢都只要掃 3×3 個格子就保證不漏。
+ */
+const TRIP_CELL_M = 150;
+
+/*
+ * 同遊區間**裡面**的分開判定。門檻比上面那套鬆很多，因為「這一趟是一起出遊」
+ * 已經成立了 —— 這裡問的只是「他現在是不是真的岔開走了另一條路」。
+ *
+ * 距離量的是「離對方那條貼路線多遠」而不是兩人的直線距離：同一條路上一前一後
+ * 差 200 公尺不是分開，繞去隔壁巷子買東西才是。距離本身也做遲滯（150 出、100 進），
+ * 不然在門檻附近走一段路，隊形會一直閃。
+ */
+const CONVOY_SPLIT_M = 150;
+const CONVOY_REJOIN_M = 100;
+/**
+ * 離開對方那條路要持續這麼久才拆開。
+ *
+ * 只要 2 分鐘，比上面那套的 180 秒還短 —— 因為量的是「離對方那條**路線**多遠」
+ * 而不是兩顆頭的直線距離：一前一後差一公里、在同一條路上停下來加油、
+ * 等紅燈落後一個路口，距離都還是 0，本來就不會誤判成分開。
+ * 會超過 150 公尺的只剩「他真的轉進了另一條街」，那撐兩分鐘就該讓動畫分開走 ——
+ * 使用者要的正是「中間短暫分開的那一段要看得到分開」。
+ */
+const CONVOY_SPLIT_MS = 120 * 1000;
 
 /*
  * 落在中斷裡多久就讓這個人的頭消失。
@@ -446,6 +515,244 @@ function progressAtTime(w: TimeWarp, t: number): number {
   return w.cum[lo] + (w.cum[lo + 1] - w.cum[lo]) * f;
 }
 
+/* ── 同遊判定的第一層：把貼路軌跡切成「一趟」，算兩趟重疊多少 ─────────────── */
+
+/**
+ * 公尺平面。**整份資料共用同一個原點**，不同人的兩趟座標才比得起來。
+ *
+ * 用等距圓柱投影而不是每次都算 haversine：比對是逐樣本做的，一次重算幾十萬次距離，
+ * 而家族的活動範圍頂多幾百公里 —— 在那個尺度上這個近似的誤差遠小於 50 公尺的判定門檻。
+ */
+interface Projector {
+  lat0: number;
+  lng0: number;
+  kx: number;
+  ky: number;
+}
+
+function makeProjector(lat0: number, lng0: number): Projector {
+  return { lat0, lng0, kx: 111320 * Math.cos((lat0 * Math.PI) / 180), ky: 110540 };
+}
+
+const projX = (p: Projector, lng: number) => (lng - p.lng0) * p.kx;
+const projY = (p: Projector, lat: number) => (lat - p.lat0) * p.ky;
+
+/** 格子鍵。邊長 TRIP_CELL_M，3×3 個格子保證涵蓋查詢點周圍 TRIP_CELL_M 公尺 */
+const cellKey = (x: number, y: number) =>
+  `${Math.floor(x / TRIP_CELL_M)},${Math.floor(y / TRIP_CELL_M)}`;
+
+/** 一趟移動：貼路結果的一個 segment，等距重新取樣＋建好格網索引之後的樣子 */
+interface Trip {
+  userId: number | null;
+  x: Float64Array;
+  y: Float64Array;
+  t: Float64Array;
+  /** 取樣後的頭尾時間 */
+  t0: number;
+  t1: number;
+  /** 'cx,cy' → 落在那一格的樣本索引 */
+  grid: Map<string, number[]>;
+}
+
+/**
+ * 把軌跡點切成一趟一趟，各自等距重新取樣。
+ *
+ * 為什麼要重新取樣：貼路結果的頂點密度是**道路幾何**決定的 —— 彎道上十幾公尺一個，
+ * 高速公路直線段可以隔好幾百公尺。直接拿原始頂點逐點比會在直線段整段漏掉，
+ * 而且「幾成的點重疊」會被彎道的密集頂點灌水。等距取樣之後，
+ * 「幾成的樣本重疊」就直接等於「幾成的路重疊」。
+ *
+ * 這裡刻意**只吃軌跡點、不吃照片節點** —— 照片的 EXIF 座標不在路上，
+ * 混進來會把這一趟的形狀往外拉。
+ */
+function buildTrips(
+  points: TrackPoint[],
+  ownerByDay: Map<string, number>,
+  proj: Projector,
+): Trip[] {
+  // 鍵帶上人：day_key 只有非站長才有使用者前綴，光看 segment 有可能把兩個人
+  // 的點混進同一趟，而一趟只認一個主人 —— 混到就是整趟掛錯人
+  const bySeg = new Map<string, { user: number | null; pts: TrackPoint[] }>();
+  for (const p of points) {
+    const user = p.user_id ?? ownerByDay.get(p.day_key) ?? null;
+    const key = `${user}@${segmentKey(p.day_key, p.seg)}`;
+    const hit = bySeg.get(key);
+    if (hit) hit.pts.push(p); else bySeg.set(key, { user, pts: [p] });
+  }
+
+  const out: Trip[] = [];
+  for (const { user, pts: list } of Array.from(bySeg.values())) {
+    const raw = list
+      .map((p) => ({
+        x: projX(proj, p.lng),
+        y: projY(proj, p.lat),
+        t: Date.parse(p.t_utc),
+      }))
+      .filter((p) => Number.isFinite(p.t))
+      .sort((a, b) => a.t - b.t);
+    if (raw.length < 2) continue;
+
+    let total = 0;
+    for (let i = 1; i < raw.length; i++) {
+      total += Math.hypot(raw[i].x - raw[i - 1].x, raw[i].y - raw[i - 1].y);
+    }
+    // 幾百公尺的路誰都會重疊，比例算出來沒有意義
+    if (total < TRIP_MIN_LEN_M) continue;
+
+    const step = Math.max(TRIP_SAMPLE_M, total / TRIP_MAX_SAMPLES);
+    const xs: number[] = [];
+    const ys: number[] = [];
+    const ts: number[] = [];
+    const push = (x: number, y: number, t: number) => { xs.push(x); ys.push(y); ts.push(t); };
+
+    push(raw[0].x, raw[0].y, raw[0].t);
+    let need = step;
+    for (let i = 1; i < raw.length; i++) {
+      const a = raw[i - 1];
+      const b = raw[i];
+      const d = Math.hypot(b.x - a.x, b.y - a.y);
+      // 停留是兩個同座標的點，距離 0 —— 跳過它不會漏掉路，時間照樣由後面補上
+      if (d <= 0) continue;
+      let pos = 0;
+      while (need <= d - pos) {
+        pos += need;
+        const f = pos / d;
+        // 時間也照**距離**內插。貼路點夠密，跟照時間內插的差距遠小於 5 分鐘的容差
+        push(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.t + (b.t - a.t) * f);
+        need = step;
+      }
+      need -= d - pos;
+    }
+    // 尾點一定要收：最後不足一步的那一段也是走過的路
+    const last = raw[raw.length - 1];
+    if (xs[xs.length - 1] !== last.x || ys[ys.length - 1] !== last.y) {
+      push(last.x, last.y, last.t);
+    }
+
+    const grid = new Map<string, number[]>();
+    for (let i = 0; i < xs.length; i++) {
+      const key = cellKey(xs[i], ys[i]);
+      const bucket = grid.get(key);
+      if (bucket) bucket.push(i); else grid.set(key, [i]);
+    }
+
+    out.push({
+      userId: user,
+      x: Float64Array.from(xs),
+      y: Float64Array.from(ys),
+      t: Float64Array.from(ts),
+      t0: ts[0],
+      t1: ts[ts.length - 1],
+      grid,
+    });
+  }
+  return out;
+}
+
+/**
+ * 這個點離那一趟的路最近有多遠（公尺）。找不到回 `Infinity`。
+ *
+ * **只認時間也對得上的樣本**（±TRIP_TIME_TOL_MS）—— 沒有這一刀，每天走同一條路
+ * 上下班會被判成天天一起出遊，去程回程走同一條路也會。
+ *
+ * ⚠️ 只掃 3×3 格，所以回傳值在**超過 TRIP_CELL_M 之後就不保證是真的最近距離**。
+ *    呼叫端只拿它跟 50／150／100 這幾個門檻比大小，都在保證範圍內。
+ */
+function nearestDist(trip: Trip, x: number, y: number, t: number): number {
+  const cx = Math.floor(x / TRIP_CELL_M);
+  const cy = Math.floor(y / TRIP_CELL_M);
+  let best = Infinity;
+  for (let ox = -1; ox <= 1; ox++) {
+    for (let oy = -1; oy <= 1; oy++) {
+      const bucket = trip.grid.get(`${cx + ox},${cy + oy}`);
+      if (!bucket) continue;
+      for (const i of bucket) {
+        if (Math.abs(trip.t[i] - t) > TRIP_TIME_TOL_MS) continue;
+        const d = Math.hypot(trip.x[i] - x, trip.y[i] - y);
+        if (d < best) best = d;
+      }
+    }
+  }
+  return best;
+}
+
+/** a 有幾成的路走在 b 那條路上，以及那些重疊的樣本落在哪一段時間 */
+function overlapWith(a: Trip, b: Trip): { ratio: number; t0: number; t1: number } {
+  let hit = 0;
+  let t0 = Infinity;
+  let t1 = -Infinity;
+  for (let i = 0; i < a.t.length; i++) {
+    if (nearestDist(b, a.x[i], a.y[i], a.t[i]) > TRIP_MATCH_M) continue;
+    hit++;
+    if (a.t[i] < t0) t0 = a.t[i];
+    if (a.t[i] > t1) t1 = a.t[i];
+  }
+  return { ratio: a.t.length > 0 ? hit / a.t.length : 0, t0, t1 };
+}
+
+/** 判定成一起出遊的一段。a 一定是成員索引較小的那個人的那一趟 */
+interface JointEpisode {
+  t0: number;
+  t1: number;
+  a: Trip;
+  b: Trip;
+}
+
+/**
+ * 哪幾趟是一起出遊的。鍵是成員索引配對 `${小}:${大}`。
+ *
+ * 分母**取兩人裡移動距離較短的那個**（實作上就是兩個方向的比例取大的）：
+ * 老婆中途下車回家、我又多開了一段，前半段仍然算同遊 —— 這是使用者拍板的。
+ *
+ * 區間取的是**真正重疊的那些樣本的時間範圍**，不是兩趟時間的交集。
+ * 前者才是「他們實際在一起的那一段」；後者會把出發前各自在路上的時間也算進去。
+ */
+function buildJointTrips(
+  trips: Trip[],
+  indexOf: Map<number | null, number>,
+  pct: number,
+): Map<string, JointEpisode[]> {
+  const out = new Map<string, JointEpisode[]>();
+  const threshold = pct / 100;
+
+  for (let i = 0; i < trips.length; i++) {
+    for (let j = i + 1; j < trips.length; j++) {
+      const A = trips[i];
+      const B = trips[j];
+      if (A.userId === B.userId) continue;
+      const ia = indexOf.get(A.userId);
+      const ib = indexOf.get(B.userId);
+      if (ia === undefined || ib === undefined || ia === ib) continue;
+      // 時間先篩。這一刀砍掉絕大多數的配對，幾何比對才不會變成 O(趟²) 的災難
+      if (Math.min(A.t1, B.t1) - Math.max(A.t0, B.t0) < TRIP_MIN_OVERLAP_MS) continue;
+
+      const oa = overlapWith(A, B);
+      const ob = overlapWith(B, A);
+      if (Math.max(oa.ratio, ob.ratio) < threshold) continue;
+
+      const t0 = Math.max(oa.t0, ob.t0);
+      const t1 = Math.min(oa.t1, ob.t1);
+      if (!(t1 > t0)) continue;
+
+      const key = ia < ib ? `${ia}:${ib}` : `${ib}:${ia}`;
+      const ep: JointEpisode = ia < ib ? { t0, t1, a: A, b: B } : { t0, t1, a: B, b: A };
+      const list = out.get(key);
+      if (list) list.push(ep); else out.set(key, [ep]);
+    }
+  }
+
+  // 播放時是照時間往前掃的指標，所以要排好；被前一段完全包住的直接丟掉，
+  // 不然指標會停在長的那一段上，把短的那一段整個跳過
+  for (const list of Array.from(out.values())) {
+    list.sort((p, q) => p.t0 - q.t0 || p.t1 - q.t1);
+    let end = -Infinity;
+    for (let k = list.length - 1; k >= 0; k--) {
+      if (list[k].t1 <= end) list.splice(k, 1); else end = Math.max(end, list[k].t1);
+    }
+  }
+  return out;
+}
+
 /** 某一段時間裡的隊形。groups 裡是 members 陣列的索引，只收兩人以上的組 */
 interface ConvoyFrame {
   t: number;
@@ -463,15 +770,39 @@ interface ConvoyFrame {
  *
  * 成本 K × C(N,2)：家庭 N ≤ 5 就是每個時刻最多 10 次距離計算，
  * 兩萬個時刻也才二十萬次，資料變動時算一次而已。
+ *
+ * 兩套規則並存，不是二選一：
+ *
+ * - **在同遊區間裡**（`joint`，由整趟的重疊率判定）→ **預設合體**，
+ *   只有「離開對方那條貼路線 >150m 而且撐過 5 分鐘」才拆開，回到 100m 內立刻復合。
+ *   逐時刻的 80m 在這裡不管用：時速 60 公里跑 80 公尺只要 4.8 秒，
+ *   兩支 logger 取樣間隔不同（1 秒 vs 60 秒）再各自內插，同一台車上的兩個人
+ *   在時間軸上就能差到好幾百公尺，於是一路閃爍分合。
+ * - **區間外**→ 原本的 80m／120s／180s 照舊。那條規則管的是**停留時的靠近**
+ *   （在家、在餐廳），而停留早就被 `extractTrips` 從貼路軌跡裡切掉了，
+ *   拿掉它會退步。
  */
-function buildConvoys(members: MemberPath[], times: Float64Array): ConvoyFrame[] {
+function buildConvoys(
+  members: MemberPath[],
+  times: Float64Array,
+  joint: Map<string, JointEpisode[]>,
+  proj: Projector,
+): ConvoyFrame[] {
   const n = members.length;
   if (n < 2 || times.length === 0) return [];
 
   const pairs = [];
   for (let a = 0; a < n; a++) {
     for (let b = a + 1; b < n; b++) {
-      pairs.push({ a, b, together: false, closeSince: NaN, farSince: NaN });
+      pairs.push({
+        a, b,
+        together: false, closeSince: NaN, farSince: NaN,
+        // 同遊區間照時間排好了，指標只往前走，不必每個時刻都二分找
+        eps: joint.get(`${a}:${b}`) ?? [],
+        ep: 0,
+        epMark: null as JointEpisode | null,
+        awaySince: NaN,
+      });
     }
   }
 
@@ -493,8 +824,45 @@ function buildConvoys(members: MemberPath[], times: Float64Array): ConvoyFrame[]
         pr.together = false;
         pr.closeSince = NaN;
         pr.farSince = NaN;
+        pr.awaySince = NaN;
+        pr.epMark = null;
         continue;
       }
+
+      while (pr.ep < pr.eps.length && pr.eps[pr.ep].t1 < t) pr.ep++;
+      const ep = pr.ep < pr.eps.length && pr.eps[pr.ep].t0 <= t ? pr.eps[pr.ep] : null;
+
+      if (ep) {
+        // 一進到新的一段同遊就先合體 —— 「整趟有七成的路重疊」已經是結論，
+        // 不需要再讓逐時刻的距離重新證明一次
+        if (pr.epMark !== ep) {
+          pr.epMark = ep;
+          pr.together = true;
+          pr.awaySince = NaN;
+        }
+        // 誰在誰的路上都算 —— 取兩個方向的較小值，偏向合體，那是同遊該有的預設
+        const ax = projX(proj, pa[0]);
+        const ay = projY(proj, pa[1]);
+        const bx = projX(proj, pb[0]);
+        const by = projY(proj, pb[1]);
+        const d = Math.min(nearestDist(ep.b, ax, ay, t), nearestDist(ep.a, bx, by, t));
+        if (d > CONVOY_SPLIT_M) {
+          if (!Number.isFinite(pr.awaySince)) pr.awaySince = t;
+          if (t - pr.awaySince >= CONVOY_SPLIT_MS) pr.together = false;
+        } else {
+          pr.awaySince = NaN;
+          // 回到對方路線 100m 內立刻復合：拆開要撐滿 5 分鐘、復合卻是立即的。
+          // 100～150 這段空白帶不動作，維持現狀，免得剛好卡在門檻上抖
+          if (d <= CONVOY_REJOIN_M) pr.together = true;
+        }
+        // 逐時刻那套的計時器要清掉，不然會帶著舊帳走出同遊區間
+        pr.closeSince = NaN;
+        pr.farSince = NaN;
+        continue;
+      }
+      pr.awaySince = NaN;
+      pr.epMark = null;
+
       const close = metersBetween(pa[1], pa[0], pb[1], pb[0]) <= CONVOY_RADIUS_M;
       if (pr.together) {
         if (close) {
@@ -840,6 +1208,7 @@ export default function FootprintMap({
   matchedTracks, showMatchedLine = false,
   showTrackLine = true,
   animateOn = 'track',
+  convoyOverlapPct = CONVOY_PCT_DEFAULT,
   timelineLines,
   trackColors,
   trackAvatars,
@@ -1181,8 +1550,37 @@ export default function FootprintMap({
 
   /** 播放進度 ↔ 時間的換算表（見 buildWarp） */
   const warp = useMemo(() => buildWarp(memberPaths), [memberPaths]);
+
+  /**
+   * 公尺平面的原點。**整份資料共用一個** —— 每趟各自取原點的話座標就對不起來了。
+   * 取第一個軌跡點即可：投影誤差只跟「離原點多遠」有關，家族活動範圍內可以忽略。
+   */
+  const projector = useMemo(() => {
+    const p = (animTracks || []).find((q) => Number.isFinite(q.lat) && Number.isFinite(q.lng));
+    return makeProjector(p ? p.lat : 23.5, p ? p.lng : 121);
+  }, [animTracks]);
+
+  /**
+   * 一趟一趟的移動，以及哪幾趟判定成一起出遊（見 buildTrips／buildJointTrips）。
+   *
+   * 吃的是**動畫用的那份軌跡**：`animateOn === 'matched'` 時就是貼路結果 ——
+   * 使用者要的「用貼路軌跡判斷重疊」在這裡自動成立，而且判定跟畫面永遠是同一份資料。
+   */
+  const trips = useMemo(
+    () => buildTrips(animTracks || [], ownerByDay, projector),
+    [animTracks, ownerByDay, projector],
+  );
+  const jointTrips = useMemo(() => {
+    const indexOf = new Map<number | null, number>();
+    memberPaths.forEach((m, i) => indexOf.set(m.userId, i));
+    return buildJointTrips(trips, indexOf, convoyOverlapPct);
+  }, [trips, memberPaths, convoyOverlapPct]);
+
   /** 整條時間軸上的隊形變化（見 buildConvoys） */
-  const convoys = useMemo(() => buildConvoys(memberPaths, warp.times), [memberPaths, warp]);
+  const convoys = useMemo(
+    () => buildConvoys(memberPaths, warp.times, jointTrips, projector),
+    [memberPaths, warp, jointTrips, projector],
+  );
 
   /** 現在播到哪個 UTC 時刻。畫面上的一切都是從這個數字推出來的 */
   const cursorT = useMemo(() => timeAtProgress(warp, progress), [warp, progress]);
