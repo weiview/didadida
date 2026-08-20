@@ -533,15 +533,18 @@ export default function MapPage() {
   // 索引很小（144 筆），進頁就抓一次，之後不再重抓。
   // 不等「顯示 Google 足跡」被打開 —— 日期選擇器要靠它知道哪幾個月有足跡，
   // 而那個判斷跟這一層畫不畫出來無關
+  // canUseTools：沒有工具權限的人整個人不出現在地圖上（連他自己看也一樣，
+  // 見後端 TRACK_MEMBER_COND）。Google 紀念層是他自己的另一半足跡，
+  // 留著只會變成一條沒有名字的線 —— 索引不抓，這一層就整層不存在
   useEffect(() => {
-    if (!isAdmin || timelineIndex) return;
+    if (!isAdmin || !canUseTools || timelineIndex) return;
     let cancelled = false;
     (async () => {
       const idx = await fetchTimelineIndex();
       if (!cancelled) setTimelineIndex(idx);
     })();
     return () => { cancelled = true; };
-  }, [isAdmin, timelineIndex]);
+  }, [isAdmin, canUseTools, timelineIndex]);
 
   /*
    * 日期選擇器翻到的那個月，補抓它的月檔。
@@ -1267,7 +1270,7 @@ export default function MapPage() {
           </span>
         </label>
         {/* 只有管理者：這一層是十二年不間斷的完整移動史，沒有公開的合理預設 */}
-        {isAdmin && (
+        {isAdmin && canUseTools && (
           <label style={{ fontSize: 13, display: 'flex', gap: 7, alignItems: 'center', cursor: 'pointer' }}>
             <input
               type="checkbox"
