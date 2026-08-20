@@ -281,6 +281,13 @@ const CONVOY_SPLIT_MS = 120 * 1000;
  */
 const HEAD_SOLID_GAP_MS = 3 * 60 * 1000;
 
+/** 彩虹漸層的取樣段數。maplibre 是在 sRGB 裡內插，段數太少中間會發灰 */
+const CONVOY_HUE_STOPS = 18;
+/** 流動一輪的時間。太快像跑馬燈，太慢看不出在動 */
+const CONVOY_FLOW_MS = 3000;
+/** 流動的更新間隔（≈20fps）。這是常駐的迴圈，沒必要每一幀都重算一次漸層 */
+const CONVOY_FLOW_STEP_MS = 50;
+
 /*
  * 落在中斷裡多久就讓這個人的頭消失。
  *
@@ -1039,6 +1046,124 @@ function convoyAt(frames: ConvoyFrame[], t: number): number[][] {
   return frames[lo].groups;
 }
 
+/* ── 合體那幾段的彩虹線 ────────────────────────────────────────────────────
+ *
+ * 使用者要的是「一起出遊的那一段路，線變成漸層七彩繽紛的流動線條」。三個拍板的取捨：
+ *
+ * - **範圍跟畫面上那顆合體圖示同一份判定** —— 直接吃 buildConvoys 的隊形變化表，
+ *   不是整條同遊路程。中間真的分開的那一段，車子拆成兩顆、線也就斷回各自的顏色。
+ * - **一直流動**，不是只有按播放的時候才流。
+ * - **那一段整個換成彩虹**：兩個人原本的線在合體段挖掉，只留一條。各自的顏色
+ *   壓在彩虹底下只會把顏色弄髒，而「誰跟誰」看車上那幾顆大頭就知道。
+ *
+ * 全在瀏覽器算 —— 貼路結果本來就在前端手上，不多打任何一次 API。
+ */
+
+/** 一段時間區間（UTC 毫秒） */
+interface Span { t0: number; t1: number }
+
+/** 接在前一段屁股上的就併起來 —— 隊形表是逐格記的，不併會碎成幾百段 */
+function pushSpan(list: Span[], t0: number, t1: number) {
+  const last = list[list.length - 1];
+  if (last && t0 <= last.t1) {
+    if (t1 > last.t1) last.t1 = t1;
+    return;
+  }
+  list.push({ t0, t1 });
+}
+
+/**
+ * 隊形變化表 → 每個人的兩組區間：
+ *
+ * - `merged`：這段時間他在某台合體車上（他自己那條線要挖掉）
+ * - `lead`：這段時間**由他代表**那台車（彩虹畫他這一條）
+ *
+ * 彩虹只畫代表的那一個：合體時兩條線幾乎重合，各畫一條彩虹會互相干擾，
+ * 兩條的漸層相位也對不起來。代表取組裡索引最小的那個，同一組永遠選到同一個人。
+ */
+function convoySpans(
+  frames: ConvoyFrame[], times: Float64Array, n: number,
+): { merged: Span[][]; lead: Span[][] } {
+  const merged: Span[][] = [];
+  const lead: Span[][] = [];
+  for (let i = 0; i < n; i++) { merged.push([]); lead.push([]); }
+  if (frames.length === 0 || times.length === 0) return { merged, lead };
+  const end = times[times.length - 1];
+  for (let i = 0; i < frames.length; i++) {
+    const t0 = frames[i].t;
+    const t1 = i + 1 < frames.length ? frames[i + 1].t : end;
+    if (!(t1 > t0)) continue;
+    for (const g of frames[i].groups) {
+      let head = Infinity;
+      for (const m of g) {
+        if (m >= 0 && m < n) pushSpan(merged[m], t0, t1);
+        if (m < head) head = m;
+      }
+      if (head >= 0 && head < n) pushSpan(lead[head], t0, t1);
+    }
+  }
+  return { merged, lead };
+}
+
+/** 這個時刻有沒有落在區間裡。區間照時間排好且不重疊，二分即可 */
+function inSpans(spans: Span[], t: number): boolean {
+  let lo = 0;
+  let hi = spans.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (t < spans[mid].t0) hi = mid - 1;
+    else if (t > spans[mid].t1) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
+/**
+ * 把一條折線照區間切成「在裡面」與「在外面」兩堆。
+ *
+ * ⚠️ 交界那一點**兩邊都要放**，不然彩虹跟各自顏色的線之間會露出一小截空白。
+ */
+function splitLineBySpans(
+  l: TrackLine, spans: Span[],
+): { inside: TrackLine[]; outside: TrackLine[] } {
+  const inside: TrackLine[] = [];
+  const outside: TrackLine[] = [];
+  if (spans.length === 0 || l.times.length !== l.line.length) {
+    return { inside, outside: [l] };
+  }
+  let line: [number, number][] = [l.line[0]];
+  let times: number[] = [l.times[0]];
+  let curIn = inSpans(spans, l.times[0]);
+  const flush = () => {
+    if (line.length >= 2) (curIn ? inside : outside).push({ userId: l.userId, line, times });
+  };
+  for (let i = 1; i < l.line.length; i++) {
+    const isIn = inSpans(spans, l.times[i]);
+    line.push(l.line[i]);
+    times.push(l.times[i]);
+    if (isIn !== curIn) {
+      flush();
+      line = [l.line[i]];
+      times = [l.times[i]];
+      curIn = isIn;
+    }
+  }
+  flush();
+  return { inside, outside };
+}
+
+/** 彩虹的漸層。`phase` 0→1 轉一圈，每一幀往前挪一點就是流動 */
+function convoyGradient(phase: number): unknown[] {
+  const expr: unknown[] = ['interpolate', ['linear'], ['line-progress']];
+  for (let i = 0; i <= CONVOY_HUE_STOPS; i++) {
+    const p = i / CONVOY_HUE_STOPS;
+    // 整條線剛好一輪 —— 兩端同色，挪動的時候才看不出接縫
+    const hue = Math.round(((((p - phase) % 1) + 1) % 1) * 360);
+    expr.push(p, `hsl(${hue}, 95%, 55%)`);
+  }
+  return expr;
+}
+
 /** 播放列上的時間。多身分之後「第幾點／共幾點」沒有意義了 —— 每個人的點數不一樣 */
 function cursorLabel(t: number): string {
   if (!Number.isFinite(t)) return '';
@@ -1265,6 +1390,11 @@ interface TrackLine {
   /** 走這一段的人（TrackDay.user_id）。查不到就是 null，畫成預設色 */
   userId: number | null;
   line: [number, number][];
+  /**
+   * 跟 `line` 一一對應的時刻（UTC 毫秒）。
+   * 合體那幾段要照時間把線切開（見 `splitLineBySpans`），沒有這個就只能拿座標去猜。
+   */
+  times: number[];
 }
 
 /**
@@ -1283,11 +1413,14 @@ function groupLines(
   for (const p of points || []) {
     const key = segmentKey(p.day_key, p.seg);
     const g = groups.get(key);
-    if (g) g.line.push([p.lng, p.lat]);
-    else {
+    if (g) {
+      g.line.push([p.lng, p.lat]);
+      g.times.push(Date.parse(p.t_utc));
+    } else {
       groups.set(key, {
         userId: p.user_id ?? ownerByDay?.get(p.day_key) ?? null,
         line: [[p.lng, p.lat]],
+        times: [Date.parse(p.t_utc)],
       });
     }
   }
@@ -1500,6 +1633,7 @@ export default function FootprintMap({
         out.push({
           userId: a.user_id ?? ownerByDay.get(dayKey) ?? null,
           line: [[a.lng, a.lat], [b.lng, b.lat]],
+          times: [Date.parse(a.t_utc), Date.parse(b.t_utc)],
         });
       }
     }
@@ -1695,6 +1829,53 @@ export default function FootprintMap({
     [memberPaths, warp, jointTrips, projector],
   );
 
+  /** user_id → memberPaths 的索引。隊形表裡記的是索引，畫線時手上的卻是 user_id */
+  const memberIndexByUser = useMemo(() => {
+    const m = new Map<number, number>();
+    memberPaths.forEach((p, i) => { if (p.userId != null) m.set(p.userId, i); });
+    return m;
+  }, [memberPaths]);
+
+  /** 每個人「在合體中」與「代表那台車」的時間區間（見 convoySpans） */
+  const convoyRanges = useMemo(
+    () => convoySpans(convoys, warp.times, memberPaths.length),
+    [convoys, warp, memberPaths.length],
+  );
+
+  /** 合體那幾段從各自顏色的線上挖掉，交給彩虹線畫 */
+  const cutSolo = useCallback((lines: TrackLine[]) => {
+    if (convoys.length === 0) return lines;
+    const out: TrackLine[] = [];
+    for (const l of lines) {
+      const mi = l.userId != null ? memberIndexByUser.get(l.userId) : undefined;
+      const merged = mi === undefined ? [] : convoyRanges.merged[mi];
+      if (merged.length === 0) { out.push(l); continue; }
+      out.push(...splitLineBySpans(l, merged).outside);
+    }
+    return out;
+  }, [convoys.length, memberIndexByUser, convoyRanges]);
+
+  const soloTrackLines = useMemo(() => cutSolo(trackLines), [cutSolo, trackLines]);
+  const soloMatchedLines = useMemo(() => cutSolo(matchedLines), [cutSolo, matchedLines]);
+
+  /**
+   * 彩虹線本身。只取「代表那台車」的那個人的線（見 convoySpans），
+   * 而且只切**動畫跑的那一份**軌跡 —— 隊形就是照那一份判出來的，
+   * 拿另一份去切會對不上（貼路過的線跟原始線不是同一條路）。
+   */
+  const convoyLines = useMemo(() => {
+    if (convoys.length === 0) return [];
+    const base = animateOn === 'matched' ? matchedLines : trackLines;
+    const out: [number, number][][] = [];
+    for (const l of base) {
+      const mi = l.userId != null ? memberIndexByUser.get(l.userId) : undefined;
+      const lead = mi === undefined ? [] : convoyRanges.lead[mi];
+      if (lead.length === 0) continue;
+      for (const seg of splitLineBySpans(l, lead).inside) out.push(seg.line);
+    }
+    return out;
+  }, [convoys.length, animateOn, matchedLines, trackLines, memberIndexByUser, convoyRanges]);
+
   /** 現在播到哪個 UTC 時刻。畫面上的一切都是從這個數字推出來的 */
   const cursorT = useMemo(() => timeAtProgress(warp, progress), [warp, progress]);
   const atEnd = warp.total <= 0 || progress >= warp.total;
@@ -1838,6 +2019,45 @@ export default function FootprintMap({
         // 「貼路貼準了沒」的除錯用法，那時得靠寬度（2.5 vs 3.5）分辨。
         // 這一頁預設只畫貼路線（SHOW_TRACK_LINE = false），平常碰不到
         paint: { 'line-color': DEFAULT_TRACK_COLOR, 'line-width': 2.5, 'line-opacity': 0.45 },
+      });
+
+      /*
+       * 合體那幾段的彩虹線。畫在所有軌跡線之上 —— 那一段本來就只剩它一條
+       * （各自顏色的線已經被挖掉），壓在底下反而會被停留點蓋住。
+       *
+       * ⚠️ `line-gradient` 有兩個硬條件：來源必須 `lineMetrics: true`（要算
+       * line-progress），而且它會**整個蓋掉 `line-color`**。這正是合體段非得
+       * 自成一層不可的原因 —— 塞回 matched-track 的話所有人的線都會變成彩虹。
+       */
+      map.addSource('convoy-track', {
+        type: 'geojson',
+        lineMetrics: true,
+        data: { type: 'FeatureCollection', features: [] },
+      });
+      // 外圈的光暈，讓彩虹在底圖上浮起來一點
+      map.addLayer({
+        id: 'convoy-track-glow',
+        type: 'line',
+        source: 'convoy-track',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-width': 11,
+          'line-opacity': 0.22,
+          'line-blur': 7,
+          'line-gradient': convoyGradient(0) as any,
+        },
+      });
+      map.addLayer({
+        id: 'convoy-track-line',
+        type: 'line',
+        source: 'convoy-track',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        // 比各自的線再粗一點（3.5 → 4.5）：合體是「兩個人的線併成一條」
+        paint: {
+          'line-width': 4.5,
+          'line-opacity': 0.95,
+          'line-gradient': convoyGradient(0) as any,
+        },
       });
 
       // 停留點：待越久畫越大。沒有這一層的話，濃縮完的軌跡看起來只是一條線
@@ -2411,13 +2631,14 @@ export default function FootprintMap({
     const src = map.getSource('gps-track') as GeoJSONSource | undefined;
     src?.setData({
       type: 'FeatureCollection',
-      features: (showTrackLine ? trackLines : []).map(({ userId, line }) => ({
+      // soloTrackLines：合體那幾段已經挖掉了，改由 convoy-track 那條彩虹畫
+      features: (showTrackLine ? soloTrackLines : []).map(({ userId, line }) => ({
         type: 'Feature',
         properties: { userId },
         geometry: { type: 'LineString', coordinates: line },
       })),
     });
-  }, [trackLines, showTrackLine, ready]);
+  }, [soloTrackLines, showTrackLine, ready]);
 
   // --- Google 時間軸紀念層 ---
   // 線已經在頁面那邊切好了，這裡不做任何判斷 —— 沒傳就是不畫
@@ -2459,13 +2680,14 @@ export default function FootprintMap({
     const src = map.getSource('matched-track') as GeoJSONSource | undefined;
     src?.setData({
       type: 'FeatureCollection',
-      features: (showMatchedLine ? matchedLines : []).map(({ userId, line }) => ({
+      // soloMatchedLines：同上，合體那幾段交給彩虹線
+      features: (showMatchedLine ? soloMatchedLines : []).map(({ userId, line }) => ({
         type: 'Feature',
         properties: { userId },
         geometry: { type: 'LineString', coordinates: line },
       })),
     });
-  }, [matchedLines, showMatchedLine, ready]);
+  }, [soloMatchedLines, showMatchedLine, ready]);
 
   // --- 兩趟之間的虛線橋接（跟著貼路軌跡一起開關）---
   useEffect(() => {
@@ -2481,6 +2703,54 @@ export default function FootprintMap({
       })),
     });
   }, [matchedBridges, showMatchedLine, ready]);
+
+  // --- 合體那幾段的彩虹線 ---
+  // 跟著它切出來的那一層一起開關：切的是哪一份軌跡由 animateOn 決定，
+  // 那一層被關掉的話彩虹留在畫面上就會變成一條孤零零、沒有來歷的線
+  const showConvoyLine = animateOn === 'matched' ? showMatchedLine : showTrackLine;
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource('convoy-track') as GeoJSONSource | undefined;
+    src?.setData({
+      type: 'FeatureCollection',
+      features: (showConvoyLine ? convoyLines : []).map((line) => ({
+        type: 'Feature',
+        // 彩虹不分人上色 —— 合體的意思就是「這一段沒有你我之分」
+        properties: {},
+        geometry: { type: 'LineString', coordinates: line },
+      })),
+    });
+  }, [convoyLines, showConvoyLine, ready]);
+
+  /*
+   * 讓彩虹流動。
+   *
+   * 使用者要的是「一直流」，所以這個 rAF 跟播放無關，只要畫面上有合體線就一直跑。
+   * 兩道節流：**沒有合體線就整個不開**（大部分日子都是各走各的），以及 ≈20fps ——
+   * 漸層是重畫一張線的貼圖，60fps 對「顏色慢慢流過去」這件事沒有任何加分，
+   * 只是白白吃手機的電。尊重 prefers-reduced-motion：那時停在靜止的彩虹上。
+   */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready || !showConvoyLine || convoyLines.length === 0) return;
+    if (!map.getLayer('convoy-track-line')) return;
+    if (typeof window !== 'undefined'
+      && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+
+    let raf = 0;
+    let last = 0;
+    const tick = (now: number) => {
+      raf = requestAnimationFrame(tick);
+      if (now - last < CONVOY_FLOW_STEP_MS) return;
+      last = now;
+      const expr = convoyGradient((now % CONVOY_FLOW_MS) / CONVOY_FLOW_MS) as any;
+      map.setPaintProperty('convoy-track-line', 'line-gradient', expr);
+      map.setPaintProperty('convoy-track-glow', 'line-gradient', expr);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [ready, showConvoyLine, convoyLines.length]);
 
   // --- 停留點 ---
   useEffect(() => {
