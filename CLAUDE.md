@@ -261,6 +261,15 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   `/admin` 一根拉桿，**放手才 PUT**（range 的 onChange 一次拖曳會噴幾十下 = 幾十次 D1 寫入）。
   值跟著 `GET /api/auth/me` 回來（同 `can_view_map` 那套，零額外請求），
   超出範圍後端回 **400 不是靜靜存起來** —— 不然站長會以為拉桿沒作用。
+- **合體那幾段的線畫成流動的彩虹**（`convoySpans`／`splitLineBySpans`／`convoyGradient`）：
+  範圍就是**時刻層那份隊形表**，跟畫面上那顆合體圖示完全同步 —— 中間真的分開的那一段，
+  車拆成兩顆、線也斷回各自的顏色。那一段兩個人各自顏色的線**整個挖掉只留一條彩虹**
+  （⚠️ 交界那一點兩邊都要放，不然會露出一小截空白），而且**只畫組裡索引最小的那個人**
+  的線 —— 兩條幾乎重合的漸層會互相干擾、相位也對不起來。
+  ⚠️ `line-gradient` 要求來源 `lineMetrics: true`，而且會**整個蓋掉 `line-color`**，
+  所以非得自成一層 `convoy-track` 不可（塞回 `matched-track` 會讓所有人的線都變彩虹）。
+  流動是**常駐 rAF**（跟播不播無關），節流 ≈20fps、**沒有合體線就整個不開**，
+  `prefers-reduced-motion` 時停在靜止的彩虹上。切線在瀏覽器算，不多打任何一次 API。
 
 ## 留言
 
