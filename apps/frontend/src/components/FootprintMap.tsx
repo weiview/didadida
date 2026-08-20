@@ -236,6 +236,19 @@ const TRIP_MAX_SAMPLES = 20000;
  * 兩種查詢都只要掃 3×3 個格子就保證不漏。
  */
 const TRIP_CELL_M = 150;
+/**
+ * 相鄰兩次相遇之間隔多久還算**同一次出遊**。
+ *
+ * 判定單位是「一條路程」而不是「一趟」：去賣場的去程與回程中間隔著一個多小時的停留，
+ * 是同一次出遊的兩段，不該各自獨立判定 —— 只要其中一段的重疊率掉到門檻以下
+ * （繞去加油、走了替代道路），那一段就會退回逐時刻規則而閃爍，那正是使用者抱怨的。
+ * 整串合起來算重疊率，成立就整條路程鎖定合體。
+ *
+ * 3 小時：吃得下賣場、吃飯、景點的停留，但早上一起上班與晚上各自出門會斷成兩次出遊，
+ * 不會互相拖累 ——「整天算一次」那個做法的退步之處就在這裡（晚上各自跑的大量里程
+ * 會把整天的比例拉到門檻以下，連早上一起上班那段都不合體了）。
+ */
+const OUTING_GAP_MS = 3 * 60 * 60 * 1000;
 
 /*
  * 同遊區間**裡面**的分開判定。門檻比上面那套鬆很多，因為「這一趟是一起出遊」
@@ -257,6 +270,16 @@ const CONVOY_REJOIN_M = 100;
  * 使用者要的正是「中間短暫分開的那一段要看得到分開」。
  */
 const CONVOY_SPLIT_MS = 120 * 1000;
+/**
+ * 前後兩個節點差超過這麼久，中間那一段就**不是真的在移動**，而是資料空隙。
+ *
+ * 頭的位置是沿著節點內插出來的，跨過空隙的內插等於一路瞬間位移；換軌跡段
+ * （`breakBefore`）更直接 —— 頭會凍結在原地然後跳到下一段的起點。那段期間算出來的
+ * 距離不是「他離對方多遠」而是「資料斷在哪裡」，拿去判分開會把同車的人硬拆開。
+ * 所以這種時刻**整個跳過**：不累積拆隊、也不累積復合，隊形維持原狀，
+ * 等兩邊都重新有真實取樣點再繼續算。
+ */
+const HEAD_SOLID_GAP_MS = 3 * 60 * 1000;
 
 /*
  * 落在中斷裡多久就讓這個人的頭消失。
@@ -396,9 +419,20 @@ interface MemberPath {
  * 他沒出門」—— 都不該把他卡在上一個點上，那會讓人以為他真的待在那裡。
  */
 function posAt(nodes: PathNode[], t: number): [number, number] | null {
+  return sampleAt(nodes, t).pos;
+}
+
+/** `posAt` 的完整版：位置 ＋ 這一刻是不是踩在真實取樣上（見 HEAD_SOLID_GAP_MS） */
+interface HeadSample {
+  pos: [number, number] | null;
+  /** false＝凍結或跨空隙內插出來的，位置可信但「移動」是假的，不可拿去判分開 */
+  solid: boolean;
+}
+
+function sampleAt(nodes: PathNode[], t: number): HeadSample {
   const n = nodes.length;
-  if (n === 0 || !Number.isFinite(t)) return null;
-  if (t < nodes[0].t || t > nodes[n - 1].t) return null;
+  if (n === 0 || !Number.isFinite(t)) return { pos: null, solid: false };
+  if (t < nodes[0].t || t > nodes[n - 1].t) return { pos: null, solid: false };
 
   // 最後一個時間 <= t 的節點
   let lo = 0;
@@ -409,12 +443,18 @@ function posAt(nodes: PathNode[], t: number): [number, number] | null {
   }
   const a = nodes[lo];
   const b = lo + 1 < n ? nodes[lo + 1] : null;
-  if (!b || b.t <= a.t) return [a.lng, a.lat];
+  if (!b || b.t <= a.t) return { pos: [a.lng, a.lat], solid: true };
   if (b.breakBefore) {
-    return b.t - a.t > HEAD_HIDE_GAP_MS ? null : [a.lng, a.lat];
+    // 換軌跡段：短的凍結在原地（頭會突然跳到下一段起點），長的整顆消失
+    return b.t - a.t > HEAD_HIDE_GAP_MS
+      ? { pos: null, solid: false }
+      : { pos: [a.lng, a.lat], solid: false };
   }
   const f = (t - a.t) / (b.t - a.t);
-  return [a.lng + (b.lng - a.lng) * f, a.lat + (b.lat - a.lat) * f];
+  return {
+    pos: [a.lng + (b.lng - a.lng) * f, a.lat + (b.lat - a.lat) * f],
+    solid: b.t - a.t <= HEAD_SOLID_GAP_MS,
+  };
 }
 
 /**
@@ -676,36 +716,54 @@ function nearestDist(trip: Trip, x: number, y: number, t: number): number {
   return best;
 }
 
-/** a 有幾成的路走在 b 那條路上，以及那些重疊的樣本落在哪一段時間 */
-function overlapWith(a: Trip, b: Trip): { ratio: number; t0: number; t1: number } {
-  let hit = 0;
-  let t0 = Infinity;
-  let t1 = -Infinity;
-  for (let i = 0; i < a.t.length; i++) {
-    if (nearestDist(b, a.x[i], a.y[i], a.t[i]) > TRIP_MATCH_M) continue;
-    hit++;
-    if (a.t[i] < t0) t0 = a.t[i];
-    if (a.t[i] > t1) t1 = a.t[i];
+/** 離這一群趟裡最近的那條線多遠 */
+function nearestDistAny(trips: Trip[], x: number, y: number, t: number): number {
+  let best = Infinity;
+  for (const tr of trips) {
+    const d = nearestDist(tr, x, y, t);
+    if (d < best) best = d;
   }
-  return { ratio: a.t.length > 0 ? hit / a.t.length : 0, t0, t1 };
+  return best;
 }
 
-/** 判定成一起出遊的一段。a 一定是成員索引較小的那個人的那一趟 */
+/** as 這幾趟加起來，有幾成的路走在 bs 那幾趟上面 */
+function overlapAcross(as: Trip[], bs: Trip[]): number {
+  let hit = 0;
+  let total = 0;
+  for (const a of as) {
+    for (let i = 0; i < a.t.length; i++) {
+      total++;
+      if (nearestDistAny(bs, a.x[i], a.y[i], a.t[i]) <= TRIP_MATCH_M) hit++;
+    }
+  }
+  return total > 0 ? hit / total : 0;
+}
+
+/** 判定成一起出遊的一條路程。a 一定是成員索引較小的那個人的那幾趟 */
 interface JointEpisode {
   t0: number;
   t1: number;
-  a: Trip;
-  b: Trip;
+  a: Trip[];
+  b: Trip[];
 }
 
 /**
- * 哪幾趟是一起出遊的。鍵是成員索引配對 `${小}:${大}`。
+ * 哪幾條路程是一起出遊的。鍵是成員索引配對 `${小}:${大}`。
+ *
+ * 三步：
+ *
+ * 1. **相遇** —— 兩人時間有交集（≥ TRIP_MIN_OVERLAP_MS）的每一對趟。
+ * 2. **串成一次出遊** —— 相鄰兩次相遇的空隙 ≤ OUTING_GAP_MS 就併起來。
+ *    賣場的「去程＋停留一小時＋回程」在這一步變成一條路程。
+ * 3. **整串算一次重疊率** —— 一次出遊裡兩人各自所有趟的樣本合起來當分母。
+ *    這是使用者要的「先判定整條路程是不是一起出遊」：其中一段繞去加油、
+ *    走了替代道路而單獨看不到門檻，整條路程仍然成立，動畫不會在那一段閃掉。
  *
  * 分母**取兩人裡移動距離較短的那個**（實作上就是兩個方向的比例取大的）：
  * 老婆中途下車回家、我又多開了一段，前半段仍然算同遊 —— 這是使用者拍板的。
  *
- * 區間取的是**真正重疊的那些樣本的時間範圍**，不是兩趟時間的交集。
- * 前者才是「他們實際在一起的那一段」；後者會把出發前各自在路上的時間也算進去。
+ * 區間取的是**整條路程的時間範圍**（涵蓋中間的停留），不是重疊樣本的範圍：
+ * 成立之後合體就是鎖定的預設，中間真的分頭走才由 buildConvoys 的 150m／2 分鐘拆開。
  */
 function buildJointTrips(
   trips: Trip[],
@@ -715,29 +773,65 @@ function buildJointTrips(
   const out = new Map<string, JointEpisode[]>();
   const threshold = pct / 100;
 
-  for (let i = 0; i < trips.length; i++) {
-    for (let j = i + 1; j < trips.length; j++) {
-      const A = trips[i];
-      const B = trips[j];
-      if (A.userId === B.userId) continue;
-      const ia = indexOf.get(A.userId);
-      const ib = indexOf.get(B.userId);
-      if (ia === undefined || ib === undefined || ia === ib) continue;
-      // 時間先篩。這一刀砍掉絕大多數的配對，幾何比對才不會變成 O(趟²) 的災難
-      if (Math.min(A.t1, B.t1) - Math.max(A.t0, B.t0) < TRIP_MIN_OVERLAP_MS) continue;
+  // 先照成員分組。趟數不多，但這樣配對迴圈只跑「不同人」的組合
+  const byMember = new Map<number, Trip[]>();
+  for (const tr of trips) {
+    const idx = indexOf.get(tr.userId);
+    if (idx === undefined) continue;
+    const list = byMember.get(idx);
+    if (list) list.push(tr); else byMember.set(idx, [tr]);
+  }
+  const idxs = Array.from(byMember.keys()).sort((p, q) => p - q);
 
-      const oa = overlapWith(A, B);
-      const ob = overlapWith(B, A);
-      if (Math.max(oa.ratio, ob.ratio) < threshold) continue;
+  for (let i = 0; i < idxs.length; i++) {
+    for (let j = i + 1; j < idxs.length; j++) {
+      const ia = idxs[i];
+      const ib = idxs[j];
+      const A = byMember.get(ia)!;
+      const B = byMember.get(ib)!;
 
-      const t0 = Math.max(oa.t0, ob.t0);
-      const t1 = Math.min(oa.t1, ob.t1);
-      if (!(t1 > t0)) continue;
+      // ① 相遇：時間先篩，這一刀砍掉絕大多數的配對，幾何比對才不會變成災難
+      const enc: { t0: number; t1: number; a: Trip; b: Trip }[] = [];
+      for (const a of A) {
+        for (const b of B) {
+          const lo = Math.max(a.t0, b.t0);
+          const hi = Math.min(a.t1, b.t1);
+          if (hi - lo >= TRIP_MIN_OVERLAP_MS) enc.push({ t0: lo, t1: hi, a, b });
+        }
+      }
+      if (enc.length === 0) continue;
+      enc.sort((p, q) => p.t0 - q.t0);
 
-      const key = ia < ib ? `${ia}:${ib}` : `${ib}:${ia}`;
-      const ep: JointEpisode = ia < ib ? { t0, t1, a: A, b: B } : { t0, t1, a: B, b: A };
-      const list = out.get(key);
-      if (list) list.push(ep); else out.set(key, [ep]);
+      // ② 串成一次出遊
+      const outings: { a: Set<Trip>; b: Set<Trip>; end: number }[] = [];
+      for (const e of enc) {
+        const cur = outings[outings.length - 1];
+        if (cur && e.t0 - cur.end <= OUTING_GAP_MS) {
+          cur.a.add(e.a);
+          cur.b.add(e.b);
+          if (e.t1 > cur.end) cur.end = e.t1;
+        } else {
+          outings.push({ a: new Set([e.a]), b: new Set([e.b]), end: e.t1 });
+        }
+      }
+
+      // ③ 整串算一次重疊率
+      for (const o of outings) {
+        const as = Array.from(o.a);
+        const bs = Array.from(o.b);
+        if (Math.max(overlapAcross(as, bs), overlapAcross(bs, as)) < threshold) continue;
+
+        let t0 = Infinity;
+        let t1 = -Infinity;
+        for (const tr of as) { if (tr.t0 < t0) t0 = tr.t0; if (tr.t1 > t1) t1 = tr.t1; }
+        for (const tr of bs) { if (tr.t0 < t0) t0 = tr.t0; if (tr.t1 > t1) t1 = tr.t1; }
+        if (!(t1 > t0)) continue;
+
+        const ep: JointEpisode = { t0, t1, a: as, b: bs };
+        const key = `${ia}:${ib}`;
+        const list = out.get(key);
+        if (list) list.push(ep); else out.set(key, [ep]);
+      }
     }
   }
 
@@ -777,8 +871,8 @@ interface ConvoyFrame {
  *
  * 兩套規則並存，不是二選一：
  *
- * - **在同遊區間裡**（`joint`，由整趟的重疊率判定）→ **預設合體**，
- *   只有「離開對方那條貼路線 >150m 而且撐過 5 分鐘」才拆開，回到 100m 內立刻復合。
+ * - **在同遊區間裡**（`joint`，由整條路程的重疊率判定）→ **預設合體**，
+ *   只有「離開對方那條貼路線 >150m 而且撐過 2 分鐘」才拆開，回到 100m 內立刻復合。
  *   逐時刻的 80m 在這裡不管用：時速 60 公里跑 80 公尺只要 4.8 秒，
  *   兩支 logger 取樣間隔不同（1 秒 vs 60 秒）再各自內插，同一台車上的兩個人
  *   在時間軸上就能差到好幾百公尺，於是一路閃爍分合。
@@ -811,13 +905,17 @@ function buildConvoys(
   }
 
   const out: ConvoyFrame[] = [];
+  const smp = new Array<HeadSample>(n);
   const pos = new Array<[number, number] | null>(n);
   // null 一定跟第一次算出來的 key（字串）不一樣，所以起手必定記一筆
   let lastKey: string | null = null;
 
   for (let i = 0; i < times.length; i++) {
     const t = times[i];
-    for (let m = 0; m < n; m++) pos[m] = posAt(members[m].nodes, t);
+    for (let m = 0; m < n; m++) {
+      smp[m] = sampleAt(members[m].nodes, t);
+      pos[m] = smp[m].pos;
+    }
 
     for (const pr of pairs) {
       const pa = pos[pr.a];
@@ -836,26 +934,37 @@ function buildConvoys(
       while (pr.ep < pr.eps.length && pr.eps[pr.ep].t1 < t) pr.ep++;
       const ep = pr.ep < pr.eps.length && pr.eps[pr.ep].t0 <= t ? pr.eps[pr.ep] : null;
 
+      /*
+       * 任一方正踩在資料空隙上就整個跳過（見 HEAD_SOLID_GAP_MS）。
+       *
+       * 空隙期間的「移動」是內插或凍結出來的假象 —— 換軌跡段時頭會停在原地
+       * 再瞬間跳到下一段起點，那一瞬的距離可以是好幾公里。拿它去累積拆隊，
+       * 同車的人會在每個段落交界被硬拆一次。維持原狀、不動任何計時器，
+       * 等兩邊都重新踩在真實取樣上再繼續算。
+       */
+      if (!smp[pr.a].solid || !smp[pr.b].solid) continue;
+
       if (ep) {
-        // 一進到新的一段同遊就先合體 —— 「整趟有七成的路重疊」已經是結論，
+        // 一進到新的一條同遊路程就先合體 —— 「整條路程有七成的路重疊」已經是結論，
         // 不需要再讓逐時刻的距離重新證明一次
         if (pr.epMark !== ep) {
           pr.epMark = ep;
           pr.together = true;
           pr.awaySince = NaN;
         }
-        // 誰在誰的路上都算 —— 取兩個方向的較小值，偏向合體，那是同遊該有的預設
+        // 誰在誰的路上都算 —— 取兩個方向的較小值，偏向合體，那是同遊該有的預設。
+        // 比的是整條路程的所有趟，中途換到下一趟不會憑空多出一次「離開對方路線」
         const ax = projX(proj, pa[0]);
         const ay = projY(proj, pa[1]);
         const bx = projX(proj, pb[0]);
         const by = projY(proj, pb[1]);
-        const d = Math.min(nearestDist(ep.b, ax, ay, t), nearestDist(ep.a, bx, by, t));
+        const d = Math.min(nearestDistAny(ep.b, ax, ay, t), nearestDistAny(ep.a, bx, by, t));
         if (d > CONVOY_SPLIT_M) {
           if (!Number.isFinite(pr.awaySince)) pr.awaySince = t;
           if (t - pr.awaySince >= CONVOY_SPLIT_MS) pr.together = false;
         } else {
           pr.awaySince = NaN;
-          // 回到對方路線 100m 內立刻復合：拆開要撐滿 5 分鐘、復合卻是立即的。
+          // 回到對方路線 100m 內立刻復合：拆開要撐滿 2 分鐘、復合卻是立即的。
           // 100～150 這段空白帶不動作，維持現狀，免得剛好卡在門檻上抖
           if (d <= CONVOY_REJOIN_M) pr.together = true;
         }

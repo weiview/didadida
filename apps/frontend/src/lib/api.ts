@@ -360,6 +360,14 @@ export interface CurrentUser {
    */
   can_view_map?: number;
   /**
+   * 1 = 用得了地圖上那塊工具（時間軸匯入、同步足跡、上傳 GPX）。
+   *
+   * **看與寫是兩件事**：`can_view_map` 管的是看得到地圖，這一欄管的是寫得進去。
+   * 舊成員一律 1（migration DEFAULT），**新加入的人預設 0** —— 由站長在
+   * /admin 新增時勾。同樣不吃 `can_manage_others` 的短路，只有站長永遠開著。
+   */
+  can_use_tools?: number;
+  /**
    * 他的軌跡在地圖上的顏色（'#rrggbb'）。後端一律回**算好的值** ——
    * 沒挑過色的人也會拿到依 uid 分配的預設，所以正常情況下不會是 null。
    * （舊後端沒有這一欄，所以型別上仍然可能缺。）
@@ -388,6 +396,11 @@ export interface AuthState {
   canViewComments: boolean;
   /** 留得了言嗎。訪客永遠 false（後端資料模型上就沒有訪客這個作者） */
   canComment: boolean;
+  /**
+   * 動不動得了足跡（時間軸匯入、同步、上傳 GPX）。**訪客永遠 false** ——
+   * 工具區整塊只給成員。關著的人 /map 上那一區整塊不出現，自動同步也不會跑。
+   */
+  canUseTools: boolean;
   /** 通知紅點上的數字。跟著 /auth/me 一起回，不另外打一支 */
   unreadNotifications: number;
   /**
@@ -428,7 +441,7 @@ export function clampConvoyPct(v: unknown): number {
 export async function checkAuth(): Promise<AuthState> {
   const locked: AuthState = {
     admin: false, guest: false, canViewMap: false,
-    canViewComments: false, canComment: false, unreadNotifications: 0,
+    canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
     convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
   };
   if (typeof window === 'undefined') return locked;
@@ -449,6 +462,8 @@ export async function checkAuth(): Promise<AuthState> {
         // 好過端出一個送出必定 404 的輸入框
         canViewComments: !!data.can_view_comments,
         canComment: !!data.can_comment,
+        // 舊後端不回這個欄位 —— 管理員照樣用得了工具，成員則保守地當成沒開
+        canUseTools: data.can_use_tools != null ? !!data.can_use_tools : !!data.admin,
         unreadNotifications: Number(data.unread_notifications ?? 0),
         // 舊後端不回這個欄位 —— 用預設值，地圖照樣判得出同遊
         convoyOverlapPct: clampConvoyPct(data.convoy_overlap_pct),
@@ -674,12 +689,13 @@ export async function fetchWhitelist(): Promise<WhitelistUser[]> {
 }
 
 export async function addWhitelistUser(
-  email: string, name: string, canManageOthers: boolean,
+  email: string, name: string, canManageOthers: boolean, canUseTools = false,
 ): Promise<{ success: boolean; restored?: boolean; message?: string }> {
   const res = await fetch(`${API_BASE_URL}/admin/users`, {
     method: 'POST',
     headers: getAuthHeaders(),
-    body: JSON.stringify({ email, name, can_manage_others: canManageOthers }),
+    // 工具權限**預設不給**（欄位本身是 DEFAULT 1，那是為了不動到現有成員）
+    body: JSON.stringify({ email, name, can_manage_others: canManageOthers, can_use_tools: canUseTools }),
   });
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.success) return { success: true, restored: !!data.restored };
@@ -694,6 +710,8 @@ export async function updateWhitelistUser(
     // 留言那兩格與足跡**不跟著「可管理全站」走**：能不能管內容跟該不該看得到
     // 家人的對話、家人的行蹤是兩回事，所以後端也沒有短路，各自獨立
     can_comment?: boolean; can_view_comments?: boolean; can_view_map?: boolean;
+    /** 用不用得了地圖工具。跟 can_view_map 分開：看得到不等於寫得進去 */
+    can_use_tools?: boolean;
   },
 ): Promise<{ success: boolean; message?: string }> {
   const res = await fetch(`${API_BASE_URL}/admin/users/${id}`, {

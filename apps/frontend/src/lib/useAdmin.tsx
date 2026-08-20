@@ -49,6 +49,12 @@ interface AuthValue {
   canViewComments: boolean;
   /** 留得了言嗎。訪客永遠 false（資料模型上就沒有訪客這個作者） */
   canComment: boolean;
+  /**
+   * 動不動得了足跡（時間軸匯入、同步足跡、上傳 GPX）。**訪客永遠 false**。
+   * 跟 canViewMap 是兩件事 —— 看得到地圖不等於寫得進去。
+   * false 時 `/map` 那塊工具區整塊不出現，進頁面的自動同步與自動貼路也不跑。
+   */
+  canUseTools: boolean;
   /** 右上角紅點上的數字。跟著 /auth/me 一起回來，不另外打一支 */
   unreadNotifications: number;
   /**
@@ -111,7 +117,7 @@ const AuthContext = createContext<AuthValue | null>(null);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AuthState>({
     admin: false, guest: false, canViewMap: false,
-    canViewComments: false, canComment: false, unreadNotifications: 0,
+    canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
     convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
   });
   const [checking, setChecking] = useState(true);
@@ -134,7 +140,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // 送出必定 403 的輸入框。等 checkAuth() 回來再說
       setState({
         admin: true, guest: false, canViewMap: true,
-        canViewComments: false, canComment: false, unreadNotifications: 0,
+        canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
         convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
       });
       checkAuth().then((next) => {
@@ -198,7 +204,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     clearTokens();
     setState({
       admin: false, guest: false, canViewMap: false,
-      canViewComments: false, canComment: false, unreadNotifications: 0,
+      canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
       convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
     });
     setAuthError(null);
@@ -252,6 +258,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     canViewMap: state.canViewMap,
     canViewComments: state.canViewComments,
     canComment: state.canComment,
+    canUseTools: state.canUseTools,
     unreadNotifications: state.unreadNotifications,
     convoyOverlapPct: state.convoyOverlapPct,
     markNotificationsRead,
