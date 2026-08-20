@@ -78,6 +78,36 @@
   cursor: pointer;
 }
 
+/*
+ * 拉桿一列：說明在上、拉桿與數字在同一行。
+ * 數字用 tabular-nums 並固定寬度，拖動時才不會因為 70→100 多一位數而讓拉桿抖動。
+ */
+.sliderRow {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.2rem 0 0.6rem;
+}
+
+.sliderRow input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent-color, #4a90d9);
+  cursor: pointer;
+}
+
+.sliderRow input[type="range"]:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.sliderValue {
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+  min-width: 3.2rem;
+  text-align: right;
+}
+
 .button {
   padding: 0.55rem 1.1rem;
   border: 1px solid var(--border-color);

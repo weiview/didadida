@@ -107,6 +107,22 @@ const SETTING_GUEST_MAP = "guest_can_view_map";
  * 訪客在 D1 裡沒有對應的列（見 migrations/0013）。
  */
 const SETTING_GUEST_COMMENTS = "guest_can_view_comments";
+/**
+ * 地圖上「兩個人這一趟算不算一起出遊」的重疊率門檻，單位是百分比。
+ * 沒設過＝`CONVOY_PCT_DEFAULT`。
+ *
+ * 為什麼是全站一格而不是每個人一欄：它問的是「這兩條路像不像同一條」，
+ * 是判定規則的靈敏度，不是誰的偏好 —— 同一天同一段路，A 看跟 B 看必須是同一個答案，
+ * 不然兩個人在講同一趟旅行時會看到不同的隊形。
+ *
+ * 實際的重疊計算全在瀏覽器（貼路結果本來就在前端手上），後端只保管這個數字。
+ */
+const SETTING_CONVOY_PCT = "convoy_overlap_pct";
+/** 預設 70%：真正同車的貼路重疊通常 >90%，留給停車場、路口岔開很多餘裕 */
+const CONVOY_PCT_DEFAULT = 70;
+/** 低於 30% 等於「路過就算同遊」，高於 100 無意義。站長調得動的範圍 */
+const CONVOY_PCT_MIN = 30;
+const CONVOY_PCT_MAX = 100;
 
 /**
  * token 裡的身分。兩層，沒有第三層：
@@ -810,6 +826,16 @@ async function guestCanViewComments(env: Env): Promise<boolean> {
   return (await getSettingCached(env, SETTING_GUEST_COMMENTS)) === "1";
 }
 
+/**
+ * 同遊判定的重疊率門檻（%）。讀不到、壞值、超出範圍一律退回預設 ——
+ * 這個數字只是靈敏度，寧可安靜地用預設值，也不要讓地圖因為一格設定壞掉而不畫車。
+ */
+async function convoyOverlapPct(env: Env): Promise<number> {
+  const n = Number(await getSettingCached(env, SETTING_CONVOY_PCT));
+  if (!Number.isFinite(n) || n < CONVOY_PCT_MIN || n > CONVOY_PCT_MAX) return CONVOY_PCT_DEFAULT;
+  return Math.round(n);
+}
+
 /** 留言內文上限。比 Story 的 200 寬，但別讓人在燈箱側欄貼一篇文章 */
 const COMMENT_MAX_LEN = 1000;
 
@@ -1252,6 +1278,12 @@ if (method === "POST" && pathname === "/api/verify-password") {
           // 訪客永遠是 0：不是設定，是資料模型上就沒有訪客這個作者
           can_comment: actor?.canComment ? 1 : 0,
           unread_notifications: unread,
+          /*
+           * 同遊判定的門檻。**刻意跟著這一條回來**，理由跟未讀數一樣：
+           * 這是每次進站都會打的路由，而且值走 getSettingCached（60 秒 memo），
+           * 幾乎不會真的去讀 D1。為它另開一支端點等於每個人開地圖多一次請求。
+           */
+          convoy_overlap_pct: await convoyOverlapPct(env),
           user: actor ? {
             id: actor.uid, name: actor.name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
@@ -1482,21 +1514,36 @@ if (method === "POST" && pathname === "/api/verify-password") {
           return new Response(JSON.stringify({
             guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
             guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
+            convoy_overlap_pct: await convoyOverlapPct(env),
           }), { headers });
         }
 
         if (method === "PUT") {
-          const body: { guest_can_view_map?: any; guest_can_view_comments?: any } = await request.json();
+          const body: {
+            guest_can_view_map?: any; guest_can_view_comments?: any; convoy_overlap_pct?: any;
+          } = await request.json();
           if (body.guest_can_view_map !== undefined) {
             await setSetting(env, SETTING_GUEST_MAP, body.guest_can_view_map ? "1" : "0");
           }
           if (body.guest_can_view_comments !== undefined) {
             await setSetting(env, SETTING_GUEST_COMMENTS, body.guest_can_view_comments ? "1" : "0");
           }
+          if (body.convoy_overlap_pct !== undefined) {
+            // 這一格是數字不是開關，壞值要當場報錯而不是靜靜地存進去 ——
+            // 讀取端會把壞值當成預設，站長會以為拉桿沒有作用
+            const pct = Math.round(Number(body.convoy_overlap_pct));
+            if (!Number.isFinite(pct) || pct < CONVOY_PCT_MIN || pct > CONVOY_PCT_MAX) {
+              return new Response(JSON.stringify({
+                error: `同遊門檻要在 ${CONVOY_PCT_MIN}–${CONVOY_PCT_MAX} 之間`,
+              }), { status: 400, headers });
+            }
+            await setSetting(env, SETTING_CONVOY_PCT, String(pct));
+          }
           return new Response(JSON.stringify({
             success: true,
             guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
             guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
+            convoy_overlap_pct: await convoyOverlapPct(env),
           }), { headers });
         }
       }

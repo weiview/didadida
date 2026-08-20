@@ -390,7 +390,27 @@ export interface AuthState {
   canComment: boolean;
   /** 通知紅點上的數字。跟著 /auth/me 一起回，不另外打一支 */
   unreadNotifications: number;
+  /**
+   * 地圖上「兩個人這一趟算不算一起出遊」的貼路重疊率門檻（%）。站長在後台調。
+   * 跟著 /auth/me 一起回來（後端那邊有 60 秒 memo，不會每次都讀 D1）。
+   */
+  convoyOverlapPct: number;
   user: CurrentUser | null;
+}
+
+/**
+ * 同遊門檻的預設值。**跟後端的 `CONVOY_PCT_DEFAULT` 是同一個數字，改一邊要改兩邊** ——
+ * 這裡這一份只在「後端還沒回來／舊後端不回這個欄位」時頂著用。
+ */
+export const CONVOY_PCT_DEFAULT = 70;
+export const CONVOY_PCT_MIN = 30;
+export const CONVOY_PCT_MAX = 100;
+
+/** 收進範圍內。壞值、缺值一律退回預設 —— 靈敏度不對，比整張地圖不畫車好 */
+export function clampConvoyPct(v: unknown): number {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return CONVOY_PCT_DEFAULT;
+  return Math.min(CONVOY_PCT_MAX, Math.max(CONVOY_PCT_MIN, n));
 }
 
 /**
@@ -408,7 +428,8 @@ export interface AuthState {
 export async function checkAuth(): Promise<AuthState> {
   const locked: AuthState = {
     admin: false, guest: false, canViewMap: false,
-    canViewComments: false, canComment: false, unreadNotifications: 0, user: null,
+    canViewComments: false, canComment: false, unreadNotifications: 0,
+    convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
   };
   if (typeof window === 'undefined') return locked;
   // 舊版把明文密碼存在這個 key。清掉已經留在使用者瀏覽器裡的那一份，
@@ -429,6 +450,8 @@ export async function checkAuth(): Promise<AuthState> {
         canViewComments: !!data.can_view_comments,
         canComment: !!data.can_comment,
         unreadNotifications: Number(data.unread_notifications ?? 0),
+        // 舊後端不回這個欄位 —— 用預設值，地圖照樣判得出同遊
+        convoyOverlapPct: clampConvoyPct(data.convoy_overlap_pct),
         user: data.user ?? null,
       };
     }
@@ -797,16 +820,35 @@ export interface SiteSettings {
    * **訪客永遠寫不了留言**，那不是開關（見後端 migrations/0013）。
    */
   guest_can_view_comments: number;
+  /**
+   * 地圖上「這一趟算不算一起出遊」的貼路重疊率門檻（%），預設 70。
+   *
+   * 放在站台設定而不是每個人各自調：它是判定規則的靈敏度，不是誰的偏好 ——
+   * 同一趟旅行，全家人看到的隊形必須是同一個。
+   */
+  convoy_overlap_pct: number;
+}
+
+/** PUT 的內容。開關是布林、門檻是數字，所以不能寫成 Partial<Record<…, boolean>> */
+export interface SiteSettingsPatch {
+  guest_can_view_map?: boolean;
+  guest_can_view_comments?: boolean;
+  convoy_overlap_pct?: number;
 }
 
 export async function fetchSiteSettings(): Promise<SiteSettings> {
   const res = await fetch(`${API_BASE_URL}/admin/settings`, { headers: getAuthHeaders() });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取站台設定失敗');
-  return await res.json();
+  const data = await res.json();
+  return {
+    guest_can_view_map: data.guest_can_view_map ?? 0,
+    guest_can_view_comments: data.guest_can_view_comments ?? 0,
+    convoy_overlap_pct: clampConvoyPct(data.convoy_overlap_pct),
+  };
 }
 
 export async function updateSiteSettings(
-  patch: Partial<Record<keyof SiteSettings, boolean>>,
+  patch: SiteSettingsPatch,
 ): Promise<{ success: boolean; settings?: SiteSettings; message?: string }> {
   const res = await fetch(`${API_BASE_URL}/admin/settings`, {
     method: 'PUT',
@@ -820,6 +862,7 @@ export async function updateSiteSettings(
       settings: {
         guest_can_view_map: data.guest_can_view_map ?? 0,
         guest_can_view_comments: data.guest_can_view_comments ?? 0,
+        convoy_overlap_pct: clampConvoyPct(data.convoy_overlap_pct),
       },
     };
   }
