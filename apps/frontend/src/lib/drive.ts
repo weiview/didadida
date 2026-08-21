@@ -18,12 +18,15 @@
  *    短效 access token，照片就都由同一個身分建檔。誰上傳的記在 D1，
  *    不看 Drive 的擁有者欄位。見 api.ts 的 fetchDriveWriterToken。
  *
- *    **站上沒有「連結 Drive 帳號」這個動作**（2026-08-14 拿掉）：站長的 refresh
- *    token 來自環境 secret `DRIVE_WRITER_REFRESH_TOKEN`，或站長用 Google 登入時
- *    後端自動收下的那份。誰都不必記得去點什麼。
+ *    **站上沒有「連結 Drive 帳號」這個動作**（2026-08-14 拿掉）：憑據就是站長
+ *    那一列的 `User.google_refresh_token` —— 他用 Google 登入站台時收下的那一份，
+ *    跟「從 Google 相簿匯入」用的是同一張（登入 scope 本來就含 drive.file）。
+ *    誰都不必記得去點什麼，站長每次登入還會順便把它刷新。
  *
- *    代價一：refresh token 會過期（同意畫面還在 Testing 的話 7 天），錯誤裡的
- *    `expired` 就是在講這件事 —— 站長重新登入一次後端就會自己收一份新的。
+ *    代價一：refresh token 還是可能失效（被撤銷、換過 OAuth client），錯誤裡的
+ *    `expired` 就是在講這件事 —— 站長重新用 Google 登入一次就會自己收回來。
+ *    ⚠️ 同意畫面**早就發布成正式狀態了，沒有「測試中 7 天到期」這回事**，
+ *    往那個方向查會走冤枉路。
  *    代價二：舊做法留下的相簿資料夾是別的帳號建的，寫入身分看不見 ——
  *    探到 404 就在自己名下重建一個並改記（見 ensureAlbumFolder）。
  *

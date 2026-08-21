@@ -32,22 +32,14 @@ export interface Env {
   GOOGLE_DRIVE_SA_KEY?: string;
   /** GPSLogger 上傳目的地資料夾的 Drive file id（只分享 Viewer 給 SA） */
   GOOGLE_DRIVE_FOLDER_ID?: string;
-  /**
-   * 站長的 Drive refresh token，**照片備份的寫入身分**。
-   *
-   * 為什麼是 secret 而不是只存 D1（2026-08-14 使用者定調「不用再做任何身份連結，
-   * 後面直接用站長身份上傳」）：D1 那份是「站長在這個環境登入過一次」才會有的，
-   * 清庫或換環境就沒了，於是每個環境都要有人記得去點一次「連結」。
-   * 放進 secret 之後這件事變成部署設定的一部分 —— 一次 `wrangler secret put`，
-   * dev/prod 從第一秒就備份得進去，D1 被清也不受影響。
-   *
-   * refresh token 綁的是 **OAuth client_id 而不是環境**，所以同一份在
-   * local / dev / prod 都有效（三邊共用同一組 GOOGLE_CLIENT_ID）。
-   *
-   * 優先序是 D1 → 這裡：D1 有的話代表站長在這個環境親自登入過，那份比較新。
-   * 見 mintDriveWriterToken()。
+  /*
+   * 這裡以前有 DRIVE_WRITER_REFRESH_TOKEN（站長的 Drive 寫入 refresh token）。
+   * **2026-08-21 移除**：它跟 `User.google_refresh_token`（0017）是同一個東西，
+   * 而多出來的那份會**擋住自癒** —— 判斷「登入要不要跳同意畫面」看的是「有沒有值」，
+   * secret 只要還在（哪怕 Google 早就回 invalid_grant）站長就再也跳不出同意畫面。
+   * 實際卡死過：畫面叫站長重新登入，但登入這條路永遠補不回那份授權。
+   * 見 driveWriterOwner()。遠端的 secret 已經一併刪掉，設了也沒有人會讀。
    */
-  DRIVE_WRITER_REFRESH_TOKEN?: string;
   /**
    * 照片主檔資料夾 `didadida/` 的覆寫。**平常不必設** —— 正常情況是網頁第一次
    * 上傳時自己建資料夾、把 id 存進 AppSetting。設了就以這裡為準，
@@ -78,19 +70,10 @@ export interface Env {
 const SETTING_PHOTOS_FOLDER = "drive_photos_folder_id";
 const SETTING_TRASH_FOLDER = "drive_trash_folder_id";
 /*
- * Drive 的**唯一寫入身分**。
- *
- * 為什麼要存 refresh token（先前明確決定不存的東西）：`drive.file` 是 per-file
- * 授權，第二位管理員碰不到第一位建的子資料夾（2026-08-12 實測確認，Picker 授權
- * 根目錄也不會往下涵蓋）。要讓一家人共用同一份 Drive 資料夾，寫入者就只能有一個。
- * 於是所有人的上傳都改成跟後端換一張**這個帳號**的短效 access token。
- *
- * ⚠️ 同意畫面還在「測試中」的話，refresh token **7 天就會失效**，得重新連結一次。
- *    要根治只能把同意畫面發布到 Production。
+ * Drive 的寫入身分以前在這裡有三個 AppSetting 鍵（drive_writer_refresh_token /
+ * _email / _linked_at）。**2026-08-21 全部移除**，改讀站長那一列的
+ * `User.google_refresh_token`。見 driveWriterOwner()。
  */
-const SETTING_DRIVE_REFRESH_TOKEN = "drive_writer_refresh_token";
-const SETTING_DRIVE_WRITER_EMAIL = "drive_writer_email";
-const SETTING_DRIVE_LINKED_AT = "drive_writer_linked_at";
 /**
  * 訪客看不看得到足跡地圖。**預設關**（沒有這一列就是關）。
  *
@@ -898,15 +881,6 @@ function parseMentions(body: string): number[] {
 }
 
 /**
- * 站長的 Drive 授權從哪裡來。**這個站沒有「連結 Drive 帳號」這個步驟了**
- * （2026-08-14），兩個來源都不需要任何人去點：
- *
- *   1. `DRIVE_WRITER_REFRESH_TOKEN` secret —— 部署設定的一部分，一個環境設一次
- *   2. D1 的 `drive_writer_refresh_token` —— 站長用 Google 登入時**自動**收下的
- *
- * D1 那份優先：它是站長在這個環境親自登入留下的，secret 是搬過來的舊值。
- */
-/**
  * 這個環境的 Drive 根資料夾要叫什麼。
  *
  * 三個環境的備份都寫進站長同一個 Drive，名字不分開的話 `findOwnFolder`
@@ -922,31 +896,48 @@ function driveRootFolderName(env: Env, url: URL): string {
   return env.DRIVE_ROOT_FOLDER || "didadida";
 }
 
-async function driveWriterCredential(env: Env): Promise<{ token: string; fromDb: boolean } | null> {
-  /*
-   * **一定要 trim。** secret 是人（或指令稿）貼進去的，尾巴很容易多一個換行 ——
-   * 2026-08-14 就這樣炸過一次：`$v | wrangler secret put` 讓值變成 104 個字元，
-   * Google 回 `invalid_grant`，前端顯示的卻是「授權過期了，請站長重新登入」，
-   * 完全看不出是多了一個 \n。而且 secret 讀不回來，查起來特別費事。
-   */
-  const stored = (await getSetting(env, SETTING_DRIVE_REFRESH_TOKEN))?.trim();
-  if (stored) return { token: stored, fromDb: true };
-  const secret = (env.DRIVE_WRITER_REFRESH_TOKEN || "").trim();
-  return secret ? { token: secret, fromDb: false } : null;
+/**
+ * Drive 的**唯一寫入身分**＝站長本人的 Google 授權。
+ *
+ * 為什麼寫入者只能有一個：`drive.file` 是 per-file 授權，第二位管理員碰不到
+ * 第一位建的子資料夾（2026-08-12 實測確認，Picker 授權根目錄也不會往下涵蓋）。
+ * 要讓一家人共用同一份 Drive 資料夾，就只能全部由同一個帳號建檔。
+ *
+ * **憑據就是站長那一列的 `User.google_refresh_token`**（0017）—— 跟「從 Google
+ * 相簿匯入」用的是同一份，登入 scope 本來就含 `drive.file`（GOOGLE_LOGIN_SCOPES）。
+ * 以前另外存了兩份（`AppSetting.drive_writer_refresh_token` ＋ 環境 secret），
+ * **2026-08-21 拿掉**：同一個東西存三個地方，而且壞掉的那份會擋住自癒，
+ * 讓「請站長重新登入一次」變成一句做不到的指示（見 Env 裡那段說明）。
+ *
+ * 現在只有一份，而且是**站長每次 Google 登入都會刷新**的那一份：失效時
+ * mintUserGoogleToken() 就地清成 NULL → 下次登入的回呼發現這個人沒有 →
+ * 自動補跳一次同意畫面收回來。整條路不需要任何人去點「連結」。
+ *
+ * 停權（active=0）的站長不算數：那是「這個人現在不該碰站上任何東西」的意思。
+ */
+async function driveWriterOwner(env: Env): Promise<{ id: number; email: string | null } | null> {
+  const row = await env.DB.prepare(
+    `SELECT id, email FROM User
+      WHERE role = 'owner' AND active = 1
+        AND google_refresh_token IS NOT NULL AND TRIM(google_refresh_token) <> ''
+      ORDER BY id LIMIT 1`
+  ).first<any>();
+  return row ? { id: Number(row.id), email: (row.email as string) ?? null } : null;
 }
 
 /**
- * 拿 refresh token 換一張短效 access token（Drive 的唯一寫入身分）。
+ * 拿站長的 refresh token 換一張短效 access token（Drive 的唯一寫入身分）。
  *
  * 回傳的 `reason` 是給前端分辨用的，三種要走完全不同的路：
- *   `not_linked`  兩個來源都沒有 —— 站長用 Google 登入一次就會自己補上
- *   `expired`     refresh token 失效（多半是同意畫面還在測試中，7 天到期）。
- *                 **不要自動重試**，那只會一直撞同一面牆
+ *   `not_linked`  站長還沒用 Google 登入過 —— 他登入一次就自己有了
+ *   `expired`     refresh token 失效（被撤銷、或換過 OAuth client）。
+ *                 **不要自動重試**，那只會一直撞同一面牆。那份已經就地清成 NULL，
+ *                 站長下次登入時回呼會自動補跳同意畫面收一份新的回來
  *   `failed`      其他錯誤（網路、Google 暫時性問題），可以重試
  *
- * D1 那份撞到 `invalid_grant` 時會**就地清掉**再退回 secret 試一次。這是自癒的關鍵：
- * 清掉之後下一次站長登入才會重新被要求同意，也才拿得到新的 refresh token
- * （見 /api/auth/google/login 的 prompt 判斷）。
+ * 換發、isolate 快取、invalid_grant 自癒全部共用 mintUserGoogleToken() ——
+ * 站長的 Drive 寫入 token 跟他自己匯入相簿用的**本來就是同一張**，沒有理由換兩次，
+ * 也沒有理由讓兩條路各自寫一份自癒邏輯（那正是先前會分岔壞掉的地方）。
  */
 async function mintDriveWriterToken(
   env: Env,
@@ -954,54 +945,19 @@ async function mintDriveWriterToken(
   | { ok: true; accessToken: string; expiresIn: number; email: string | null }
   | { ok: false; reason: "not_linked" | "expired" | "failed"; detail: string }
 > {
-  const cred = await driveWriterCredential(env);
-  if (!cred) return { ok: false, reason: "not_linked", detail: "後端還沒有站長的 Drive 授權" };
-  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
-    return { ok: false, reason: "failed", detail: "後端缺 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET" };
+  const owner = await driveWriterOwner(env);
+  if (!owner) {
+    return { ok: false, reason: "not_linked", detail: "站長還沒用 Google 登入過，後端沒有 Drive 授權" };
   }
 
-  const exchange = async (refreshToken: string) => {
-    const res = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: env.GOOGLE_CLIENT_ID!,
-        client_secret: env.GOOGLE_CLIENT_SECRET!,
-        refresh_token: refreshToken,
-        grant_type: "refresh_token",
-      }),
-    });
-    const data: any = await res.json().catch(() => null);
-    return { ok: res.ok && !!data?.access_token, status: res.status, data };
-  };
-
-  let attempt = await exchange(cred.token);
-
-  // D1 那份掛了就丟掉它，改用 secret 那份。secret 也掛才是真的沒救
-  if (!attempt.ok && attempt.data?.error === "invalid_grant" && cred.fromDb) {
-    await env.DB.prepare("DELETE FROM AppSetting WHERE key IN (?, ?, ?)")
-      .bind(SETTING_DRIVE_REFRESH_TOKEN, SETTING_DRIVE_WRITER_EMAIL, SETTING_DRIVE_LINKED_AT)
-      .run();
-    settingMemo.delete(SETTING_DRIVE_REFRESH_TOKEN);
-    console.warn("drive writer refresh token 失效，已清掉 D1 那份，等站長下次登入重收");
-    if (env.DRIVE_WRITER_REFRESH_TOKEN) attempt = await exchange(env.DRIVE_WRITER_REFRESH_TOKEN);
-  }
-
-  if (!attempt.ok) {
-    // invalid_grant＝被撤銷或過期，這種再試幾次都一樣
-    const expired = attempt.data?.error === "invalid_grant";
-    return {
-      ok: false,
-      reason: expired ? "expired" : "failed",
-      detail: String(attempt.data?.error_description || attempt.data?.error || `HTTP ${attempt.status}`),
-    };
-  }
-
+  const minted = await mintUserGoogleToken(env, owner.id);
+  if (!minted.ok) return minted;
   return {
     ok: true,
-    accessToken: attempt.data.access_token,
-    expiresIn: Number(attempt.data.expires_in) || 3600,
-    email: await getSetting(env, SETTING_DRIVE_WRITER_EMAIL),
+    accessToken: minted.token,
+    // mintUserGoogleToken 快取時已經先扣了 60 秒，這裡照它剩下的時間回
+    expiresIn: Math.max(Math.round((minted.expiresAt - Date.now()) / 1000), 60),
+    email: owner.email,
   };
 }
 
@@ -1030,11 +986,13 @@ const userGoogleTokens = new Map<number, { token: string; expiresAt: number }>()
 async function mintUserGoogleToken(
   env: Env, uid: number,
 ): Promise<
-  | { ok: true; token: string }
+  | { ok: true; token: string; expiresAt: number }
   | { ok: false; reason: "not_linked" | "expired" | "failed"; detail: string }
 > {
   const cached = userGoogleTokens.get(uid);
-  if (cached && cached.expiresAt > Date.now()) return { ok: true, token: cached.token };
+  if (cached && cached.expiresAt > Date.now()) {
+    return { ok: true, token: cached.token, expiresAt: cached.expiresAt };
+  }
 
   if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
     return { ok: false, reason: "failed", detail: "後端缺 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET" };
@@ -1081,11 +1039,10 @@ async function mintUserGoogleToken(
   }
 
   const expiresIn = Number(data.expires_in) || 3600;
-  userGoogleTokens.set(uid, {
-    token: data.access_token,
-    expiresAt: Date.now() + (expiresIn - 60) * 1000,
-  });
-  return { ok: true, token: data.access_token };
+  // 早 60 秒就當作過期，免得剛好卡在邊界上送出請求
+  const expiresAt = Date.now() + (expiresIn - 60) * 1000;
+  userGoogleTokens.set(uid, { token: data.access_token, expiresAt });
+  return { ok: true, token: data.access_token, expiresAt };
 }
 
 /**
@@ -2747,10 +2704,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
             console.error("SA 金鑰解析失敗", e);
           }
         }
-        const [writerEmail, linkedAt] = await Promise.all([
-          getSetting(env, SETTING_DRIVE_WRITER_EMAIL),
-          getSetting(env, SETTING_DRIVE_LINKED_AT),
-        ]);
+        // Drive 上唯一的寫入身分＝站長本人的 Google 授權（見 driveWriterOwner）
+        const writer = await driveWriterOwner(env);
         return new Response(JSON.stringify({
           client_id: env.GOOGLE_CLIENT_ID || null,
           sa_email: saEmail,
@@ -2759,15 +2714,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
           // 這個環境的根資料夾要叫什麼（見 driveRootFolderName）。網頁第一次
           // 上傳時照這個名字去找／去建，不能寫死在前端 —— 三個環境不同名
           root_folder_name: driveRootFolderName(env, url),
-          // 所有人的上傳都用這個帳號的身分寫進 Drive。**null 不代表不能傳**：
-          // 憑證可能來自 DRIVE_WRITER_REFRESH_TOKEN secret，那條路沒有 email 可記
-          writer_email: writerEmail,
-          writer_linked_at: linkedAt,
-          // 少任何一項都上傳不了，讓前端一眼看出是哪裡沒設好。
-          // 憑證看的是「兩個來源有沒有其中一個」，不是 writer_email
-          ready: Boolean(
-            env.GOOGLE_CLIENT_ID && saEmail && (writerEmail || env.DRIVE_WRITER_REFRESH_TOKEN)
-          ),
+          // 所有人的上傳都用這個帳號的身分寫進 Drive（不是「現在登入的人」）。
+          // null＝站長還沒用 Google 登入過這個環境，那就是真的傳不了
+          writer_email: writer?.email ?? null,
+          // 少任何一項都上傳不了，讓前端一眼看出是哪裡沒設好
+          ready: Boolean(env.GOOGLE_CLIENT_ID && saEmail && writer),
         }), { headers });
       }
 
@@ -3917,19 +3868,16 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           } catch (e) {}
         }
         /*
-         * 什麼時候要強制跳同意畫面：**這個環境完全沒有 Drive 寫入身分的時候**。
+         * **這裡不強制跳同意畫面。** 以前的規則是「這個環境還沒有 Drive 寫入
+         * 憑證時，所有人登入都多看一次同意畫面」—— 那個判斷只看「有沒有值」，
+         * 值早就失效也算數，於是真的壞掉時反而永遠跳不出來（2026-08-21 卡死過）。
          *
-         * Google 只在「使用者明確按下同意」那一次給 refresh token，同一個帳號之後
-         * 再登入都不會再給。所以沒有憑證可用時只能請大家多按一次同意，換到之後
-         * 就自動退回原本的 `select_account`，誰都不會再看到那一頁。
-         *
-         * 這一步在驗身分之前，還不知道來的是不是站長 —— 所以是「沒憑證時所有人都
-         * 多一次同意」。**個人那份不靠這裡** —— 回呼發現「這個人一份都沒有」時
-         * 會自己補跳一次，不必在這裡替所有人多一個同意畫面。
+         * 現在補同意這件事整個交給回呼：它認得出人，發現「這個人一份 refresh
+         * token 都沒有」才補跳一次（見下面「收下這個人自己的授權」）。
+         * 精準到人，也不必為了站長的 Drive 讓全家人多按一次同意。
          */
-        const needConsent = (await driveWriterCredential(env)) === null;
         return Response.redirect(googleAuthUrl(env, new URL(request.url).origin, {
-          albumId, redirectHost, consent: needConsent, retried: false,
+          albumId, redirectHost, consent: false, retried: false,
         }), 302);
       }
 
@@ -4045,29 +3993,12 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         });
 
         /*
-         * **站長登入時自動收下 Drive 寫入身分**（2026-08-14，取代原本要人去點的
-         * 「連結 Drive 寫入帳號」）。三個條件缺一不可：
-         *
-         *   1. 來的是站長 —— 備份倉庫只能是他的 Drive，成員的一律不留。
-         *      存一份長期憑證是有代價的東西，不該因為某次登入剛好帶回來就默默留下。
-         *   2. Google 真的給了 refresh token —— 只有走過同意畫面那次才有，
-         *      也就是上面 `needConsent` 成立的那次。
-         *   3. 這個環境還沒有可用的憑證 —— 已經有就別覆蓋，免得站長每次重新同意
-         *      都換一把（舊的那把會立刻失效，同一個 client 同時只認得幾把）。
-         *
-         * 失敗沒有任何訊息要給前端：站上已經沒有「連結」這個動作了，
-         * 使用者不必知道這一步發生過。真的沒收到就等下一次登入，或設 secret。
+         * 這裡以前還有一段「站長登入時自動把 refresh token 收進 AppSetting 當
+         * Drive 寫入身分」。**2026-08-21 拿掉**：上面那一行已經把它存進
+         * `User.google_refresh_token` 了，Drive 直接讀站長那一列就好
+         * （見 driveWriterOwner）。同一份憑證不必再抄一份到別的地方 ——
+         * 抄出來的那份沒人刷新，壞掉還會擋住自癒。
          */
-        if (
-          admitted.user.role === "owner" &&
-          freshRefresh &&
-          (await driveWriterCredential(env)) === null
-        ) {
-          await setSetting(env, SETTING_DRIVE_REFRESH_TOKEN, freshRefresh);
-          await setSetting(env, SETTING_DRIVE_WRITER_EMAIL, admitted.user.email);
-          await setSetting(env, SETTING_DRIVE_LINKED_AT, new Date().toISOString());
-          console.log("已自動收下站長的 Drive 寫入授權", admitted.user.email);
-        }
         return Response.redirect(`${target}#${frag.toString()}`, 302);
       }
 

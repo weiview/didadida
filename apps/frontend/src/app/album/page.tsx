@@ -49,7 +49,7 @@ function AlbumContent() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const { isAdmin, canEdit, canAddTo, canReorderIn } = useAdmin();
+  const { isAdmin, isOwner, canEdit, canAddTo, canReorderIn } = useAdmin();
   /**
    * 這本相簿本身。留著它是為了 `canEditAlbum` —— 光有 isAdmin 不夠，
    * 一般成員只動得了自己建的相簿（跟後端 canTouchAlbum 同一條規則）。
@@ -123,7 +123,6 @@ function AlbumContent() {
 
   // Google Sync State
   const [syncingGoogle, setSyncingGoogle] = useState(false);
-  const [syncProgress, setSyncProgress] = useState<{current: number, total: number} | null>(null);
   /**
    * Google 那半邊的授權掉了（後端回 409 google_reauth）時要講的話。
    *
@@ -296,6 +295,23 @@ function AlbumContent() {
    * 找不到（照片被刪了、或不在這本相簿裡）就什麼都不做，不要跳錯誤 ——
    * 通知本來就可能比內容活得久。
    */
+  /**
+   * 關燈箱。**順手把網址上的 `?photo=` 拿掉** —— 那是通知點進來留下的深連結，
+   * 留著的話重新整理又會被上面那段效果重新開一次燈箱（`deepLinkDone` 只擋得住
+   * 同一次載入之內的重開，擋不住重整）。
+   *
+   * 用 `history.replaceState` 不用 router.replace：這裡只是要改網址列，不需要
+   * 讓 Next 重跑一輪路由（會捲回頂端、也會讓整頁重畫）。
+   */
+  const closeLightbox = () => {
+    setSelectedPhotoIndex(null);
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has("photo")) return;
+    url.searchParams.delete("photo");
+    window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+  };
+
   const deepLinkDone = useRef(false);
   useEffect(() => {
     if (deepLinkDone.current || loading || displayPhotos.length === 0) return;
@@ -438,7 +454,7 @@ function AlbumContent() {
         key: 'busy',
         disabled: true,
         label: syncingGoogle
-          ? (syncProgress ? `匯入中... (${syncProgress.current}/${syncProgress.total})` : "準備 Google 相簿...")
+          ? (uploadProgress ? `匯入中... (${uploadProgress.current}/${uploadProgress.total})` : "準備 Google 相簿...")
           : (uploadProgress ? `上傳中... (${uploadProgress.current}/${uploadProgress.total})` : "上傳中..."),
       }];
     }
@@ -512,7 +528,7 @@ function AlbumContent() {
       needsLink
         ? (err as DriveWriterError).reason === 'not_linked'
           ? '後端還沒有站長的 Drive 授權'
-          : '站長的 Drive 授權過期了（同意畫面還在測試中的話只有 7 天）'
+          : '站長的 Drive 授權失效了（被撤銷，或換過 Google OAuth 設定）'
         : err instanceof Error ? err.message : 'Google Drive 沒接上',
     );
   };
@@ -775,7 +791,7 @@ function AlbumContent() {
     try {
       // 立刻將 UI 設為載入鎖定狀態，避免異步建立 Session 期間 UI 切回
       setSyncingGoogle(true);
-      setSyncProgress(null);
+      setUploadProgress(null);
       setGoogleReauth(null);
 
       // 每次匯入都必須建立新的 Google Picker Session (舊 Session 無法重複選照片)
@@ -794,6 +810,19 @@ function AlbumContent() {
 
       const startTime = Date.now();
       let photosProcessingStarted = false;
+      /*
+       * 使用者直接按 X 關掉選相片的視窗＝取消。**不能一看到 closed 就收工** ——
+       * pickerUri 後面接的 `/autoclose` 就是要 Google 在選完之後自己關掉那個視窗，
+       * 所以「視窗關了」同時是「取消」與「選完了」的樣子。差別只在 session 會不會
+       * 變 ready —— 先關窗、下一瞬間才 ready 的順序也真的會發生。
+       *
+       * 所以看到關掉只先記時間，寬限期內照常輪詢，撐過去還沒 ready 才當作取消。
+       * 取消不彈任何東西：是他自己關的，跳一個「已取消」只是多一次點擊。
+       *
+       * popup 被瀏覽器擋掉時是 null，這條就整個不成立，退回原本的 10 分鐘逾時。
+       */
+      let popupClosedAt = 0;
+      const PICKER_CLOSE_GRACE_MS = 1500;
 
       const pollTimer = setInterval(async () => {
         if (photosProcessingStarted) {
@@ -803,6 +832,7 @@ function AlbumContent() {
         // 如果超過 10 分鐘，自動中斷
         if (Date.now() - startTime > 10 * 60 * 1000) {
           clearInterval(pollTimer);
+          photosProcessingStarted = true;
           setSyncingGoogle(false);
           alert("同步逾時，已自動取消。");
           return;
@@ -861,24 +891,54 @@ function AlbumContent() {
 
           if (sources.length === 0) {
             setSyncingGoogle(false);
-            setSyncProgress(null);
+            setUploadProgress(null);
             return;
           }
 
-          setSyncProgress({ current: 0, total: sources.length });
+          /*
+           * **進度回報跟本機上傳共用同一份 `uploadProgress`**，畫的也是同一條
+           * 進度列。以前這裡另外記一份 `syncProgress`，只餵得起 FAB 上那行
+           * 「匯入中 (x/y)」—— 於是同一條管線（ingestSources）跑起來，本機那條
+           * 有進度列、Google 這條沒有，看起來像卡住。
+           */
           const result = await ingestSources(
             sources,
-            (current, total) => setSyncProgress({ current, total }),
+            (current, total, fileName) => setUploadProgress({ current, total, fileName }),
           );
           setSyncingGoogle(false);
-          setSyncProgress(null);
+          setUploadProgress(null);
           await finishIngest(result);
         }
       }, 2000);
+
+      /*
+       * 關窗偵測**獨立成一支 400ms 的小哨兵**，不跟 2 秒那支狀態輪詢共用一拍 ——
+       * 共用的話「發現關窗」本身就要先等最多 2 秒，再加寬限期，按下 X 之後右下角
+       * 要卡上快十秒才回得來，用起來跟沒修一樣。
+       *
+       * 寬限期到了還分不出是取消還是選完，就自己問最後一次狀態：ready 代表他是
+       * 選完才關的，原樣交還給狀態輪詢（下一拍 ≤2 秒就接手）；不 ready 才是取消。
+       */
+      const closeWatcher = setInterval(async () => {
+        if (photosProcessingStarted) { clearInterval(closeWatcher); return; }
+        if (!popup || !popup.closed) return;
+        if (!popupClosedAt) { popupClosedAt = Date.now(); return; }
+        if (Date.now() - popupClosedAt < PICKER_CLOSE_GRACE_MS) return;
+        clearInterval(closeWatcher);
+        try {
+          const last = await fetchGooglePickerPhotos(session!.id!);
+          if (last.ready) return;
+        } catch (e) { /* 問不到就當取消，反正窗已經關了 */ }
+        if (photosProcessingStarted) return;
+        clearInterval(pollTimer);
+        photosProcessingStarted = true;
+        setSyncingGoogle(false);
+        setUploadProgress(null);
+      }, 400);
     } catch (err) {
       console.error(err);
       setSyncingGoogle(false);
-      setSyncProgress(null);
+      setUploadProgress(null);
       popup?.close();
       if (err instanceof GoogleReauthError) setGoogleReauth(err.message);
     }
@@ -1411,15 +1471,38 @@ function AlbumContent() {
             </div>
           ) : driveNeedsLink ? (
             /*
-             * 這一格沒有按鈕，是刻意的。備份用的是站長的 Drive 授權，站上任何人
-             * （包含站長自己）按什麼都補不上 —— 那份授權只有兩個來源：站長重新用
-             * Google 登入一次，或後端補上 DRIVE_WRITER_REFRESH_TOKEN。
-             * 給一顆按了也沒用的按鈕比不給還糟。
+             * 備份用的是**站長的** Drive 授權，所以這裡分兩種人：
+             *
+             * 站長自己 → 給按鈕。他用 Google 登入一次，後端就會把授權收回來
+             *   （`User.google_refresh_token`）。這是站上唯一補得回來的路。
+             * 其他人   → 不給按鈕。按什麼都補不上，給一顆按了也沒用的按鈕比不給還糟。
+             *
+             * ⚠️ 按下去會離開這一頁，記在記憶體裡的 File 就沒了 —— 所以話要講在
+             * 前面：回來之後這批要用「補傳 Drive」重選檔案。**不自動跳轉。**
              */
-            <div style={{ marginTop: 8, fontSize: 13 }}>
-              這要站長處理：請站長登出後用 Google 重新登入一次，後端會自己把授權收回來。
-              之後回到這裡用「補傳 Drive」重選這批檔案就補得上。
-            </div>
+            isOwner ? (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ fontSize: 13, marginBottom: 8 }}>
+                  用 Google 登入一次就會把授權收回來。這批照片要回來之後用
+                  「補傳 Drive」重選檔案補上（離開這一頁會忘記剛才選了哪些）。
+                </div>
+                <button
+                  type="button"
+                  onClick={() => { window.location.href = googleLoginUrl(id ?? undefined); }}
+                  style={{
+                    padding: '7px 14px', borderRadius: 7, border: 'none',
+                    background: '#b45309', color: '#fff', fontSize: 13.5, cursor: 'pointer',
+                  }}
+                >
+                  用 Google 重新登入
+                </button>
+              </div>
+            ) : (
+              <div style={{ marginTop: 8, fontSize: 13 }}>
+                這要站長處理：請站長用 Google 登入一次，後端會自己把授權收回來。
+                之後回到這裡用「補傳 Drive」重選這批檔案就補得上。
+              </div>
+            )
           ) : (
             <div style={{ marginTop: 8 }}>
               {/* Drive 用的是後端換來的站長寫入 token，跟按下去的人是誰無關，
@@ -1589,7 +1672,7 @@ function AlbumContent() {
            */
           isAdmin={canEdit(displayPhotos[selectedPhotoIndex])}
           availableTags={availableTags}
-          onClose={() => setSelectedPhotoIndex(null)} 
+          onClose={closeLightbox}
           onUpdate={loadData}
           onPrev={() => {
             if (selectedPhotoIndex > 0) setSelectedPhotoIndex(selectedPhotoIndex - 1);
