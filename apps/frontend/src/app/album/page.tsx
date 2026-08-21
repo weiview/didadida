@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, syncGooglePhoto, resolveGooglePhotoConflict, photoThumbSrc, getGoogleToken, googleLoginUrl, DriveWriterError, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
 import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
@@ -72,7 +72,6 @@ function AlbumContent() {
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
   const [visibleCount, setVisibleCount] = useState<number>(24);
   const [uploadProgress, setUploadProgress] = useState<{current: number, total: number, fileName: string} | null>(null);
-  const [hasGoogleToken, setHasGoogleToken] = useState(false);
   /** Drive 沒接上時的原因。照片照樣傳得上去，只是少了 4K 與原始檔備份 */
   const [driveError, setDriveError] = useState<string | null>(null);
   const [showDriveBackfill, setShowDriveBackfill] = useState(false);
@@ -125,12 +124,13 @@ function AlbumContent() {
   // Google Sync State
   const [syncingGoogle, setSyncingGoogle] = useState(false);
   const [syncProgress, setSyncProgress] = useState<{current: number, total: number} | null>(null);
-  const [googleSession, setGoogleSession] = useState<any | null>(null);
-  const [currentConflict, setCurrentConflict] = useState<{
-    tempPhoto: any;
-    existingPhotos: any[];
-    resolveFn: (decision: string, replaceIds?: number[]) => void;
-  } | null>(null);
+  /**
+   * Google 那半邊的授權掉了（後端回 409 google_reauth）時要講的話。
+   *
+   * 這是**唯一**會把人帶去 Google 的入口了 —— 平常匯入用的是後端存的
+   * refresh token，按下去不會跳轉，頁面狀態也不會沒。
+   */
+  const [googleReauth, setGoogleReauth] = useState<string | null>(null);
 
   // 篩選與排序 State
   const [searchQuery, setSearchQuery] = useState("");
@@ -251,11 +251,9 @@ function AlbumContent() {
     
     /*
      * 管理員狀態與登入回呼都由 useAdmin 負責（fragment 在那裡收，網址也在那裡擦）。
-     * 這裡只是問一句「手上那個 Google token 還能用嗎」—— 它同時是相簿匯入
-     * 與 Drive 備份的憑證，登入時一起拿到的。
+     * 這裡不再問「Google token 還在不在」—— 瀏覽器手上已經沒有那張票了。
      */
     if (typeof window !== "undefined") {
-      setHasGoogleToken(!!getGoogleToken());
       // 訪客不預熱：`/api/config/drive` 是管理員才讀得到的設定，訪客打過去
       // 一定是 401，主控台就多一行紅字。備份是管理員的功能，訪客連按都按不到
       if (isAdmin) prewarmDrive();
@@ -462,16 +460,15 @@ function AlbumContent() {
           },
           {
             key: 'google',
-            label: hasGoogleToken ? '從 Google 相簿匯入' : '連結 Google 相簿',
+            // 永遠是「匯入」，沒有「連結 Google 相簿」那一態 —— 人已經是用
+            // Google 身分登入的，匯入就走他自己那份授權（後端換 token）
+            label: '從 Google 相簿匯入',
             title: 'Google Picker 不會給位置資訊，匯入後要自己補地點',
             onClick: () => {
-              let popup: Window | null = null;
-              if (hasGoogleToken) {
-                // 絕對同步開啟空視窗取得權限，突破任何阻擋器
-                popup = window.open("", "GooglePicker", "width=1000,height=800,menubar=no,toolbar=no,location=no,status=no");
-                if (popup) popup.document.write("<html><body style='font-family:sans-serif;text-align:center;margin-top:20%;'>載入 Google 相簿中...</body></html>");
-              }
-              handleGoogleSync(null, popup);
+              // 絕對同步開啟空視窗取得權限，突破任何阻擋器
+              const popup = window.open("", "GooglePicker", "width=1000,height=800,menubar=no,toolbar=no,location=no,status=no");
+              if (popup) popup.document.write("<html><body style='font-family:sans-serif;text-align:center;margin-top:20%;'>載入 Google 相簿中...</body></html>");
+              handleGoogleSync(popup);
             },
           },
         ],
@@ -656,31 +653,54 @@ function AlbumContent() {
     }
   };
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!id) return;
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
+  /**
+   * 一張待匯入的照片。**檔案是延後載入的**（`load()`）—— Google 匯入一批可能幾十張，
+   * 先全部抓下來等於把整批原始檔一起壓在記憶體裡，這樣一次只留手上這一張。
+   */
+  type IngestSource = { name: string; load: () => Promise<File> };
 
-    setUploading(true);
-    let allSuccess = true;
-    const total = files.length;
+  type IngestResult = {
+    uploaded: UploadedPhoto[];
+    dupes: PendingDuplicate[];
+    allSuccess: boolean;
+    reauth: GoogleReauthError | null;
+  };
+
+  /**
+   * 匯入管線。**本機選檔與 Google 相簿匯入走的是同一條**：
+   * 縮成 2000px → `uploadPhoto`（後端產 800／400 縮圖進 R2）→ 4K 與原始檔送 Drive。
+   *
+   * Google 那條以前是後端自己另做一套（把原始檔整個塞進 R2、沒有縮圖、也沒進 Drive），
+   * 2026-08-21 併掉了 —— 同一件事沒有理由做出兩種結果，而且那一套還在啃 R2 額度。
+   *
+   * 重複與 Drive 失敗都**不中斷整批**：重複的留到最後統一問，Drive 失敗記進待補清單。
+   * 只有 Google 授權沒了會停下來 —— 後面每一張都會是同一個錯，跑完只是白等。
+   */
+  const ingestSources = async (
+    sources: IngestSource[],
+    onProgress: (current: number, total: number, name: string) => void,
+  ): Promise<IngestResult> => {
+    const total = sources.length;
     const uploaded: UploadedPhoto[] = [];
     // Drive 沒接上時，把「哪張照片配哪個原始檔」留下來給橫幅那顆按鈕用
     const missedDrive: { photoId: number; file: File }[] = [];
     // 後端判定跟相簿裡撞了的那幾張。**它們一個位元組都還沒寫進去**，跑完再統一問
     const dupes: PendingDuplicate[] = [];
+    let allSuccess = true;
+    let reauth: GoogleReauthError | null = null;
 
     const drive = await prepareDrive();
     // 重複那幾張稍後才決定要不要傳，那時不該再跑一次 bootstrap，沿用這批的位置
     driveRef.current = drive;
 
     for (let i = 0; i < total; i++) {
-      const rawFile = files[i];
-      setUploadProgress({ current: i + 1, total, fileName: rawFile.name });
+      const source = sources[i];
+      onProgress(i + 1, total, source.name);
       try {
+        const rawFile = await source.load();
         // 縮圖處理 (長邊不超過 2000px)
         const { file, exifData, takenAt } = await resizeImageFile(rawFile, 2000);
-        const result = await uploadPhoto(id, file, exifData, takenAt || undefined);
+        const result = await uploadPhoto(id as string, file, exifData, takenAt || undefined);
         if (result.status === 'ok') {
           uploaded.push(result.photo);
           // 4K 與原始檔送 Drive。任何一步失敗都只是少一份備份，照片已經存在了
@@ -689,7 +709,7 @@ function AlbumContent() {
         } else if (result.status === 'duplicate') {
           // 縮好的 file 一起留著：使用者若選「照樣上傳」，不必再解一次圖
           dupes.push({
-            key: `${Date.now()}-${i}-${rawFile.name}`,
+            key: `${Date.now()}-${i}-${source.name}`,
             file: rawFile, resized: file, previewUrl: URL.createObjectURL(rawFile),
             exifData, takenAt: takenAt || undefined,
             reason: result.reason, existing: result.existing,
@@ -698,6 +718,7 @@ function AlbumContent() {
           allSuccess = false;
         }
       } catch (err) {
+        if (err instanceof GoogleReauthError) { reauth = err; break; }
         console.error(err);
         allSuccess = false;
       }
@@ -706,20 +727,36 @@ function AlbumContent() {
     // 累加而不是覆蓋：連傳兩批都沒接上 Drive 時，第一批不該被第二批洗掉
     if (missedDrive.length > 0) setPendingDriveBatch((prev) => [...prev, ...missedDrive]);
 
-    if (!allSuccess) {
-      alert("部分或全部照片上傳失敗，請稍後再試。");
-    }
+    return { uploaded, dupes, allSuccess, reauth };
+  };
+
+  /** 匯入收尾。視窗順序是固定的：重複清單疊在補地點上面，先決定要不要傳 */
+  const finishIngest = async (result: IngestResult) => {
+    if (result.reauth) setGoogleReauth(result.reauth.message);
+    else if (!result.allSuccess) alert("部分或全部照片上傳失敗，請稍後再試。");
 
     await loadData(); // 重新整理照片。要 await，補件視窗才拿得到縮圖
-    setUploading(false);
-    setUploadProgress(null);
 
     // 這批只要有任何一張沒有 EXIF 座標就跳出補件視窗；全部都有 GPS 的話不打擾。
-    if (uploaded.some((p) => p.lat === null || p.lng === null)) {
-      setPostUploadIds(uploaded.map((p) => p.id));
+    if (result.uploaded.some((p) => p.lat === null || p.lng === null)) {
+      setPostUploadIds(result.uploaded.map((p) => p.id));
     }
-    // 重複清單疊在補件視窗上面：先決定要不要傳，關掉之後才輪到補地點
-    if (dupes.length > 0) setDuplicateItems(dupes);
+    if (result.dupes.length > 0) setDuplicateItems(result.dupes);
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!id) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    setUploading(true);
+    const result = await ingestSources(
+      Array.from(files).map((f) => ({ name: f.name, load: async () => f })),
+      (current, total, fileName) => setUploadProgress({ current, total, fileName }),
+    );
+    await finishIngest(result);
+    setUploading(false);
+    setUploadProgress(null);
 
     // reset input
     if (fileInputRef.current) {
@@ -727,25 +764,24 @@ function AlbumContent() {
     }
   };
 
-  const handleGoogleSync = async (initialSession: any, popup: Window | null) => {
+  /**
+   * 從 Google 相簿匯入。
+   *
+   * **不會跳去 Google 要授權** —— 使用者本來就是用 Google 身分登入的，後端手上
+   * 有他自己的 refresh token（migrations/0017），Picker 與取檔都由後端當場換票。
+   * 只有那份授權被使用者自己收回時後端才回 409，那時才出現重新登入的入口。
+   */
+  const handleGoogleSync = async (popup: Window | null) => {
     try {
-      if (!hasGoogleToken) {
-        // 沒 token 就是還沒登入（或登入過期）。這個 token 只給 Google 相簿匯入用，
-        // Drive 備份走的是另一套（後端的寫入帳號）
-        window.location.href = googleLoginUrl(id ?? undefined);
-        return;
-      }
-
       // 立刻將 UI 設為載入鎖定狀態，避免異步建立 Session 期間 UI 切回
       setSyncingGoogle(true);
       setSyncProgress(null);
+      setGoogleReauth(null);
 
       // 每次匯入都必須建立新的 Google Picker Session (舊 Session 無法重複選照片)
       const session = await createGooglePickerSession();
-
       if (!session || (session as any).error || !session.pickerUri) {
-        alert("無法建立 Google Picker (可能登入已過期)，請重新連結 Google 相簿。");
-        setHasGoogleToken(false);
+        alert("無法建立 Google Picker，請稍後再試。");
         setSyncingGoogle(false);
         popup?.close();
         return;
@@ -772,10 +808,20 @@ function AlbumContent() {
           return;
         }
 
-        const res = await fetchGooglePickerPhotos(session!.id!);
-        if (res.ready) {
-          console.log("[Google Picker Polling] ready is true, res:", res);
+        // 這裡在 interval 裡面，丟出去沒人接得到（會變成 unhandled rejection，
+        // 而且輪詢還會繼續跑），所以每一輪自己收乾淨
+        let res: { ready: boolean; mediaItems?: any[] };
+        try {
+          res = await fetchGooglePickerPhotos(session!.id!);
+        } catch (err) {
+          clearInterval(pollTimer);
+          photosProcessingStarted = true;
+          setSyncingGoogle(false);
+          if (err instanceof GoogleReauthError) setGoogleReauth(err.message);
+          else console.error(err);
+          return;
         }
+
         if (res.ready && res.mediaItems) {
           clearInterval(pollTimer);
           photosProcessingStarted = true;
@@ -786,59 +832,55 @@ function AlbumContent() {
               popup.close();
             }
           } catch(e) {}
-          
-          if (res.mediaItems.length === 0) {
-            console.log("[Google Picker Polling] mediaItems is empty array");
+
+          /*
+           * Picker 回的是一串「照片在 Google 上的位置」，位元組還沒動。
+           * 取檔要繞後端（`fetchGoogleMediaFile`）：baseUrl 在
+           * lh3.googleusercontent.com 上、要帶 Authorization，而那個網域不回
+           * CORS preflight，瀏覽器自己抓一定失敗。
+           */
+          const sources: IngestSource[] = [];
+          for (const item of res.mediaItems) {
+            const baseUrl = item.mediaFile?.baseUrl || item.baseUrl;
+            const filename = item.mediaFile?.filename || item.filename || item.id + ".jpg";
+            const mimeType: string = item.mediaFile?.mimeType || item.mimeType || '';
+            // Picker 也選得到影片，這個站只收照片
+            if (!baseUrl || (mimeType && !mimeType.startsWith('image/'))) {
+              console.warn("跳過非照片或沒有下載連結的項目:", item);
+              continue;
+            }
+            // Picker 把時間放在 mediaItem.createTime，舊回應在 mediaMetadata 底下
+            const creationTime = item.createTime
+              || item.mediaFile?.mediaFileMetadata?.creationTime
+              || item.mediaMetadata?.creationTime;
+            sources.push({
+              name: filename,
+              load: () => fetchGoogleMediaFile(baseUrl, filename, creationTime),
+            });
+          }
+
+          if (sources.length === 0) {
             setSyncingGoogle(false);
+            setSyncProgress(null);
             return;
           }
 
-          setSyncProgress({ current: 0, total: res.mediaItems.length });
-          let successCount = 0;
-
-          for (let i = 0; i < res.mediaItems.length; i++) {
-            const item = res.mediaItems[i];
-            console.log(`[Google Picker Item ${i}]`, item);
-            setSyncProgress({ current: i + 1, total: res.mediaItems.length });
-            
-            const baseUrl = item.mediaFile?.baseUrl || item.baseUrl;
-            const filename = item.mediaFile?.filename || item.filename || item.id + ".jpg";
-            
-            if (!baseUrl) {
-              console.error("無法取得照片下載連結:", item);
-              continue;
-            }
-
-            const result = await syncGooglePhoto(id as string, baseUrl, filename, item.mediaMetadata?.creationTime);
-            
-            if (result && result.conflict) {
-              const decision = await new Promise<{action: string, replaceIds?: number[]}>((resolve) => {
-                setCurrentConflict({
-                  tempPhoto: result.tempPhoto,
-                  existingPhotos: result.existingPhotos,
-                  resolveFn: (action, replaceIds) => resolve({ action, replaceIds })
-                });
-              });
-              
-              setCurrentConflict(null);
-              
-              if (decision) {
-                const resolved = await resolveGooglePhotoConflict(decision.action, result.existingPhotos, result.tempPhoto, decision.replaceIds);
-                if (resolved) successCount++;
-              }
-            } else if (result) {
-              successCount++;
-            }
-          }
-          
+          setSyncProgress({ current: 0, total: sources.length });
+          const result = await ingestSources(
+            sources,
+            (current, total) => setSyncProgress({ current, total }),
+          );
           setSyncingGoogle(false);
           setSyncProgress(null);
-          loadData();
+          await finishIngest(result);
         }
       }, 2000);
     } catch (err) {
       console.error(err);
       setSyncingGoogle(false);
+      setSyncProgress(null);
+      popup?.close();
+      if (err instanceof GoogleReauthError) setGoogleReauth(err.message);
     }
   };
 
@@ -1318,12 +1360,42 @@ function AlbumContent() {
       </div>
       
       {/*
+        * Google 那半邊的授權掉了 —— 使用者自己在 Google 帳號設定裡收回權限，
+        * 或改過密碼。**這是站上唯一還會把人帶去 Google 的入口**：平常匯入用的是
+        * 後端存的 refresh token，按下去不跳轉、頁面狀態也不會沒。
+        *
+        * 站上的身分沒事（後端回的是 409 不是 401），所以只講 Google 這一半，
+        * 不要說成「請重新登入」讓人以為整個站把他踢出去了。
+        */}
+      {googleReauth && (
+        <div style={{
+          margin: '10px 0', padding: '10px 14px', borderRadius: 8,
+          background: '#fee2e2', border: '1px solid #fca5a5', color: '#7f1d1d',
+          fontSize: 13.5, lineHeight: 1.7,
+        }}>
+          <strong>Google 相簿匯入需要重新授權</strong>（{googleReauth}）
+          <div style={{ marginTop: 8 }}>
+            <button
+              type="button"
+              onClick={() => { window.location.href = googleLoginUrl(id ?? undefined); }}
+              style={{
+                padding: '7px 14px', borderRadius: 7, border: 'none',
+                background: '#b91c1c', color: '#fff', fontSize: 13.5, cursor: 'pointer',
+              }}
+            >
+              用 Google 重新登入
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/*
         * Drive 沒接上要講出來，不能只寫進 console。照片是傳成功了，但少了 4K 與
         * 原始檔備份 —— 使用者以為備份好了才是真正的問題。
         *
-        * 橫幅裡那顆按鈕分兩種情況：手上還有 Google token 就直接補傳剛才那批；
-        * token 過期就只能先去登入 —— 跳轉會把記在記憶體裡的 File 弄丟，
-        * 所以標籤要講清楚回來之後得走「補傳 Drive」重選檔案那條路。
+        * 橫幅裡那顆按鈕分兩種情況：只是暫時沒接上就直接補傳剛才那批；
+        * 後端根本沒有站長的 Drive 授權（driveNeedsLink）就連按都不給按 ——
+        * 那份授權只有站長重新用 Google 登入一次才補得回來。
         */}
       {isAdmin && driveError && (
         <div style={{
@@ -1350,8 +1422,8 @@ function AlbumContent() {
             </div>
           ) : (
             <div style={{ marginTop: 8 }}>
-              {/* Drive 用的是後端換來的寫入 token，跟「有沒有 Google 登入」無關，
-                  所以這裡不必再管 hasGoogleToken —— 重試就好 */}
+              {/* Drive 用的是後端換來的站長寫入 token，跟按下去的人是誰無關，
+                  所以這裡不必先去登入什麼 —— 重試就好 */}
               <button
                 type="button"
                 onClick={handleBackfillCurrentBatch}
@@ -1712,17 +1784,6 @@ function AlbumContent() {
           loadData();
           const skipped = skippedNoTime > 0 ? `，${skippedNoTime} 張沒有拍攝時間未處理` : '';
           alert(`已為 ${updated} 張照片${what}${skipped}`);
-        }}
-      />
-
-      <GoogleSyncConflictModal
-        isOpen={!!currentConflict}
-        tempPhoto={currentConflict?.tempPhoto}
-        existingPhotos={currentConflict?.existingPhotos || []}
-        onResolve={(decision, replaceIds) => {
-          if (currentConflict?.resolveFn) {
-            currentConflict.resolveFn(decision, replaceIds);
-          }
         }}
       />
     </div>

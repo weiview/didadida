@@ -28,43 +28,20 @@ function getAuthHeaders() {
  * ── Google 登入 ────────────────────────────────────────────────────────────
  *
  * 一次登入拿齊三樣：管理員身分、Drive 備份權限、相簿匯入權限。
- * 所以只有一個 Google token，Picker 與 Drive 共用它，不會互相蓋掉。
  *
  * 走整頁跳轉（後端 /api/auth/google/login）而不是 GIS 彈窗：彈窗要「短暫啟用
- * 狀態」才開得起來，而且拿到的 token 只能放記憶體、重整就沒了。跳轉回來的
- * token 存得下，所以重整之後照樣傳得上 Drive。
+ * 狀態」才開得起來，而且拿到的 token 只能放記憶體、重整就沒了。
+ *
+ * ⚠️ **瀏覽器這邊不再留任何 Google token**（2026-08-21）。以前登入回來會把一張
+ * 短效 access token 存進 localStorage 給「從 Google 相簿匯入」用，一小時就過期
+ * —— 過期之後那顆按鈕會變成「連結 Google 相簿」，把人整頁踢去 Google 再授權
+ * 一次。現在後端收下每個人自己的 refresh token，匯入時當場換（見後端的
+ * mintUserGoogleToken 與 migrations/0017），前端只帶站上自己的 JWT。
  */
-const GOOGLE_TOKEN_KEY = 'google_access_token';
-const GOOGLE_TOKEN_EXP_KEY = 'google_token_expires_at';
 
 /** 管理員登入 = Google 登入。`albumId` 只是為了登入後回到原本那本相簿 */
 export function googleLoginUrl(albumId?: string | number): string {
   return `${API_BASE_URL}/auth/google/login${albumId ? `?state=${albumId}` : ''}`;
-}
-
-export function storeGoogleToken(token: string, expiresInSec: number): void {
-  localStorage.setItem(GOOGLE_TOKEN_KEY, token);
-  // 留 60 秒餘裕，免得拿到一個正好在上傳途中過期的 token
-  localStorage.setItem(GOOGLE_TOKEN_EXP_KEY, String(Date.now() + (expiresInSec - 60) * 1000));
-}
-
-/** 還沒過期就回 token，過期就順手清掉 —— 留著只會讓每個呼叫端各自吃一次 401 */
-export function getGoogleToken(): string | null {
-  if (typeof window === 'undefined') return null;
-  const token = localStorage.getItem(GOOGLE_TOKEN_KEY);
-  if (!token) return null;
-  const exp = Number(localStorage.getItem(GOOGLE_TOKEN_EXP_KEY) || 0);
-  // 沒有到期時刻的是舊版存的，當作還能用；真的過期會由 Google 回 401
-  if (exp && exp <= Date.now()) {
-    clearGoogleToken();
-    return null;
-  }
-  return token;
-}
-
-export function clearGoogleToken(): void {
-  localStorage.removeItem(GOOGLE_TOKEN_KEY);
-  localStorage.removeItem(GOOGLE_TOKEN_EXP_KEY);
 }
 
 /**
@@ -90,11 +67,9 @@ export function consumeAuthHash(): AuthHashResult {
   const p = new URLSearchParams(raw);
   const error = p.get('authError');
   const token = p.get('token');
-  const googleToken = p.get('googleToken');
-  if (!error && !token && !googleToken) return empty;
+  if (!error && !token) return empty;
 
   if (token) localStorage.setItem(SITE_TOKEN_KEY, token);
-  if (googleToken) storeGoogleToken(googleToken, Number(p.get('googleExpiresIn')) || 3600);
   window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
   return { admin: !!token, error };
 }
@@ -480,17 +455,16 @@ export async function checkAuth(): Promise<AuthState> {
 }
 
 /**
- * 登出：把手上的兩張 token 都丟掉。
+ * 登出：把手上的 token 丟掉。
  *
- * Google 的那張一定要一起清 —— 只清站上的 token，下一個人在同一台電腦上
- * 按「傳到 Drive」時用的還是前一個人的 Google 授權。
+ * 只有站上這一張要清 —— Google 那邊的授權存在後端、綁在帳號上，
+ * 這台電腦上的下一個人拿不到（他自己的 JWT 換到的是他自己那份）。
  *
  * 沒有對應的後端呼叫：JWT 是無狀態的，作廢它只能等過期，或由站長在後台
  * 把那個帳號移出白名單（那一步是立刻生效的，見後端的 currentActor）。
  */
 export function logout(): void {
   clearSiteToken();
-  clearGoogleToken();
 }
 
 /**
@@ -1731,109 +1705,80 @@ export async function fetchTags(): Promise<Tag[]> {
   }
 }
 
-function getGoogleAuthHeaders() {
-  // 走 getGoogleToken() 而不是直接讀 key：過期的 token 應該當作沒有，
-  // 不要送出去換一個看不懂的 401
-  const token = getGoogleToken();
-  const adminToken = typeof window !== 'undefined' ? localStorage.getItem(SITE_TOKEN_KEY) : '';
-  return {
-    'Content-Type': 'application/json',
-    'X-Google-Token': token || '',
-    'Authorization': `Bearer ${adminToken}`
-  };
+/**
+ * 匯入時後端說「你的 Google 授權沒了」。
+ *
+ * 後端回的是 **409 不是 401** —— 401 在這個站是進站閘門的意思
+ * （`{"error":"locked"}`），兩者混在一起呼叫端會誤判成整個 token 過期而把人
+ * 登出。409 只代表 Google 那一半要重接，站上的身分還好好的。
+ */
+export class GoogleReauthError extends Error {
+  reason: string;
+  constructor(message: string, reason: string) {
+    super(message);
+    this.name = 'GoogleReauthError';
+    this.reason = reason;
+  }
 }
 
-export async function fetchGoogleAlbums(): Promise<any[]> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/google/albums`, {
-      headers: getGoogleAuthHeaders(),
-    });
-    if (res.status === 401) return [{ error: 'unauthorized' }];
-    if (!res.ok) {
-      console.log("Google API Failed:", await res.text());
-      return [];
-    }
-    const data = await res.json();
-    console.log("Google Albums API Response:", data);
-    return data.albums || [];
-  } catch (err) {
-    console.error(err);
-    return [];
+/** 409 才是 reauth；其餘錯誤照舊當一般失敗處理 */
+async function throwIfReauth(res: Response): Promise<void> {
+  if (res.status !== 409) return;
+  let data: any = {};
+  try { data = await res.json(); } catch { /* body 不是 JSON 就當一般失敗 */ }
+  if (data?.error === 'google_reauth') {
+    throw new GoogleReauthError(data.message || '需要重新授權 Google', data.reason || 'failed');
   }
 }
 
 export async function createGooglePickerSession(): Promise<{ id?: string, pickerUri?: string }> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/google/picker/sessions`, {
-      method: "POST",
-      headers: getGoogleAuthHeaders(),
-    });
-    if (!res.ok) return {};
-    return await res.json();
-  } catch (err) {
-    console.error(err);
-    return {};
-  }
+  const res = await fetch(`${API_BASE_URL}/google/picker/sessions`, {
+    method: "POST",
+    headers: getAuthHeaders(),
+  });
+  await throwIfReauth(res);
+  if (!res.ok) return {};
+  return await res.json();
 }
 
 export async function fetchGooglePickerPhotos(sessionId: string): Promise<{ ready: boolean, mediaItems?: any[] }> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/google/picker/sessions/${sessionId}/photos`, {
-      headers: getGoogleAuthHeaders(),
-    });
-    if (!res.ok) return { ready: false };
-    return await res.json();
-  } catch (err) {
-    console.error(err);
-    return { ready: false };
-  }
+  const res = await fetch(`${API_BASE_URL}/google/picker/sessions/${sessionId}/photos`, {
+    headers: getAuthHeaders(),
+  });
+  await throwIfReauth(res);
+  if (!res.ok) return { ready: false };
+  return await res.json();
 }
 
-export async function syncGooglePhoto(albumId: string, googlePhotoUrl: string, filename: string, creationTime: string, exif?: any): Promise<boolean | any> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/google/sync-photo`, {
-      method: "POST",
-      headers: getGoogleAuthHeaders(),
-      body: JSON.stringify({
-        targetAlbumId: albumId,
-        googlePhotoUrl,
-        filename,
-        creationTime,
-        exif
-      })
-    });
-    
-    if (res.ok) {
-      const data = await res.json();
-      if (data.conflict) {
-        return data;
-      }
-      return true;
-    }
-    return false;
-  } catch (err) {
-    console.error(err);
-    return false;
-  }
-}
-
-export async function resolveGooglePhotoConflict(decision: string, existingPhotos: any[], tempPhoto: any, replacePhotoIds?: number[]): Promise<boolean> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/google/resolve-conflict`, {
-      method: "POST",
-      headers: getGoogleAuthHeaders(),
-      body: JSON.stringify({
-        decision,
-        existingPhotos,
-        tempPhoto,
-        replacePhotoIds
-      })
-    });
-    return res.ok;
-  } catch (err) {
-    console.error(err);
-    return false;
-  }
+/**
+ * 把 Picker 選到的那張照片的**原始位元組**取回來，包成 File 交給一般上傳流程。
+ *
+ * 為什麼要繞後端一手：Picker 給的 `baseUrl` 在 lh3.googleusercontent.com 上，
+ * 必須帶 `Authorization` 才拿得到，而那個網域不回 CORS 的 preflight ——
+ * 瀏覽器直接抓一定失敗。後端 `POST /api/google/media` 用該使用者自己的
+ * Google 授權去抓，再把 bytes 原封轉回來。
+ *
+ * `lastModified` 塞 Google 的拍攝時間：Picker 的圖是有 EXIF 的，但萬一沒有，
+ * 後端會退回檔案時間，這樣至少不會變成「今天拍的」。
+ */
+export async function fetchGoogleMediaFile(
+  baseUrl: string,
+  filename: string,
+  creationTime?: string,
+): Promise<File> {
+  const res = await fetch(`${API_BASE_URL}/google/media`, {
+    method: "POST",
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ baseUrl }),
+  });
+  await throwIfReauth(res);
+  if (!res.ok) throw new Error(`下載失敗（${res.status}）`);
+  const blob = await res.blob();
+  const stamp = creationTime ? Date.parse(creationTime) : NaN;
+  return new File([blob], filename || 'google-photo.jpg', {
+    type: blob.type || 'image/jpeg',
+    lastModified: Number.isFinite(stamp) ? stamp : Date.now(),
+  });
 }
 
 // ===== 足跡地圖 =====
