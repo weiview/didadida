@@ -1,0 +1,30 @@
+-- 0017：每個人自己的 Google refresh token，給「從 Google 相簿匯入」用。
+--
+-- ## 為什麼要存
+--
+-- 相簿匯入（Photos Picker API）非得帶「照片主人自己」的 OAuth token 不可 ——
+-- 站長那份 Drive 寫入身分（AppSetting.drive_writer_refresh_token）看不到別人的
+-- Google 相簿，這件事無法共用一個帳號。
+--
+-- 以前那張 token 是登入時塞進瀏覽器 localStorage 的短效 access token，**一小時就死**。
+-- 死了之後按「從 Google 相簿匯入」就變成「連結 Google 相簿」，整頁跳去 Google 重登
+-- —— 使用者明明就是用 Google 登進來的，卻要為了匯入再授權一次，而且跳走會把
+-- 頁面狀態全部弄丟。改成後端收下長效的 refresh token，要用的時候當場換一張短效的，
+-- 前端從此完全不碰 Google token。
+--
+-- ## 值從哪裡來
+--
+-- `/api/auth/google/callback`。Google **只在使用者走過同意畫面那一次**給 refresh token，
+-- 所以回呼發現「這個人沒有存過、這次 Google 也沒給」時會自己再跳一次
+-- `prompt=consent`（state 裡帶 retried 旗標，只補一次，不會變成迴圈）。
+-- 也就是說現有成員下次登入會多看到一次同意畫面，之後就再也不會。
+--
+-- ## 敏感度
+--
+-- 這是長效憑證，跟 AppSetting 裡站長那份同級（同樣是 D1 明文）。範圍就是登入時要的
+-- 那兩個 scope：`photospicker.mediaitems.readonly`（唯讀、而且只看得到使用者親手挑的
+-- 那幾張）與 `drive.file`（per-file，只碰得到本站自己建的檔）。
+-- **不要回進任何 API 回應**，站上沒有任何一支路由該把它端出去。
+-- 使用者被停權（active=0）時值留著沒關係 —— currentActor 那關就進不來了。
+
+ALTER TABLE User ADD COLUMN google_refresh_token TEXT;

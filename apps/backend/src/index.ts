@@ -1,4 +1,3 @@
-import exifr from 'exifr';
 import {
   normalizeGeo, formatWallClock, utcFromLocal,
   parseExifDateTime, geoOverwriteGuard, DEFAULT_TZ_OFFSET_MINUTES,
@@ -1006,6 +1005,119 @@ async function mintDriveWriterToken(
   };
 }
 
+/* ── 匯入用的 Google 身分 ───────────────────────────────────────────────────
+ *
+ * 上面那一份（mintDriveWriterToken）是站長的 Drive 寫入身分，全站共用一個帳號。
+ * 這裡是另一件事：**從 Google 相簿匯入一定要照片主人自己的身分** ——
+ * 站長的帳號看不到別人的 Google 相簿，這件事沒辦法共用。
+ *
+ * 以前那張 token 是登入時發給瀏覽器、存在 localStorage 的短效 access token，
+ * **一小時就過期**；過期之後按「從 Google 相簿匯入」會整頁跳去 Google 再授權
+ * 一次 —— 明明剛剛就是用 Google 登進來的，而且跳走會把頁面狀態全弄丟。
+ * 現在後端收下每個人自己的 refresh token（`User.google_refresh_token`，0017），
+ * 要用的時候當場換一張短效的，前端從此完全不碰 Google token。
+ */
+
+/**
+ * 換好的短效 token 放在 isolate 記憶體裡。
+ *
+ * Picker 是**每 2 秒輪詢一次**直到使用者選完，沒有這層快取的話每一次輪詢都要
+ * 多一趟 D1 讀取加一趟 Google 換發。key 是 uid，值撐到過期前 60 秒。
+ * isolate 被回收就整個沒了，那沒關係 —— 重換一張而已。
+ */
+const userGoogleTokens = new Map<number, { token: string; expiresAt: number }>();
+
+async function mintUserGoogleToken(
+  env: Env, uid: number,
+): Promise<
+  | { ok: true; token: string }
+  | { ok: false; reason: "not_linked" | "expired" | "failed"; detail: string }
+> {
+  const cached = userGoogleTokens.get(uid);
+  if (cached && cached.expiresAt > Date.now()) return { ok: true, token: cached.token };
+
+  if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+    return { ok: false, reason: "failed", detail: "後端缺 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET" };
+  }
+
+  const row = await env.DB.prepare(
+    "SELECT google_refresh_token AS t FROM User WHERE id = ?"
+  ).bind(uid).first<any>();
+  /*
+   * 沒存過＝這個人從沒走過帶同意畫面的那次登入（或者是用密碼登入的站長，
+   * 那條路根本沒經過 Google）。回呼那邊會自己補跳一次同意畫面，所以
+   * 前端只要請他用 Google 重新登入一次就會有。
+   */
+  const refresh = String(row?.t || "").trim();
+  if (!refresh) return { ok: false, reason: "not_linked", detail: "這個帳號還沒有 Google 授權" };
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: env.GOOGLE_CLIENT_ID,
+      client_secret: env.GOOGLE_CLIENT_SECRET,
+      refresh_token: refresh,
+      grant_type: "refresh_token",
+    }),
+  });
+  const data: any = await res.json().catch(() => null);
+
+  if (!res.ok || !data?.access_token) {
+    /*
+     * invalid_grant＝被撤銷或過期。**就地清掉**：留著只會讓每次匯入都撞同一面牆，
+     * 清掉之後下一次登入的回呼才判定得出「這個人沒有」而補跳一次同意畫面。
+     * 跟 mintDriveWriterToken 清掉 D1 那份是同一個自癒手法。
+     */
+    if (data?.error === "invalid_grant") {
+      await env.DB.prepare("UPDATE User SET google_refresh_token = NULL WHERE id = ?").bind(uid).run();
+      userGoogleTokens.delete(uid);
+      return { ok: false, reason: "expired", detail: "Google 授權過期了" };
+    }
+    return {
+      ok: false, reason: "failed",
+      detail: String(data?.error_description || data?.error || `HTTP ${res.status}`),
+    };
+  }
+
+  const expiresIn = Number(data.expires_in) || 3600;
+  userGoogleTokens.set(uid, {
+    token: data.access_token,
+    expiresAt: Date.now() + (expiresIn - 60) * 1000,
+  });
+  return { ok: true, token: data.access_token };
+}
+
+/**
+ * Google 相簿那幾支共用的入口：認人 → 換一張他自己的 Google token。
+ *
+ * 拿不到一律回 **409 `google_reauth`**，不是 401 —— 401 在這個站是進站閘門
+ * 「沒有 token」的意思（`{"error":"locked"}`），前端看到會把人踢回登入頁。
+ * 這裡的情況完全不同：站上的身分好好的，只有 Google 那一半要補，
+ * 前端該做的是在原地顯示一行「請用 Google 重新登入一次」。
+ */
+async function googleUserAuth(
+  request: Request, env: Env, headers: Record<string, string>,
+): Promise<{ ok: true; token: string } | { ok: false; res: Response }> {
+  const actor = await currentActor(request, env);
+  if (!actor || actor.uid == null) {
+    return {
+      ok: false,
+      res: new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers }),
+    };
+  }
+  const minted = await mintUserGoogleToken(env, actor.uid);
+  if (!minted.ok) {
+    return {
+      ok: false,
+      res: new Response(JSON.stringify({
+        error: "google_reauth", reason: minted.reason, message: minted.detail,
+      }), { status: 409, headers }),
+    };
+  }
+  return { ok: true, token: minted.token };
+}
+
 async function driveFolders(env: Env): Promise<{ photos: string | null; trash: string | null }> {
   const [photos, trash] = await Promise.all([
     env.GOOGLE_DRIVE_PHOTOS_FOLDER_ID ? Promise.resolve(env.GOOGLE_DRIVE_PHOTOS_FOLDER_ID) : getSetting(env, SETTING_PHOTOS_FOLDER),
@@ -1118,6 +1230,43 @@ async function googleAdminCheck(
 }
 
 /**
+ * 登入要的三樣權限：`openid email`（認人）、`drive.file`（照片備份）、
+ * `photospicker`（相簿匯入）。**合成一次要齊**，不然每一樣都要各自跳一次授權。
+ */
+const GOOGLE_LOGIN_SCOPES = [
+  "openid",
+  "email",
+  "https://www.googleapis.com/auth/drive.file",
+  "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
+].join(" ");
+
+/**
+ * 組一條 Google 授權網址。登入的正門與回呼裡「補一次同意畫面」共用同一個組法。
+ *
+ * `consent` 為真才拿得到 refresh token —— Google 只在使用者親手按下同意那一次給。
+ * `retried` 一路帶進 state、再跟著回呼回來，是**避免無限迴圈**的閂：補跳過一次
+ * 還是沒拿到就算了，那次登入照樣成立，只是匯入會請他再登一次。
+ */
+function googleAuthUrl(
+  env: Env, origin: string,
+  opts: { albumId: string; redirectHost: string; consent: boolean; retried: boolean },
+): string {
+  const params = new URLSearchParams({
+    client_id: env.GOOGLE_CLIENT_ID || "",
+    redirect_uri: `${origin}/api/auth/google/callback`,
+    response_type: "code",
+    scope: GOOGLE_LOGIN_SCOPES,
+    access_type: "offline",
+    prompt: opts.consent ? "consent select_account" : "select_account",
+    state: JSON.stringify({
+      albumId: opts.albumId, redirectHost: opts.redirectHost, retried: opts.retried,
+    }),
+  });
+  if (opts.consent) params.set("include_granted_scopes", "true");
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+/**
  * 允許的前端來源。**同時是 CORS 白名單與登入導回的白名單。**
  *
  * 登入那條特別重要：導回的網址帶著管理員 JWT（在 fragment 裡），
@@ -1145,7 +1294,7 @@ const origin = request.headers.get("Origin") || "";
     const headers = {
       "Access-Control-Allow-Origin": allowOrigin,
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Google-Token",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
       "Content-Type": "application/json",
     };
 
@@ -3164,17 +3313,6 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// 輔助函式：計算 Hamming Distance 漢明距離 (用於比對 pHash)
-function hammingDistance(hex1: string, hex2: string): number {
-  if (!hex1 || !hex2 || hex1.length !== hex2.length) return 999;
-  let dist = 0;
-  for (let i = 0; i < hex1.length; i++) {
-    const val = parseInt(hex1[i], 16) ^ parseInt(hex2[i], 16);
-    dist += (val & 1) + ((val >> 1) & 1) + ((val >> 2) & 1) + ((val >> 3) & 1);
-  }
-  return dist;
-}
-
       // 路由：處理 R2 照片上傳
       if (method === "POST" && pathname === "/api/upload") {
         const formData = await request.formData();
@@ -3757,9 +3895,10 @@ function hammingDistance(hex1: string, hex2: string): number {
        * Drive 備份」的來源。跳轉沒有這兩個問題。當初避開跳轉是怕把選好的檔案清單
        * 弄丟，但授權移到登入這一刻就完全不衝突了。
        *
-       * `access_type=offline` 一律帶著：後端要的不是**這個人**的長期憑證，而是
-       * 「萬一登入的是站長、而且這個環境還沒有 Drive 寫入身分，就順手收下」。
-       * 一般成員帶回來的 refresh token 一律丟掉（見回呼那段），跟從前一樣不存。
+       * `access_type=offline` 一律帶著，而且**每個人的 refresh token 都會被收下**
+       * （2026-08-21）：那是「從 Google 相簿匯入」唯一的憑據，不然匯入就得再授權
+       * 一次（見 mintUserGoogleToken 與 migrations/0017）。站長那份還會多一個用途
+       * —— 當這個環境的 Drive 寫入身分。
        */
       if (method === "GET" && pathname === "/api/auth/google/login") {
         const urlObj = new URL(request.url);
@@ -3777,16 +3916,6 @@ function hammingDistance(hex1: string, hex2: string): number {
             if (ALLOWED_ORIGINS.includes(candidate)) redirectHost = candidate;
           } catch (e) {}
         }
-        const combinedState = encodeURIComponent(JSON.stringify({ albumId, redirectHost }));
-        const clientId = env.GOOGLE_CLIENT_ID || "";
-        const redirectUri = new URL(request.url).origin + "/api/auth/google/callback";
-        const scope = [
-          "openid",
-          "email",
-          "https://www.googleapis.com/auth/drive.file",
-          "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
-        ].join(" ");
-
         /*
          * 什麼時候要強制跳同意畫面：**這個環境完全沒有 Drive 寫入身分的時候**。
          *
@@ -3795,14 +3924,13 @@ function hammingDistance(hex1: string, hex2: string): number {
          * 就自動退回原本的 `select_account`，誰都不會再看到那一頁。
          *
          * 這一步在驗身分之前，還不知道來的是不是站長 —— 所以是「沒憑證時所有人都
-         * 多一次同意」。反正拿回來的東西只有站長那份會被留下。
+         * 多一次同意」。**個人那份不靠這裡** —— 回呼發現「這個人一份都沒有」時
+         * 會自己補跳一次，不必在這裡替所有人多一個同意畫面。
          */
         const needConsent = (await driveWriterCredential(env)) === null;
-        const extra = needConsent
-          ? "&access_type=offline&prompt=" + encodeURIComponent("consent select_account") + "&include_granted_scopes=true"
-          : "&access_type=offline&prompt=select_account";
-        const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scope)}${extra}&state=${combinedState}`;
-        return Response.redirect(url, 302);
+        return Response.redirect(googleAuthUrl(env, new URL(request.url).origin, {
+          albumId, redirectHost, consent: needConsent, retried: false,
+        }), 302);
       }
 
       // 路由：Google OAuth 回呼
@@ -3812,6 +3940,8 @@ function hammingDistance(hex1: string, hex2: string): number {
         const rawState = urlObj.searchParams.get("state") || "";
         let albumId = rawState;
         let redirectHost = "";
+        // 補跳同意畫面那一次會把 retried 帶進來。見下面「收下這個人自己的授權」
+        let retried = false;
         try {
           const parsed = JSON.parse(decodeURIComponent(rawState));
           if (parsed && typeof parsed === "object") {
@@ -3823,6 +3953,7 @@ function hammingDistance(hex1: string, hex2: string): number {
              */
             const candidate = String(parsed.redirectHost || "");
             if (ALLOWED_ORIGINS.includes(candidate)) redirectHost = candidate;
+            retried = parsed.retried === true;
           }
         } catch (e) {}
 
@@ -3881,10 +4012,36 @@ function hammingDistance(hex1: string, hex2: string): number {
          * 也不會被 CDN 記下來。query 那份原本會跟著這些地方一起外流。
          * 前端讀完會馬上把它從網址列擦掉，免得留在瀏覽器歷史裡。
          */
+        /*
+         * **收下這個人自己的 refresh token。** 這是「從 Google 相簿匯入」唯一的
+         * 憑據（見 mintUserGoogleToken 與 migrations/0017）—— 以前是把短效的
+         * access token 塞進網址 fragment 讓瀏覽器存著，一小時就死，死了之後
+         * 匯入就變成再授權一次。現在 fragment 裡只剩站上自己的 JWT。
+         *
+         * Google 只在**走過同意畫面那一次**給 refresh token。這次沒給、而且這個人
+         * 也還沒存過的話，就地補跳一次 `prompt=consent`（state 帶 retried，只補
+         * 一次，不會變成迴圈）。也就是現有成員下次登入會多看到一次同意畫面，
+         * 之後再也不會。
+         */
+        const freshRefresh = typeof tokenData.refresh_token === "string"
+          ? tokenData.refresh_token.trim() : "";
+        if (freshRefresh) {
+          await env.DB.prepare("UPDATE User SET google_refresh_token = ? WHERE id = ?")
+            .bind(freshRefresh, admitted.user.id).run();
+          userGoogleTokens.delete(admitted.user.id);
+        } else if (!retried) {
+          const stored = await env.DB.prepare(
+            "SELECT google_refresh_token AS t FROM User WHERE id = ?"
+          ).bind(admitted.user.id).first<any>();
+          if (!String(stored?.t || "").trim()) {
+            return Response.redirect(googleAuthUrl(env, new URL(request.url).origin, {
+              albumId, redirectHost, consent: true, retried: true,
+            }), 302);
+          }
+        }
+
         const frag = new URLSearchParams({
           token: await generateJWT(env, 'admin', admitted.user),
-          googleToken: tokenData.access_token,
-          googleExpiresIn: String(Number(tokenData.expires_in) || 3600),
         });
 
         /*
@@ -3903,11 +4060,10 @@ function hammingDistance(hex1: string, hex2: string): number {
          */
         if (
           admitted.user.role === "owner" &&
-          typeof tokenData.refresh_token === "string" &&
-          tokenData.refresh_token &&
+          freshRefresh &&
           (await driveWriterCredential(env)) === null
         ) {
-          await setSetting(env, SETTING_DRIVE_REFRESH_TOKEN, tokenData.refresh_token);
+          await setSetting(env, SETTING_DRIVE_REFRESH_TOKEN, freshRefresh);
           await setSetting(env, SETTING_DRIVE_WRITER_EMAIL, admitted.user.email);
           await setSetting(env, SETTING_DRIVE_LINKED_AT, new Date().toISOString());
           console.log("已自動收下站長的 Drive 寫入授權", admitted.user.email);
@@ -3915,37 +4071,28 @@ function hammingDistance(hex1: string, hex2: string): number {
         return Response.redirect(`${target}#${frag.toString()}`, 302);
       }
 
-      // 路由：取得 Google 相簿列表
-      if (method === "GET" && pathname === "/api/google/albums") {
-        const googleToken = request.headers.get("X-Google-Token");
-        
-        const res1 = await fetch("https://photoslibrary.googleapis.com/v1/albums?pageSize=50&excludeNonAppCreatedData=false", {
-          headers: { Authorization: `Bearer ${googleToken}` }
-        });
-        const data1 = await res1.json() as any;
-
-        const res2 = await fetch("https://photoslibrary.googleapis.com/v1/sharedAlbums?pageSize=50&excludeNonAppCreatedData=false", {
-          headers: { Authorization: `Bearer ${googleToken}` }
-        });
-        const data2 = await res2.json() as any;
-
-        if (data1.error && data1.error.code === 401) {
-          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-        }
-
-        const allAlbums = [...(data1.albums || []), ...(data2.sharedAlbums || [])];
-        // 去除重複 (有些相簿可能兩邊都有)
-        const uniqueAlbums = Array.from(new Map(allAlbums.map(item => [item.id, item])).values());
-
-        return new Response(JSON.stringify({ albums: uniqueAlbums, debug: { data1, data2 } }), { headers });
-      }
+      /* ── Google 相簿匯入 ──────────────────────────────────────────────────
+       *
+       * **匯入用的是「登入的這個人自己的」Google 身分，站上不再有第二次授權。**
+       * 這幾支以前吃 `X-Google-Token`（登入時塞進 localStorage 的那張短效 token），
+       * 一小時就過期 —— 過期之後按「匯入」等於整頁跳去 Google 重登一次。
+       * 現在一律由後端拿他自己的 refresh token 當場換（見 googleUserAuth）。
+       *
+       * 三支就是一趟匯入的全部：開 Picker → 輪詢使用者選完沒 → 把選到的位元組
+       * 交給瀏覽器。**照片的處理（縮圖、EXIF、重複偵測、Drive 備份）全部走
+       * 本機上傳那一條**（/api/upload ＋ 前端的 pushPhotoToDrive）——
+       * 以前這裡另有一條 sync-photo/resolve-conflict，那條把 Google 給的原始檔
+       * 整份塞進 R2、不產縮圖、也不上 Drive，跟儲存模型完全相反（見 CLAUDE.md
+       * 「儲存模型」）。同一件事不要有兩套實作。
+       */
 
       // 路由：建立 Picker Session
       if (method === "POST" && pathname === "/api/google/picker/sessions") {
-        const googleToken = request.headers.get("X-Google-Token");
+        const auth = await googleUserAuth(request, env, headers);
+        if (!auth.ok) return auth.res;
         const res = await fetch("https://photospicker.googleapis.com/v1/sessions", {
           method: "POST",
-          headers: { Authorization: `Bearer ${googleToken}`, "Content-Type": "application/json" }
+          headers: { Authorization: `Bearer ${auth.token}`, "Content-Type": "application/json" }
         });
         const data = await res.json();
         return new Response(JSON.stringify(data), { headers });
@@ -3954,329 +4101,78 @@ function hammingDistance(hex1: string, hex2: string): number {
       // 路由：檢查 Picker Session 狀態並取得照片
       if (method === "GET" && pathname.startsWith("/api/google/picker/sessions/") && pathname.endsWith("/photos")) {
         const sessionId = pathname.split("/")[5];
-        const googleToken = request.headers.get("X-Google-Token");
-        
+        const auth = await googleUserAuth(request, env, headers);
+        if (!auth.ok) return auth.res;
+
         // 1. 檢查狀態
         const statusRes = await fetch(`https://photospicker.googleapis.com/v1/sessions/${sessionId}`, {
-          headers: { Authorization: `Bearer ${googleToken}` }
+          headers: { Authorization: `Bearer ${auth.token}` }
         });
         const statusData = await statusRes.json() as any;
-        
+
         // Google Photospicker API: 當使用者點擊「完成/選擇」後，mediaItemsSet 會變為 true
         const isReady = statusData.mediaItemsSet === true || statusData.mediaItemsSet === "true";
-        
+
         if (!isReady) {
           return new Response(JSON.stringify({ ready: false, statusData }), { headers });
         }
-        
+
         // 2. 如果使用者選完了，就去抓照片清單
         const itemsRes = await fetch(`https://photospicker.googleapis.com/v1/mediaItems?sessionId=${sessionId}`, {
-          headers: { Authorization: `Bearer ${googleToken}` }
+          headers: { Authorization: `Bearer ${auth.token}` }
         });
         const itemsData = await itemsRes.json() as any;
         const mediaItems = itemsData.mediaItems || [];
-        
+
         return new Response(JSON.stringify({ ready: true, mediaItems, itemsData, statusData }), { headers });
       }
 
-      // 路由：從 Google 相簿抓照片
-      if (method === "GET" && pathname.startsWith("/api/google/albums/") && pathname.endsWith("/photos")) {
-        const albumId = pathname.split("/")[4];
-        const googleToken = request.headers.get("X-Google-Token");
-        
-        let body: any = { pageSize: 50 };
-        if (albumId === "ALL_PHOTOS") {
-          body = { pageSize: 1 };
-        } else {
-          body.albumId = albumId;
-        }
+      /*
+       * 路由：把 Picker 選到的那張照片的位元組轉給瀏覽器。
+       *
+       * 為什麼非得經過後端：Picker 的 `baseUrl` 要帶 `Authorization` 才拿得到原始
+       * 解析度，而自訂標頭會觸發 CORS 預檢，Google 那邊不收 —— 瀏覽器自己抓不到。
+       * 後端只是把位元組**串流**轉手，不落地、不進 R2、不解 EXIF；拿到檔案之後
+       * 前端就當成一般的本機檔案走同一條上傳路（縮圖進 R2、4K＋原始檔進 Drive）。
+       *
+       * `baseUrl` 是前端送回來的，**一定要驗主機名** —— 不驗的話這支就是一台
+       * 任人指定目標的代理（SSRF）。只放行 Google 自己的圖片主機。
+       */
+      if (method === "POST" && pathname === "/api/google/media") {
+        const auth = await googleUserAuth(request, env, headers);
+        if (!auth.ok) return auth.res;
 
-        const res = await fetch("https://photoslibrary.googleapis.com/v1/mediaItems:search", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${googleToken}`, "Content-Type": "application/json" },
-          body: JSON.stringify(body)
-        });
-        const data = await res.json();
-        return new Response(JSON.stringify(data), { headers });
-      }
-
-      // 路由：同步 Google 照片到 R2
-      if (method === "POST" && pathname === "/api/google/sync-photo") {
-        const body = await request.json() as any;
-        const { targetAlbumId, googlePhotoUrl, filename, creationTime, exif, clientPhash } = body;
-        
-        const googleToken = request.headers.get("X-Google-Token");
-        
-        if (!googlePhotoUrl) {
-          console.error("400 Bad Request - Missing googlePhotoUrl. Body received:", body);
-          return new Response(JSON.stringify({ error: "Missing googlePhotoUrl" }), { status: 400, headers });
-        }
-        // 跟本機上傳同一條規矩（canAddToAlbum）：不能加就別下載了，早退一步省掉整趟傳輸
-        if (!(await canAddToAlbum(targetAlbumId))) return forbidden(headers, "沒有權限上傳到別人的相簿");
-        
-        // 取得照片原始檔案 (Picker API 的 baseUrl 加上 =d 來下載原始解析度)
-        let downloadUrl = googlePhotoUrl;
-        if (!downloadUrl.includes("=")) {
-          downloadUrl += "=d";
-        }
-        let fetchPhotoRes = await fetch(downloadUrl, {
-          headers: {
-            "Authorization": `Bearer ${googleToken}`
-          }
-        });
-
-        // 如果帶 Token 失敗 (部分 Picker API baseUrl 不需要 Bearer Token)，則嘗試直接 fetch
-        if (!fetchPhotoRes.ok) {
-          fetchPhotoRes = await fetch(downloadUrl);
-        }
-
-        if (!fetchPhotoRes.ok) {
-          const errText = await fetchPhotoRes.text();
-          console.error("下載照片失敗:", fetchPhotoRes.status, errText);
-          return new Response(JSON.stringify({ error: "Download failed", details: errText }), { status: 500, headers });
-        }
-        
-        // 嘗試從 Content-Disposition 抓取 Google 給的原始檔名
-        let finalTitle = filename;
-        const contentDisposition = fetchPhotoRes.headers.get("Content-Disposition");
-        if (contentDisposition) {
-          const match = contentDisposition.match(/filename="?([^"]+)"?/);
-          if (match && match[1]) {
-            finalTitle = match[1];
-          }
-        }
-        
-        const baseNameMatch = finalTitle.match(/(.+?)(\.[^.]+$|$)/);
-        const baseName = baseNameMatch ? baseNameMatch[1] : finalTitle;
-        const ext = baseNameMatch ? baseNameMatch[2] : "";
-        
-        const arrayBuffer = await fetchPhotoRes.arrayBuffer();
-        const fileHash = await calculateFileHash(arrayBuffer);
-        
-        let parsedExif = exif;
-        let finalTakenAt = creationTime;
+        const body = await request.json().catch(() => ({})) as { baseUrl?: unknown };
+        const raw = typeof body.baseUrl === "string" ? body.baseUrl : "";
+        let target: URL;
         try {
-          // 在後端直接解析 EXIF
-          // 不寫 ifd0：exifr 的 ifd0 本來就無法關閉（型別上也只收物件不收 boolean），
-          // 開著 tiff 就一定會解析到，寫 `ifd0: true` 只是個沒有作用的型別錯誤
-          const rawExif = await exifr.parse(arrayBuffer, { tiff: true, exif: true, gps: true });
-          if (rawExif) {
-            parsedExif = {
-              Make: rawExif.Make || (exif ? exif.Make : undefined),
-              Model: rawExif.Model || (exif ? exif.Model : undefined),
-              FocalLength: rawExif.FocalLength || (exif ? exif.FocalLength : undefined),
-              FNumber: rawExif.FNumber || (exif ? exif.FNumber : undefined),
-              ISO: rawExif.ISO || (exif ? exif.ISO : undefined),
-              ExposureTime: rawExif.ExposureTime || (exif ? exif.ExposureTime : undefined),
-              DateTimeOriginal: rawExif.DateTimeOriginal || (exif ? exif.DateTimeOriginal : undefined),
-              // GPS 用 ?? 而非 ||：赤道/本初子午線的 0 是合法座標，會被 || 誤判掉
-              // 註：Google Picker 的 =d 下載一律移除位置資訊，這裡對 Google 來源預期為 undefined，
-              // 保留是為了日後其他同步來源
-              latitude: rawExif.latitude ?? (exif ? exif.latitude : undefined),
-              longitude: rawExif.longitude ?? (exif ? exif.longitude : undefined),
-              GPSAltitude: rawExif.GPSAltitude ?? (exif ? exif.GPSAltitude : undefined),
-              // Google 的 =d 下載保留非位置類 EXIF，所以 OffsetTimeOriginal 通常還在，
-              // 這批照片的時區反而能準確還原
-              OffsetTimeOriginal: rawExif.OffsetTimeOriginal || (exif ? exif.OffsetTimeOriginal : undefined),
-              GPSDateStamp: rawExif.GPSDateStamp || (exif ? exif.GPSDateStamp : undefined),
-              GPSTimeStamp: rawExif.GPSTimeStamp || (exif ? exif.GPSTimeStamp : undefined)
-            };
-          }
-        } catch (err) {
-          console.error("Exif parsing error in backend", err);
+          target = new URL(raw);
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "baseUrl 不是合法網址" }), { status: 400, headers });
+        }
+        if (target.protocol !== "https:" || !/(^|\.)googleusercontent\.com$/.test(target.hostname)) {
+          return new Response(JSON.stringify({ error: "baseUrl 不是 Google 的圖片位址" }), { status: 400, headers });
         }
 
-        // Workers 執行環境的時區固定為 UTC，exifr revive 出來的 Date 其 UTC 欄位
-        // 即為原始牆上時間，normalizeGeo 內部以 UTC getter 取值，不會二次位移。
-        const syncGeo = normalizeGeo(parsedExif, creationTime);
-        if (syncGeo.takenAtUtc) finalTakenAt = syncGeo.takenAtUtc;
-
-        // 多層檢測重複照片 (按優先度：1. 精確 Hash 2. EXIF 拍攝時間 3. pHash 視覺特徵 4. 檔名)
-        const candidates = await env.DB.prepare(
-          "SELECT * FROM Photo WHERE album_id = ?"
-        ).bind(targetAlbumId).all();
-
-        const existingPhotosMap = new Map<number, any>();
-
-        for (const p of candidates.results as any[]) {
-          // Layer 1: SHA-256 檔案完全相同
-          if (p.file_hash && p.file_hash === fileHash) {
-            existingPhotosMap.set(p.id, p);
-          }
-          // Layer 2: EXIF 拍攝時間完全一致
-          else if (finalTakenAt && p.taken_at && new Date(p.taken_at).getTime() === new Date(finalTakenAt).getTime()) {
-            existingPhotosMap.set(p.id, p);
-          }
-          // Layer 3: pHash 視覺相似 (漢明距離 <= 8 視為同一張圖)
-          else if (clientPhash && p.phash && hammingDistance(clientPhash, p.phash) <= 8) {
-            existingPhotosMap.set(p.id, p);
-          }
-          // Layer 4: 檔名完全相同或含 _new 後綴
-          else if (p.title === finalTitle || p.title.startsWith(`${baseName}_new`)) {
-            existingPhotosMap.set(p.id, p);
-          }
+        // Picker 的 baseUrl 要自己加 `=d` 才是原始解析度（沒有 `=` 才代表還沒帶參數）
+        const downloadUrl = raw.includes("=") ? raw : `${raw}=d`;
+        let upstream = await fetch(downloadUrl, { headers: { Authorization: `Bearer ${auth.token}` } });
+        // 有些 baseUrl 不吃 Bearer（帶了反而 403），再試一次不帶的
+        if (!upstream.ok) upstream = await fetch(downloadUrl);
+        if (!upstream.ok) {
+          const detail = await upstream.text().catch(() => "");
+          console.error("Google 照片下載失敗", upstream.status, detail.slice(0, 200));
+          return new Response(JSON.stringify({ error: "download_failed", status: upstream.status }), { status: 502, headers });
         }
 
-        const existingPhotos = Array.from(existingPhotosMap.values());
-
-        const finalFileName = `${Date.now()}_${finalTitle.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
-        await env.BUCKET.put(finalFileName, arrayBuffer, {
-          httpMetadata: { contentType: "image/jpeg" }
+        return new Response(upstream.body, {
+          headers: {
+            "Access-Control-Allow-Origin": allowOrigin,
+            "Content-Type": upstream.headers.get("content-type") || "application/octet-stream",
+            // 這是別人相簿裡的私密照片，一個位元組都不該進共用快取
+            "Cache-Control": "no-store",
+          },
         });
-        
-        const host = new URL(request.url).origin;
-        const fileUrl = `${host}/api/photos/view/${encodeURIComponent(finalFileName)}`;
-        const finalExif = parsedExif ? JSON.stringify(parsedExif) : null;
-        
-        const tempPhoto = {
-          title: finalTitle,
-          file_name: finalFileName,
-          album_id: targetAlbumId,
-          url: fileUrl,
-          taken_at: finalTakenAt || new Date().toISOString(),
-          exif: finalExif,
-          file_hash: fileHash,
-          phash: clientPhash || null,
-          lat: syncGeo.lat,
-          lng: syncGeo.lng,
-          geo_source: syncGeo.geoSource,
-          taken_at_local: syncGeo.takenAtLocal,
-          tz_offset_minutes: syncGeo.tzOffsetMinutes,
-          time_source: syncGeo.timeSource
-        };
-
-        if (existingPhotos && existingPhotos.length > 0) {
-          return new Response(JSON.stringify({ conflict: true, existingPhotos, tempPhoto }), { headers });
-        }
-
-        const syncInserted = await env.DB.prepare(
-          // shuffle_key 見 /api/upload 的說明：漏填會讓照片永遠不出現在相簿預覽
-          `INSERT INTO Photo
-             (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
-              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by, shuffle_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
-        ).bind(
-          tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
-          tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash, tempPhoto.phash,
-          tempPhoto.lat, tempPhoto.lng, tempPhoto.geo_source,
-          tempPhoto.taken_at_local, tempPhoto.tz_offset_minutes, tempPhoto.time_source,
-          me.uid,
-        ).run();
-
-        const syncedId = Number(syncInserted.meta?.last_row_id ?? 0);
-        if (syncedId) await syncFtsForPhotos(env.DB, [syncedId]);
-
-        return new Response(JSON.stringify({ success: true, url: fileUrl }), { headers });
-      }
-
-      // 路由：處理照片衝突
-      if (method === "POST" && pathname === "/api/google/resolve-conflict") {
-        const body = await request.json() as any;
-        const { decision, existingPhotos, tempPhoto, replacePhotoIds } = body;
-
-        /*
-         * album_id 也是前端送回來的，權限一定要再驗一次。
-         *
-         * 這一支同時做兩件事，權限也分兩層：**放新照片進去**只要 canAddToAlbum，
-         * 但 decision='replace' 會**刪掉既有的照片**，那幾張得逐張驗過
-         * （下面 replace 分支開頭）—— 不然「可以加照片」等於可以拿一張新的
-         * 把別人的舊照片換掉。
-         */
-        if (tempPhoto?.album_id && !(await canAddToAlbum(tempPhoto.album_id))) {
-          return forbidden(headers, "沒有權限上傳到別人的相簿");
-        }
-
-        // tempPhoto 是由前端原樣送回來的，座標與來源標記都不能照單全收
-        const tpLat = isValidLatLng(tempPhoto?.lat, tempPhoto?.lng) ? tempPhoto.lat : null;
-        const tpLng = tpLat === null ? null : tempPhoto.lng;
-        // 這條路徑只可能產出 'exif'（照片自帶 GPS），不接受前端宣稱更高的權威
-        const tpGeoSource = tpLat !== null && tempPhoto?.geo_source === 'exif' ? 'exif' : null;
-        const tpLocal = typeof tempPhoto?.taken_at_local === 'string' ? tempPhoto.taken_at_local : null;
-        const tpTz = isValidTzOffset(tempPhoto?.tz_offset_minutes) ? tempPhoto.tz_offset_minutes : null;
-        // 同理，同步流程不可能產生 'manual'，只放行 normalizeGeo 真的會回傳的值
-        const tpTimeSource = ['offset_tag', 'gps_utc', 'file_time', 'assumed']
-          .includes(tempPhoto?.time_source) ? tempPhoto.time_source : null;
-
-        // replace 與 keep_both 都會插入一張新照片，兩邊共用同一個變數，
-        // 收尾時再一次同步 FTS。skip 不會插入，維持 null。
-        let replacedInsert: D1Result | null = null;
-
-        if (decision === "skip") {
-          // 刪除暫存在 R2 的新檔案
-          await env.BUCKET.delete(tempPhoto.file_name);
-        } else if (decision === "replace") {
-          // 刪除多個舊檔案
-          if (replacePhotoIds && Array.isArray(replacePhotoIds) && replacePhotoIds.length > 0) {
-            const validIds: number[] = [];
-            for (const id of replacePhotoIds) {
-              const existingPhoto = (existingPhotos || []).find((p: any) => p.id === id);
-              if (existingPhoto) validIds.push(existingPhoto.id);
-            }
-            if (validIds.length > 0) {
-              // 要換掉的是別人的照片就到此為止（見這一支開頭的說明）。
-              // 新檔還暫存在 R2，順手清掉，不然它永遠不會被任何一列引用到
-              if (!(await canTouchPhotos(validIds))) {
-                await env.BUCKET.delete(tempPhoto.file_name);
-                return forbidden(headers, "沒有權限取代別人的照片");
-              }
-              /*
-               * 要刪的物件鍵一律回 D1 查，不要用前端送回來的 existingPhotos。
-               * 那份是 sync-photo 當時回給前端、再由前端原樣送回來的，既不保證帶得到
-               * thumb_url / thumb_sm_url，也不保證跟現況一致 —— 少一個欄位的下場是
-               * 縮圖被留在 R2 裡，沒有任何錯誤訊息。
-               */
-              const fetched = await env.DB.batch<any>(
-                chunkIds(validIds).map((c) => env.DB.prepare(
-                  `SELECT id, file_name, thumb_url, thumb_sm_url, drive_file_id, drive_original_id
-                     FROM Photo WHERE id IN (${placeholdersFor(c)})`
-                ).bind(...c)),
-              );
-              const stale = fetched.flatMap((part) => part.results as any[]);
-              const keys = stale.flatMap((p: any) => r2KeysForPhoto(p));
-              if (keys.length > 0) await env.BUCKET.delete(keys);
-              await queueDriveTrash(env, stale);
-              ctx.waitUntil(drainDriveTrash(env, 10).catch((e) => console.error("Drive 待搬佇列", e)));
-              await env.DB.batch(
-                chunkIds(validIds).map((c) => env.DB.prepare(
-                  `DELETE FROM Photo WHERE id IN (${placeholdersFor(c)})`
-                ).bind(...c)),
-              );
-              await deleteFtsForPhotos(env.DB, validIds);
-            }
-          }
-          // 新增新檔案
-          replacedInsert = await env.DB.prepare(
-            // shuffle_key 見 /api/upload 的說明
-            `INSERT INTO Photo
-               (title, file_name, album_id, url, taken_at, exif, file_hash, phash,
-                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by, shuffle_key)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
-          ).bind(
-            tempPhoto.title, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
-            tempPhoto.taken_at, tempPhoto.exif, tempPhoto.file_hash || null, tempPhoto.phash || null,
-            tpLat, tpLng, tpGeoSource, tpLocal, tpTz, tpTimeSource, me.uid,
-          ).run();
-        } else if (decision === "keep_both") {
-          // 修改標題避免混淆
-          const count = existingPhotos ? existingPhotos.length : 1;
-          const newTitle = tempPhoto.title.replace(/(\.[^.]+)$/, `_new_${count}$1`);
-          replacedInsert = await env.DB.prepare(
-            // shuffle_key 見 /api/upload 的說明
-            `INSERT INTO Photo
-               (title, file_name, album_id, url, taken_at, exif,
-                lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by, shuffle_key)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
-          ).bind(
-            newTitle, tempPhoto.file_name, tempPhoto.album_id, tempPhoto.url,
-            tempPhoto.taken_at, tempPhoto.exif,
-            tpLat, tpLng, tpGeoSource, tpLocal, tpTz, tpTimeSource, me.uid,
-          ).run();
-        }
-
-        const resolvedId = Number(replacedInsert?.meta?.last_row_id ?? 0);
-        if (resolvedId) await syncFtsForPhotos(env.DB, [resolvedId]);
-
-        return new Response(JSON.stringify({ success: true }), { headers });
       }
 
       // ===== 足跡地圖 =====

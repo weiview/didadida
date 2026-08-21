@@ -71,6 +71,34 @@ OPTIONS 直接回（快取一天）
 | `GET/PUT /api/tracks/segments` | 沒有替代品，逐段交通工具整個功能拿掉了 |
 | `ADMIN_EMAILS` 環境變數 | D1 的 `User` 表 |
 | `GOOGLE_PICKER_API_KEY` | Picker 那條路已移除，程式不再讀它 |
+| `GET /api/google/albums`、`/api/google/albums/:id/photos` | 沒有替代品，Picker 之外沒有列相簿這件事 |
+| `POST /api/google/sync-photo`、`/api/google/resolve-conflict` | `POST /api/google/media` 拿位元組，之後走一般上傳（`/api/upload` ＋ 前端 `pushPhotoToDrive`） |
+| `X-Google-Token` 請求標頭 | 沒了。Google token 由後端自己換（見「Google 相簿匯入」） |
+
+### Google 相簿匯入
+
+**匯入用的是登入者自己的 Google 身分，站上只授權一次**（就是登入那一次）。
+
+- 憑據是 `User.google_refresh_token`（0017），在 `/api/auth/google/callback` 收下。
+  Google **只在走過同意畫面那一次**給 refresh token，所以回呼發現「這個人一份都沒有」
+  時會自己補跳一次 `prompt=consent`（`state.retried` 只補一次，不會迴圈）。
+- `mintUserGoogleToken()` 當場換短效 token，isolate 內 `Map<uid>` 快取到過期前 60 秒
+  —— Picker 是每 2 秒輪詢，沒快取等於每輪都多一趟 D1 ＋ 一趟 Google。
+  `invalid_grant` 就地把欄位清成 NULL（自癒，下次登入才補得回來）。
+- 三支端點都走 `googleUserAuth()`：`POST /api/google/picker/sessions`、
+  `GET /api/google/picker/sessions/:id/photos`、`POST /api/google/media`。
+  拿不到 token 一律回 **409 `{"error":"google_reauth"}` 不是 401** ——
+  401 在這個站是進站閘門的意思，前端會誤判成整個 session 死了而把人踢走。
+  前端 `GoogleReauthError` 接住它，在原地顯示紅色橫幅＋「用 Google 重新登入」。
+- `POST /api/google/media` 是**位元組代理**：Picker 的 `baseUrl` 要帶 Authorization，
+  而 `lh3.googleusercontent.com` 不回 CORS 預檢，瀏覽器自己抓不到。
+  ⚠️ **一定要驗主機名**（只放行 `*.googleusercontent.com` ＋ https），不驗就是一台
+  任人指定目標的 SSRF 代理。回應 `Cache-Control: no-store`，不包 `withEdgeCache`。
+- **照片本身完全走本機上傳那一條**（前端 `ingestSources()`：縮 2000px → `/api/upload`
+  產 800／400 進 R2 → `pushPhotoToDrive` 送 4K ＋原始檔進 Drive）。
+  舊的 `sync-photo` 把原始檔整份塞進 R2、不產縮圖、也不上 Drive，跟儲存模型相反。
+  重複偵測、補地點、Drive 待補清單也因此自動跟著有了。
+- ⚠️ **瀏覽器端不再存任何 Google token**，`localStorage` 只剩站上的 `admin_token`。
 
 ## 三個環境
 
@@ -171,7 +199,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0014）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0017）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
