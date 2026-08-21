@@ -17,6 +17,3 @@ GOOGLE_DRIVE_SA_KEY=
 
 # 站長（uid 1）的 GPSLogger 資料夾 id；其他成員各自綁在 User.track_drive_folder_id
 GOOGLE_DRIVE_FOLDER_ID=
-
-# 選配。沒設不會壞，只是站長第一次用 Google 登入之前沒有 Drive 備份
-DRIVE_WRITER_REFRESH_TOKEN=

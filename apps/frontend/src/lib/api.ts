@@ -1397,13 +1397,11 @@ export interface DriveConfig {
    * Drive 上唯一的寫入身分＝**站長**，不是「現在登入的人」。所有管理員上傳時都跟
    * 後端換這個帳號的短效 token，這樣誰建的相簿都寫得進去（見 lib/drive.ts 檔頭）。
    *
-   * 授權來自環境 secret 或站長登入時後端自動收下的那份，站上沒有連結入口，
-   * 所以這一欄**可能是 null 但備份照樣正常**（走 secret 那條就沒有信箱可記）。
-   * 別拿它當「能不能上傳」的判斷。
+   * 憑據是站長那一列的 `User.google_refresh_token`（他用 Google 登入時收下的），
+   * 站上沒有「連結 Drive」這個動作。**null＝站長還沒用 Google 登入過這個環境**，
+   * 那就是真的傳不了 —— 跟 `ready` 是同一件事。
    */
   writer_email: string | null;
-  /** 站長那份授權是什麼時候收下的（ISO）。走 secret 的話是 null */
-  writer_linked_at: string | null;
   /** client_id、sa_email、寫入帳號三樣都齊了才有辦法上傳 */
   ready: boolean;
 }

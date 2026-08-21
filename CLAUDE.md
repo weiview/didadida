@@ -189,10 +189,9 @@ npx wrangler pages deploy out --project-name didadida-frontend --branch main --c
 | `GUEST_PASSWORD` | `/api/verify-guest` 回 503，除了 Google 登入沒人進得了站 |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google 登入整條掛掉 |
 | `GOOGLE_DRIVE_SA_KEY` | 燈箱取大圖、搬 trash、讀 GPSLogger 全掛 |
-| `DRIVE_WRITER_REFRESH_TOKEN` | 選配。沒設不會壞，只是站長第一次 Google 登入前沒有 Drive 備份 |
 
 ⚠️ **`$v | wrangler secret put` 會多存一個換行**（管線加的，wrangler 不 trim），
-曾經害 Google 回 `invalid_grant` 而畫面上顯示成「授權過期」。灌值時注意。
+曾經害 Google 回 `invalid_grant`。灌任何一個 secret 都一樣，值裡不要有尾巴。
 
 Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 自己的 origin** ＋
 `/api/auth/google/callback`（prod、dev、`http://127.0.0.1:8787` 三個）。
@@ -330,8 +329,18 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 ## 儲存模型
 
 - **R2 一張照片只有兩顆縮圖：800px ＋ 400px WebP。** 2000px 那顆已經拿掉。
-- **大圖／原始檔在 Google Drive**，走站長帳號（後端存 refresh token），不管誰上傳都寫進同一個 Drive。
+- **大圖／原始檔在 Google Drive**，不管誰上傳都寫進**站長**同一個 Drive
+  （`drive.file` 是 per-file 授權，寫入者只能有一個）。憑據就是站長那一列的
+  **`User.google_refresh_token`**（0017）—— 跟「Google 相簿匯入」用的同一張，
+  登入 scope 本來就含 `drive.file`。站上沒有「連結 Drive」這個動作，站長每次
+  Google 登入都會刷新它；失效就地清成 NULL，下次登入回呼自動補跳同意收回來。
   燈箱拿不到 Drive 時退回 800px 並在角落標示。
+  ⚠️ **不要再另外存一份**（曾經有 `AppSetting.drive_writer_refresh_token` ＋
+  `DRIVE_WRITER_REFRESH_TOKEN` secret，2026-08-21 移除）：多出來的那份沒人刷新，
+  壞掉還會**擋住自癒** —— 判斷「登入要不要跳同意畫面」看的是「有沒有值」，
+  值早就失效也算數，於是「請站長重新登入」變成一句做不到的指示。真的卡死過。
+  ⚠️ 同意畫面**早就是正式發布狀態，沒有「測試中 7 天到期」這回事**，
+  `invalid_grant` 不要往那個方向查。
 - 三個環境寫進同一個 Drive，靠 `DRIVE_ROOT_FOLDER` 分資料夾名。
   ⚠️ `findOwnFolder` **照名字找**，Drive 裡留著同名舊資料夾會被直接接管。
 - GPS 軌跡：家人把自己的 GPSLogger 資料夾分享給 service account，`/admin` 按「掃描並自動綁定」，
