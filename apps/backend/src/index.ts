@@ -1234,6 +1234,8 @@ const ALLOWED_ORIGINS = [
   "https://didadida-frontend.pages.dev",
   "https://dev.didadida-frontend.pages.dev",
   "http://localhost:3000",
+  // localhost 與 127.0.0.1 在瀏覽器眼裡是**兩個不同的 origin**，next dev 兩種開法都有人用
+  "http://127.0.0.1:3000",
 ];
 
 export default {
@@ -3907,11 +3909,22 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
 
         if (!code) return new Response("Missing code", { status: 400 });
 
-        // 優先使用傳過來的 redirectHost。往上提到換 token 之前，失敗時也才有地方可回
-        let baseFrontEndUrl = redirectHost || "https://didadida-frontend.pages.dev";
-        if (!redirectHost && (urlObj.hostname.includes("localhost") || urlObj.hostname.includes("127.0.0.1"))) {
-          baseFrontEndUrl = "http://localhost:3000";
-        }
+        /*
+         * 優先使用傳過來的 redirectHost（往上提到換 token 之前，失敗時也才有地方可回）。
+         *
+         * 認不得來源時的**退路照這個 worker 自己的網域決定，不是一律回 prod** ——
+         * 以前兩個環境共用一行寫死的 prod 網址，於是瀏覽器一旦沒帶 Referer
+         * （隱私設定、某些 App 內建瀏覽器），在 dev 站登入會被丟到 prod 站，
+         * 手上還捏著一張 dev 簽的 token：看起來像 prod 壞了，其實是走錯環境。
+         */
+        const selfHost = urlObj.hostname;
+        const isLocalWorker = selfHost.includes("localhost") || selfHost.includes("127.0.0.1");
+        const fallbackFrontEnd = isLocalWorker
+          ? "http://localhost:3000"
+          : selfHost.startsWith("didadida-api-dev")
+            ? "https://dev.didadida-frontend.pages.dev"
+            : "https://didadida-frontend.pages.dev";
+        const baseFrontEndUrl = redirectHost || fallbackFrontEnd;
         const target = albumId ? `${baseFrontEndUrl}/album?id=${albumId}` : `${baseFrontEndUrl}/`;
 
         const clientId = env.GOOGLE_CLIENT_ID || "";
