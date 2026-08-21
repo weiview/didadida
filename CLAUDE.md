@@ -127,6 +127,11 @@ npx wrangler d1 execute didadida-db-dev --env dev --local --file=../../database/
 for f in migrations/*.sql; do npx wrangler d1 execute didadida-db-dev --env dev --local --file="$f" -y; done
 ```
 
+⚠️ **0008 與 0009 會噴 `duplicate column name`（`role`／`user_id`），那是正常的** ——
+`schema.sql` 已經含著那兩欄。`d1 execute --file` 是單一交易，那兩支整包回滾，
+但最終 schema 仍與遠端 dev 一致（表、欄位、索引都比對過）。**建完是空的**，
+白名單沒人就登不進去，記得補一列站長：`INSERT INTO User (id,name,email,role,can_manage_others,active)`。
+
 **祕密不在 repo 裡**，要自己建 `apps/backend/.dev.vars`（gitignore，**永遠不要讀出內容或印出來**）。
 需要的 key：見 `apps/backend/.dev.vars.example`。前端 `.env.development` 也不在 repo，
 內容只有一行 `NEXT_PUBLIC_API_URL=http://127.0.0.1:8787/api`。
