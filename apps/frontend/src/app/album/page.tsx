@@ -966,13 +966,30 @@ function AlbumContent() {
            * CORS preflight，瀏覽器自己抓一定失敗。
            */
           const sources: IngestSource[] = [];
+          // 被擋掉的那幾筆。跑完統一講一次 —— 以前是 console.warn，
+          // 於是整批都被擋掉時畫面上什麼都不會發生，看起來就是「匯入壞了」
+          const skipped: string[] = [];
           for (const item of res.mediaItems) {
             const baseUrl = item.mediaFile?.baseUrl || item.baseUrl;
-            const filename = item.mediaFile?.filename || item.filename || item.id + ".jpg";
             const mimeType: string = item.mediaFile?.mimeType || item.mimeType || '';
-            // Picker 也選得到影片，這個站只收照片
-            if (!baseUrl || (mimeType && !mimeType.startsWith('image/'))) {
-              console.warn("跳過非照片或沒有下載連結的項目:", item);
+            // Picker 的 mediaItem 有 type: 'PHOTO' | 'VIDEO'，mimeType 只是保險
+            const isVideoItem = mimeType.startsWith('video/') || item.type === 'VIDEO';
+            const filename = item.mediaFile?.filename || item.filename
+              || item.id + (isVideoItem ? '.mp4' : '.jpg');
+            if (!baseUrl || (!isVideoItem && mimeType && !mimeType.startsWith('image/'))) {
+              skipped.push(`${filename}：不是照片或影片`);
+              continue;
+            }
+            /*
+             * ⚠️ 影片要 Google 那邊**轉完檔**才拿得到位元組（`=dv`）。還在處理時
+             *    直接抓會 502，與其讓它跑到一半才炸，不如在這裡就講明白哪幾支
+             *    要等一下再匯。processingStatus 只有影片才有。
+             */
+            const status = item.mediaFile?.mediaFileMetadata?.videoMetadata?.processingStatus;
+            // ⚠️ 只擋明確講「還在處理／失敗」的。列舉值還有一個 UNSPECIFIED，
+            //    寫成「不是 READY 就擋」會把它一起擋掉 —— 拿不準的一律讓它去試
+            if (isVideoItem && (status === 'PROCESSING' || status === 'FAILED')) {
+              skipped.push(`${filename}：Google 那邊還沒處理好這支影片（${status}），等一下再匯`);
               continue;
             }
             // Picker 把時間放在 mediaItem.createTime，舊回應在 mediaMetadata 底下
@@ -981,13 +998,14 @@ function AlbumContent() {
               || item.mediaMetadata?.creationTime;
             sources.push({
               name: filename,
-              load: () => fetchGoogleMediaFile(baseUrl, filename, creationTime),
+              load: () => fetchGoogleMediaFile(baseUrl, filename, creationTime, isVideoItem),
             });
           }
 
           if (sources.length === 0) {
             setSyncingGoogle(false);
             setUploadProgress(null);
+            if (skipped.length > 0) alert(`這批沒有東西可以匯入：\n\n${skipped.join('\n')}`);
             return;
           }
 
@@ -1004,6 +1022,7 @@ function AlbumContent() {
           setSyncingGoogle(false);
           setUploadProgress(null);
           await finishIngest(result);
+          if (skipped.length > 0) alert(`有 ${skipped.length} 個項目沒匯進來：\n\n${skipped.join('\n')}`);
         }
       }, 2000);
 

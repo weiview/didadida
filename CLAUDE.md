@@ -115,6 +115,18 @@ Authorization，而 R2 的物件鍵要先拿到（鎖著的）相簿 JSON 才知
   而 `lh3.googleusercontent.com` 不回 CORS 預檢，瀏覽器自己抓不到。
   ⚠️ **一定要驗主機名**（只放行 `*.googleusercontent.com` ＋ https），不驗就是一台
   任人指定目標的 SSRF 代理。回應 `Cache-Control: no-store`，不包 `withEdgeCache`。
+  ⚠️ **下載參數照片是 `=d`、影片是 `=dv`**（後端照前端送的 `video` 旗標加）。
+  給錯不會報錯 —— 影片吃到 `=d` 回的是一張 JPEG 封面圖，於是相簿裡多一張靜止的圖。
+- **影片也能從 Google 相簿匯入**（2026-08-24 修好，在那之前前端只放行 `image/*`，
+  整批都是影片時會安靜地什麼都不做）。判斷影片看 `mediaFile.mimeType` 或 `item.type`，
+  之後跟本機選檔完全同一條路（`ingestSources` 的 `isVideoFile()` 分岔：擷封面 →
+  `/api/upload` → `pushVideoToDrive`）。⚠️ 三件事要知道：
+  ① **拿到的是 Google 轉檔後的版本，不是相機原始檔** —— Picker API 沒有第二條路，
+  要原始檔只能本機選檔上傳；② `videoMetadata.processingStatus` 是 `PROCESSING`／`FAILED`
+  時先擋掉並講清楚（**不要寫成「不是 READY 就擋」**，列舉裡還有一個 UNSPECIFIED）；
+  ③ 匯入的影片會**整個變成一個 Blob 進瀏覽器**（本機上傳是 `File.slice()` 惰性讀），
+  幾 GB 的檔請用本機上傳那條。被擋掉的項目一律**收集起來最後 alert 一次**，
+  不要只 console.warn —— 那正是「按了沒反應」的來源。
 - **照片本身完全走本機上傳那一條**（前端 `ingestSources()`：縮 2000px → `/api/upload`
   產 800／400 進 R2 → `pushPhotoToDrive` 送 4K ＋原始檔進 Drive）。
   舊的 `sync-photo` 把原始檔整份塞進 R2、不產縮圖、也不上 Drive，跟儲存模型相反。

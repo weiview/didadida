@@ -1831,23 +1831,30 @@ export async function fetchGooglePickerPhotos(sessionId: string): Promise<{ read
  *
  * `lastModified` 塞 Google 的拍攝時間：Picker 的圖是有 EXIF 的，但萬一沒有，
  * 後端會退回檔案時間，這樣至少不會變成「今天拍的」。
+ *
+ * `video` 要照實給：Picker 的下載參數**照片是 `=d`、影片是 `=dv`**（後端加），
+ * 給錯的話影片那邊拿回來的會是一張封面圖而不是影片。
+ * ⚠️ 影片拿到的是 **Google 轉檔後的版本**，不是相機原始檔 —— Picker API 沒有
+ *    第二條路。本機選檔上傳才是原始檔。
  */
 export async function fetchGoogleMediaFile(
   baseUrl: string,
   filename: string,
   creationTime?: string,
+  video = false,
 ): Promise<File> {
   const res = await fetch(`${API_BASE_URL}/google/media`, {
     method: "POST",
     headers: getAuthHeaders(),
-    body: JSON.stringify({ baseUrl }),
+    body: JSON.stringify({ baseUrl, video }),
   });
   await throwIfReauth(res);
   if (!res.ok) throw new Error(`下載失敗（${res.status}）`);
   const blob = await res.blob();
   const stamp = creationTime ? Date.parse(creationTime) : NaN;
-  return new File([blob], filename || 'google-photo.jpg', {
-    type: blob.type || 'image/jpeg',
+  return new File([blob], filename || (video ? 'google-video.mp4' : 'google-photo.jpg'), {
+    // 型別要對：ingestSources 是靠 isVideoFile() 分岔的，退路才看副檔名
+    type: blob.type || (video ? 'video/mp4' : 'image/jpeg'),
     lastModified: Number.isFinite(stamp) ? stamp : Date.now(),
   });
 }

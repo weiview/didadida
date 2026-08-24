@@ -4287,8 +4287,9 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         const auth = await googleUserAuth(request, env, headers);
         if (!auth.ok) return auth.res;
 
-        const body = await request.json().catch(() => ({})) as { baseUrl?: unknown };
+        const body = await request.json().catch(() => ({})) as { baseUrl?: unknown; video?: unknown };
         const raw = typeof body.baseUrl === "string" ? body.baseUrl : "";
+        const isVideo = body.video === true;
         let target: URL;
         try {
           target = new URL(raw);
@@ -4299,8 +4300,18 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           return new Response(JSON.stringify({ error: "baseUrl 不是 Google 的圖片位址" }), { status: 400, headers });
         }
 
-        // Picker 的 baseUrl 要自己加 `=d` 才是原始解析度（沒有 `=` 才代表還沒帶參數）
-        const downloadUrl = raw.includes("=") ? raw : `${raw}=d`;
+        /*
+         * Picker 的 baseUrl 要自己加下載參數（沒有 `=` 才代表還沒帶過）。
+         *
+         * ⚠️ **照片是 `=d`、影片是 `=dv`，不能通用。** 影片給 `=d` 拿回來的是一張
+         *    封面圖 —— 位元組是 JPEG，Content-Type 也是 image/*，前端於是把它當照片
+         *    收下，相簿裡多一張靜止的圖、而且完全沒有錯誤。這是「Google 相簿匯入
+         *    影片沒反應」的其中一半原因（另一半是前端只放行 image/*）。
+         * ⚠️ `=dv` 給的是 **Google 轉檔後的版本**，不是相機原始檔 —— Picker API 沒有
+         *    拿原始影片的路。要原始檔只能從本機選檔上傳。
+         *    而且影片要 Google 那邊處理完（processingStatus READY）才抓得到。
+         */
+        const downloadUrl = raw.includes("=") ? raw : `${raw}=${isVideo ? "dv" : "d"}`;
         let upstream = await fetch(downloadUrl, { headers: { Authorization: `Bearer ${auth.token}` } });
         // 有些 baseUrl 不吃 Bearer（帶了反而 403），再試一次不帶的
         if (!upstream.ok) upstream = await fetch(downloadUrl);
