@@ -1812,12 +1812,25 @@ export async function createGooglePickerSession(): Promise<{ id?: string, picker
   return await res.json();
 }
 
-export async function fetchGooglePickerPhotos(sessionId: string): Promise<{ ready: boolean, mediaItems?: any[] }> {
+/**
+ * 問一次「使用者選完了沒」，選完了就把清單帶回來。
+ *
+ * ⚠️ **失敗不可以回 `{ ready: false }`** —— 那跟「還沒選完」長得一模一樣，
+ *    輪詢會就這樣空轉到十分鐘逾時，畫面上完全沒有線索。錯誤照實放在 `error`，
+ *    呼叫端自己決定要不要停（單次失敗可能只是網路抖一下）。
+ */
+export async function fetchGooglePickerPhotos(
+  sessionId: string,
+): Promise<{ ready: boolean, mediaItems?: any[], error?: string }> {
   const res = await fetch(`${API_BASE_URL}/google/picker/sessions/${sessionId}/photos`, {
     headers: getAuthHeaders(),
   });
   await throwIfReauth(res);
-  if (!res.ok) return { ready: false };
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    console.error('Picker 查詢失敗', res.status, detail.slice(0, 500));
+    return { ready: false, error: `${res.status} ${detail.slice(0, 200)}` };
+  }
   return await res.json();
 }
 

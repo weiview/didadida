@@ -899,6 +899,10 @@ function AlbumContent() {
         return;
       }
 
+      // 這行也是刻意留著的診斷起點：Console 連這一行都沒有，代表問題在按鈕
+      // 到建 session 之間，不在後面那串輪詢
+      console.log('Picker session 已建立', session.id);
+
       // 非同步取得連結後，直接將 popup 的網址更換為支援自動關閉的 pickerUri
       if (popup) {
         popup.location.href = session.pickerUri + "/autoclose";
@@ -918,7 +922,22 @@ function AlbumContent() {
        * popup 被瀏覽器擋掉時是 null，這條就整個不成立，退回原本的 10 分鐘逾時。
        */
       let popupClosedAt = 0;
-      const PICKER_CLOSE_GRACE_MS = 1500;
+      /*
+       * ⚠️ 關窗之後**要繼續問一段時間**，不能問一次就算了。
+       *
+       * Google 那邊「使用者按下完成」與「session 的 mediaItemsSet 變成 true」不是
+       * 同一瞬間 —— `/autoclose` 先把視窗關掉，狀態可能幾秒後才翻。原本是關窗
+       * 1.5 秒後問**一次**，不 ready 就把輪詢整個拆掉當成取消：於是使用者明明選完了，
+       * 畫面上卻什麼都沒發生、Console 也一個字都沒有。（影片更容易踩到，Google 那邊
+       * 要多花時間備妥。）
+       *
+       * 現在關窗只記時間，2 秒那支輪詢照跑；撐過這個窗還沒 ready 才當作取消。
+       */
+      const PICKER_CANCEL_AFTER_CLOSE_MS = 20000;
+      // 最後一次查詢失敗的樣子。輪詢單次失敗不停（可能只是網路抖一下），
+      // 但收工時要拿它講清楚 —— 不然又變成「什麼都沒發生」
+      let lastPollError: string | null = null;
+      let closeLogged = false;
 
       const pollTimer = setInterval(async () => {
         if (photosProcessingStarted) {
@@ -930,15 +949,18 @@ function AlbumContent() {
           clearInterval(pollTimer);
           photosProcessingStarted = true;
           setSyncingGoogle(false);
-          alert("同步逾時，已自動取消。");
+          alert(lastPollError
+            ? `同步逾時，已自動取消。最後一次查詢的錯誤：${lastPollError}`
+            : "同步逾時，已自動取消。");
           return;
         }
 
         // 這裡在 interval 裡面，丟出去沒人接得到（會變成 unhandled rejection，
         // 而且輪詢還會繼續跑），所以每一輪自己收乾淨
-        let res: { ready: boolean; mediaItems?: any[] };
+        let res: { ready: boolean; mediaItems?: any[]; error?: string };
         try {
           res = await fetchGooglePickerPhotos(session!.id!);
+          lastPollError = res.error ?? null;
         } catch (err) {
           clearInterval(pollTimer);
           photosProcessingStarted = true;
@@ -946,6 +968,26 @@ function AlbumContent() {
           if (err instanceof GoogleReauthError) setGoogleReauth(err.message);
           else console.error(err);
           return;
+        }
+
+        if (!res.ready && popupClosedAt) {
+          const waited = Date.now() - popupClosedAt;
+          // 一次就好，不要每 2 秒洗版
+          if (!closeLogged) {
+            closeLogged = true;
+            console.log('Picker 視窗已關閉，繼續問狀態（最多',
+              PICKER_CANCEL_AFTER_CLOSE_MS / 1000, '秒）', res);
+          }
+          if (waited > PICKER_CANCEL_AFTER_CLOSE_MS) {
+            console.warn('Picker 視窗關閉後', Math.round(waited / 1000),
+              '秒都還沒 ready，當作取消。最後一次狀態：', res);
+            clearInterval(pollTimer);
+            photosProcessingStarted = true;
+            setSyncingGoogle(false);
+            setUploadProgress(null);
+            if (lastPollError) alert(`匯入沒有開始：${lastPollError}`);
+            return;
+          }
         }
 
         if (res.ready && res.mediaItems) {
@@ -965,6 +1007,27 @@ function AlbumContent() {
            * lh3.googleusercontent.com 上、要帶 Authorization，而那個網域不回
            * CORS preflight，瀏覽器自己抓一定失敗。
            */
+          /*
+           * ⚠️ **選完了但一個項目都沒有，要當成異常講出來。** 這個組合以前是
+           *    整段流程最安靜的失敗：迴圈跑零次、沒有 sources、沒有 skipped，
+           *    於是關掉轉圈圈就 return —— 使用者眼中就是「按了完全沒反應」。
+           */
+          if (res.mediaItems.length === 0) {
+            setSyncingGoogle(false);
+            setUploadProgress(null);
+            alert("Google 說你選完了，但一個項目都沒回傳。請再試一次；一直這樣的話把 Console 的訊息給我。");
+            return;
+          }
+          // 這行是刻意留著的：下次再有「匯不進來」時，這裡直接看得出 Google 回了什麼
+          console.log('Picker 回傳', res.mediaItems.length, '個項目',
+            res.mediaItems.map((it: any) => ({
+              type: it.type,
+              mime: it.mediaFile?.mimeType,
+              name: it.mediaFile?.filename,
+              hasBaseUrl: !!it.mediaFile?.baseUrl,
+              video: it.mediaFile?.mediaFileMetadata?.videoMetadata,
+            })));
+
           const sources: IngestSource[] = [];
           // 被擋掉的那幾筆。跑完統一講一次 —— 以前是 console.warn，
           // 於是整批都被擋掉時畫面上什麼都不會發生，看起來就是「匯入壞了」
@@ -1028,27 +1091,19 @@ function AlbumContent() {
 
       /*
        * 關窗偵測**獨立成一支 400ms 的小哨兵**，不跟 2 秒那支狀態輪詢共用一拍 ——
-       * 共用的話「發現關窗」本身就要先等最多 2 秒，再加寬限期，按下 X 之後右下角
-       * 要卡上快十秒才回得來，用起來跟沒修一樣。
+       * 共用的話「發現關窗」本身就要先等最多 2 秒才知道視窗沒了。
        *
-       * 寬限期到了還分不出是取消還是選完，就自己問最後一次狀態：ready 代表他是
-       * 選完才關的，原樣交還給狀態輪詢（下一拍 ≤2 秒就接手）；不 ready 才是取消。
+       * ⚠️ 這支**只記時間，不做判斷**。它曾經自己問一次狀態、不 ready 就把輪詢
+       * 整個收掉當成取消 —— 那是個競態：Google 先關窗、幾秒後才把 mediaItemsSet
+       * 翻成 true，於是選完的東西被當成取消丟掉，而且因為「取消不彈東西」，
+       * 使用者眼中是按完全沒反應、Console 一個字都沒有。判斷一律留給輪詢。
        */
-      const closeWatcher = setInterval(async () => {
+      const closeWatcher = setInterval(() => {
         if (photosProcessingStarted) { clearInterval(closeWatcher); return; }
-        if (!popup || !popup.closed) return;
-        if (!popupClosedAt) { popupClosedAt = Date.now(); return; }
-        if (Date.now() - popupClosedAt < PICKER_CLOSE_GRACE_MS) return;
+        if (!popup || !popup.closed || popupClosedAt) return;
+        popupClosedAt = Date.now();
         clearInterval(closeWatcher);
-        try {
-          const last = await fetchGooglePickerPhotos(session!.id!);
-          if (last.ready) return;
-        } catch (e) { /* 問不到就當取消，反正窗已經關了 */ }
-        if (photosProcessingStarted) return;
-        clearInterval(pollTimer);
-        photosProcessingStarted = true;
-        setSyncingGoogle(false);
-        setUploadProgress(null);
+        // 剩下的交給 2 秒那支輪詢：ready 就接手，撐過窗口才當取消
       }, 400);
     } catch (err) {
       console.error(err);

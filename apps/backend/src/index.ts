@@ -4254,6 +4254,17 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           headers: { Authorization: `Bearer ${auth.token}` }
         });
         const statusData = await statusRes.json() as any;
+        /*
+         * ⚠️ **失敗不可以長得像「還沒選完」。** 以前這裡不看狀態碼，statusRes 掛掉時
+         *    statusData.mediaItemsSet 是 undefined ＝ ready:false，前端就這樣空轉輪詢
+         *    到十分鐘逾時，畫面上完全沒有線索。
+         */
+        if (!statusRes.ok) {
+          console.error("Picker session 狀態查詢失敗", statusRes.status, JSON.stringify(statusData).slice(0, 300));
+          return new Response(JSON.stringify({
+            error: "picker_status_failed", status: statusRes.status, detail: statusData,
+          }), { status: 502, headers });
+        }
 
         // Google Photospicker API: 當使用者點擊「完成/選擇」後，mediaItemsSet 會變為 true
         const isReady = statusData.mediaItemsSet === true || statusData.mediaItemsSet === "true";
@@ -4262,14 +4273,36 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           return new Response(JSON.stringify({ ready: false, statusData }), { headers });
         }
 
-        // 2. 如果使用者選完了，就去抓照片清單
-        const itemsRes = await fetch(`https://photospicker.googleapis.com/v1/mediaItems?sessionId=${sessionId}`, {
-          headers: { Authorization: `Bearer ${auth.token}` }
-        });
-        const itemsData = await itemsRes.json() as any;
-        const mediaItems = itemsData.mediaItems || [];
+        /*
+         * 2. 使用者選完了，去抓清單。**要翻頁** —— 一次預設只給 100 筆，
+         *    以前只讀第一頁，選超過 100 張時後面的會安靜地不見。
+         */
+        const mediaItems: any[] = [];
+        let pageToken = "";
+        for (let page = 0; page < 20; page++) {
+          const qs = new URLSearchParams({ sessionId, pageSize: "100" });
+          if (pageToken) qs.set("pageToken", pageToken);
+          const itemsRes = await fetch(`https://photospicker.googleapis.com/v1/mediaItems?${qs}`, {
+            headers: { Authorization: `Bearer ${auth.token}` }
+          });
+          const itemsData = await itemsRes.json() as any;
+          /*
+           * ⚠️ 同上：以前是 `itemsData.mediaItems || []`，於是**任何失敗都變成
+           *    「選完了，但一張都沒有」** —— 前端拿到空陣列什麼都不做，使用者按了
+           *    半天沒有任何反應也沒有任何錯誤。失敗要照實往外講。
+           */
+          if (!itemsRes.ok) {
+            console.error("Picker mediaItems 取回失敗", itemsRes.status, JSON.stringify(itemsData).slice(0, 300));
+            return new Response(JSON.stringify({
+              error: "picker_items_failed", status: itemsRes.status, detail: itemsData,
+            }), { status: 502, headers });
+          }
+          if (Array.isArray(itemsData.mediaItems)) mediaItems.push(...itemsData.mediaItems);
+          pageToken = typeof itemsData.nextPageToken === "string" ? itemsData.nextPageToken : "";
+          if (!pageToken) break;
+        }
 
-        return new Response(JSON.stringify({ ready: true, mediaItems, itemsData, statusData }), { headers });
+        return new Response(JSON.stringify({ ready: true, mediaItems, statusData }), { headers });
       }
 
       /*

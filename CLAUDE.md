@@ -127,6 +127,16 @@ Authorization，而 R2 的物件鍵要先拿到（鎖著的）相簿 JSON 才知
   ③ 匯入的影片會**整個變成一個 Blob 進瀏覽器**（本機上傳是 `File.slice()` 惰性讀），
   幾 GB 的檔請用本機上傳那條。被擋掉的項目一律**收集起來最後 alert 一次**，
   不要只 console.warn —— 那正是「按了沒反應」的來源。
+- ⚠️ **「視窗關了」不等於「取消」**：`pickerUri` 後面接的 `/autoclose` 就是要 Google
+  選完之後自己關窗，而 `mediaItemsSet` 可能**幾秒之後**才翻成 true（影片更慢）。
+  所以關窗偵測那支 400ms 哨兵**只記時間、不做判斷**，判斷全留給 2 秒那支輪詢：
+  關窗後仍不 ready 就繼續問到 `PICKER_CANCEL_AFTER_CLOSE_MS`（20 秒）才當取消。
+  曾經是「關窗 1.5 秒後問一次，不 ready 就整個收掉」—— 選完的東西被當成取消丟掉，
+  而且取消刻意不彈東西，於是使用者眼中是**按完全沒反應、Console 一個字都沒有**。
+- 這條路上**每一個失敗都要留下痕跡**：後端 session 狀態／mediaItems 取回失敗回 **502
+  `picker_status_failed`／`picker_items_failed`**（以前吞掉 → 前端看起來像「還沒選完」
+  而空轉到十分鐘逾時）、mediaItems **要翻頁**（一頁 100 筆，選超過 100 張會安靜地少）、
+  前端輪詢失敗記在 `lastPollError` 收工時講出來、`ready` 但零項目要 alert。
 - **照片本身完全走本機上傳那一條**（前端 `ingestSources()`：縮 2000px → `/api/upload`
   產 800／400 進 R2 → `pushPhotoToDrive` 送 4K ＋原始檔進 Drive）。
   舊的 `sync-photo` 把原始檔整份塞進 R2、不產縮圖、也不上 Drive，跟儲存模型相反。
