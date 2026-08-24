@@ -4880,6 +4880,59 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         }), { headers });
       }
 
+      /*
+       * 路由：批次**指定**拍攝時間（不是修正）。
+       *
+       * 跟上面兩支的差別是它**不要求原本有時間** —— 這支就是為了
+       * `taken_at IS NULL` 的東西存在的：影片（封面圖是 canvas 畫的，不帶 EXIF）、
+       * 掃描的老照片、被 App 洗掉 EXIF 的圖。平移與改時區都需要一個基準，
+       * 對 NULL 一律跳過，所以它們補不了這個洞。
+       *
+       * 語意與單張的 `PUT /api/photos/:id/geo` 送 takenAtLocal 完全一致：
+       * 牆上時間與時區都由使用者指定，taken_at = local − tz，time_source = manual。
+       * 解析與換算刻意共用 parseExifDateTime／formatWallClock／utcFromLocal 三支，
+       * 不在這裡自己拼字串 —— 不變式只能有一個實作。
+       */
+      if (method === "POST" && pathname === "/api/photos/geo/set-time") {
+        const body: any = await request.json().catch(() => ({}));
+        const ids = sanitizePhotoIds(body?.photoIds);
+        if (ids.length === 0) {
+          return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
+        }
+        if (!isValidTzOffset(body?.tzOffsetMinutes)) {
+          return new Response(JSON.stringify({ error: "Invalid tzOffsetMinutes" }), { status: 400, headers });
+        }
+        const wc = parseExifDateTime(body?.takenAtLocal);
+        if (!wc) {
+          return new Response(JSON.stringify({ error: "Invalid takenAtLocal" }), { status: 400, headers });
+        }
+        if (!(await canTouchPhotos(ids))) return forbidden(headers);
+
+        const tz = body.tzOffsetMinutes;
+        const localStr = formatWallClock(wc);
+        const utcStr = utcFromLocal(localStr, tz);
+        // 三個固定綁定（local、utc、tz）先扣掉，剩下的才是 id 能用的位置
+        const res = await env.DB.batch(
+          chunkIds(ids, 3).map((c) => env.DB.prepare(`
+            UPDATE Photo SET
+              taken_at_local = ?,
+              taken_at = ?,
+              tz_offset_minutes = ?,
+              time_source = 'manual'
+            WHERE id IN (${placeholdersFor(c)})
+          `).bind(localStr, utcStr, tz, ...c)),
+        );
+
+        const updated = res.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
+        // 這支沒有「因為沒時間而跳過」這回事，skippedNoTime 恆為 0；
+        // 欄位照樣回，前端那個結果提示三個模式共用一份
+        return new Response(JSON.stringify({
+          success: true,
+          updated,
+          skippedNoTime: 0,
+        }), { headers });
+      }
+
       // 路由：批次改時區（出國拍照但機身時區沒改）
       // taken_at 是對的 —— 相機時鐘走的還是原本那個時區的正確時間，換算出來的瞬間沒錯，
       // 錯的只是「拿哪個時區去顯示」。所以 taken_at 一律不動，只重算牆上時間。

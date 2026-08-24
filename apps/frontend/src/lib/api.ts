@@ -2042,6 +2042,35 @@ export async function shiftPhotoTime(
 }
 
 /**
+ * 批次**指定**拍攝時間 —— 給本來就沒有時間的東西用。
+ *
+ * 影片（封面圖是 canvas 畫的、不帶 EXIF）、掃描的老照片、被 App 洗掉 EXIF 的圖，
+ * `taken_at` 都是 NULL。平移與改時區都需要一個基準時間，對 NULL 一律跳過，
+ * 所以補不了這個洞，只能直接指定。
+ *
+ * 牆上時間與時區一起送：後端算 taken_at = local − tz，維持全站不變式。
+ * `takenAtLocal` 是 `YYYY-MM-DD HH:MM:SS`（不帶時區的牆上時間）。
+ */
+export async function setPhotoTime(
+  photoIds: number[],
+  takenAtLocal: string,
+  tzOffsetMinutes: number,
+): Promise<{ success: boolean; updated: number; skippedNoTime: number } | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/geo/set-time`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ photoIds, takenAtLocal, tzOffsetMinutes }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/**
  * 批次改時區，用於出國拍照但機身時區沒改。
  * taken_at 是對的，錯的只是「拿哪個時區去顯示」，所以只重算牆上時間。
  */

@@ -1976,9 +1976,11 @@ function AlbumContent() {
         }}
       />
 
+      {/* titles 是原始檔名，只給「指定時間」那個模式預填用（VID_20260824_143000.mp4） */}
       <FixTimeModal
         isOpen={showFixTime}
         photoIds={selectedPhotos}
+        titles={selectedPhotos.map((id) => photos.find((p) => p.id === id)?.title ?? '')}
         onClose={() => setShowFixTime(false)}
         onDone={({ updated, skippedNoTime, what }) => {
           setSelectedPhotos([]);

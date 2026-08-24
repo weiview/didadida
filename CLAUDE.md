@@ -238,6 +238,18 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 - `Photo.taken_at`（UTC 瞬間）／`taken_at_local`（牆上時間）／`tz_offset_minutes`，
   不變量是 **`taken_at = taken_at_local − tz`**。
+- 批次改時間有**三支**，前端共用同一個 `FixTimeModal`（三個分頁）：
+  `POST /api/photos/geo/shift-time`（平移：兩欄一起加減，tz 不動）、
+  `POST /api/photos/geo/set-timezone`（改時區：瞬間不動，重算牆上時間）、
+  `POST /api/photos/geo/set-time`（**指定**：牆上時間與時區都由使用者給）。
+  ⚠️ 前兩支都以 **`AND taken_at IS NOT NULL`** 結尾 —— 修正需要一個基準。
+  影片（封面圖是 canvas 畫的，不帶 EXIF）、掃描的老照片本來就是 NULL，
+  **只有第三支補得了**，那也是它存在的唯一理由。三支一律寫 `time_source = manual`。
+  換算共用 `parseExifDateTime`／`formatWallClock`／`utcFromLocal`，**不要在路由裡自己拼字串**
+  —— 不變式只能有一個實作。`parseExifDateTime` **硬性要求秒數**，所以前端 `datetime-local`
+  沒填秒數時要自己補 `:00`，否則被當成無效字串退 400。
+  前端會拿原始檔名（`VID_20260824_143000.mp4`）猜一個**預填值**，⚠️ **`PXL_` 開頭刻意不猜** ——
+  Pixel 那串數字是 **UTC**，當牆上時間填進去會整整差一個時區，而且錯得很安靜。
 - `Photo` 除了基本欄位還有：`drive_file_id`／`drive_original_id`（Drive 上的 4K 與原始檔）、
   `thumb_url`／`thumb_sm_url`（R2 的 800／400 WebP）、`uploaded_by`（誰傳的，見「身分與權限」）、
   `file_hash`／`phash`（去重）、`shuffle_key`（隨機排序用的固定亂數）。
@@ -393,6 +405,11 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - 燈箱裡拖時間軸時，`VideoPlayer` 的外框**擋掉 touch 事件冒泡**，不然手機上會被
   燈箱當成「滑到下一張」。
 - **訪客看不到影片**這件事目前沒有另外的開關 —— 整站進站閘門本來就擋著。
+- **影片的拍攝時間是 NULL，要由使用者自己指定**（封面圖是 canvas 畫的，沒有 EXIF）：
+  相簿裡選起來 →「拍攝時間」→「指定時間」分頁，走 `POST /api/photos/geo/set-time`
+  （見「資料模型」那三支）。⚠️ 平移與改時區那兩支**對影片沒有作用**（`taken_at IS NOT NULL`）。
+  沒給時間的影片在相簿格線不受影響（那支照 `sort_order`），但**會沉到搜尋結果最底**
+  （`ORDER BY p.taken_at DESC`，NULL 在 DESC 排最後）。
 - 轉檔／第二種畫質（P4）**使用者明確延後**，先看實際讀取速度再決定。
 
 ## 儲存模型
