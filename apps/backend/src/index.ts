@@ -2,7 +2,7 @@ import {
   normalizeGeo, formatWallClock, utcFromLocal,
   parseExifDateTime, geoOverwriteGuard, DEFAULT_TZ_OFFSET_MINUTES,
 } from './geo';
-import { listGpxFiles, listSharedFolders, fetchDriveMedia, moveDriveFile, renameDriveFolder, serviceAccountEmail } from './drive';
+import { listGpxFiles, listSharedFolders, fetchDriveMedia, fetchDriveMediaRange, moveDriveFile, renameDriveFolder, serviceAccountEmail } from './drive';
 import { syncFtsForPhotos, deleteFtsForPhotos, ftsMatchExpr } from './fts';
 
 export interface Env {
@@ -195,6 +195,86 @@ async function tokenIdentity(request: Request, env: Env): Promise<Identity | nul
   const token = authHeader.replace("Bearer ", "");
   if (!token) return null;
   return await verifyJWT(token, env);
+}
+
+/*
+ * ── 媒體的簽章網址 ────────────────────────────────────────────────────────
+ *
+ * `<img src>` 與 `<video src>` 不會帶 Authorization，所以媒體路由沒辦法靠進站閘門
+ * 那張 token 保護。原本的護欄是「網址猜不到」—— R2 的物件鍵帶時間戳與亂數、
+ * 頭像檔名帶亂數，那個護欄在它們身上是成立的。
+ *
+ * ⚠️ 但 `/api/photos/:id/full` 吃的是 **AUTOINCREMENT 的流水號**，「猜不到」這件事
+ *    在它身上從來沒成立過：任何台灣 IP 不必帶 token，從 1 數上去就能把整個站的
+ *    Drive 4K 原圖抓完。這一組簽章補的就是那個洞。
+ *
+ * 為什麼是「一張站上通行的媒體 token」，不是「每張照片一組簽章」：
+ * 相簿內容那支路由**不分頁**（5000 張的相簿一次回完），逐張簽等於一次請求裡跑
+ * 5000 趟 crypto.subtle.sign —— 遠超單次 10ms CPU。而 /full 回的是圖片位元組，
+ * 內容不隨身分變化（沒有 applyGeoPrivacy 那種洩漏問題），所以「證明你進得了站」
+ * 就是剛好的粒度：擋掉的是完全沒有 token 的人，而那正是這個洞。
+ *
+ * 有效期跟進站 token 同一個 7 天。它是跟著 `/api/auth/me` 一起發的，不可能活得比
+ * 拿到它的那張 token 久 —— 也就不需要另一套續期邏輯，每次進站就換一張新的。
+ *
+ * ⚠️ 驗過之後**一定要把 mt 從 cache key 裡拿掉**（見 /full 那條路由）。留著的話
+ *    每個人、每次登入都是一份獨立的邊緣快取，Drive 取檔次數直接乘上人數。
+ */
+const MEDIA_TOKEN_TTL_SEC = 86400 * 7;
+
+/** 簽章的內容只有到期時間，**不綁人** —— 綁了也擋不住更多東西，只會多一份快取 */
+const mediaTokenPayload = (exp: string) => `media:${exp}`;
+
+async function mediaHmacKey(env: Env, usage: "sign" | "verify"): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(env.APP_PASSWORD),
+    { name: "HMAC", hash: "SHA-256" }, false, [usage],
+  );
+}
+
+/** 發一張媒體 token。格式 `<到期的 epoch 秒>.<base64url 的 HMAC>` */
+async function mintMediaToken(env: Env): Promise<string> {
+  const exp = String(Math.floor(Date.now() / 1000) + MEDIA_TOKEN_TTL_SEC);
+  const key = await mediaHmacKey(env, "sign");
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(mediaTokenPayload(exp)));
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `${exp}.${b64}`;
+}
+
+/** 驗一張媒體 token。沒帶、格式不對、過期、簽章不符一律 false */
+async function verifyMediaToken(raw: string | null, env: Env): Promise<boolean> {
+  if (!raw) return false;
+  const dot = raw.indexOf(".");
+  if (dot <= 0) return false;
+  const exp = raw.slice(0, dot);
+  // 先看到期再驗簽：過期的不必花 CPU 算 HMAC
+  if (!/^\d+$/.test(exp) || Number(exp) < Math.floor(Date.now() / 1000)) return false;
+  try {
+    const key = await mediaHmacKey(env, "verify");
+    const sigBytes = Uint8Array.from(
+      atob(raw.slice(dot + 1).replace(/-/g, "+").replace(/_/g, "/")),
+      c => c.charCodeAt(0),
+    );
+    return await crypto.subtle.verify(
+      "HMAC", key, sigBytes, new TextEncoder().encode(mediaTokenPayload(exp)));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 這個路徑是不是「靠簽章網址進來」的媒體路由。
+ *
+ * **只有這張表上的路徑認 mt** —— 一張 mt 不可以拿去讀相簿 JSON、留言或軌跡，
+ * 它證明的只是「這個網址是站上發出來的」，不是一個身分。
+ * 再加路徑進來要一條一條寫，不要改成 startsWith("/api/photos/") 之類的寬鬆比對。
+ *
+ * `/video` 跟 `/full` 同一個理由在這裡：<video src> 一樣不會帶 Authorization，
+ * 而它吃的也是同一組流水號。
+ */
+function isSignedMediaPath(pathname: string): boolean {
+  return /^\/api\/photos\/\d+\/(full|video)$/.test(pathname);
 }
 
 /**
@@ -1292,6 +1372,11 @@ const origin = request.headers.get("Origin") || "";
      *      **頭像也在這一類**（0015）：一樣是 <img src>，護欄一樣是猜不到的檔名
      *      （`<uid>-<亂數>.webp`）。所以那條路由絕對不可以改成吃 user id。
      *
+     * ⚠️ `/api/photos/:id/full` **曾經在這張白名單上，已經移走了**（見 isSignedMediaPath）。
+     *    它吃的是流水號，「網址猜不到」那個護欄對它從來沒成立過 —— 任何台灣 IP 不帶
+     *    token 從 1 數上去就能抓完整站的 Drive 4K。它現在走簽章網址（`?mt=`），
+     *    由下面那一段驗。**不要為了「圖片要放行」把它加回白名單。**
+     *
      * 位置很重要：**必須排在 withEdgeCache 之前**。閘門若放在各路由裡面，
      * 訪客的回應會先進共用的邊緣快取，之後匿名請求就直接命中那份快取拿到 200。
      */
@@ -1301,12 +1386,21 @@ const origin = request.headers.get("Origin") || "";
       || pathname === "/api/auth/me"
       || pathname.startsWith("/api/auth/google/")
       || pathname.startsWith("/api/photos/view/")
-      || /^\/api\/photos\/\d+\/full$/.test(pathname)
       // 只開 GET。上傳／刪除頭像照樣要 token，不能因為圖片要放行就整條路徑打開
       || (method === "GET" && pathname.startsWith("/api/users/avatar/"));
 
-    if (!isOpenPath && !(await tokenIdentity(request, env))) {
-      return new Response(JSON.stringify({ error: "locked" }), { status: 401, headers });
+    /*
+     * 閘門認兩種東西：Authorization 裡那張 token，或**媒體路徑上的簽章網址**。
+     * 後者只對 isSignedMediaPath 那張表上的 GET 成立，而且只是「進得了站」的證明，
+     * 不帶身分 —— 需要知道「是誰」的路由照樣得自己去 currentActor()。
+     */
+    if (!isOpenPath) {
+      const gateOk = (await tokenIdentity(request, env)) !== null
+        || (method === "GET" && isSignedMediaPath(pathname)
+            && await verifyMediaToken(url.searchParams.get("mt"), env));
+      if (!gateOk) {
+        return new Response(JSON.stringify({ error: "locked" }), { status: 401, headers });
+      }
     }
 
     try {
@@ -1437,6 +1531,12 @@ if (method === "POST" && pathname === "/api/verify-password") {
            * 幾乎不會真的去讀 D1。為它另開一支端點等於每個人開地圖多一次請求。
            */
           convoy_overlap_pct: await convoyOverlapPct(env),
+          /*
+           * 圖片／影片的簽章網址要用的那張。**訪客也有** —— 燈箱大圖本來就給訪客看，
+           * 這張 token 擋的是「完全沒進站的人」，不是訪客。
+           * 同樣跟著這一條回來（零額外請求），效期與手上那張進站 token 一致。
+           */
+          media_token: await mintMediaToken(env),
           user: actor ? {
             id: actor.uid, name: actor.name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
@@ -2435,7 +2535,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
           && pathname.endsWith("/full") && pathname.split("/").length === 5) {
         const photoId = pathname.split("/")[3];
         const cache = caches.default;
-        const cacheKey = new Request(new URL(request.url).toString(), { method: "GET" });
+        /*
+         * cache key 把 mt 拿掉。閘門已經驗過了，留在 key 裡只會讓每個人、每次登入
+         * 都是一份獨立的邊緣快取 —— 同一張照片的 Drive 取檔次數直接乘上人數。
+         * 圖片位元組不隨身分變化，所以共用一份是對的。
+         */
+        const keyUrl = new URL(request.url);
+        keyUrl.searchParams.delete("mt");
+        const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
         const hit = await cache.match(cacheKey);
         if (hit) return hit;
 
@@ -2474,6 +2581,76 @@ if (method === "POST" && pathname === "/api/verify-password") {
           // Drive 掛掉不該讓照片看不到。不快取這次，下次再試
           console.error("Drive 取檔失敗，退回 R2", e);
           return fallback();
+        }
+      }
+
+      /*
+       * 路由：影片位元組。
+       *
+       * 跟上面的 /full 是同一個模式（Drive 上的檔沒有分享給任何人，只有 service
+       * account 讀得到，所以一定要經過 Worker 代理），但有三處刻意不一樣：
+       *
+       * 1. **Range 原封轉發，回應照樣 206。** <video> 拖時間軸、手機分段下載全靠
+       *    這個；一律回整份的話，每拖一次就是重下一支完整的影片。
+       * 2. **不進 caches.default。** Cache API 存的是「這個網址的一整份回應」，
+       *    而這裡每個請求要的範圍都不同 —— 把某一段 206 存成那個網址的答案，
+       *    下一個要別段的人就會拿到錯的位元組。瀏覽器自己的媒體快取已經夠用，
+       *    而且 Drive 那個 file id 的內容永遠不變，下面給的是一年 immutable。
+       * 3. **沒有退路。** 照片拿不到 Drive 還能退回 R2 的 800px；影片在 R2 只有
+       *    一張封面圖，退回去就是一張不會動的圖 —— 比明確報錯更難懂。
+       *
+       * 位元組是串流轉發的，不落 Worker 的記憶體（見 fetchDriveMediaRange），
+       * 所以 2GB 的影片跟 128MB 的記憶體上限沒有關係。
+       *
+       * ⚠️ 影片的 Drive id 存在 **drive_original_id**，不是 drive_file_id（見 0019）。
+       */
+      if (method === "GET" && pathname.startsWith("/api/photos/")
+          && pathname.endsWith("/video") && pathname.split("/").length === 5) {
+        const photoId = pathname.split("/")[3];
+        const photo = await env.DB.prepare(
+          "SELECT drive_original_id, media_type FROM Photo WHERE id = ?"
+        ).bind(photoId).first<any>();
+
+        // 對著一張照片要影片是前端弄錯了，不要真的去代理一張圖片的位元組
+        if (!photo || photo.media_type !== "video") {
+          return new Response(JSON.stringify({ error: "Video not found" }), { status: 404, headers });
+        }
+        // 上傳到一半斷掉會留下這種列：封面已經在 R2，影片還沒送上 Drive
+        if (!photo.drive_original_id) {
+          return new Response(JSON.stringify({ error: "這支影片還沒上傳到 Drive" }), { status: 404, headers });
+        }
+        if (!env.GOOGLE_DRIVE_SA_KEY) {
+          return new Response(JSON.stringify({ error: "Drive 未設定" }), { status: 503, headers });
+        }
+
+        try {
+          const upstream = await fetchDriveMediaRange(
+            env.GOOGLE_DRIVE_SA_KEY, photo.drive_original_id, request.headers.get("Range"),
+          );
+          /*
+           * 這幾個標頭少一個 <video> 就不肯讓人拖時間軸：Accept-Ranges 是「可以拖」，
+           * Content-Range／Content-Length 是這一段在哪、有多長。**照抄上游的**，
+           * 不要自己算 —— 算錯的話瀏覽器會在影片中間卡住不動。
+           */
+          const videoHeaders = new Headers();
+          for (const h of ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag"]) {
+            const v = upstream.headers.get(h);
+            if (v) videoHeaders.set(h, v);
+          }
+          // Drive 偶爾回 application/octet-stream，那樣 <video> 直接不收
+          const upType = videoHeaders.get("Content-Type") || "";
+          if (!upType.startsWith("video/")) videoHeaders.set("Content-Type", "video/mp4");
+          if (!videoHeaders.has("Accept-Ranges")) videoHeaders.set("Accept-Ranges", "bytes");
+          videoHeaders.set("Access-Control-Allow-Origin", "*");
+          /*
+           * private ＝ 只准瀏覽器自己留，不准任何共用快取（含 Cloudflare 邊緣）碰。
+           * 這裡的回應是「某個範圍」，共用快取存下來一定會餵錯給別人。
+           */
+          videoHeaders.set("Cache-Control", "private, max-age=31536000, immutable");
+          return new Response(upstream.body, { status: upstream.status, headers: videoHeaders });
+        } catch (e) {
+          console.error("Drive 影片取檔失敗", e);
+          return new Response(JSON.stringify({ error: "影片取檔失敗" }), { status: 502, headers });
         }
       }
 
@@ -2746,16 +2923,21 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const albumId = Number(url.searchParams.get("album_id") ?? 0) || 0;
         const albumClause = albumId ? " AND album_id = ?" : "";
 
+        /*
+         * ⚠️ **一定要排除影片。** 影片的 Drive id 記在 drive_original_id，
+         *    drive_file_id 對它們永遠是 NULL（見 0019）—— 不擋的話每一支影片都會
+         *    賴在待補清單上永遠補不完，而且補傳會拿影片去跑 encode4kWebp。
+         */
         const { results: photos } = await env.DB.prepare(`
           SELECT id, url, file_name, title
             FROM Photo
-           WHERE id > ? AND drive_file_id IS NULL${albumClause}
+           WHERE id > ? AND drive_file_id IS NULL AND media_type = 'photo'${albumClause}
            ORDER BY id LIMIT ?
         `).bind(...(albumId ? [cursor, albumId, limit] : [cursor, limit])).all();
 
         // 剩幾張要另外算：photos 只是這一批，進度條需要總數
         const remaining = await env.DB.prepare(
-          `SELECT COUNT(*) AS n FROM Photo WHERE drive_file_id IS NULL${albumClause}`
+          `SELECT COUNT(*) AS n FROM Photo WHERE drive_file_id IS NULL AND media_type = 'photo'${albumClause}`
         ).bind(...(albumId ? [albumId] : [])).first<any>();
 
         return new Response(JSON.stringify({
@@ -3289,6 +3471,23 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         // 使用者在重複清單裡按了「照樣上傳」才會帶這個旗標
         const allowDuplicate = formData.get('allow_duplicate') === '1';
 
+        /*
+         * 影片跟照片走**同一條上傳路**（0019）。從這支路由的角度看只有兩點不同：
+         *   - 送上來的 thumb／thumb_sm 是瀏覽器擷的**封面圖**，不是縮小的原圖；
+         *   - 原始影片檔由前端直接送 Drive，之後用 /api/photos/:id/drive 記進
+         *     drive_original_id，不經過這裡。
+         * 其餘每一步 —— R2 兩顆物件、重複偵測、FTS、uploaded_by —— 完全一樣，
+         * 所以底下不需要任何 if。
+         *
+         * 白名單比對而不是照收：這個欄位會進 SQL，也會決定 /video 肯不肯代理，
+         * 收一個沒見過的值只會讓後面每一處判斷都變成第三種狀態。
+         */
+        const mediaType = formData.get('media_type') === 'video' ? 'video' : 'photo';
+        const durationRaw = Number(formData.get('duration_ms'));
+        const durationMs = mediaType === 'video' && Number.isFinite(durationRaw) && durationRaw > 0
+          ? Math.round(durationRaw)
+          : null;
+
         if (!thumb || !albumId) {
           // 縮圖產不出來就整張不收：沒有它 R2 這邊一個位元組都沒有，
           // 存進 D1 只會得到一列點不開的照片
@@ -3409,13 +3608,14 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           // random() & 0x7FFFFFFF 保證落在 JS 安全整數內，後端才算得出同樣的種子。
           `INSERT INTO Photo
              (title, file_name, album_id, url, thumb_url, thumb_sm_url, exif, taken_at, file_hash, phash,
-              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by, shuffle_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+              lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by,
+              media_type, duration_ms, shuffle_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
           originalName, fileName, albumId, fileUrl, thumbUrl, thumbSmUrl, exifData,
           uploadTakenAt, fileHash, clientPhash,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
-          uploadTimeSource, me.uid,
+          uploadTimeSource, me.uid, mediaType, durationMs,
         ).run();
 
         const newPhotoId = Number(inserted.meta?.last_row_id ?? 0);
@@ -3432,6 +3632,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           file_hash: fileHash,
           lat: geo.lat,
           lng: geo.lng,
+          media_type: mediaType,
         }), { headers });
       }
 

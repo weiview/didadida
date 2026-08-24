@@ -221,6 +221,33 @@ export async function fetchDriveMedia(saKeyJson: string, fileId: string): Promis
 }
 
 /**
+ * 影片用的取檔：**把瀏覽器的 Range 原封轉給 Drive，回應也原封帶回來**。
+ *
+ * 跟 fetchDriveMedia 分開而不是加個參數，是因為兩邊對「成功」的定義不一樣：
+ * 這裡的 206（部分內容）與 416（範圍要不到）都是正常結果，要照原樣交給
+ * <video>，不能當成錯誤丟掉。判斷失敗只看 5xx／401 那一類。
+ *
+ * ⚠️ 一定要轉發 Range。整支回整份的話，使用者每拖一次時間軸就是重下一次
+ *    整部影片 —— 2GB 的檔在手機上等於直接沒得看。
+ *
+ * ⚠️ 位元組**不落地也不進 Worker 的記憶體**：回傳的是上游的 body 串流，
+ *    Worker 只是把它接上下一段。128MB 記憶體上限與這裡的檔案大小無關。
+ */
+export async function fetchDriveMediaRange(
+  saKeyJson: string, fileId: string, range: string | null,
+): Promise<Response> {
+  const token = await getAccessToken(saKeyJson);
+  const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+  if (range) headers.Range = range;
+  const res = await fetch(`${DRIVE_FILES_URL}/${encodeURIComponent(fileId)}?alt=media`, { headers });
+  // 206／416 都放行，其餘不是 2xx 的才算取檔失敗
+  if (!res.ok && res.status !== 416) {
+    throw new Error(`Drive 影片取檔失敗 (${res.status})`);
+  }
+  return res;
+}
+
+/**
  * 把檔案搬到另一個資料夾。刪照片時用它送進 `didadida/trash/`。
  *
  * Drive 沒有「移動」這個動作，只有改 parents，而且 `removeParents` 必須指名

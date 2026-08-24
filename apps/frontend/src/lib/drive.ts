@@ -364,6 +364,10 @@ export async function ensureAlbumFolder(
  *
  * 用 multipart 而不是 resumable：這裡最大的檔是相機原始檔，幾 MB 而已，
  * resumable 要多一趟往返去開工作階段，對這個大小不划算。
+ *
+ * ⚠️ **影片不要走這支**，走 uploadToDriveResumable。multipart 是「整個檔一次
+ *    POST 出去」：幾 GB 的檔要嘛中途斷線整份重來、要嘛在手機上直接把分頁
+ *    撐爆，而且完全沒有進度可以回報。
  */
 export async function uploadToDrive(
   token: string,
@@ -388,6 +392,158 @@ export async function uploadToDrive(
   const data = await res.json();
   if (!data?.id) throw new Error('Drive 上傳沒有回傳 file id');
   return data.id;
+}
+
+/**
+ * 分塊上傳的塊大小。**必須是 256KB 的整數倍**（Drive 的硬性要求，不然回 400）。
+ *
+ * 8MB 是折衷：太小的話 2GB 要切成幾千塊、每塊一趟往返；太大的話一塊失敗要重來
+ * 的量就大，而且行動網路上單次請求越久越容易被中斷。
+ */
+const RESUMABLE_CHUNK_BYTES = 8 * 1024 * 1024;
+/** 單一塊連續失敗幾次就放棄整支 */
+const RESUMABLE_MAX_RETRY = 4;
+
+/**
+ * 分塊（resumable）上傳，給影片用。回傳 file id。
+ *
+ * 為什麼影片非這樣不可：
+ *   - multipart 是一次 POST 整份，2GB 中途斷線就是整份重來；
+ *   - 分塊才有辦法回報進度（`onProgress`），不然使用者要對著一條不動的
+ *     進度條等十幾分鐘，那正是「以為當掉了」的情境；
+ *   - 斷了可以接著傳 —— 問 Drive 收到哪個位元組了，從那裡繼續。
+ *
+ * ⚠️ **每一塊的 PUT 不帶 Authorization**：工作階段網址（session URI）本身就是
+ *    授權過的，而它裡面帶著 upload_id。這也讓長時間上傳不怕 access token 過期
+ *    ——token 只在開工作階段那一趟用到，之後一小時的效期跟上傳無關。
+ *
+ * ⚠️ 要讀得到回應的 `Location` 與 `Range` 兩個標頭，靠的是 Google 自己在 CORS
+ *    回應裡把它們列進 Access-Control-Expose-Headers。**不要改成走 Worker 代理**
+ *    —— 那會讓幾 GB 的位元組穿過 Worker（100MB 請求體上限，直接爆）。
+ *
+ * `File.slice()` 是惰性的，切出來的塊不會把整個檔案讀進記憶體。
+ */
+export async function uploadToDriveResumable(
+  token: string,
+  file: File,
+  name: string,
+  folderId: string,
+  onProgress?: (sent: number, total: number) => void,
+): Promise<string> {
+  const start = await fetch(`${DRIVE_UPLOAD}?uploadType=resumable&fields=id`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json; charset=UTF-8',
+      // 先報總長度與型別，Drive 才知道要開多大的工作階段
+      'X-Upload-Content-Type': file.type || 'application/octet-stream',
+      'X-Upload-Content-Length': String(file.size),
+    },
+    body: JSON.stringify({ name, parents: [folderId] }),
+  });
+  if (!start.ok) {
+    const detail = await start.text().catch(() => '');
+    throw new Error(`Drive 開上傳工作階段失敗 ${start.status}: ${detail.slice(0, 200)}`);
+  }
+  const session = start.headers.get('Location');
+  if (!session) throw new Error('Drive 沒有回傳上傳工作階段的網址');
+
+  let offset = 0;
+  let attempt = 0;
+  onProgress?.(0, file.size);
+
+  while (offset < file.size) {
+    const end = Math.min(offset + RESUMABLE_CHUNK_BYTES, file.size);
+    let res: Response;
+    try {
+      res = await fetch(session, {
+        method: 'PUT',
+        // bytes <起>-<迄>/<總長>，迄是含端點
+        headers: { 'Content-Range': `bytes ${offset}-${end - 1}/${file.size}` },
+        body: file.slice(offset, end),
+      });
+    } catch (err) {
+      // 斷線。問一次 Drive 到底收到哪了再從那裡接，不要盲目重送同一塊
+      if (++attempt > RESUMABLE_MAX_RETRY) throw err;
+      await sleep(attempt * 1000);
+      offset = await resumeOffset(session, file.size);
+      onProgress?.(offset, file.size);
+      continue;
+    }
+
+    // 308 ＝ 還沒收完，繼續。Range 講的是「目前為止收到哪」
+    if (res.status === 308) {
+      attempt = 0;
+      offset = rangeEnd(res.headers.get('Range')) ?? end;
+      onProgress?.(offset, file.size);
+      continue;
+    }
+
+    if (res.ok) {
+      onProgress?.(file.size, file.size);
+      const data = await res.json().catch(() => null);
+      if (!data?.id) throw new Error('Drive 上傳完成卻沒有回傳 file id');
+      return data.id as string;
+    }
+
+    // 5xx 是 Drive 自己的問題，退一步再接著傳；4xx 是我們送錯了，重試沒有意義
+    if (res.status >= 500 && ++attempt <= RESUMABLE_MAX_RETRY) {
+      await sleep(attempt * 1000);
+      offset = await resumeOffset(session, file.size);
+      onProgress?.(offset, file.size);
+      continue;
+    }
+    const detail = await res.text().catch(() => '');
+    throw new Error(`Drive 分塊上傳失敗 ${res.status}: ${detail.slice(0, 200)}`);
+  }
+
+  throw new Error('Drive 分塊上傳沒有收到完成回應');
+}
+
+/** 問 Drive「這個工作階段目前收到哪個位元組了」，回傳下一塊該從哪開始 */
+async function resumeOffset(session: string, total: number): Promise<number> {
+  const res = await fetch(session, {
+    method: 'PUT',
+    // 星號 ＝ 這次不送內容，只是問進度
+    headers: { 'Content-Range': `bytes */${total}` },
+  });
+  if (res.status === 308) return rangeEnd(res.headers.get('Range')) ?? 0;
+  // 200/201 代表其實已經傳完了；讓外層那一圈自己收尾
+  if (res.ok) return total;
+  throw new Error(`Drive 查詢上傳進度失敗 ${res.status}`);
+}
+
+/** `bytes=0-8388607` → 8388608（下一塊的起點） */
+function rangeEnd(header: string | null): number | null {
+  const m = header?.match(/bytes=0-(\d+)/);
+  return m ? Number(m[1]) + 1 : null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * 把一支影片的原始檔送上 Drive，再把 file id 記回 D1。
+ *
+ * ⚠️ **失敗一定要往外丟，不要像照片那樣吞掉。** 照片吞得起是因為 R2 上有
+ *    800px 可看，Drive 只是備份；影片在 R2 只有一張封面圖，Drive 沒上去
+ *    就等於相簿裡多一格點開只有靜止畫面的東西。呼叫端接到錯誤後會把剛建的
+ *    那一列刪掉，讓使用者看到「失敗」而不是一格壞掉的影片。
+ *
+ * ⚠️ file id 記在 **drive_original_id**（不是 drive_file_id）—— 影片沒有
+ *    「衍生的 4K」那一份，上去的就是原始檔（見 migrations/0019）。
+ */
+export async function pushVideoToDrive(
+  target: { folderId: string; token: string },
+  photoId: number,
+  file: File,
+  onProgress?: (sent: number, total: number) => void,
+): Promise<boolean> {
+  const driveOriginalId = await uploadToDriveResumable(
+    target.token, file, `${photoId}_${file.name}`, target.folderId, onProgress,
+  );
+  return await recordPhotoDrive(photoId, { driveFileId: null, driveOriginalId });
 }
 
 /**

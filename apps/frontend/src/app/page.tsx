@@ -9,6 +9,7 @@ import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import PhotoLightbox from "./album/PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
+import PhotoImage, { PhotoSpinner } from "@/components/PhotoImage";
 import FilterBottomSheet from "@/components/FilterBottomSheet";
 import FabMenu from "@/components/FabMenu";
 import BottomActionBar from "@/components/BottomActionBar";
@@ -54,6 +55,29 @@ function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, dr
     if (!hovered) return;
     setMountedCount((c) => Math.max(c, Math.min(previews.length, photoIndex + 2)));
   }, [hovered, photoIndex, previews.length]);
+
+  /*
+   * 封面是 CSS 背景圖，而背景圖沒有 onLoad 可以接。用一個離線的 Image() 問它載完了沒
+   * —— 同一個網址瀏覽器只抓一次，背景圖那邊直接吃快取，不會多一次請求。
+   *
+   * 沒有封面的相簿（畫的是相簿名字）一開始就算載好了，不然會掛一個永遠不停的轉圈圈。
+   */
+  const [coverLoaded, setCoverLoaded] = useState(!album.cover_photo_url);
+  useEffect(() => {
+    const url = album.cover_photo_url;
+    if (!url) { setCoverLoaded(true); return; }
+    setCoverLoaded(false);
+    const probe = new Image();
+    probe.src = url;
+    // 已經在快取裡的話 complete 當場就是 true，等 onload 會等不到
+    if (probe.complete) { setCoverLoaded(true); return; }
+    let alive = true;
+    // 載不出來也要收掉轉圈圈，不然壞掉的封面會一直轉
+    const done = () => { if (alive) setCoverLoaded(true); };
+    probe.onload = done;
+    probe.onerror = done;
+    return () => { alive = false; };
+  }, [album.cover_photo_url]);
 
   const coverText = album.name;
 
@@ -124,6 +148,8 @@ function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, dr
               {coverText}
             </span>
           )}
+
+          {!coverLoaded && <PhotoSpinner />}
         </div>
         <h2 className={styles.albumTitle}>{album.name}</h2>
         <p className={styles.albumMeta}>
@@ -833,12 +859,11 @@ export default function Home() {
                     className={albumStyles.photoCard}
                     onClick={() => setSelectedPhotoIndex(index)}
                   >
-                    <img
+                    <PhotoImage
                       src={photoThumbSrc(photo, 'md')}
                       alt={photo.title}
-                      className={albumStyles.photoImage} 
-                      loading="lazy" 
-                      decoding="async" 
+                      className={albumStyles.photoImage}
+                      lazy
                     />
                     <div className={albumStyles.photoOverlay}>
                       <h3 className={albumStyles.photoTitle}>{photo.title}</h3>

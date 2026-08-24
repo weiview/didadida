@@ -1,0 +1,74 @@
+/*
+ * 照片載入狀態的共用外觀。首頁、相簿格線、燈箱三個地方都走這一份 ——
+ * 轉圈圈與淡入各寫一套遲早會走鐘。
+ *
+ * ⚠️ 顏色刻意用中性灰，不用 var(--text-light) 也不用純白：這些東西同時要蓋在
+ *    相簿卡片的 #f0f0f0 與燈箱的純黑上，任何偏亮或偏暗的顏色都會在其中一邊消失。
+ */
+
+.wrapper {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+/*
+ * 兩張圖疊在一起：低解析度那張先頂著，高解析度載好之後淡入蓋掉它。
+ *
+ * ⚠️ 刻意不設 object-fit —— 那由呼叫端的 className 決定（格線 cover、燈箱 contain）。
+ *    兩邊都是單一 class、同一個層級，寫在這裡的話誰蓋掉誰要看 CSS module 的打包順序，
+ *    不可靠。這裡只管位置與淡入。
+ */
+.layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.main {
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+
+.mainLoaded {
+  opacity: 1;
+}
+
+/* 轉圈圈。位置用 margin 負值而不是 transform：transform 要留給旋轉本身 */
+.spinner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 28px;
+  height: 28px;
+  margin: -14px 0 0 -14px;
+  border: 2px solid rgba(128, 128, 128, 0.3);
+  border-top-color: rgba(128, 128, 128, 0.85);
+  border-radius: 50%;
+  animation: photoImageSpin 0.8s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes photoImageSpin {
+  to { transform: rotate(360deg); }
+}
+
+/*
+ * 「還有更清晰的版本在路上」的角落提示。跟燈箱的 .qualityNote 用同一套視覺語言
+ * （同樣的底色、字級、位置邏輯），因為它們是同一類東西 —— 關於畫質的狀態說明。
+ * 錨在左上，左下留給 .qualityNote。
+ */
+.pending {
+  position: absolute;
+  left: 12px;
+  top: 10px;
+  z-index: 2;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 0.7rem;
+  line-height: 1.4;
+  pointer-events: none;
+}

@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from "react";
 import styles from "./lightbox.module.css";
 import PhotoComments from "./PhotoComments";
-import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc } from "@/lib/api";
+import PhotoImage from "@/components/PhotoImage";
+import VideoPlayer from "@/components/VideoPlayer";
+import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, isVideo } from "@/lib/api";
 import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
 
@@ -211,8 +213,32 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           onTouchMove={onTouchMoveEvent}
           onTouchEnd={onTouchEndEvent}
         >
+          {/*
+            * 影片與照片在這裡分岔。
+            *
+            * ⚠️ 影片**不能走下面那套判斷**：它的 Drive file id 記在 drive_original_id，
+            *    drive_file_id 永遠是 null（見 migrations/0019）—— 不先擋掉的話每一支
+            *    影片都會掛上「Drive 沒接上，顯示的是 800px 縮圖」，而那是假的。
+            */}
+          {isVideo(photo) ? (
+            <VideoPlayer photo={photo} />
+          ) : (
+            <>
           {/* 走 Worker 代理拿 Drive 的 4K；沒有的話那條路由自己會退回 R2 的 800px */}
-          <img src={photoFullSrc(photo)} alt={photo.title} className={styles.image} />
+          {/*
+            * 縮圖先頂著、Drive 的 4K 載好再淡入蓋掉。使用者是從格線點進來的，
+            * 那張 800px 已經在瀏覽器快取裡 —— 於是點開的瞬間就有畫面，不是黑的。
+            *
+            * pendingLabel 只在真的有 4K 可等的時候給：沒搬上 Drive 的照片，
+            * /full 會 302 回同一張 800px，掛「載入中」等於承諾一個不會來的東西。
+            */}
+          <PhotoImage
+            src={photoFullSrc(photo)}
+            placeholderSrc={photoThumbSrc(photo, 'md')}
+            alt={photo.title}
+            className={styles.image}
+            pendingLabel={photo.drive_file_id ? '高畫質載入中…' : null}
+          />
           {/*
             * R2 只存縮圖，大圖唯一的來源是 Drive。沒有 drive_file_id 就代表現在看到的
             * 是 800px 的相簿縮圖 —— 不講的話使用者只會覺得「這張怎麼有點糊」。
@@ -223,6 +249,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             <span className={styles.qualityNote}>
               Drive 沒接上或缺這張備份，顯示的是 800px 縮圖
             </span>
+          )}
+            </>
           )}
           {hasPrev && (
             <button className={`${styles.navButton} ${styles.prevButton}`} onClick={(e) => { e.stopPropagation(); onPrev?.(); }}>

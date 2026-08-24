@@ -1,0 +1,40 @@
+/*
+ * 影片在燈箱裡的外框。撐滿 imageContainer 那一格並置中，讓直式與橫式的影片
+ * 都完整看得到（跟照片的 object-fit: contain 是同一個意思）。
+ *
+ * position: relative 是必要的 —— PhotoSpinner 是絕對定位，錨點要是這一格。
+ */
+.wrapper {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.video {
+  max-width: 100%;
+  max-height: 100%;
+  /* 沒有這一行，Safari 會讓 <video> 撐出自己的固有尺寸而溢出容器 */
+  width: auto;
+  height: auto;
+  display: block;
+  background: #000;
+}
+
+.error {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  max-width: 80%;
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.6);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 0.85rem;
+  line-height: 1.6;
+  text-align: center;
+}

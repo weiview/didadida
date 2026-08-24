@@ -11,9 +11,24 @@ const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8787/a
  */
 const SITE_TOKEN_KEY = 'admin_token';
 
+/**
+ * 圖片／影片的簽章網址要用的那張 token。
+ *
+ * 為什麼需要第二把：`<img src>` 與 `<video src>` 不會帶 Authorization，所以
+ * `/api/photos/:id/full` 沒辦法靠上面那張進站 token 保護 —— 而它吃的是**流水號**，
+ * 以前不帶 token 從 1 數上去就能把整個站的 Drive 4K 抓完。現在後端要求網址帶
+ * `?mt=`（見後端的 mintMediaToken 與 isSignedMediaPath）。
+ *
+ * 這張**不是身分**，只證明「這個網址是站上發出來的」。效期跟進站 token 同一個
+ * 7 天，而且每次 checkAuth() 都換一張新的 —— 所以不需要任何續期邏輯。
+ */
+const MEDIA_TOKEN_KEY = 'media_token';
+
 function clearSiteToken(): void {
   if (typeof window === 'undefined') return;
   localStorage.removeItem(SITE_TOKEN_KEY);
+  // 兩張一起清。留一張下來只會讓大圖在下次進站前安靜地 401
+  localStorage.removeItem(MEDIA_TOKEN_KEY);
 }
 
 function getAuthHeaders() {
@@ -122,9 +137,35 @@ export function photoThumbSrc(
  * 那條路由自己會處理「還沒搬上 Drive」與「Drive 掛掉」，退回 R2 的 2000px。
  *
  * 前端因此不需要知道 drive_file_id 有沒有值 —— 也不該知道，那是後端的事。
+ *
+ * ⚠️ 網址一定要帶 `mt`（見 MEDIA_TOKEN_KEY）。這條路由已經不在進站閘門的白名單上，
+ *    沒帶簽章一律 401 —— 而 `<img>` 的 401 在畫面上就只是一張破圖，很難查。
  */
 export function photoFullSrc(photo: { id: number }): string {
-  return `${API_BASE_URL}/photos/${photo.id}/full`;
+  const base = `${API_BASE_URL}/photos/${photo.id}/full`;
+  const mt = typeof window !== 'undefined' ? localStorage.getItem(MEDIA_TOKEN_KEY) : null;
+  // 沒有就照原樣送出去讓後端擋掉。在這裡自己判斷「應該有才對」修不了任何事，
+  // 而 checkAuth() 每次進站都會補上一張新的
+  return mt ? `${base}?mt=${encodeURIComponent(mt)}` : base;
+}
+
+/**
+ * 影片的播放網址。跟 photoFullSrc 是同一個模式（Worker 代理 Drive、要帶 mt），
+ * 差別是那條路由會轉發 Range —— `<video>` 拖時間軸靠的就是它。
+ *
+ * ⚠️ **不要加 `crossOrigin` 屬性**。不加的話 `<video src>` 走的是 no-cors，
+ *    跟 `<img>` 一樣不需要預檢；加了就變成 CORS 請求，Range 會多一次預檢，
+ *    而我們也沒有任何理由去讀那個回應的內容。
+ */
+export function photoVideoSrc(photo: { id: number }): string {
+  const base = `${API_BASE_URL}/photos/${photo.id}/video`;
+  const mt = typeof window !== 'undefined' ? localStorage.getItem(MEDIA_TOKEN_KEY) : null;
+  return mt ? `${base}?mt=${encodeURIComponent(mt)}` : base;
+}
+
+/** 這一格是影片還是照片。舊資料沒有 media_type，一律當照片 */
+export function isVideo(photo: { media_type?: string | null }): boolean {
+  return photo.media_type === 'video';
 }
 
 export interface Photo {
@@ -149,6 +190,17 @@ export interface Photo {
    * 燈箱會退回 800px 並在角落標示。補傳 Drive 之後就會有值。
    */
   drive_file_id?: string | null;
+  /**
+   * `'video'` ＝ 這一格是影片：R2 上只有封面圖，實際內容在 Drive，
+   * 播放走 `photoVideoSrc()`。舊資料沒有這個欄位，undefined 一律當照片。
+   *
+   * ⚠️ 影片的 Drive file id 記在 `drive_original_id`，**`drive_file_id` 永遠是
+   *    null** —— 所以燈箱那句「Drive 沒接上，顯示 800px 縮圖」對影片不成立，
+   *    要先擋掉再判斷（見 migrations/0019）。
+   */
+  media_type?: 'photo' | 'video';
+  /** 影片長度（毫秒），格線右下角那個「0:42」。null ＝ 抓不到，就不畫 */
+  duration_ms?: number | null;
   sort_order: number;
   taken_at?: string;
   /** 牆上時間 'YYYY-MM-DD HH:MM:SS'，顯示與行程段比對都用這個 */
@@ -428,6 +480,13 @@ export async function checkAuth(): Promise<AuthState> {
     const res = await fetch(`${API_BASE_URL}/auth/me`, { headers: getAuthHeaders() });
     if (res.ok) {
       const data = await res.json();
+      /*
+       * 大圖簽章 token 順手收起來（見 MEDIA_TOKEN_KEY）。
+       * 舊後端不回這個欄位 —— 那就不要動已經存著的那張，蓋成空字串會讓每一張大圖都 401。
+       */
+      if (typeof data.media_token === 'string' && data.media_token) {
+        localStorage.setItem(MEDIA_TOKEN_KEY, data.media_token);
+      }
       return {
         admin: !!data.admin,
         guest: !!data.guest,
@@ -1285,6 +1344,14 @@ export type UploadResult =
   | { status: 'duplicate'; reason: 'same_file' | 'same_time'; existing: DuplicateMatch[] }
   | { status: 'error' };
 
+/**
+ * 上傳一張照片 —— **影片也走這一支**。
+ *
+ * 影片的話 `file` 給的是瀏覽器擷出來的**封面圖**（見 lib/videoUtils），
+ * 再用 `video` 這個選填參數補上原始檔名與長度。R2 那兩顆縮圖、重複偵測、
+ * FTS、uploaded_by 全部沿用同一條路 —— 影片與照片在相簿裡本來就是同一格。
+ * 原始影片檔不經過這裡，由 pushVideoToDrive 直接送 Drive。
+ */
 export async function uploadPhoto(
   albumId: string,
   file: File,
@@ -1292,12 +1359,18 @@ export async function uploadPhoto(
   takenAt?: string,
   /** 使用者在重複清單裡選了「照樣上傳」才給 true */
   allowDuplicate = false,
+  /** 有值就代表這一格是影片，`file` 是它的封面圖 */
+  video?: { fileName: string; durationMs: number },
 ): Promise<UploadResult> {
   const formData = new FormData();
   formData.append('album_id', albumId);
   // 檔名要另外送：R2 只收縮圖，而縮圖的 blob 沒有原始檔名
-  formData.append('filename', file.name);
+  formData.append('filename', video ? video.fileName : file.name);
   if (allowDuplicate) formData.append('allow_duplicate', '1');
+  if (video) {
+    formData.append('media_type', 'video');
+    formData.append('duration_ms', String(Math.round(video.durationMs)));
+  }
 
   /*
    * **只送兩張縮圖，不再送 2000px 那份**（2026-08-14）。

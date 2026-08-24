@@ -36,6 +36,8 @@ apps/backend/
 apps/frontend/
   src/app/           App Router：/ (首頁)、/album、/map、/admin
   src/components/    FootprintMap.tsx 是最大的一支（maplibre-gl，dynamic import 禁 SSR）
+                     VideoPlayer.tsx 是燈箱裡的影片播放器（見「影片」）
+  src/lib/videoUtils.ts      封面圖擷取、長度格式化、可收的影片型別
   src/lib/api.ts     唯一的 API 客戶端
   functions/_middleware.ts   Pages Function：非台灣來源直接 403
 database/
@@ -56,9 +58,28 @@ OPTIONS 直接回（快取一天）
 
 閘門白名單只有兩類，**不要隨手加第三類**：換 token 的入口
 （`/api/verify-password`、`/api/verify-guest`、`/api/auth/me`、`/api/auth/google/*`），
-以及圖片（`/api/photos/view/*`、`/api/photos/:id/full`）—— 圖片是 `<img src>`，
-瀏覽器不會幫忙帶 Authorization，而 R2 的物件鍵要先拿到（鎖著的）相簿 JSON 才知道。
+以及**護欄是「網址猜不到」的圖片**（`/api/photos/view/*` 的 R2 物件鍵帶時間戳＋亂數、
+`/api/users/avatar/*` 的檔名帶亂數）—— 圖片是 `<img src>`，瀏覽器不會幫忙帶
+Authorization，而 R2 的物件鍵要先拿到（鎖著的）相簿 JSON 才知道。
 **新路由預設就是關的**，這是刻意的。
+
+閘門另外認一條路：**媒體的簽章網址**。`isSignedMediaPath()` 那張表上的 GET
+可以用 `?mt=<簽章>` 代替 Authorization。目前是 `/api/photos/:id/full` 與
+`/api/photos/:id/video` 兩條（`<img src>`／`<video src>` 都不會帶 Authorization）。
+
+- ⚠️ `/api/photos/:id/full` **不在白名單上**（2026-08-24 移走）。它吃的是
+  AUTOINCREMENT 的流水號，「猜不到」那個護欄對它從來沒成立過 —— 任何台灣 IP 不帶
+  token 從 1 數上去就能抓完整站的 Drive 4K。**不要為了「圖片要放行」把它加回去。**
+- `mt` 是 `mintMediaToken()` 發的 `<到期秒>.<HMAC>`（金鑰同 `APP_PASSWORD`，效期同
+  進站 token 的 7 天），跟著 `GET /api/auth/me` 回來（零額外請求），
+  前端存在 `localStorage.media_token`，由 `photoFullSrc()`／`photoVideoSrc()` 掛上網址。
+- **`mt` 不是身分**，只證明「這個網址是站上發出來的」。拿它打 `/api/albums` 一樣 401；
+  要知道「是誰」的路由照樣得走 `currentActor()`。
+- **不是每張照片各簽一組**：相簿內容那支路由不分頁，5000 張的相簿逐張簽等於一次請求
+  跑 5000 趟 `crypto.subtle.sign`，遠超單次 10ms CPU。`/full` 回的是圖片位元組、
+  內容不隨身分變化，所以「證明你進得了站」就是剛好的粒度。
+- ⚠️ `/full` 的 **cache key 一定要把 `mt` 拿掉**（`searchParams.delete("mt")`）。
+  留著的話每個人、每次登入都是一份獨立的邊緣快取，Drive 取檔次數直接乘上人數。
 
 身分用 `currentActor(request, env)` 拿，它有 `WeakMap<Request>` 快取 ——
 同一個請求裡問幾次都只查一次 D1，**不要自己再 `SELECT … FROM User`**，那是白花讀取額度。
@@ -98,7 +119,8 @@ OPTIONS 直接回（快取一天）
   產 800／400 進 R2 → `pushPhotoToDrive` 送 4K ＋原始檔進 Drive）。
   舊的 `sync-photo` 把原始檔整份塞進 R2、不產縮圖、也不上 Drive，跟儲存模型相反。
   重複偵測、補地點、Drive 待補清單也因此自動跟著有了。
-- ⚠️ **瀏覽器端不再存任何 Google token**，`localStorage` 只剩站上的 `admin_token`。
+- ⚠️ **瀏覽器端不再存任何 Google token**。`localStorage` 只有站上自己的兩張：
+  `admin_token`（進站 JWT）與 `media_token`（大圖／影片的簽章，見「後端的請求流程」）。
 
 ## 三個環境
 
@@ -203,7 +225,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0017）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0019）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
@@ -235,7 +257,8 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - 站長在 `/admin` 加人、給權限、停權。移出白名單是**停權（`active=0`）不是刪列**。
 - 真的要刪帳號時，`Album.user_id` 是 `NOT NULL + CASCADE`，**改掛站長一定要排在刪 `User` 之前**。
 - 前端判斷是不是管理員**只能用 `useAdmin()`**（context，Provider 在 `layout.tsx`，走 `GET /api/auth/me`）。
-  不要自己讀 localStorage —— localStorage 只有 `admin_token`（JWT）。
+  不要自己讀 localStorage —— 那裡只有 `admin_token`（進站 JWT）與 `media_token`（圖片簽章），
+  兩張都不說「我是誰」。
 - 照片歸屬看 `Photo.uploaded_by`，`NULL` 時回頭看相簿主人。算數量時**不要寫 `COALESCE`**
   （包在函式裡吃不到索引），要拆成 `uploaded_by = ?` 與 `uploaded_by IS NULL AND a.user_id = ?` 兩段。
 - `photo_count`（他的相簿裡總共幾張，含別人傳的）與 `uploaded_count`（他自己傳了幾張，
@@ -331,6 +354,47 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   打 PK，語句順序 mention→reply→photo→album，同一個人只收一則、理由取最貼切的那個。
 - ⚠️ 留言那幾條路由**都不可以包 `withEdgeCache`** —— 回應裡有家人的顯示名稱。
 
+## 影片
+
+2026-08-24 加的。**影片與照片在相簿裡是同一格**：同一張 `Photo` 表、同一個排序、
+同樣能設封面／加標籤／留言／刪除。差別只在內容放哪、怎麼播。
+
+- `Photo.media_type`（`'photo'`／`'video'`，DEFAULT `'photo'`）與 `duration_ms`（0019）。
+  預設值就是為了**不對 prod 幾千列做 backfill UPDATE**。
+- ⚠️ **影片的 Drive file id 記在 `drive_original_id`，`drive_file_id` 永遠是 NULL。**
+  照片那兩欄的意思是「衍生的 4K」與「相機原始檔」，而影片沒有衍生版 —— 傳上去的
+  就是原始檔。這樣 `recordPhotoDrive`、`DriveTrash` 刪除、記錄路由全部零修改沿用。
+  代價是「`drive_file_id` 是不是 NULL」對影片不代表「沒備份」，已知會咬人的有兩處，
+  都處理過了：`/api/photos/drive-pending`（列表與 COUNT 都加了 `AND media_type = 'photo'`，
+  不然每支影片都會永遠卡在補傳清單裡，而補傳會對影片跑 `encode4kWebp`）、
+  以及燈箱那句「Drive 沒接上，顯示 800px 縮圖」（先用 `isVideo()` 分岔掉）。
+- **上傳走瀏覽器直傳 Drive 的 resumable 分塊**（`uploadToDriveResumable`，8MB 一塊，
+  必須是 256KB 的整數倍）。⚠️ **不要改成經過 Worker** —— Worker 請求體上限 100MB，
+  幾 GB 的檔直接爆。分塊 PUT **不帶 Authorization**（工作階段網址本身就授權過了），
+  所以傳一小時也不怕 access token 過期。`File.slice()` 是惰性的，不會把整個檔讀進記憶體。
+- 封面圖在**瀏覽器**擷（`lib/videoUtils.ts` `captureVideoPoster`）：`<video>` 載入 →
+  seek 到第 1 秒（很多相機第一格是全黑）→ canvas → WebP → 走**一般照片那條上傳路**
+  （`/api/upload` ＋ `media_type=video`）。於是重複偵測、FTS、`uploaded_by`、R2 兩顆
+  縮圖全部自動跟著有。
+- ⚠️ **影片的 Drive 失敗語意跟照片相反**：照片吞得起（R2 上有 800px 可看），
+  影片吞不起（R2 只有封面）。所以 `pushVideoToDrive` **失敗往外丟**，呼叫端
+  `deletePhoto()` 把剛建的那一列收掉 —— 使用者看到「失敗」，不是相簿裡多一格
+  點開只有靜止畫面的東西。`ingestSources` 與 `resolveDuplicate` 兩處都要。
+  ⚠️ 影片**不可以進 `pendingDriveBatch`**，那條會對它跑 `pushPhotoToDrive` → `encode4kWebp`。
+- 播放走 `GET /api/photos/:id/video`（`fetchDriveMediaRange`），跟 `/full` 的三個刻意差異：
+  ① **轉發 `Range`**，206／416 原樣帶回來 —— `<video>` 拖時間軸靠的就是它；
+  ② ⚠️ **不進 `caches.default`** —— Cache API 一個網址只存一份完整回應，把某人的 206
+  存成「這個網址的答案」會餵給下一個人錯誤的位元組。回應是 `Cache-Control: private`；
+  ③ **沒有退路** —— 照片拿不到 Drive 還能 302 回 R2 的 800px，影片在 R2 只有封面。
+  位元組是**串流**出去的（回傳上游的 `body`），不落地、不進 Worker 記憶體。
+- 前端 `<video>` **不要加 `crossOrigin`**：不加是 no-cors，跟 `<img>` 一樣免預檢；
+  加了 Range 會多一次預檢，而我們也沒有要讀回應內容。`preload="metadata"` 不是 `auto`
+  —— 幾 GB 的檔不能一進燈箱就自動下載。
+- 燈箱裡拖時間軸時，`VideoPlayer` 的外框**擋掉 touch 事件冒泡**，不然手機上會被
+  燈箱當成「滑到下一張」。
+- **訪客看不到影片**這件事目前沒有另外的開關 —— 整站進站閘門本來就擋著。
+- 轉檔／第二種畫質（P4）**使用者明確延後**，先看實際讀取速度再決定。
+
 ## 儲存模型
 
 - **R2 一張照片只有兩顆縮圖：800px ＋ 400px WebP。** 2000px 那顆已經拿掉。
@@ -346,6 +410,8 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   值早就失效也算數，於是「請站長重新登入」變成一句做不到的指示。真的卡死過。
   ⚠️ 同意畫面**早就是正式發布狀態，沒有「測試中 7 天到期」這回事**，
   `invalid_grant` 不要往那個方向查。
+- **影片：原始檔整份在 Drive，R2 只有一張封面圖。** 沒有轉檔、沒有第二種畫質，
+  播放就是把 Drive 的位元組經 Worker 轉出來（見「影片」）。
 - 三個環境寫進同一個 Drive，靠 `DRIVE_ROOT_FOLDER` 分資料夾名。
   ⚠️ `findOwnFolder` **照名字找**，Drive 裡留著同名舊資料夾會被直接接管。
 - GPS 軌跡：家人把自己的 GPSLogger 資料夾分享給 service account，`/admin` 按「掃描並自動綁定」，
@@ -381,6 +447,13 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 9. FootprintMap 的 emoji 一律 canvas → `addImage`，**不可進 `text-field`**（底圖 SDF 字型沒有 emoji 字符）。
 10. `apps/backend/` 根目錄躺著幾十個 `check_*.sql` / `print_*.js` 之類的一次性查詢腳本，
     已被 `.gitignore` 擋掉、**不是架構的一部分**。
+11. 顯示照片一律走 `components/PhotoImage.tsx`（轉圈圈→placeholder→淡入），**不要再寫裸的
+    `<img>`**。燈箱傳 `placeholderSrc={photoThumbSrc(photo,'md')}` 讓快取裡那張先頂著。
+    `.layer` 刻意不設 `object-fit`，由呼叫端的 class 決定（格線 `cover`、燈箱 `contain`）——
+    兩邊都是單一 class，寫進共用檔會變成看 CSS module 打包順序。
+    ⚠️ **首頁相簿封面是 CSS 背景圖，不要改成 `<img>` 套 PhotoImage** ——
+    背景圖＋延後掛載（`mountedCount`）省掉的是「相簿數 × 預覽張數」次 Workers 請求。
+    那裡用離線 `new Image()` 探載入狀態，配 `PhotoSpinner`。
 
 ## 工作習慣
 

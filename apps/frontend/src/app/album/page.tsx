@@ -5,7 +5,7 @@ import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
 import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
-import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive } from "@/lib/drive";
+import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive, pushVideoToDrive } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
@@ -15,9 +15,11 @@ import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import PlaceCheckinModal from "@/components/PlaceCheckinModal";
 import DriveBackfillModal from "@/components/DriveBackfillModal";
 import { resizeImageFile } from "@/lib/imageUtils";
+import { ACCEPTED_VIDEO_TYPES, captureVideoPoster, formatDuration, isVideoFile } from "@/lib/videoUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
+import PhotoImage from "@/components/PhotoImage";
 import FilterBottomSheet from "@/components/FilterBottomSheet";
 import FabMenu, { type FabAction } from "@/components/FabMenu";
 import BottomActionBar from "@/components/BottomActionBar";
@@ -39,7 +41,31 @@ type PendingDuplicate = {
   takenAt?: string;
   reason: 'same_file' | 'same_time';
   existing: DuplicateMatch[];
+  /**
+   * 有值就代表這一格是影片：`resized` 是封面圖、`file` 是原始影片檔。
+   * 重複視窗那邊長得一模一樣（左邊就是封面），只有「照樣上傳」時要走
+   * pushVideoToDrive 而不是 pushPhotoToDrive。
+   */
+  video?: { fileName: string; durationMs: number };
 };
+
+/**
+ * 整批的完成比例。有位元組進度的話，把「現在這個檔傳了幾成」也算進去 ——
+ * 否則一支 2GB 的影片會讓進度條在同一格停十幾分鐘，看起來就是當掉了。
+ */
+function uploadFraction(p: { current: number; total: number; bytes?: { sent: number; total: number } }): number {
+  if (p.total <= 0) return 0;
+  const within = p.bytes && p.bytes.total > 0 ? p.bytes.sent / p.bytes.total : 0;
+  // current 是「第幾個」（1 起算），所以前面已完成的是 current - 1 個
+  return Math.min(1, (p.current - 1 + within) / p.total);
+}
+
+/** 位元組寫成人看得懂的樣子。影片動輒幾百 MB，顯示成位元組沒有意義 */
+function formatBytes(n: number): string {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+  if (n >= 1024 ** 2) return `${Math.round(n / 1024 ** 2)} MB`;
+  return `${Math.max(1, Math.round(n / 1024))} KB`;
+}
 
 function AlbumContent() {
   const searchParams = useSearchParams();
@@ -71,7 +97,15 @@ function AlbumContent() {
   const [selectedPhotoIndex, setSelectedPhotoIndex] = useState<number | null>(null);
   const [availableTags, setAvailableTags] = useState<Tag[]>([]);
   const [visibleCount, setVisibleCount] = useState<number>(24);
-  const [uploadProgress, setUploadProgress] = useState<{current: number, total: number, fileName: string} | null>(null);
+  /**
+   * 上傳進度。`bytes` 只有影片會有 —— 一支 2GB 的影片在「1/1」那一格會停十幾分鐘，
+   * 沒有位元組進度的話進度條整段不動，就是使用者說的「以為當掉了」。
+   * 照片幾 MB 一下就過去，不需要（也不值得為它多接一層 XHR 來拿進度）。
+   */
+  const [uploadProgress, setUploadProgress] = useState<{
+    current: number; total: number; fileName: string;
+    bytes?: { sent: number; total: number };
+  } | null>(null);
   /** Drive 沒接上時的原因。照片照樣傳得上去，只是少了 4K 與原始檔備份 */
   const [driveError, setDriveError] = useState<string | null>(null);
   const [showDriveBackfill, setShowDriveBackfill] = useState(false);
@@ -635,23 +669,43 @@ function AlbumContent() {
 
     setDuplicateBusy(true);
     try {
-      const result = await uploadPhoto(id, item.resized, item.exifData, item.takenAt, true);
+      const result = await uploadPhoto(
+        id, item.resized, item.exifData, item.takenAt, true, item.video,
+      );
       if (result.status !== 'ok') {
         alert('這張上傳失敗，先跳過。');
         return;
       }
-      dupUploadedRef.current.push(result.photo);
 
-      // Drive 沿用整批那次的授權；沒有就記進待補清單，跟一般上傳一樣
-      if (driveRef.current) {
+      /*
+       * 影片跟照片在這裡分岔：影片的 Drive 是必要的，不是備份。傳不上去就把
+       * 剛建的那一列收掉（同 ingestSources 的理由），而且不能記進「待補 Drive」
+       * —— 那份清單走的是 pushPhotoToDrive，會拿影片去跑 encode4kWebp。
+       */
+      if (item.video) {
         try {
-          await pushPhotoToDrive(driveRef.current, result.photo.id, item.file);
+          if (!driveRef.current) throw new Error('Drive 沒接上，影片沒有地方存');
+          await pushVideoToDrive(driveRef.current, result.photo.id, item.file);
         } catch (err) {
-          console.warn('新照片沒送上 Drive', err);
+          console.error('影片沒送上 Drive，收掉剛建的那一列', err);
+          await deletePhoto(result.photo.id);
+          alert('這支影片沒送上 Drive，先跳過。');
+          return;
+        }
+        dupUploadedRef.current.push(result.photo);
+      } else {
+        dupUploadedRef.current.push(result.photo);
+        // Drive 沿用整批那次的授權；沒有就記進待補清單，跟一般上傳一樣
+        if (driveRef.current) {
+          try {
+            await pushPhotoToDrive(driveRef.current, result.photo.id, item.file);
+          } catch (err) {
+            console.warn('新照片沒送上 Drive', err);
+            setPendingDriveBatch((prev) => [...prev, { photoId: result.photo.id, file: item.file }]);
+          }
+        } else {
           setPendingDriveBatch((prev) => [...prev, { photoId: result.photo.id, file: item.file }]);
         }
-      } else {
-        setPendingDriveBatch((prev) => [...prev, { photoId: result.photo.id, file: item.file }]);
       }
 
       if (decision === 'replace' && replaceIds && replaceIds.length > 0) {
@@ -694,7 +748,11 @@ function AlbumContent() {
    */
   const ingestSources = async (
     sources: IngestSource[],
-    onProgress: (current: number, total: number, name: string) => void,
+    onProgress: (
+      current: number, total: number, name: string,
+      /** 影片才有：這個檔傳了幾個位元組 */
+      bytes?: { sent: number; total: number },
+    ) => void,
   ): Promise<IngestResult> => {
     const total = sources.length;
     const uploaded: UploadedPhoto[] = [];
@@ -714,6 +772,44 @@ function AlbumContent() {
       onProgress(i + 1, total, source.name);
       try {
         const rawFile = await source.load();
+
+        /*
+         * 影片：擷一格當封面，走同一支 uploadPhoto（封面就是那張「照片」），
+         * 原始檔再用分塊上傳送 Drive。
+         *
+         * ⚠️ **影片沒有 Drive 就等於沒有影片** —— R2 上只有封面圖，相簿裡會多
+         *    一格點開只有靜止畫面的東西。所以這裡跟照片相反：Drive 失敗要把剛
+         *    建的那一列刪掉，讓使用者看到「這支失敗了」而不是一格壞掉的影片。
+         */
+        if (isVideoFile(rawFile)) {
+          const { poster, durationMs } = await captureVideoPoster(rawFile);
+          const meta = { fileName: rawFile.name, durationMs };
+          const result = await uploadPhoto(id as string, poster, undefined, undefined, false, meta);
+          if (result.status === 'duplicate') {
+            dupes.push({
+              key: `${Date.now()}-${i}-${source.name}`,
+              file: rawFile, resized: poster, previewUrl: URL.createObjectURL(poster),
+              exifData: undefined, takenAt: undefined,
+              reason: result.reason, existing: result.existing,
+              video: meta,
+            });
+          } else if (result.status === 'ok') {
+            try {
+              if (!drive) throw new Error('Drive 沒接上，影片沒有地方存');
+              await pushVideoToDrive(drive, result.photo.id, rawFile,
+                (sent, size) => onProgress(i + 1, total, source.name, { sent, total: size }));
+              uploaded.push(result.photo);
+            } catch (err) {
+              console.error(`影片 ${rawFile.name} 沒送上 Drive，收掉剛建的那一列`, err);
+              await deletePhoto(result.photo.id);
+              allSuccess = false;
+            }
+          } else {
+            allSuccess = false;
+          }
+          continue;
+        }
+
         // 縮圖處理 (長邊不超過 2000px)
         const { file, exifData, takenAt } = await resizeImageFile(rawFile, 2000);
         const result = await uploadPhoto(id as string, file, exifData, takenAt || undefined);
@@ -768,7 +864,7 @@ function AlbumContent() {
     setUploading(true);
     const result = await ingestSources(
       Array.from(files).map((f) => ({ name: f.name, load: async () => f })),
-      (current, total, fileName) => setUploadProgress({ current, total, fileName }),
+      (current, total, fileName, bytes) => setUploadProgress({ current, total, fileName, bytes }),
     );
     await finishIngest(result);
     setUploading(false);
@@ -903,7 +999,7 @@ function AlbumContent() {
            */
           const result = await ingestSources(
             sources,
-            (current, total, fileName) => setUploadProgress({ current, total, fileName }),
+            (current, total, fileName, bytes) => setUploadProgress({ current, total, fileName, bytes }),
           );
           setSyncingGoogle(false);
           setUploadProgress(null);
@@ -1411,7 +1507,11 @@ function AlbumContent() {
               type="file"
               ref={fileInputRef}
               style={{ display: 'none' }}
-              accept="image/jpeg, image/png, image/webp, image/heic, image/heif"
+              /*
+               * 影片的格式清單刻意跟播放端同一組（見 videoUtils）：瀏覽器解不開的
+               * 檔，封面擷不出來、之後也播不出來 —— 擋在選檔那一步比事後報錯好懂。
+               */
+              accept={`image/jpeg, image/png, image/webp, image/heic, image/heif, ${ACCEPTED_VIDEO_TYPES}`}
               multiple
               onChange={handleFileChange}
             />
@@ -1529,10 +1629,19 @@ function AlbumContent() {
           <div className={styles.progressBar}>
             <div 
               className={styles.progressFill} 
-              style={{ width: `${(uploadProgress.current / uploadProgress.total) * 100}%` }}
+              /*
+               * 有位元組進度時，把「這個檔傳到幾成」算進整批的比例裡，
+               * 進度條才會在一支大影片的十幾分鐘裡持續前進，而不是卡在同一格。
+               */
+              style={{ width: `${uploadFraction(uploadProgress) * 100}%` }}
             />
           </div>
-          <p className={styles.progressText}>正在處理: {uploadProgress.fileName} ({uploadProgress.current} / {uploadProgress.total})</p>
+          <p className={styles.progressText}>
+            正在處理: {uploadProgress.fileName} ({uploadProgress.current} / {uploadProgress.total})
+            {uploadProgress.bytes && (
+              <> · 上傳 {formatBytes(uploadProgress.bytes.sent)} / {formatBytes(uploadProgress.bytes.total)}</>
+            )}
+          </p>
         </div>
       )}
 
@@ -1605,13 +1714,23 @@ function AlbumContent() {
                   </div>
                 </>
               )}
-              <img
+              <PhotoImage
                 src={photoThumbSrc(photo, 'md')}
                 alt={photo.title}
-                className={styles.photoImage} 
-                loading="lazy" 
-                decoding="async" 
+                className={styles.photoImage}
+                lazy
               />
+              {/*
+                * 影片在格線上就是它的封面圖，跟照片長得一模一樣 —— 沒有這個角標
+                * 使用者根本看不出哪幾格點下去會動。長度抓不到時 formatDuration
+                * 回 null，那就只剩一個播放三角形。
+                */}
+              {photo.media_type === 'video' && (
+                <span className={styles.videoBadge}>
+                  <span className={styles.videoBadgeIcon} aria-hidden="true">▶</span>
+                  {formatDuration(photo.duration_ms)}
+                </span>
+              )}
               {/* 當每排 3 欄 (含) 以上時，照片上隱藏文字與標籤資訊，只呈現純淨照片縮圖 */}
               {(gridColumns === 1 || gridColumns === 2) && (
                 <div className={styles.photoOverlay}>

@@ -1,0 +1,43 @@
+-- 0019：相簿收得下影片。
+--
+-- 影片與照片**共用同一張 Photo 表**，不另開一張 Video。理由是相簿頁、排序、
+-- 標籤、留言、封面、刪除（DriveTrash）、FTS 這一整套已經全部掛在 Photo 上，
+-- 分兩張表等於每一支查詢都要 UNION 一次，而它們在使用者眼裡本來就是同一格。
+--
+-- ## 儲存長相（跟照片是同一套，只是少一份）
+--
+--   R2   封面圖 800／400 WebP        ← 瀏覽器抓第一格畫面編出來的，走既有的 /api/upload
+--   Drive 原始影片檔                  ← 不轉檔、不縮，多大都整份丟上去
+--
+-- ## 為什麼影片的 Drive id 存在 `drive_original_id`，不另開 `drive_video_id`
+--
+-- 照片的兩個欄位是「衍生的 4K」與「相機原始檔」；影片沒有衍生版本，
+-- 上去的那一份就是原始檔，語意剛好對上 drive_original_id。
+-- 沿用它的好處是整條既有管線一個字都不用改：recordPhotoDrive 記得動、
+-- 刪除時 queueDriveTrash 自動把它排進待搬佇列、補傳流程也認得。
+-- 多開一欄則要在那三個地方各補一次，而且每補一次就多一個會漏掉的點。
+--
+-- ⚠️ 代價是 `drive_file_id` 對影片**永遠是 NULL**，而「補傳 Drive」那張清單
+--    正是用 `drive_file_id IS NULL` 找待補的照片 —— 影片會整批賴在上面，
+--    而且補傳會拿影片去跑 encode4kWebp。所以那支路由要加 `media_type = 'photo'`。
+--    這是唯一一處因為共用欄位而必須改的地方，已經改了。
+--
+-- ## media_type 預設 'photo'
+--
+-- 現有的每一列都是照片，預設值讓這次 migration 不必回頭 UPDATE 任何一列
+-- （prod 上是好幾千列，[[free-tier-is-top-priority]]）。
+-- 讀取端一律比 `media_type = 'video'`，不要比 `!= 'photo'`。
+--
+-- ## duration_ms 只為了格線上那個「0:42」
+--
+-- 瀏覽器擷封面時本來就拿得到 duration，順手存下來；沒有它就得為了顯示長度
+-- 去載影片的 metadata，等於每格一次 Drive 代理請求。NULL＝舊資料或抓不到，
+-- 顯示端自己不畫那個角標。
+--
+-- ⚠️ 影片**沒有時間資訊**（使用者明確要的）：taken_at／taken_at_local／
+--    tz_offset_minutes 全是 NULL。相簿格線照 sort_order 排不受影響，
+--    但搜尋是 ORDER BY taken_at DESC，NULL 會沉到最底 —— 已知，不修。
+--    想用 COALESCE(taken_at, created_at) 修的話會吃不到索引。
+
+ALTER TABLE Photo ADD COLUMN media_type TEXT NOT NULL DEFAULT 'photo';
+ALTER TABLE Photo ADD COLUMN duration_ms INTEGER;
