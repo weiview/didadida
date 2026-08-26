@@ -105,6 +105,20 @@ const CONVOY_PCT_DEFAULT = 70;
 /** 低於 30% 等於「路過就算同遊」，高於 100 無意義。站長調得動的範圍 */
 const CONVOY_PCT_MIN = 30;
 const CONVOY_PCT_MAX = 100;
+/**
+ * 不開放的照片要不要**連看得到的人也先糊掉**。**預設關**（沒有這一列就是關）。
+ *
+ * ⚠️ 這跟「不要做馬賽克 UI」那條規矩不衝突，因為對象完全不同：
+ *   - 沒權限的人 → 那一格**整個不存在**（SQL 就濾掉了）。端出一格馬賽克等於
+ *     告訴他「這裡有一張你不能看的照片」，那才是被禁止的做法。
+ *   - 看得到的人（站長與 can_manage_others）→ 這個開關管的是他們自己那一份。
+ *     用途是「旁邊有人的時候不要一捲就整片跳出來」，不是權限。
+ *
+ * 所以這個值**只發給看得到不開放照片的人**（見 /api/auth/me）——
+ * 對其他人它連存在都不必存在，也省掉一次設定讀取。
+ * 遮罩本身純粹在瀏覽器（CSS filter），後端不因此少送任何位元組。
+ */
+const SETTING_RESTRICTED_BLUR = "restricted_blur";
 
 /**
  * token 裡的身分。兩層，沒有第三層：
@@ -1050,6 +1064,16 @@ async function convoyOverlapPct(env: Env): Promise<number> {
   return Math.round(n);
 }
 
+/**
+ * 不開放的照片要不要對「看得到的人」也先蓋一層模糊。沒設過＝關。
+ *
+ * 走 getSettingCached（60 秒 memo）—— 它跟著 /api/auth/me 回去，
+ * 而那一條是每個人每次進站都會打的。
+ */
+async function restrictedBlurOn(env: Env): Promise<boolean> {
+  return (await getSettingCached(env, SETTING_RESTRICTED_BLUR)) === "1";
+}
+
 /** 留言內文上限。比 Story 的 200 寬，但別讓人在燈箱側欄貼一篇文章 */
 const COMMENT_MAX_LEN = 1000;
 
@@ -1649,6 +1673,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
            */
           convoy_overlap_pct: await convoyOverlapPct(env),
           /*
+           * 不開放的照片要不要連我自己看都先糊著。
+           *
+           * **只有看得到不開放照片的人才問這個設定** —— 其他人的清單裡根本沒有
+           * 那幾張，這個值對他們沒有意義，而且這樣省掉一次設定讀取（乘上每個人
+           * 的每次進站）。遮罩是瀏覽器端的 CSS，位元組照樣是完整的。
+           */
+          restricted_blur: actor?.canManageOthers && await restrictedBlurOn(env) ? 1 : 0,
+          /*
            * 圖片／影片的簽章網址要用的那張。**訪客也有** —— 燈箱大圖本來就給訪客看，
            * 這張 token 擋的是「完全沒進站的人」，不是訪客。
            * 同樣跟著這一條回來（零額外請求），效期與手上那張進站 token 一致。
@@ -1889,12 +1921,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
             guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
             guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
             convoy_overlap_pct: await convoyOverlapPct(env),
+            restricted_blur: (await getSetting(env, SETTING_RESTRICTED_BLUR)) === "1" ? 1 : 0,
           }), { headers });
         }
 
         if (method === "PUT") {
           const body: {
             guest_can_view_map?: any; guest_can_view_comments?: any; convoy_overlap_pct?: any;
+            restricted_blur?: any;
           } = await request.json();
           if (body.guest_can_view_map !== undefined) {
             await setSetting(env, SETTING_GUEST_MAP, body.guest_can_view_map ? "1" : "0");
@@ -1913,11 +1947,15 @@ if (method === "POST" && pathname === "/api/verify-password") {
             }
             await setSetting(env, SETTING_CONVOY_PCT, String(pct));
           }
+          if (body.restricted_blur !== undefined) {
+            await setSetting(env, SETTING_RESTRICTED_BLUR, body.restricted_blur ? "1" : "0");
+          }
           return new Response(JSON.stringify({
             success: true,
             guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
             guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
             convoy_overlap_pct: await convoyOverlapPct(env),
+            restricted_blur: (await getSetting(env, SETTING_RESTRICTED_BLUR)) === "1" ? 1 : 0,
           }), { headers });
         }
       }

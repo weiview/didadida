@@ -194,6 +194,29 @@
   pointer-events: none;
 }
 
+/*
+ * 遮罩開著時，角標升級成那一格的開關（掀開／收回），所以要收得到點擊。
+ * 這是唯一一個蓋掉上面 pointer-events: none 的情況。
+ */
+.restrictedBadgeBtn {
+  pointer-events: auto;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+/*
+ * 不開放又開了模糊遮罩：整格的縮圖糊掉。
+ *
+ * ⚠️ 糊的是 .photoImage（img 本身）而不是整張卡 —— 糊整張卡會把角標與編輯用的
+ *    勾選框一起糊掉，而那兩個正是「這格是什麼、怎麼掀開」的唯一線索。
+ * scale 是把邊緣推出可視範圍：blur 會讓四邊透出一圈沒糊到的原圖。
+ */
+.blurredPhoto .photoImage,
+.photoCard.blurredPhoto:hover .photoImage {
+  filter: blur(18px);
+  transform: scale(1.15);
+}
+
 .videoBadgeIcon {
   font-size: 0.62rem;
   /* 三角形字符本身偏上，往下推一點才跟數字對齊 */

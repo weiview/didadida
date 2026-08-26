@@ -443,6 +443,14 @@ export interface AuthState {
    * 跟著 /auth/me 一起回來（後端那邊有 60 秒 memo，不會每次都讀 D1）。
    */
   convoyOverlapPct: number;
+  /**
+   * 不開放的照片要不要**連我自己看都先蓋一層模糊**（站長在後台開的全站設定）。
+   *
+   * 後端只發給看得到不開放照片的人，其他人一律 0 —— 他們手上根本沒有那幾張。
+   * 遮罩純粹是瀏覽器的 CSS filter，位元組照樣是完整的：它擋的是「旁邊剛好有人
+   * 看著螢幕」，不是權限。掀開狀態在 lib/restrictedReveal.ts。
+   */
+  restrictedBlur: boolean;
   user: CurrentUser | null;
 }
 
@@ -477,7 +485,7 @@ export async function checkAuth(): Promise<AuthState> {
   const locked: AuthState = {
     admin: false, guest: false, canViewMap: false,
     canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-    convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
+    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, user: null,
   };
   if (typeof window === 'undefined') return locked;
   // 舊版把明文密碼存在這個 key。清掉已經留在使用者瀏覽器裡的那一份，
@@ -509,6 +517,8 @@ export async function checkAuth(): Promise<AuthState> {
         unreadNotifications: Number(data.unread_notifications ?? 0),
         // 舊後端不回這個欄位 —— 用預設值，地圖照樣判得出同遊
         convoyOverlapPct: clampConvoyPct(data.convoy_overlap_pct),
+        // 舊後端不回這個欄位 —— 當成關的（維持這個開關出現之前的樣子）
+        restrictedBlur: !!data.restricted_blur,
         user: data.user ?? null,
       };
     }
@@ -886,6 +896,13 @@ export interface SiteSettings {
    * 同一趟旅行，全家人看到的隊形必須是同一個。
    */
   convoy_overlap_pct: number;
+  /**
+   * 不開放的照片要不要連「看得到的人」也先糊掉，預設 0。
+   *
+   * 這一格**不是權限**（權限是 Photo.restricted 本身，後端 SQL 濾掉）。
+   * 它管的是站長自己那一份畫面：捲相簿時不要整片跳出來。
+   */
+  restricted_blur: number;
 }
 
 /** PUT 的內容。開關是布林、門檻是數字，所以不能寫成 Partial<Record<…, boolean>> */
@@ -893,6 +910,7 @@ export interface SiteSettingsPatch {
   guest_can_view_map?: boolean;
   guest_can_view_comments?: boolean;
   convoy_overlap_pct?: number;
+  restricted_blur?: boolean;
 }
 
 export async function fetchSiteSettings(): Promise<SiteSettings> {
@@ -903,6 +921,7 @@ export async function fetchSiteSettings(): Promise<SiteSettings> {
     guest_can_view_map: data.guest_can_view_map ?? 0,
     guest_can_view_comments: data.guest_can_view_comments ?? 0,
     convoy_overlap_pct: clampConvoyPct(data.convoy_overlap_pct),
+    restricted_blur: data.restricted_blur ?? 0,
   };
 }
 
@@ -922,6 +941,7 @@ export async function updateSiteSettings(
         guest_can_view_map: data.guest_can_view_map ?? 0,
         guest_can_view_comments: data.guest_can_view_comments ?? 0,
         convoy_overlap_pct: clampConvoyPct(data.convoy_overlap_pct),
+        restricted_blur: data.restricted_blur ?? 0,
       },
     };
   }

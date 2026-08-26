@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { applyTripSegments, reverseGeocode, setPlaceNames, photoThumbSrc, type Photo } from '@/lib/api';
+import { useAdmin } from '@/lib/useAdmin';
+import { useRevealedRestricted } from '@/lib/restrictedReveal';
 
 interface Props {
   isOpen: boolean;
@@ -58,6 +60,11 @@ export default function PlaceCheckinModal({
 }: Props) {
   const [selected, setSelected] = useState<number[]>([]);
   const [showDone, setShowDone] = useState(false);
+  /* 不開放的照片要不要糊掉（站長在 /admin 開的全站設定），掀開狀態全站共用一份 */
+  const { restrictedBlur } = useAdmin();
+  const revealedRestricted = useRevealedRestricted();
+  const blurOf = (p: Photo) =>
+    restrictedBlur && p.restricted === 1 && !revealedRestricted.has(p.id);
   const [step0, setStep0] = useState<'idle' | 'running' | 'done'>('idle');
   const [step0Applied, setStep0Applied] = useState(0);
   const [naming, setNaming] = useState<{ done: number; total: number } | null>(null);
@@ -304,6 +311,13 @@ export default function PlaceCheckinModal({
                           style={{
                             width: '100%', height: '100%', objectFit: 'cover',
                             opacity: isSel ? 1 : 0.62, display: 'block',
+                            /*
+                             * 遮罩開著時這裡也糊。這一格是拿來挑「哪幾張要補地點」的，
+                             * 靠的是時間與地名，不是看清楚照片內容 —— 所以**這裡沒有
+                             * 掀開的入口**，要看就回相簿點那一張（掀開是共用的一份，
+                             * 掀完再回來這裡就是清楚的）。
+                             */
+                            ...(blurOf(p) ? { filter: 'blur(10px)', transform: 'scale(1.2)' } : null),
                           }}
                         />
                         <span style={{

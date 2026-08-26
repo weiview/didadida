@@ -7,6 +7,7 @@ import Link from "next/link";
 import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
 import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive, pushVideoToDrive } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
+import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
 import AssignPlaceModal from "@/components/AssignPlaceModal";
@@ -75,7 +76,17 @@ function AlbumContent() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const { isAdmin, isOwner, canEdit, canAddTo, canReorderIn } = useAdmin();
+  const { isAdmin, isOwner, canEdit, canAddTo, canReorderIn, restrictedBlur } = useAdmin();
+  /**
+   * 「不開放先糊著」的遮罩：掀開了哪幾張。
+   *
+   * 集合放在 module 層（lib/restrictedReveal），不是這一頁的 state ——
+   * 在格線掀開之後點進燈箱要是又糊回去，那不叫暫時解開，那叫壞掉。
+   * 重整就全部蓋回去。
+   */
+  const revealedRestricted = useRevealedRestricted();
+  const isBlurred = (p: Photo) =>
+    restrictedBlur && p.restricted === 1 && !revealedRestricted.has(p.id);
   /**
    * 這本相簿本身。留著它是為了 `canEditAlbum` —— 光有 isAdmin 不夠，
    * 一般成員只動得了自己建的相簿（跟後端 canTouchAlbum 同一條規則）。
@@ -1796,7 +1807,7 @@ function AlbumContent() {
                 if (el) photoCardRefs.current.set(index, el);
                 else photoCardRefs.current.delete(index);
               }}
-              className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
+              className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""} ${isBlurred(photo) ? styles.blurredPhoto : ""}`}
               draggable={canReorderPhotos && longPressIndex === index && sortBy === "custom"}
               onClick={async () => {
                 if (longPressIndex !== null || draggingIndex !== null) return;
@@ -1815,6 +1826,15 @@ function AlbumContent() {
                   const newCoverUrl = isCurrentCover ? null : photo.url;
                   setCurrentCoverPhotoUrl(newCoverUrl);
                   await updateAlbum(Number(id), { cover_photo_url: newCoverUrl || "" });
+                  return;
+                }
+                /*
+                 * 遮罩開著時，第一下只掀開這一格、**不進燈箱** ——
+                 * 不然點下去馬上是一張全螢幕的大圖，遮罩就白蓋了。
+                 * 掀開之後再點一下才是平常的「打開燈箱」。
+                 */
+                if (isBlurred(photo)) {
+                  revealRestricted(photo.id);
                   return;
                 }
                 setSelectedPhotoIndex(index);
@@ -1884,7 +1904,21 @@ function AlbumContent() {
                 * 沒有角標的話，站長會完全分不出哪幾張是藏起來的。
                 */}
               {photo.restricted === 1 && (
-                <span className={styles.restrictedBadge}>🔒 不開放</span>
+                /*
+                 * 遮罩開著時角標同時是那一格的開關（點它收回／掀開），所以要能吃到
+                 * 點擊 —— 平常那顆是 pointer-events: none，整張卡都是「打開燈箱」。
+                 */
+                restrictedBlur ? (
+                  <button
+                    type="button"
+                    className={`${styles.restrictedBadge} ${styles.restrictedBadgeBtn}`}
+                    onClick={(e) => { e.stopPropagation(); toggleRestrictedReveal(photo.id); }}
+                  >
+                    🔒 不開放 · {isBlurred(photo) ? '點一下顯示' : '收回'}
+                  </button>
+                ) : (
+                  <span className={styles.restrictedBadge}>🔒 不開放</span>
+                )
               )}
               {/* 當每排 3 欄 (含) 以上時，照片上隱藏文字與標籤資訊，只呈現純淨照片縮圖 */}
               {(gridColumns === 1 || gridColumns === 2) && (

@@ -6,6 +6,7 @@ import albumStyles from "./album/album.module.css";
 import Link from "next/link";
 import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
+import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import PhotoLightbox from "./album/PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
@@ -163,7 +164,15 @@ function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, dr
 export default function Home() {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [loading, setLoading] = useState(true);
-  const { isAdmin, checking: isCheckingAuth, canEdit, canManageOthers, canViewMap } = useAdmin();
+  const { isAdmin, checking: isCheckingAuth, canEdit, canManageOthers, canViewMap, restrictedBlur } = useAdmin();
+  /*
+   * 搜尋結果裡也會有不開放的那幾張（後端只對看得到的人回傳）。
+   * 遮罩與掀開狀態跟相簿格線共用同一份（lib/restrictedReveal）——
+   * 在相簿裡掀開的那張，搜出來也是掀開的。
+   */
+  const revealedRestricted = useRevealedRestricted();
+  const isBlurred = (p: Photo) =>
+    restrictedBlur && p.restricted === 1 && !revealedRestricted.has(p.id);
 
   // Modal state
   const [showModal, setShowModal] = useState(false);
@@ -856,8 +865,12 @@ export default function Home() {
                       if (el) photoCardRefs.current.set(index, el);
                       else photoCardRefs.current.delete(index);
                     }}
-                    className={albumStyles.photoCard}
-                    onClick={() => setSelectedPhotoIndex(index)}
+                    className={`${albumStyles.photoCard} ${isBlurred(photo) ? albumStyles.blurredPhoto : ''}`}
+                    onClick={() => {
+                      // 遮罩開著時第一下只掀開這一格，不進燈箱（同相簿格線）
+                      if (isBlurred(photo)) return revealRestricted(photo.id);
+                      setSelectedPhotoIndex(index);
+                    }}
                   >
                     <PhotoImage
                       src={photoThumbSrc(photo, 'md')}
@@ -865,6 +878,23 @@ export default function Home() {
                       className={albumStyles.photoImage}
                       lazy
                     />
+                    {/*
+                      * 不開放的角標。搜尋結果本來沒有這個 —— 但遮罩開著的時候
+                      * 它同時是掀開／收回的開關，沒有它那一格就只是一片糊。
+                      */}
+                    {photo.restricted === 1 && (
+                      restrictedBlur ? (
+                        <button
+                          type="button"
+                          className={`${albumStyles.restrictedBadge} ${albumStyles.restrictedBadgeBtn}`}
+                          onClick={(e) => { e.stopPropagation(); toggleRestrictedReveal(photo.id); }}
+                        >
+                          🔒 不開放 · {isBlurred(photo) ? '點一下顯示' : '收回'}
+                        </button>
+                      ) : (
+                        <span className={albumStyles.restrictedBadge}>🔒 不開放</span>
+                      )
+                    )}
                     <div className={albumStyles.photoOverlay}>
                       <h3 className={albumStyles.photoTitle}>{photo.title}</h3>
                       <p className={albumStyles.photoDate}>

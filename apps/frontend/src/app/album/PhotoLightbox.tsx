@@ -5,6 +5,7 @@ import PhotoImage from "@/components/PhotoImage";
 import VideoPlayer from "@/components/VideoPlayer";
 import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, isVideo, setPhotosRestricted } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
+import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
 
@@ -46,8 +47,15 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
    * 層級的決定，後端也只讓 can_manage_others 動得了。端給改得動照片但管不了全站
    * 的人，只會換到一顆按下去 403 的開關。
    */
-  const { canManageOthers } = useAdmin();
+  const { canManageOthers, restrictedBlur } = useAdmin();
   const [isSavingRestricted, setIsSavingRestricted] = useState(false);
+  /*
+   * 遮罩：不開放的照片連我自己看都先糊著（站長在 /admin 開的全站設定）。
+   * 掀開狀態是全站共用的一份（lib/restrictedReveal），所以在格線上掀開的那一張
+   * 點進來就是掀開的，換上一張／下一張又各自算各自的。
+   */
+  const revealedRestricted = useRevealedRestricted();
+  const blurred = restrictedBlur && photo.restricted === 1 && !revealedRestricted.has(photo.id);
 
   const handleToggleRestricted = async (next: boolean) => {
     setIsSavingRestricted(true);
@@ -227,7 +235,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
         <div className={styles.mainPane}>
 
         <div
-          className={styles.imageContainer}
+          className={`${styles.imageContainer} ${blurred ? styles.blurred : ''}`}
           onTouchStart={onTouchStartEvent}
           onTouchMove={onTouchMoveEvent}
           onTouchEnd={onTouchEndEvent}
@@ -292,8 +300,32 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                 : '按一下設成不開放：只有可管理全站內容的人看得到，其他人的相簿、搜尋與地圖上都不會有它'}
               onClick={(e) => { e.stopPropagation(); handleToggleRestricted(photo.restricted !== 1); }}
             >
-              <span aria-hidden>{photo.restricted === 1 ? '🔒' : '🔓'}</span>
+              <span className={styles.restrictIcon} aria-hidden>{photo.restricted === 1 ? '🔒' : '🔓'}</span>
               {photo.restricted === 1 && <span>不開放</span>}
+            </button>
+          )}
+          {/*
+            * 蓋著的時候整塊都是「點一下掀開」。這一層一定要蓋在影片上面 ——
+            * 不然糊著的影片還是按得到播放鍵，遮罩等於沒有。
+            */}
+          {blurred && (
+            <button
+              type="button"
+              className={styles.revealVeil}
+              onClick={(e) => { e.stopPropagation(); revealRestricted(photo.id); }}
+            >
+              <span>🔒 不開放</span>
+              <span className={styles.revealVeilHint}>點一下暫時顯示</span>
+            </button>
+          )}
+          {/* 掀開之後留一顆收回去的小鈕，位置接在左上角那顆鎖底下 */}
+          {restrictedBlur && photo.restricted === 1 && !blurred && (
+            <button
+              type="button"
+              className={styles.revealBack}
+              onClick={(e) => { e.stopPropagation(); toggleRestrictedReveal(photo.id); }}
+            >
+              暫時顯示中 · 收回
             </button>
           )}
           {hasPrev && (

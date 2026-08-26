@@ -63,6 +63,11 @@ interface AuthValue {
    */
   convoyOverlapPct: number;
   /**
+   * 不開放的照片要不要連自己看都先糊著（站長在 /admin 開的全站設定）。
+   * 只有看得到不開放照片的人會拿到 true。掀開狀態在 lib/restrictedReveal.ts。
+   */
+  restrictedBlur: boolean;
+  /**
    * 把通知全部標成已讀（後端只有一個時間戳，沒有逐則已讀）。
    * 成功就順手把 unreadNotifications 歸零，不必等下一次 /auth/me。
    */
@@ -118,7 +123,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AuthState>({
     admin: false, guest: false, canViewMap: false,
     canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-    convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
+    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, user: null,
   });
   const [checking, setChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -141,7 +146,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setState({
         admin: true, guest: false, canViewMap: true,
         canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-        convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
+        // 遮罩也不樂觀關掉：真正的值等 checkAuth() 回來。猜錯的方向要是
+        // 「先攤開來再糊回去」，那一下就白做了
+        convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: true, user: null,
       });
       checkAuth().then((next) => {
         if (!alive) return;
@@ -205,7 +212,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setState({
       admin: false, guest: false, canViewMap: false,
       canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-      convoyOverlapPct: CONVOY_PCT_DEFAULT, user: null,
+      convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, user: null,
     });
     setAuthError(null);
   }, []);
@@ -261,6 +268,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     canUseTools: state.canUseTools,
     unreadNotifications: state.unreadNotifications,
     convoyOverlapPct: state.convoyOverlapPct,
+    restrictedBlur: state.restrictedBlur,
     markNotificationsRead,
     canEdit,
     canAddTo,

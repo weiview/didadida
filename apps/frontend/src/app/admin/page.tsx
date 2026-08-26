@@ -102,6 +102,14 @@ export default function AdminPage() {
    */
   const [guestComments, setGuestComments] = useState<boolean | null>(null);
   const [savingGuestComments, setSavingGuestComments] = useState(false);
+  /**
+   * 站台開關：不開放的照片要不要連「看得到的人」也先蓋一層模糊。**預設關**。
+   *
+   * ⚠️ 這一格**不是權限**。沒權限的人手上根本沒有那幾張（後端 SQL 就濾掉了），
+   * 開關管的是站長與可管理全站內容的人自己那一份畫面。
+   */
+  const [restrictedBlur, setRestrictedBlur] = useState<boolean | null>(null);
+  const [savingRestrictedBlur, setSavingRestrictedBlur] = useState(false);
 
   /*
    * 同遊門檻。拉桿有兩份值：`convoyPct` 是手指現在拖到哪（每動一格就變），
@@ -132,6 +140,7 @@ export default function AdminPage() {
       setGuestComments(settings.guest_can_view_comments === 1);
       setConvoyPct(settings.convoy_overlap_pct);
       setSavedConvoyPct(settings.convoy_overlap_pct);
+      setRestrictedBlur(settings.restricted_blur === 1);
       setError(null);
     } catch (e: any) {
       setError(e.message || "讀取白名單失敗");
@@ -244,6 +253,19 @@ export default function AdminPage() {
     setNotice(next
       ? "訪客現在看得到照片底下的留言了（還是留不了言）。"
       : "訪客看不到留言了，燈箱裡那一塊會整個消失。");
+  };
+
+  const toggleRestrictedBlur = async (next: boolean) => {
+    setSavingRestrictedBlur(true);
+    setNotice(null);
+    const result = await updateSiteSettings({ restricted_blur: next });
+    setSavingRestrictedBlur(false);
+    if (!result.success) return setError(result.message || "修改失敗");
+    setError(null);
+    setRestrictedBlur(result.settings!.restricted_blur === 1);
+    setNotice(next
+      ? "不開放的照片現在會先蓋一層模糊，點一下才暫時看得到。重整之後又蓋回去。"
+      : "不開放的照片恢復正常顯示（其他人本來就看不到那幾張）。");
   };
 
   const handleRemove = async () => {
@@ -377,6 +399,29 @@ export default function AdminPage() {
         <p className={styles.hint}>
           訪客<strong>永遠留不了言</strong>，這格只管看不看得到。家人之間的對話會連名字一起被
           訪客看見，開之前先想一下留言區裡都講了些什麼。
+        </p>
+      </section>
+
+      <section className={`glass-panel ${styles.card}`}>
+        <h2 className={styles.sectionTitle}>不開放的照片</h2>
+        <p className={styles.hint}>
+          標成「不開放」的照片<strong>只有你跟可管理全站內容的人看得到</strong>，
+          其他成員與訪客的相簿、搜尋、地圖上那一格整個不存在 —— 那是權限，一直都在。
+          這裡這一格管的是<strong>你自己那一份畫面</strong>：捲到那幾張的時候要不要先糊著。
+        </p>
+        <label className={styles.checkbox}>
+          <input
+            type="checkbox"
+            checked={restrictedBlur === true}
+            disabled={restrictedBlur === null || savingRestrictedBlur}
+            onChange={(e) => toggleRestrictedBlur(e.target.checked)}
+          />
+          不開放的照片先蓋一層模糊（縮圖與燈箱都算）
+        </label>
+        <p className={styles.hint}>
+          點那一張一下就暫時掀開，再點角標上的「收回」蓋回去；
+          <strong>重整或關掉分頁就全部蓋回去</strong>，不會記住。
+          用途是旁邊剛好有人看著螢幕的時候，捲相簿不會整片跳出來。
         </p>
       </section>
 
