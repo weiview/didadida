@@ -332,7 +332,11 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 - 切換走 `PUT /api/photos/restricted`（`{photoIds, restricted}`），**只認 `me.canManageOthers`，
   不是 `canTouchPhotos`** —— 標成不開放之後連標的人自己都看不到了，而「誰看得到」
-  是全站層級的決定，跟「誰傳的」無關。前端在燈箱右側一顆開關（`canManageOthers` 才端出來）。
+  是全站層級的決定，跟「誰傳的」無關。前端是**燈箱裡照片左上角一顆小開關**
+  （`canManageOthers` 才端出來）—— 曾經是右側資訊欄裡一整段（標題＋說明文字），
+  跟 Story／標籤同一個層級，但這是每幾百張才動一次的管理動作，佔那麼大一塊會把
+  照片本身往下推。⚠️ 關著要淡到不搶注意力，**開著一定要整顆亮起來並且把「不開放」
+  三個字寫出來** —— 它決定的是「誰看得到」，狀態不能靠猜。
 - ⚠️ **路由要排在 `PUT /api/photos/:id` 前面**：`/api/photos/restricted` 切出來也是 4 段，
   排後面會被當成「id 叫 restricted 的照片」吃掉（跟 `/api/photos/reorder` 同一個理由）。
 - 過濾**一律寫在 SQL 的 WHERE 裡**（`RESTRICTED_VISIBLE_COND`，Photo 要別名為 `p`），

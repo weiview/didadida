@@ -271,6 +271,31 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           )}
             </>
           )}
+          {/*
+            * 不開放：一顆角落的小開關，就這樣。
+            *
+            * 以前這是右側資訊欄裡一整段（標題＋一行說明），跟 Story／標籤同一個層級。
+            * 但它是每幾百張才會動一次的管理動作，佔那麼大一塊等於把「看照片」這件事
+            * 往下推 —— 使用者的原話是「目前設計會影響體驗」。
+            *
+            * 關著的時候刻意很淡；開著就整顆亮起來並且把「不開放」三個字寫出來。
+            * 這顆開關決定的是「誰看得到」，狀態絕對不能靠猜。
+            */}
+          {canManageOthers && (
+            <button
+              type="button"
+              className={`${styles.restrictBtn} ${photo.restricted === 1 ? styles.restrictBtnOn : ''}`}
+              disabled={isSavingRestricted}
+              aria-pressed={photo.restricted === 1}
+              title={photo.restricted === 1
+                ? `目前不開放：只有可管理全站內容的人看得到這${isVideo(photo) ? '支影片' : '張照片'}，其他人的相簿、搜尋與地圖上都沒有它。按一下改回開放`
+                : '按一下設成不開放：只有可管理全站內容的人看得到，其他人的相簿、搜尋與地圖上都不會有它'}
+              onClick={(e) => { e.stopPropagation(); handleToggleRestricted(photo.restricted !== 1); }}
+            >
+              <span aria-hidden>{photo.restricted === 1 ? '🔒' : '🔓'}</span>
+              {photo.restricted === 1 && <span>不開放</span>}
+            </button>
+          )}
           {hasPrev && (
             <button className={`${styles.navButton} ${styles.prevButton}`} onClick={(e) => { e.stopPropagation(); onPrev?.(); }}>
               &#10094;
@@ -395,33 +420,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             </div>
           )}
 
-          {/*
-            * 不開放：整格對其他人消失（不是馬賽克、也不是點開才說沒權限）。
-            * 勾起來的當下如果它正好是相簿封面，後端會順手把封面清掉。
-            */}
-          {canManageOthers && (
-            <div className={styles.section}>
-              <div className={styles.sectionHeader}>
-                <h3>不開放</h3>
-                <div className={styles.switchWrapper}>
-                  <label className={styles.switch}>
-                    <input
-                      type="checkbox"
-                      checked={photo.restricted === 1}
-                      disabled={isSavingRestricted}
-                      onChange={(e) => handleToggleRestricted(e.target.checked)}
-                    />
-                    <span className={styles.slider}></span>
-                  </label>
-                </div>
-              </div>
-              <span className={styles.exifValue} style={{ color: '#888' }}>
-                {photo.restricted === 1
-                  ? `這${isVideo(photo) ? '支影片' : '張照片'}只有可管理全站內容的人看得到，其他人的相簿、搜尋與地圖上都沒有它`
-                  : '打開之後，只有可管理全站內容的人看得到'}
-              </span>
-            </div>
-          )}
+          {/* 「不開放」的開關在照片左上角（見 imageContainer 裡那顆），不在這一欄 */}
 
           <div className={styles.exifToggleRow}>
             <div className={styles.switchWrapper}>

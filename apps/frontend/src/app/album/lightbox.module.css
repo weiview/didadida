@@ -136,6 +136,54 @@
 }
 
 /*
+ * 「不開放」的角落小開關。左上角是因為其他角都有人了：右上是關閉鈕、
+ * 左右中間是換頁箭頭、左下是 qualityNote。
+ *
+ * 關著的時候很淡 —— 它是每幾百張才動一次的管理動作，不該跟照片搶注意力。
+ * 開著就換成暖褐色的實心藥丸並且把字寫出來，因為它決定的是「誰看得到」。
+ */
+.restrictBtn {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  z-index: 3100;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.4);
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.72rem;
+  line-height: 1.2;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.restrictBtn:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+}
+
+.restrictBtn:disabled {
+  cursor: progress;
+  opacity: 0.35;
+}
+
+.restrictBtnOn {
+  opacity: 1;
+  background: rgba(180, 83, 9, 0.85);
+  color: #fff;
+}
+
+.restrictBtnOn:hover {
+  background: rgba(180, 83, 9, 0.95);
+}
+
+/*
  * 燈箱分兩塊：`.mainPane` 是照片＋照片資訊（Story／標籤／地點／EXIF），
  * `.commentsPane` 只有留言。
  *

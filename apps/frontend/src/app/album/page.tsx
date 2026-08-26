@@ -476,10 +476,10 @@ function AlbumContent() {
 
   /**
    * 右下角浮動鈕展開後的那串動作。`actions[0]` 貼著 FAB，所以最常用的「上傳照片」擺第一。
-   * 原本「上傳照片」是一顆點了會再展開下拉選單的按鈕，收進 FabMenu 之後直接攤平成兩項。
+   * 原本「上傳照片」是一顆點了會再展開下拉選單的按鈕，收進 FabMenu 之後直接攤平。
    *
    * **兩組權限**：上傳那一組看 `canAddToAlbum`（別人的相簿也給），其餘（地點、
-   * Drive、編輯照片）看 `canEditAlbum`。在別人的相簿裡就只剩上傳那一顆。
+   * 編輯照片）看 `canEditAlbum`。在別人的相簿裡就只剩上傳那一顆。
    */
   const buildFabActions = (): FabAction[] => {
     if (uploading || syncingGoogle) {
@@ -497,8 +497,9 @@ function AlbumContent() {
       {
         key: 'upload',
         label: '上傳照片',
-        // 兩種來源收成一扇門。展開四顆藥丸時「上傳照片」跟「從 Google 相簿匯入」
-        // 並排，看起來像兩件不相干的事，其實只是同一件事的兩個來源
+        // 所有「把檔案送進來」的事收成一扇門。攤在最上層並排的話，「上傳照片」
+        // 「從 Google 相簿匯入」「補傳 Drive」看起來像三件不相干的事，
+        // 其實是同一件事的三個來源
         children: [
           {
             key: 'local',
@@ -521,6 +522,20 @@ function AlbumContent() {
               handleGoogleSync(popup);
             },
           },
+          /*
+           * 補傳 Drive 也是上傳 —— 它做的事就是「把當初沒送上去的原始檔再送一次」。
+           * 以前它跟「地點」「編輯照片」並排在最上層，看起來像另一件事。
+           *
+           * 權限跟著這本相簿的編輯權走（別人的相簿裡只能上傳，不能替人補備份），
+           * 所以不是整組跟著 canAddToAlbum。
+           * 頁面重整之後黃色橫幅就沒了，但沒備份的照片還在 —— 這裡是它唯一的常駐入口。
+           */
+          ...(canEditAlbum ? [{
+            key: 'drive',
+            label: '補傳 Drive',
+            title: '重選原始檔，補上缺的 4K 與原始檔備份',
+            onClick: () => setShowDriveBackfill(true),
+          }] : []),
         ],
       },
     ];
@@ -532,13 +547,7 @@ function AlbumContent() {
         title: '整本相簿攤開，照日期看哪些照片還缺位置或地名',
         onClick: () => setShowPlaceCheckin(true),
       },
-      // 頁面重整之後黃色橫幅就沒了，但沒備份的照片還在。這裡是它唯一的常駐入口
-      {
-        key: 'drive',
-        label: '補傳 Drive',
-        title: '重選原始檔，補上缺的 4K 與原始檔備份',
-        onClick: () => setShowDriveBackfill(true),
-      },
+      // 補傳 Drive 不在這裡，它收在「上傳照片」底下（見上面）
       { key: 'edit', label: '編輯照片', onClick: () => setIsEditingPhotos(true) },
     ];
 
