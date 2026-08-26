@@ -39,6 +39,7 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
   const [progress, setProgress] = useState<{ current: number; total: number; name: string } | null>(null);
   const [result, setResult] = useState<{ ok: number; failed: number; error?: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [copied, setCopied] = useState(false);
 
   const load = useCallback(async () => {
     setPending(null);
@@ -75,7 +76,7 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
    * 檔名對照片。同一個主檔名在待補清單裡出現兩次就兩邊都不碰 ——
    * 猜錯會把 A 的原始檔記成 B 的備份，而那是靜悄悄的錯，之後沒人查得出來。
    */
-  const { matches, unmatchedFiles, ambiguous, untouched } = useMemo(() => {
+  const { matches, unmatchedFiles, ambiguous, matchedIds, dupNames } = useMemo(() => {
     const byKey = new Map<string, DrivePendingPhoto[]>();
     for (const p of pending ?? []) {
       const k = baseKey(p.title || p.file_name);
@@ -83,11 +84,17 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
       if (list) list.push(p);
       else byKey.set(k, [p]);
     }
+    // 待補清單裡自己就同名的那幾張。清單上要標出來 —— 不標的話使用者會一直
+    // 重選那個檔案，然後一直什麼都沒發生（它們是被「不猜」規則擋掉的）
+    const dupNames = new Set<string>();
+    // forEach 而不是 for…of：tsconfig 的 target 沒開 downlevelIteration，
+    // 直接迭代 Map 會被 TS2802 擋下來
+    byKey.forEach((list, k) => { if (list.length > 1) dupNames.add(k); });
 
     const matches: Match[] = [];
     const unmatchedFiles: File[] = [];
     const ambiguous: string[] = [];
-    const used = new Set<number>();
+    const matchedIds = new Set<number>();
 
     for (const file of files) {
       const hits = byKey.get(baseKey(file.name));
@@ -97,13 +104,31 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
         ambiguous.push(file.name);
       } else {
         matches.push({ photo: hits[0], file });
-        used.add(hits[0].id);
+        matchedIds.add(hits[0].id);
       }
     }
 
-    const untouched = (pending ?? []).filter((p) => !used.has(p.id));
-    return { matches, unmatchedFiles, ambiguous, untouched };
+    return { matches, unmatchedFiles, ambiguous, matchedIds, dupNames };
   }, [pending, files]);
+
+  /**
+   * 把待補的檔名整份複製走。
+   *
+   * 有清單還不夠 —— 幾十張的時候人要拿著它去硬碟裡一個一個找，用貼的比用看的快。
+   * 剪貼簿被擋掉（權限、非安全來源）就直接 prompt 攤開來讓人自己選取，
+   * 不要只 console.error：那又是一次「按了沒反應」。
+   */
+  const copyNames = async () => {
+    const text = (pending ?? []).map((p) => p.title || p.file_name).join('\n');
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      window.prompt('複製不了，請自己選取這段文字：', text);
+    }
+  };
 
   const handleStart = async () => {
     if (matches.length === 0 || busy) return;
@@ -210,8 +235,63 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
 
           {pending !== null && pending.length > 0 && (
             <>
-              <div style={{ fontSize: 14, marginBottom: 12 }}>
-                有 <strong>{pending.length}</strong> 張照片還沒有 Drive 備份。
+              <div style={{
+                fontSize: 14, marginBottom: 8,
+                display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+              }}>
+                <span>有 <strong>{pending.length}</strong> 張照片還沒有 Drive 備份：</span>
+                <button
+                  type="button"
+                  onClick={copyNames}
+                  style={{
+                    padding: '3px 10px', borderRadius: 6, border: '1px solid #cbd5e1',
+                    background: '#fff', color: '#334155', fontSize: 12.5, cursor: 'pointer',
+                  }}
+                >
+                  {copied ? '已複製 ✓' : '複製全部檔名'}
+                </button>
+              </div>
+
+              {/*
+                * **一定要把檔名列出來。** 這個視窗要人「重新選一次原始檔」，
+                * 而補傳是靠檔名對回照片的 —— 只講「還有 N 張」等於要使用者
+                * 自己猜是哪幾張，硬碟裡幾千個檔根本無從選起。
+                *
+                * 只列文字不列縮圖：一次幾百張縮圖就是幾百次 Workers 請求，
+                * 而這裡要回答的問題是「我該去找哪個檔」，檔名就夠了。
+                */}
+              <div style={{
+                maxHeight: 190, overflowY: 'auto', margin: '0 0 14px',
+                border: '1px solid #e2e8f0', borderRadius: 8, background: '#f8fafc',
+              }}>
+                {pending.map((p) => {
+                  const name = p.title || p.file_name;
+                  const isMatched = matchedIds.has(p.id);
+                  const isDup = dupNames.has(baseKey(name));
+                  return (
+                    <div
+                      key={p.id}
+                      title={name}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 8,
+                        padding: '5px 10px', fontSize: 12.5, lineHeight: 1.5,
+                        borderBottom: '1px solid #eef2f7',
+                        color: isMatched ? '#15803d' : '#334155',
+                      }}
+                    >
+                      <span style={{ width: 14, flexShrink: 0 }}>{isMatched ? '✓' : ''}</span>
+                      <span style={{
+                        flex: 1, overflow: 'hidden',
+                        textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      }}>
+                        {name}
+                      </span>
+                      {isDup && (
+                        <span style={{ color: '#92400e', flexShrink: 0 }}>同名多張</span>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
 
               <button
@@ -260,9 +340,9 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                       <div style={{ ...note, paddingLeft: 14 }}>{ambiguous.join('、')}</div>
                     </details>
                   )}
-                  {untouched.length > 0 && (
+                  {pending.length - matchedIds.size > 0 && (
                     <div style={note}>
-                      還有 {untouched.length} 張沒被選到，留著下次再補。
+                      還有 {pending.length - matchedIds.size} 張沒被選到（上面清單裡沒有 ✓ 的那些），留著下次再補。
                     </div>
                   )}
                 </div>
@@ -285,6 +365,8 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
               <div style={{ ...note, marginTop: 16, borderTop: '1px solid #f1f5f9', paddingTop: 12 }}>
                 靠<strong>檔名</strong>對應（不含副檔名）。改過檔名的檔案對不上，
                 但不會出錯，只會被列進「找不到對應照片」。
+                標著「同名多張」的那幾張不猜也不碰 —— 猜錯會把 A 的原始檔記成 B 的備份，
+                而那是查不出來的錯。要補的話先把其中幾張改名再回來。
                 <br />
                 每張要重新編一次 4K 再傳兩個檔，數量多會跑一陣子，請不要關掉這個視窗。
               </div>
