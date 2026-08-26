@@ -75,6 +75,11 @@ Authorization，而 R2 的物件鍵要先拿到（鎖著的）相簿 JSON 才知
   前端存在 `localStorage.media_token`，由 `photoFullSrc()`／`photoVideoSrc()` 掛上網址。
 - **`mt` 不是身分**，只證明「這個網址是站上發出來的」。拿它打 `/api/albums` 一樣 401；
   要知道「是誰」的路由照樣得走 `currentActor()`。
+- **票有兩種粒度**（0020）：一般票 `<exp>.<HMAC>`，可管理全站內容的人拿到的是
+  尾巴多一段 `.a` 的升級票。差別只在「不開放」那幾張（見「不開放的照片」）。
+  粒度有進 HMAC 的 payload，所以自己加／拔 `.a` 驗不過。
+  ⚠️ 升級票**七天內不會因為權限被撤而失效**（它刻意不查 D1）—— 已知，要修的話
+  等於每一張大圖都多一次 D1 讀取。
 - **不是每張照片各簽一組**：相簿內容那支路由不分頁，5000 張的相簿逐張簽等於一次請求
   跑 5000 趟 `crypto.subtle.sign`，遠超單次 10ms CPU。`/full` 回的是圖片位元組、
   內容不隨身分變化，所以「證明你進得了站」就是剛好的粒度。
@@ -319,6 +324,32 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   前端連 Google 時間軸紀念層也一起收（`/map` 不抓 index、開關不出現）——
   那是他自己的另一半足跡，留著就是一條沒有名字的線。
   **資料完全不動，權限開回來下一次進頁就全部復原。**
+
+## 不開放的照片
+
+`Photo.restricted`（0020，`INTEGER NOT NULL DEFAULT 0`）。1 ＝ **只有可管理全站內容的人
+（站長與 `can_manage_others=1`）看得到**，其餘成員與訪客眼中那一格整個不存在。
+
+- 切換走 `PUT /api/photos/restricted`（`{photoIds, restricted}`），**只認 `me.canManageOthers`，
+  不是 `canTouchPhotos`** —— 標成不開放之後連標的人自己都看不到了，而「誰看得到」
+  是全站層級的決定，跟「誰傳的」無關。前端在燈箱右側一顆開關（`canManageOthers` 才端出來）。
+- ⚠️ **路由要排在 `PUT /api/photos/:id` 前面**：`/api/photos/restricted` 切出來也是 4 段，
+  排後面會被當成「id 叫 restricted 的照片」吃掉（跟 `/api/photos/reorder` 同一個理由）。
+- 過濾**一律寫在 SQL 的 WHERE 裡**（`RESTRICTED_VISIBLE_COND`，Photo 要別名為 `p`），
+  蓋住：`/api/albums` 的預覽圖、`/api/albums/:id/photos`、`/api/search`、`/api/footprint`、
+  `/api/photos/geo-pending`、`/api/photos/drive-pending`。
+  ⚠️ drive-pending 的**列表與 COUNT 要用同一個條件**，不然補傳進度永遠歸不了零。
+- 大圖／影片位元組（`/full`、`/video`）沒有身分可看，靠 **mt 的升級票**（見「後端的請求流程」），
+  或真的帶 Authorization 進來。拿不到一律回 **404 不是 403** —— 403 等於承認那個編號上有東西。
+  ⚠️ `/full` 的 **cache key 要加 `adm=1`**，而且必須**先 `delete("adm")` 再由後端自己 set**：
+  照抄請求裡的 `?adm=1` 等於讓任何人指定要讀哪一份邊緣快取。
+- 標成不開放時後端會**順手把指到它的 `Album.cover_photo_url` 清成 NULL** ——
+  封面是存下來的網址，不清的話它會以封面的身分掛在首頁上給所有人看。前端也擋掉
+  「把不開放的照片設成封面」。
+- ⚠️ **不要做「馬賽克／點開才說沒權限」那種 UI**。使用者要的是看不到；端出一格點下去說
+  沒權限，等於告訴所有人「這裡有一張你不能看的照片」。
+- 留言那幾支**沒有**跟著擋（`GET /api/photos/:id/comments` 不查 Photo 表）。要擋就是每次
+  開燈箱多一次 D1 讀取，而那條路本來就要 `can_view_comments`、而且照片清單裡根本找不到那個 id。
 
 ## 足跡動畫：一起出遊的判定
 

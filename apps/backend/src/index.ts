@@ -222,8 +222,33 @@ async function tokenIdentity(request: Request, env: Env): Promise<Identity | nul
  */
 const MEDIA_TOKEN_TTL_SEC = 86400 * 7;
 
-/** 簽章的內容只有到期時間，**不綁人** —— 綁了也擋不住更多東西，只會多一份快取 */
-const mediaTokenPayload = (exp: string) => `media:${exp}`;
+/*
+ * 票有**兩種粒度**（0020 起）。
+ *
+ * 一般的那張還是「不綁人」—— 它只證明「這個網址是站上發出來的」，內容不隨身分
+ * 變化的照片共用同一份邊緣快取，這是刻意的（綁人＝每個人一份快取，Drive 取檔
+ * 次數直接乘上人數）。
+ *
+ * 升級版那張多證明一件事：**持票人可以管理全站內容**。它只在一個地方有差別 ——
+ * 被標成「不開放」的那幾張（Photo.restricted），一般票拿不到位元組。
+ * 為什麼不是每張不開放的照片各簽一組：那要在相簿內容那支不分頁的路由裡逐張簽，
+ * 5000 張就是 5000 趟 HMAC，遠超單次 10ms CPU（跟當初決定發「一張通行票」
+ * 是同一個理由）。
+ *
+ * 代價講清楚：升級票發出去之後**七天內不會因為權限被撤而失效**。撤掉權限的
+ * 下一秒，那個人手上那張還能取得不開放照片的位元組，直到過期或重新登入換票。
+ * 進站 token 本身沒有這個問題（每次都回頭查 D1），是這張刻意不查 D1 的票才有。
+ * 要修得讓 /full 每次都 currentActor()，那就等於為了少數幾張照片，讓每一張大圖
+ * 都多一次 D1 讀取 —— 不划算。
+ */
+type MediaScope = 'none' | 'basic' | 'admin';
+
+/**
+ * 簽章的內容：到期時間 ＋ 粒度。
+ * 粒度一定要進 payload，否則把升級票尾巴那個 `.a` 拔掉／加上就換了一個粒度。
+ */
+const mediaTokenPayload = (exp: string, scope: 'basic' | 'admin') =>
+  scope === 'admin' ? `media:admin:${exp}` : `media:${exp}`;
 
 async function mediaHmacKey(env: Env, usage: "sign" | "verify"): Promise<CryptoKey> {
   return crypto.subtle.importKey(
@@ -232,35 +257,65 @@ async function mediaHmacKey(env: Env, usage: "sign" | "verify"): Promise<CryptoK
   );
 }
 
-/** 發一張媒體 token。格式 `<到期的 epoch 秒>.<base64url 的 HMAC>` */
-async function mintMediaToken(env: Env): Promise<string> {
+/**
+ * 發一張媒體 token。
+ *
+ * 格式 `<到期的 epoch 秒>.<base64url 的 HMAC>`，升級票在尾巴多一段 `.a`。
+ * **刻意讓一般票的格式一個字都沒變** —— 已經躺在家人瀏覽器 localStorage 裡的
+ * 那些票在這次部署之後照樣驗得過，不會有一段「大圖全破」的空窗。
+ */
+async function mintMediaToken(env: Env, scope: 'basic' | 'admin' = 'basic'): Promise<string> {
   const exp = String(Math.floor(Date.now() / 1000) + MEDIA_TOKEN_TTL_SEC);
   const key = await mediaHmacKey(env, "sign");
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(mediaTokenPayload(exp)));
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(mediaTokenPayload(exp, scope)));
   const b64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  return `${exp}.${b64}`;
+  return scope === 'admin' ? `${exp}.${b64}.a` : `${exp}.${b64}`;
 }
 
-/** 驗一張媒體 token。沒帶、格式不對、過期、簽章不符一律 false */
-async function verifyMediaToken(raw: string | null, env: Env): Promise<boolean> {
-  if (!raw) return false;
-  const dot = raw.indexOf(".");
-  if (dot <= 0) return false;
-  const exp = raw.slice(0, dot);
+/**
+ * 驗一張媒體 token，回傳它的粒度。沒帶、格式不對、過期、簽章不符一律 'none'。
+ *
+ * 粒度是由票尾巴那段自己宣告、再拿去驗簽的 —— 宣告成 admin 但簽的是一般票，
+ * 驗簽當場就不過，所以自稱不會變成事實。
+ */
+async function verifyMediaToken(raw: string | null, env: Env): Promise<MediaScope> {
+  if (!raw) return 'none';
+  const parts = raw.split(".");
+  if (parts.length !== 2 && !(parts.length === 3 && parts[2] === "a")) return 'none';
+  const [exp, sig] = parts;
+  if (!exp || !sig) return 'none';
+  const scope: 'basic' | 'admin' = parts.length === 3 ? 'admin' : 'basic';
   // 先看到期再驗簽：過期的不必花 CPU 算 HMAC
-  if (!/^\d+$/.test(exp) || Number(exp) < Math.floor(Date.now() / 1000)) return false;
+  if (!/^\d+$/.test(exp) || Number(exp) < Math.floor(Date.now() / 1000)) return 'none';
   try {
     const key = await mediaHmacKey(env, "verify");
     const sigBytes = Uint8Array.from(
-      atob(raw.slice(dot + 1).replace(/-/g, "+").replace(/_/g, "/")),
+      atob(sig.replace(/-/g, "+").replace(/_/g, "/")),
       c => c.charCodeAt(0),
     );
-    return await crypto.subtle.verify(
-      "HMAC", key, sigBytes, new TextEncoder().encode(mediaTokenPayload(exp)));
+    const ok = await crypto.subtle.verify(
+      "HMAC", key, sigBytes, new TextEncoder().encode(mediaTokenPayload(exp, scope)));
+    return ok ? scope : 'none';
   } catch {
-    return false;
+    return 'none';
   }
+}
+
+/**
+ * 同一個 request 只驗一次簽。
+ *
+ * 閘門驗過一次，/full 那條路由還要再問一次「這張票是不是升級版」——
+ * 沒有這層 memo 就是同一個請求算兩趟 HMAC。理由與作法跟 actorCache 一樣。
+ */
+const mediaScopeCache = new WeakMap<Request, Promise<MediaScope>>();
+
+function requestMediaScope(request: Request, url: URL, env: Env): Promise<MediaScope> {
+  const cached = mediaScopeCache.get(request);
+  if (cached) return cached;
+  const pending = verifyMediaToken(url.searchParams.get("mt"), env);
+  mediaScopeCache.set(request, pending);
+  return pending;
 }
 
 /**
@@ -522,6 +577,25 @@ function actorOwns(actor: Actor, row: { user_id?: any; uploaded_by?: any }): boo
   if (row.uploaded_by != null && Number(row.uploaded_by) === actor.uid) return true;
   return false;
 }
+
+/*
+ * ── 「不開放」的照片（0020）─────────────────────────────────────────────────
+ *
+ * Photo.restricted = 1 的那一格，**只有可管理全站內容的人看得到**（站長與
+ * can_manage_others=1）。其餘成員與訪客眼中它整個不存在：相簿內容、搜尋、
+ * 首頁的相簿預覽圖、足跡地圖、待補清單全部濾掉，大圖／影片的位元組也拿不到。
+ *
+ * ⚠️ 過濾**一定要寫在 SQL 的 WHERE 裡**，不可以查出來再於 Worker 裡篩掉 ——
+ *    分頁的 LIMIT 會因此少給幾筆（前端看到的是「有下一頁但翻不出東西」），
+ *    而且座標與隱私那條老規矩本來就是這樣（見 CLAUDE.md「一進來就該知道的坑」）。
+ *
+ * ⚠️ 相對地，**不要為它另外做一層「馬賽克／點不開」的 UI**。使用者要的是看不到，
+ *    端出一格點下去說沒權限，等於告訴所有人「這裡有一張你不能看的照片」。
+ */
+const canSeeRestricted = (actor: Actor | null): boolean => !!actor?.canManageOthers;
+
+/** WHERE 片段。用到它的 SQL 必須把 Photo 別名為 `p`（跟 LOCAL_TIME_EXPR 同一個規矩） */
+const RESTRICTED_VISIBLE_COND = "p.restricted = 0";
 
 /**
  * 沒權限時統一的回應。訊息給前端直接顯示。
@@ -1397,7 +1471,7 @@ const origin = request.headers.get("Origin") || "";
     if (!isOpenPath) {
       const gateOk = (await tokenIdentity(request, env)) !== null
         || (method === "GET" && isSignedMediaPath(pathname)
-            && await verifyMediaToken(url.searchParams.get("mt"), env));
+            && (await requestMediaScope(request, url, env)) !== 'none');
       if (!gateOk) {
         return new Response(JSON.stringify({ error: "locked" }), { status: 401, headers });
       }
@@ -1536,7 +1610,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
            * 這張 token 擋的是「完全沒進站的人」，不是訪客。
            * 同樣跟著這一條回來（零額外請求），效期與手上那張進站 token 一致。
            */
-          media_token: await mintMediaToken(env),
+          media_token: await mintMediaToken(env, actor?.canManageOthers ? 'admin' : 'basic'),
           user: actor ? {
             id: actor.uid, name: actor.name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
@@ -2383,10 +2457,16 @@ if (method === "POST" && pathname === "/api/verify-password") {
        * 不再隨照片數量成長。
        */
       if (method === "GET" && pathname === "/api/albums") {
+       /*
+        * 預覽圖要不要含不開放的那幾張，取決於是誰在看 —— 所以這裡要的是 actor
+        * 而不只是「有沒有登入」。currentActor 對同一個 request 只查一次 D1，
+        * 這行不會比原本的 isAuthorized 多花任何讀取。
+        */
+       const albumsActor = await currentActor(request, env);
        // 快取 60 秒，剛好對齊下面預覽圖的分鐘種子 —— 種子換人時快取也正好過期，
        // 不會出現「快取裡的舊種子」與「新算出來的種子」互相打架的空窗
        return withEdgeCache(request, ctx,
-         { browserMaxAge: 60, edgeMaxAge: 60, skip: await isAuthorized(request, env) },
+         { browserMaxAge: 60, edgeMaxAge: 60, skip: albumsActor !== null },
          async () => {
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 20) || 20, 1), 60);
         const offset = Math.max(Number(url.searchParams.get("offset") ?? 0) || 0, 0);
@@ -2459,9 +2539,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * 起點落在尾端時第一條會不足 5 筆，第二條負責繞回開頭補齊。
          * 兩條都走 idx_photo_album_shuffle 的 covering index，各自最多讀 5 列。
          */
+        // 不開放的那幾張不可以被抽成預覽圖 —— 首頁那排小圖是整個站最公開的地方
+        const previewRestricted = canSeeRestricted(albumsActor) ? "" : " AND restricted = 0";
         const previewSelect = (op: string) =>
           `SELECT COALESCE(thumb_sm_url, thumb_url, url) AS url
-             FROM Photo WHERE album_id = ? AND shuffle_key ${op} ?
+             FROM Photo WHERE album_id = ? AND shuffle_key ${op} ?${previewRestricted}
             ORDER BY shuffle_key LIMIT 5`;
         const statements = (albums as any[]).flatMap((a) => {
           const seed = seedFor(Number(a.id));
@@ -2536,12 +2618,26 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const photoId = pathname.split("/")[3];
         const cache = caches.default;
         /*
+         * 這張票是不是升級版（見 mintMediaToken）。<img src> 帶不了 Authorization，
+         * 所以「不開放的照片給不給看」只能靠票的粒度；真的用 fetch 帶 token 進來的
+         * 也認（那時 currentActor 才會去查 D1，一般的 <img> 路徑一次都不查）。
+         */
+        const fullElevated = (await requestMediaScope(request, url, env)) === 'admin'
+          || canSeeRestricted(await currentActor(request, env));
+        /*
          * cache key 把 mt 拿掉。閘門已經驗過了，留在 key 裡只會讓每個人、每次登入
          * 都是一份獨立的邊緣快取 —— 同一張照片的 Drive 取檔次數直接乘上人數。
          * 圖片位元組不隨身分變化，所以共用一份是對的。
+         *
+         * ⚠️ 唯一的分岔是「不開放」那幾張：它們的位元組**只能存在升級版那把 key
+         *    底下**，否則一般人下一次請求就會從共用快取裡直接命中，繞過下面的檢查。
+         *    所以 adm 一定要**先 delete 再由伺服器自己 set** —— 照抄請求裡的
+         *    `?adm=1` 等於讓任何人自己指定要讀哪一份快取。
          */
         const keyUrl = new URL(request.url);
         keyUrl.searchParams.delete("mt");
+        keyUrl.searchParams.delete("adm");
+        if (fullElevated) keyUrl.searchParams.set("adm", "1");
         const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
         const hit = await cache.match(cacheKey);
         if (hit) return hit;
@@ -2549,9 +2645,16 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const photo = await env.DB.prepare(
           // url 現在跟 thumb_url 是同一顆物件，但舊照片（Google 同步進來的那批）
           // 只有 url，所以還是照 COALESCE 的順序逐級退
-          "SELECT COALESCE(thumb_url, thumb_sm_url, url) AS fallback_url, drive_file_id FROM Photo WHERE id = ?"
+          "SELECT COALESCE(thumb_url, thumb_sm_url, url) AS fallback_url, drive_file_id, restricted FROM Photo WHERE id = ?"
         ).bind(photoId).first<any>();
         if (!photo) {
+          return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+        }
+        /*
+         * 不開放的照片對其他人來說**不存在**，所以回 404 而不是 403 ——
+         * 403 等於告訴對方「這個編號上有東西，只是你不能看」。
+         */
+        if (Number(photo.restricted) === 1 && !fullElevated) {
           return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
         }
 
@@ -2608,11 +2711,21 @@ if (method === "POST" && pathname === "/api/verify-password") {
           && pathname.endsWith("/video") && pathname.split("/").length === 5) {
         const photoId = pathname.split("/")[3];
         const photo = await env.DB.prepare(
-          "SELECT drive_original_id, media_type FROM Photo WHERE id = ?"
+          "SELECT drive_original_id, media_type, restricted FROM Photo WHERE id = ?"
         ).bind(photoId).first<any>();
 
         // 對著一張照片要影片是前端弄錯了，不要真的去代理一張圖片的位元組
         if (!photo || photo.media_type !== "video") {
+          return new Response(JSON.stringify({ error: "Video not found" }), { status: 404, headers });
+        }
+        /*
+         * 不開放的影片：跟 /full 同一套判斷，一樣回 404 不是 403。
+         * 這條路由本來就不進 caches.default（回應是某一段 Range），所以沒有
+         * 上面那個 cache key 的問題。
+         */
+        if (Number(photo.restricted) === 1
+            && (await requestMediaScope(request, url, env)) !== 'admin'
+            && !canSeeRestricted(await currentActor(request, env))) {
           return new Response(JSON.stringify({ error: "Video not found" }), { status: 404, headers });
         }
         // 上傳到一半斷掉會留下這種列：封面已經在 R2，影片還沒送上 Drive
@@ -2672,7 +2785,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
       // 路由：取得特定相簿的照片 (含 Tags)
       if (method === "GET" && pathname.startsWith("/api/albums/") && pathname.endsWith("/photos")) {
         // 同樣有座標差異，管理員跳過快取
-        const albumIsAdmin = await isAuthorized(request, env);
+        const albumActor = await currentActor(request, env);
+        const albumIsAdmin = albumActor !== null;
         return withEdgeCache(request, ctx,
           { browserMaxAge: 30, edgeMaxAge: 300, skip: albumIsAdmin },
           async () => {
@@ -2686,7 +2800,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           SELECT p.*, a.user_id AS user_id, a.map_private
           FROM Photo p
           LEFT JOIN Album a ON a.id = p.album_id
-          WHERE p.album_id = ?
+          WHERE p.album_id = ?${canSeeRestricted(albumActor) ? "" : ` AND ${RESTRICTED_VISIBLE_COND}`}
           ORDER BY p.sort_order ASC, p.created_at DESC
         `).bind(albumId).all();
         const photos = applyGeoPrivacy(rawPhotos as any[], albumIsAdmin);
@@ -2752,7 +2866,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
       if (method === "GET" && pathname === "/api/search") {
        // 搜尋結果會跑 applyGeoPrivacy，管理員與訪客拿到的座標不同 —— 管理員一律
        // 跳過邊緣快取，否則家人會從共用快取裡撈到私密相簿的經緯度
-       const searchIsAdmin = await isAuthorized(request, env);
+       const searchActor = await currentActor(request, env);
+       const searchIsAdmin = searchActor !== null;
        return withEdgeCache(request, ctx,
          { browserMaxAge: 30, edgeMaxAge: 300, skip: searchIsAdmin },
          async () => {
@@ -2774,6 +2889,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
         // 得再補 DISTINCT，而 DISTINCT 會讓 SQLite 為了去重把結果集整個具體化。
         const where: string[] = [];
         const binds: any[] = [];
+        // 不開放的那幾張連搜尋都搜不到（FTS 索引照樣建著，過濾在外層）
+        if (!canSeeRestricted(searchActor)) where.push(RESTRICTED_VISIBLE_COND);
         if (matchExpr) {
           where.push(`p.id IN (SELECT rowid FROM PhotoFts WHERE PhotoFts MATCH ?)`);
           binds.push(matchExpr);
@@ -2837,17 +2954,20 @@ if (method === "POST" && pathname === "/api/verify-password") {
        * 是 NOT NULL 的部分索引，剛好相反），還是得掃，但至少回傳量小很多。
        */
       if (method === "GET" && pathname === "/api/photos/geo-pending") {
-        if (!(await isAuthorized(request, env))) {
+        const geoPendingActor = await currentActor(request, env);
+        if (!geoPendingActor) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
         const cursor = Number(url.searchParams.get("cursor") ?? 0) || 0;
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 1000) || 1000, 1), 2000);
         const onlyMissing = url.searchParams.get("only_missing") === "1";
+        // 不開放的那幾張對其他人來說不存在，時間軸比對也不該把它們列出來
+        const geoPendingRestricted = canSeeRestricted(geoPendingActor) ? "" : "AND restricted = 0";
 
         const { results: photos } = await env.DB.prepare(`
           SELECT id, lat, taken_at, taken_at_local
             FROM Photo
-           WHERE id > ? ${onlyMissing ? "AND lat IS NULL" : ""}
+           WHERE id > ? ${onlyMissing ? "AND lat IS NULL" : ""} ${geoPendingRestricted}
            ORDER BY id LIMIT ?
         `).bind(cursor, limit).all();
 
@@ -2915,13 +3035,20 @@ if (method === "POST" && pathname === "/api/verify-password") {
        * 二來避免不同相簿裡剛好同名的檔案互相對錯。
        */
       if (method === "GET" && pathname === "/api/photos/drive-pending") {
-        if (!(await isAuthorized(request, env))) {
+        const drivePendingActor = await currentActor(request, env);
+        if (!drivePendingActor) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
         const cursor = Number(url.searchParams.get("cursor") ?? 0) || 0;
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 200) || 200, 1), 500);
         const albumId = Number(url.searchParams.get("album_id") ?? 0) || 0;
-        const albumClause = albumId ? " AND album_id = ?" : "";
+        /*
+         * 不開放的那幾張對其他人來說不存在，這張清單會端出縮圖網址 —— 一樣要濾掉。
+         * ⚠️ 底下的列表與 COUNT **必須用同一個條件**，不然「剩幾張」永遠歸不了零，
+         *    補傳的進度條會卡在一個補不完的數字上。
+         */
+        const drivePendingRestricted = canSeeRestricted(drivePendingActor) ? "" : " AND restricted = 0";
+        const albumClause = (albumId ? " AND album_id = ?" : "") + drivePendingRestricted;
 
         /*
          * ⚠️ **一定要排除影片。** 影片的 Drive id 記在 drive_original_id，
@@ -3172,6 +3299,54 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const statements = body.map(item => env.DB.prepare("UPDATE Album SET sort_order = ? WHERE id = ?").bind(item.sort_order, item.id));
         if (statements.length > 0) await env.DB.batch(statements);
         return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      /*
+       * 路由：切換單張（或一批）照片／影片的「不開放」。
+       *
+       * ⚠️ **位置不能往後搬**：`/api/photos/restricted` 切出來是 4 段，跟底下
+       *    `PUT /api/photos/:id` 那條的長度判斷一模一樣（見 CLAUDE.md「路由靠
+       *    pathname.split 分辨」那條坑）。排在它後面的話，這個網址會被當成
+       *    「id 叫 restricted 的照片」吃掉。隔壁的 /api/photos/reorder 也是同一個理由。
+       *
+       * ⚠️ **只有可管理全站內容的人動得了，不是 canTouchPhotos。** 其餘那幾支
+       *    批次路由問的是「這是不是你的東西」，這一支不行 —— 標成不開放之後
+       *    連標的人自己都看不到了，等於把自己的照片弄丟；而且「誰看得到」
+       *    是全站層級的決定，跟「誰傳的」是兩回事。
+       *
+       * 一批一起改是為了沿用相簿頁那套既有的選取列，不是為了大量操作 ——
+       * 使用者要的是單張，燈箱那顆開關送的就是一個 id 的陣列。
+       */
+      if (method === "PUT" && pathname === "/api/photos/restricted") {
+        if (!me.canManageOthers) {
+          return forbidden(headers, "只有可管理全站內容的人能設定不開放");
+        }
+        const body: any = await request.json();
+        const ids = sanitizePhotoIds(body?.photoIds);
+        if (ids.length === 0) {
+          return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
+        }
+        const value = body?.restricted === 0 || body?.restricted === false ? 0 : 1;
+        const res = await env.DB.batch(
+          chunkIds(ids, 1).map((c) => env.DB.prepare(
+            `UPDATE Photo SET restricted = ? WHERE id IN (${placeholdersFor(c)})`
+          ).bind(value, ...c)),
+        );
+        /*
+         * 相簿封面是**存下來的網址**（Album.cover_photo_url），不是每次去查哪張照片
+         * —— 不清掉的話，一張被標成不開放的照片還是會以封面的身分掛在首頁上，
+         * 對所有人。刪除照片那條路由本來就有同一件事要做（見 DELETE /api/photos/:id）。
+         */
+        if (value === 1) {
+          await env.DB.batch(
+            chunkIds(ids).map((c) => env.DB.prepare(
+              `UPDATE Album SET cover_photo_url = NULL
+                WHERE cover_photo_url IN (SELECT url FROM Photo WHERE id IN (${placeholdersFor(c)}))`
+            ).bind(...c)),
+          );
+        }
+        const updated = res.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
+        return new Response(JSON.stringify({ success: true, updated, restricted: value }), { headers });
       }
 
       /*
@@ -4393,6 +4568,8 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
 
         // 非管理者只看得到雙層隱私都放行的照片
         if (!isAdmin) conds.push("a.map_private = 0", "p.geo_private = 0");
+        // 不開放的那幾張連點都不該出現（跟座標隱私是兩件事，見 canSeeRestricted）
+        if (!canSeeRestricted(actor)) conds.push(RESTRICTED_VISIBLE_COND);
 
         const qAlbum = url.searchParams.get("album_id");
         if (qAlbum) { conds.push("p.album_id = ?"); binds.push(qAlbum); }

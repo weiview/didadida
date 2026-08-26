@@ -168,6 +168,32 @@
   pointer-events: none;
 }
 
+/*
+ * 「不開放」的角標。放左下角是為了避開右上的影片角標與左上的編輯勾選框 ——
+ * 一支不開放的影片會同時掛著兩個角標，重疊的話兩個都讀不出來。
+ */
+.restrictedBadge {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 12px;
+  background: rgba(180, 30, 30, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 500;
+  line-height: 1.6;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  /* 整張卡片都是「點開燈箱」，角標不該把那個點擊吃掉 */
+  pointer-events: none;
+}
+
 .videoBadgeIcon {
   font-size: 0.62rem;
   /* 三角形字符本身偏上，往下推一點才跟數字對齊 */

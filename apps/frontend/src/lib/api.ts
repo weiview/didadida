@@ -221,6 +221,14 @@ export interface Photo {
    */
   geo_private?: number;
   /**
+   * 「這一格不開放」。1 ＝ **只有可管理全站內容的人看得到**，其餘成員與訪客
+   * 拿到的清單裡根本沒有這一列（過濾在後端的 SQL 裡，見 migrations/0020）。
+   *
+   * 所以前端看到 `restricted === 1` 就代表「我是看得到的那種人」——
+   * 不需要（也不可以）自己再判斷一次要不要畫出來，那會變成兩套規則。
+   */
+  restricted?: number;
+  /**
    * 擁有權。跟後端 actorOwns 讀的是同一組欄位：
    * `user_id` 是**相簿主人**（不是照片自己的欄位，後端 JOIN 出來的），
    * `uploaded_by` 是傳這張的人（舊照片是 null，退回看相簿主人）。
@@ -2118,6 +2126,28 @@ export async function setPhotoGeoPrivacy(photoIds: number[], geoPrivate: boolean
       method: 'PUT',
       headers: getAuthHeaders(),
       body: JSON.stringify({ photoIds, geoPrivate: geoPrivate ? 1 : 0 }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
+/**
+ * 切換「不開放」。
+ *
+ * ⚠️ 後端只讓可管理全站內容的人動（其餘一律 403）—— 呼叫端要自己先用
+ *    `useAdmin()` 的 canManageOthers 決定那顆開關端不端出來，不要端出來再吃 403。
+ *
+ * 一次收一批是為了沿用既有的批次端點；燈箱那顆開關送的就是一個 id 的陣列。
+ */
+export async function setPhotosRestricted(photoIds: number[], restricted: boolean): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/restricted`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ photoIds, restricted: restricted ? 1 : 0 }),
     });
     return res.ok;
   } catch (err) {

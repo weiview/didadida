@@ -3,7 +3,8 @@ import styles from "./lightbox.module.css";
 import PhotoComments from "./PhotoComments";
 import PhotoImage from "@/components/PhotoImage";
 import VideoPlayer from "@/components/VideoPlayer";
-import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, isVideo } from "@/lib/api";
+import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, isVideo, setPhotosRestricted } from "@/lib/api";
+import { useAdmin } from "@/lib/useAdmin";
 import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
 
@@ -37,6 +38,24 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   
   const [newTagName, setNewTagName] = useState("");
   const [isAddingTag, setIsAddingTag] = useState(false);
+
+  /*
+   * 「不開放」那顆開關（0020）。
+   *
+   * 這裡刻意**不看 isAdmin**（那個是逐張的「這張我改得動嗎」）—— 誰看得到是全站
+   * 層級的決定，後端也只讓 can_manage_others 動得了。端給改得動照片但管不了全站
+   * 的人，只會換到一顆按下去 403 的開關。
+   */
+  const { canManageOthers } = useAdmin();
+  const [isSavingRestricted, setIsSavingRestricted] = useState(false);
+
+  const handleToggleRestricted = async (next: boolean) => {
+    setIsSavingRestricted(true);
+    const ok = await setPhotosRestricted([photo.id], next);
+    setIsSavingRestricted(false);
+    if (ok) onUpdate();
+    else alert("設定失敗，請再試一次");
+  };
 
   useEffect(() => {
     setDescValue(photo.description || "");
@@ -373,6 +392,34 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                 <h3>地點</h3>
               </div>
               <span className={styles.exifValue}>{photo.place_name || '尚未指定地點'}</span>
+            </div>
+          )}
+
+          {/*
+            * 不開放：整格對其他人消失（不是馬賽克、也不是點開才說沒權限）。
+            * 勾起來的當下如果它正好是相簿封面，後端會順手把封面清掉。
+            */}
+          {canManageOthers && (
+            <div className={styles.section}>
+              <div className={styles.sectionHeader}>
+                <h3>不開放</h3>
+                <div className={styles.switchWrapper}>
+                  <label className={styles.switch}>
+                    <input
+                      type="checkbox"
+                      checked={photo.restricted === 1}
+                      disabled={isSavingRestricted}
+                      onChange={(e) => handleToggleRestricted(e.target.checked)}
+                    />
+                    <span className={styles.slider}></span>
+                  </label>
+                </div>
+              </div>
+              <span className={styles.exifValue} style={{ color: '#888' }}>
+                {photo.restricted === 1
+                  ? `這${isVideo(photo) ? '支影片' : '張照片'}只有可管理全站內容的人看得到，其他人的相簿、搜尋與地圖上都沒有它`
+                  : '打開之後，只有可管理全站內容的人看得到'}
+              </span>
             </div>
           )}
 

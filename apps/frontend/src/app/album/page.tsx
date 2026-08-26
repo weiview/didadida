@@ -1738,6 +1738,15 @@ function AlbumContent() {
               onClick={async () => {
                 if (longPressIndex !== null || draggingIndex !== null) return;
                 if (isEditingPhotos) {
+                  /*
+                   * 不開放的那一張不能當封面 —— 封面是存下來的網址，會出現在
+                   * 首頁與相簿列表上，對所有人。後端在標成不開放的當下就會把
+                   * 既有的封面清掉，這裡擋的是反過來的順序。
+                   */
+                  if (photo.restricted === 1) {
+                    alert("這一張設成不開放了，不能當相簿封面");
+                    return;
+                  }
                   // 在編輯模式下，若點擊已是封面的照片則取消封面設定，否則設為新封面
                   const isCurrentCover = currentCoverPhotoUrl === photo.url;
                   const newCoverUrl = isCurrentCover ? null : photo.url;
@@ -1804,6 +1813,15 @@ function AlbumContent() {
                   <span className={styles.videoBadgeIcon} aria-hidden="true">▶</span>
                   {formatDuration(photo.duration_ms)}
                 </span>
+              )}
+              {/*
+                * 不開放的那幾格只有可管理全站內容的人拿得到（後端就濾掉了，
+                * 見 migrations/0020）—— 所以這裡不必再判斷一次身分，
+                * 看得到 restricted === 1 本身就代表「我是那種人」。
+                * 沒有角標的話，站長會完全分不出哪幾張是藏起來的。
+                */}
+              {photo.restricted === 1 && (
+                <span className={styles.restrictedBadge}>🔒 不開放</span>
               )}
               {/* 當每排 3 欄 (含) 以上時，照片上隱藏文字與標籤資訊，只呈現純淨照片縮圖 */}
               {(gridColumns === 1 || gridColumns === 2) && (
