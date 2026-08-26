@@ -555,6 +555,15 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
     ⚠️ **首頁相簿封面是 CSS 背景圖，不要改成 `<img>` 套 PhotoImage** ——
     背景圖＋延後掛載（`mountedCount`）省掉的是「相簿數 × 預覽張數」次 Workers 請求。
     那裡用離線 `new Image()` 探載入狀態，配 `PhotoSpinner`。
+12. **上傳的收尾一定要寫在 `finally` 裡**（`handleFileChange`／Google 匯入那條都是）。
+    漏掉的話一個沒預料到的錯誤會同時做兩件事：`uploading`／`syncingGoogle` 永遠停在 true
+    （FAB 從此只剩一行「上傳中...」），而且 `<input type="file">` 的 `value` 沒清掉 ——
+    **再選同一批檔案瀏覽器不認為值變了，`change` 事件根本不會來**。使用者眼中就是
+    「按了、選了，什麼都沒發生」，Console 只有一行 unhandled rejection。
+    ⚠️ 失敗也**一律逐檔講原因**（`IngestResult.failures`，跟 Google 匯入的 `skipped` 同一個規矩）：
+    「部分或全部照片上傳失敗，請稍後再試」對 HEIC 是句假話，再試一百次都一樣。
+    `uploadPhoto` 的 `{status:'error'}` 因此帶著 `reason`。
+    Drive 失敗**不算這張失敗**（照片已經在 R2 了），要記進 `pendingDriveBatch` 讓補傳看得到它。
 
 ## 工作習慣
 

@@ -673,7 +673,9 @@ function AlbumContent() {
         id, item.resized, item.exifData, item.takenAt, true, item.video,
       );
       if (result.status !== 'ok') {
-        alert('這張上傳失敗，先跳過。');
+        alert(result.status === 'error'
+          ? `這張上傳失敗，先跳過。\n\n${result.reason}`
+          : '這張上傳失敗，先跳過。');
         return;
       }
 
@@ -732,9 +734,21 @@ function AlbumContent() {
   type IngestResult = {
     uploaded: UploadedPhoto[];
     dupes: PendingDuplicate[];
-    allSuccess: boolean;
+    /**
+     * 沒進來的那幾個，**一行一個原因**。
+     *
+     * 以前這裡只有一個 `allSuccess` 布林，收工彈的是「部分或全部照片上傳失敗，
+     * 請稍後再試」—— 使用者既不知道是哪一張，也不知道再試有沒有用（HEIC 再試
+     * 一百次還是一樣）。跟 Google 匯入那條的 `skipped` 同一個規矩：
+     * **每一個失敗都要留下痕跡**。
+     */
+    failures: string[];
     reauth: GoogleReauthError | null;
   };
+
+  /** 把任何丟出來的東西變成一句看得懂的話 */
+  const errText = (err: unknown): string =>
+    err instanceof Error ? err.message : String(err);
 
   /**
    * 匯入管線。**本機選檔與 Google 相簿匯入走的是同一條**：
@@ -760,7 +774,7 @@ function AlbumContent() {
     const missedDrive: { photoId: number; file: File }[] = [];
     // 後端判定跟相簿裡撞了的那幾張。**它們一個位元組都還沒寫進去**，跑完再統一問
     const dupes: PendingDuplicate[] = [];
-    let allSuccess = true;
+    const failures: string[] = [];
     let reauth: GoogleReauthError | null = null;
 
     const drive = await prepareDrive();
@@ -802,10 +816,10 @@ function AlbumContent() {
             } catch (err) {
               console.error(`影片 ${rawFile.name} 沒送上 Drive，收掉剛建的那一列`, err);
               await deletePhoto(result.photo.id);
-              allSuccess = false;
+              failures.push(`${source.name}：影片沒送上 Drive（${errText(err)}）`);
             }
           } else {
-            allSuccess = false;
+            failures.push(`${source.name}：${result.reason}`);
           }
           continue;
         }
@@ -815,9 +829,21 @@ function AlbumContent() {
         const result = await uploadPhoto(id as string, file, exifData, takenAt || undefined);
         if (result.status === 'ok') {
           uploaded.push(result.photo);
-          // 4K 與原始檔送 Drive。任何一步失敗都只是少一份備份，照片已經存在了
-          if (drive) await pushPhotoToDrive(drive, result.photo.id, rawFile);
-          else missedDrive.push({ photoId: result.photo.id, file: rawFile });
+          /*
+           * 4K 與原始檔送 Drive。失敗**只是少一份備份**，照片本身已經在 R2 了。
+           *
+           * ⚠️ 這裡以前沒有 try：一張的 Drive 斷線會被外層的 catch 接走、
+           *    整張算成「上傳失敗」（其實它好好地在相簿裡），而且**不會**進待補
+           *    清單 —— 橫幅那顆「補傳 Drive」從此看不到它。
+           */
+          if (drive) {
+            try {
+              await pushPhotoToDrive(drive, result.photo.id, rawFile);
+            } catch (err) {
+              console.warn('新照片沒送上 Drive，記進待補清單', err);
+              missedDrive.push({ photoId: result.photo.id, file: rawFile });
+            }
+          } else missedDrive.push({ photoId: result.photo.id, file: rawFile });
         } else if (result.status === 'duplicate') {
           // 縮好的 file 一起留著：使用者若選「照樣上傳」，不必再解一次圖
           dupes.push({
@@ -827,25 +853,32 @@ function AlbumContent() {
             reason: result.reason, existing: result.existing,
           });
         } else {
-          allSuccess = false;
+          failures.push(`${source.name}：${result.reason}`);
         }
       } catch (err) {
         if (err instanceof GoogleReauthError) { reauth = err; break; }
         console.error(err);
-        allSuccess = false;
+        failures.push(`${source.name}：${errText(err)}`);
       }
     }
 
     // 累加而不是覆蓋：連傳兩批都沒接上 Drive 時，第一批不該被第二批洗掉
     if (missedDrive.length > 0) setPendingDriveBatch((prev) => [...prev, ...missedDrive]);
 
-    return { uploaded, dupes, allSuccess, reauth };
+    return { uploaded, dupes, failures, reauth };
   };
 
   /** 匯入收尾。視窗順序是固定的：重複清單疊在補地點上面，先決定要不要傳 */
   const finishIngest = async (result: IngestResult) => {
     if (result.reauth) setGoogleReauth(result.reauth.message);
-    else if (!result.allSuccess) alert("部分或全部照片上傳失敗，請稍後再試。");
+    else if (result.failures.length > 0) {
+      // 逐行列出哪一個、為什麼。太多就只列前 10 行，剩下的用數字帶過 ——
+      // alert 塞不下五十行，而前十行通常就足以看出全部是同一個原因
+      const shown = result.failures.slice(0, 10).join('\n');
+      const rest = result.failures.length - 10;
+      alert(`有 ${result.failures.length} 個檔案沒上傳成功：\n\n${shown}`
+        + (rest > 0 ? `\n…另外還有 ${rest} 個` : ''));
+    }
 
     await loadData(); // 重新整理照片。要 await，補件視窗才拿得到縮圖
 
@@ -856,23 +889,35 @@ function AlbumContent() {
     if (result.dupes.length > 0) setDuplicateItems(result.dupes);
   };
 
+  /**
+   * 本機選檔上傳。
+   *
+   * ⚠️ **整段一定要包在 try/finally 裡。** 中途任何一個沒預料到的錯誤丟出來的話：
+   *    ① `uploading` 永遠停在 true，右下角那顆 FAB 從此只剩一行「上傳中...」；
+   *    ② `<input type="file">` 的 value 沒清掉，**再選同一批檔案不會觸發 change**
+   *       —— 按了、選了，然後什麼都沒發生，Console 只有一行 unhandled rejection。
+   *    這正是「有時候傳得上去、有時候按了沒反應」的長相。
+   */
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!id) return;
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
     setUploading(true);
-    const result = await ingestSources(
-      Array.from(files).map((f) => ({ name: f.name, load: async () => f })),
-      (current, total, fileName, bytes) => setUploadProgress({ current, total, fileName, bytes }),
-    );
-    await finishIngest(result);
-    setUploading(false);
-    setUploadProgress(null);
-
-    // reset input
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
+    try {
+      const result = await ingestSources(
+        Array.from(files).map((f) => ({ name: f.name, load: async () => f })),
+        (current, total, fileName, bytes) => setUploadProgress({ current, total, fileName, bytes }),
+      );
+      await finishIngest(result);
+    } catch (err) {
+      console.error('上傳流程整個中斷', err);
+      alert(`上傳中斷了：${errText(err)}`);
+    } finally {
+      setUploading(false);
+      setUploadProgress(null);
+      // 一定要清掉：不清的話「再選同一批檔案」瀏覽器認為值沒變，change 不會來
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
@@ -1078,13 +1123,22 @@ function AlbumContent() {
            * 「匯入中 (x/y)」—— 於是同一條管線（ingestSources）跑起來，本機那條
            * 有進度列、Google 這條沒有，看起來像卡住。
            */
-          const result = await ingestSources(
-            sources,
-            (current, total, fileName, bytes) => setUploadProgress({ current, total, fileName, bytes }),
-          );
-          setSyncingGoogle(false);
-          setUploadProgress(null);
-          await finishIngest(result);
+          // finally 跟本機那條同一個理由：丟出來的話 syncingGoogle 永遠停在 true，
+          // FAB 從此只剩一行「匯入中...」。而且這裡在 setInterval 的 callback 裡，
+          // 錯誤連個接的人都沒有
+          try {
+            const result = await ingestSources(
+              sources,
+              (current, total, fileName, bytes) => setUploadProgress({ current, total, fileName, bytes }),
+            );
+            await finishIngest(result);
+          } catch (err) {
+            console.error('Google 匯入流程整個中斷', err);
+            alert(`匯入中斷了：${errText(err)}`);
+          } finally {
+            setSyncingGoogle(false);
+            setUploadProgress(null);
+          }
           if (skipped.length > 0) alert(`有 ${skipped.length} 個項目沒匯進來：\n\n${skipped.join('\n')}`);
         }
       }, 2000);

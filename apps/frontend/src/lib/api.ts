@@ -1350,7 +1350,7 @@ export interface DuplicateMatch {
 export type UploadResult =
   | { status: 'ok'; photo: UploadedPhoto }
   | { status: 'duplicate'; reason: 'same_file' | 'same_time'; existing: DuplicateMatch[] }
-  | { status: 'error' };
+  | { status: 'error'; reason: string };
 
 /**
  * 上傳一張照片 —— **影片也走這一支**。
@@ -1390,12 +1390,25 @@ export async function uploadPhoto(
    */
   let md: Blob | null = null;
   let sm: Blob | null = null;
+  /*
+   * 縮圖失敗的原因要**帶回給呼叫端**，不能只留在 Console。HEIC／HEIF 這種
+   * 瀏覽器解不開的格式全都停在這一步，而「上傳失敗，請稍後再試」對它們是句假話
+   * —— 再試一百次都一樣，使用者要知道的是「這個格式不行」。
+   */
+  let thumbError: string | null = null;
   try {
     ({ sm, md } = await generateThumbnails(file));
   } catch (err) {
+    thumbError = err instanceof Error ? err.message : String(err);
     console.warn("縮圖產生失敗，這張照片不會上傳", err);
   }
-  if (!md) return { status: 'error' };
+  if (!md) {
+    return {
+      status: 'error',
+      reason: thumbError
+        ?? '這個瀏覽器產不出這張的縮圖（HEIC／HEIF 之類的格式要先轉成 JPEG）',
+    };
+  }
   // R2 的物件鍵副檔名由後端依 blob.type 決定，這裡的檔名只是 FormData 的擺設
   formData.append('thumb', md, 'thumb');
   if (sm) formData.append('thumb_sm', sm, 'thumb_sm');
@@ -1434,7 +1447,15 @@ export async function uploadPhoto(
       headers: { 'Authorization': `Bearer ${token}` },
       body: formData,
     });
-    if (!res.ok) return { status: 'error' };
+    if (!res.ok) {
+      // 狀態碼要講出來：401 是進站 token 過期（重新登入就好）、403 是沒權限、
+      // 5xx 才是「稍後再試」。全部糊成同一句的話三種都只能瞎猜
+      const detail = await res.text().catch(() => '');
+      return {
+        status: 'error',
+        reason: `伺服器回 ${res.status}${detail ? `：${detail.slice(0, 120)}` : ''}`,
+      };
+    }
     const data = await res.json();
     if (data?.duplicate) {
       return {
@@ -1443,7 +1464,9 @@ export async function uploadPhoto(
         existing: Array.isArray(data.existing) ? data.existing : [],
       };
     }
-    if (typeof data?.id !== 'number') return { status: 'error' };
+    if (typeof data?.id !== 'number') {
+      return { status: 'error', reason: '伺服器沒有回傳照片編號' };
+    }
     return {
       status: 'ok',
       photo: {
@@ -1454,7 +1477,10 @@ export async function uploadPhoto(
     };
   } catch (error) {
     console.error(error);
-    return { status: 'error' };
+    return {
+      status: 'error',
+      reason: `連不上伺服器（${error instanceof Error ? error.message : String(error)}）`,
+    };
   }
 }
 
