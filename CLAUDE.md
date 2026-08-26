@@ -354,7 +354,8 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   順序是 get → put → **寫 D1** → 刪舊物件（反過來寫失敗就等於照片指向已刪物件＝破圖）。
   一次最多 8 張（搬一顆是一次 R2 讀＋寫＋刪），回應把 `rotated` 講出來。
   ⚠️ 這**收不回已經下載到對方瀏覽器裡的位元組**，也清不掉舊網址在其他機房的快取殘影 ——
-  能保證的是「新網址沒有人拿過、舊物件已經不存在」。
+  能保證的是「新網址沒有人拿過、舊物件已經不存在」。**已經開著的分頁**也一樣 ——
+  它手上那份清單是標記之前拿的，重新整理（或任何一次 `loadData()`）才會消失。
 - 標成不開放時後端會**順手把指到它的 `Album.cover_photo_url` 清成 NULL** ——
   封面是存下來的網址，不清的話它會以封面的身分掛在首頁上給所有人看。前端也擋掉
   「把不開放的照片設成封面」。⚠️ 清封面要排在**換鍵之前**（比對的是舊的 `Photo.url`）。
@@ -367,6 +368,17 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   `GET /api/notifications`（本來就 JOIN Photo，加 `AND p.restricted = 0`）。
   ⚠️ `/api/auth/me` 的**未讀數要跟通知清單同一套條件**，不然紅點會停在一個點進去
   什麼都沒有的數字上（跟 drive-pending 的清單與 COUNT 同一個道理）。
+- ⚠️ **訪客那份共用邊緣快取要用版本號作廢**（`AppSetting.content_epoch`，k/v 不需要
+  migration）。`withEdgeCache` 只對訪客寫共用快取（成員一律 skip），而 **Cache API
+  清不掉** —— `cache.delete` 只作用在當下那一個機房。所以不是去清舊的，是把 epoch
+  併進 cache key（`__v`），**換一把 key 讓舊的再也沒有人問得到**。
+  `PUT /api/photos/restricted` **兩個方向都要 `bumpContentEpoch()`**：取消不開放不推的話
+  那張照片要等快取過期才回得來，站長會以為開關壞了。
+  帶版本號的四支：`/api/albums`、`/api/albums/:id/photos`、`/api/search`、`/api/footprint`。
+  epoch **刻意用 `getSetting` 不用 `getSettingCached`** —— 後者自己有 60 秒 isolate TTL，
+  快取它等於把要解的問題往後搬 60 秒。代價是訪客每次清單請求多讀一列 AppSetting，
+  **比縮短 edgeMaxAge 便宜**（清單一次要掃幾百到幾千列，多讀一列換到 300 秒的快取照舊）。
+  那四支的 `browserMaxAge` 也一起降到 10 秒 —— 訪客自己瀏覽器那份快取，epoch 管不到。
 - 前端**不必另外做「跳過這一張」** —— 相簿清單是伺服器過濾過的，`?photo=<id>` 深連結
   也是在那份清單裡找，找不到就什麼都不做。燈箱因此永遠不會落在不開放的那一格上。
 

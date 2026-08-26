@@ -842,6 +842,11 @@ async function withEdgeCache(
     edgeMaxAge: number;
     /** true 就完全不碰快取。管理員請求務必給 true */
     skip: boolean;
+    /**
+     * 內容版本號，給了就併進 cache key。**帶得到不開放內容的清單一定要給** ——
+     * 那是唯一能讓已經寫進邊緣快取的舊清單失效的辦法（見 bumpContentEpoch）。
+     */
+    epoch?: string | null;
   },
   produce: () => Promise<Response>,
 ): Promise<Response> {
@@ -856,6 +861,7 @@ async function withEdgeCache(
    */
   const keyUrl = new URL(request.url);
   keyUrl.searchParams.set("__origin", request.headers.get("Origin") || "-");
+  if (opts.epoch) keyUrl.searchParams.set("__v", opts.epoch);
   const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
 
   const cache = caches.default;
@@ -940,6 +946,35 @@ async function getSettingCached(env: Env, key: string): Promise<string | null> {
   const value = await getSetting(env, key);
   settingMemo.set(key, { value, at: Date.now() });
   return value;
+}
+
+/** 站上內容的版本號。推一格，所有共用的邊緣快取清單就整批失效（見 bumpContentEpoch） */
+const SETTING_CONTENT_EPOCH = "content_epoch";
+
+/**
+ * 讀內容版本號。
+ *
+ * ⚠️ **刻意不走 getSettingCached** —— isolate 記憶體那份自己有 60 秒 TTL，而這個
+ *    值存在的唯一理由就是「馬上生效」，再快取一層等於把要解的問題往後搬 60 秒。
+ *
+ * 代價是每一次**訪客**的清單請求多讀一列 AppSetting（主鍵單列）。這其實比縮短
+ * 快取時間便宜：清單那幾支一次要掃幾百到幾千列，多讀一列換到的是「edgeMaxAge
+ * 維持 300 秒」而不是被迫砍到 30 秒。成員本來就 skip 快取，一次都不會讀到。
+ */
+async function contentEpoch(env: Env): Promise<string> {
+  return (await getSetting(env, SETTING_CONTENT_EPOCH)) || "0";
+}
+
+/**
+ * 內容的「誰看得到」變了，把版本號往前推一格（目前只有「不開放」會呼叫）。
+ *
+ * 為什麼需要這個東西：`withEdgeCache` 只對**訪客**寫共用的邊緣快取（成員一律
+ * skip），而 **Cache API 沒有辦法從程式裡精準清掉** —— `cache.delete` 只作用在
+ * 當下這一個機房。所以做法不是去清舊的，而是**換一把 key 讓舊的再也沒有人問得到**，
+ * 剩下的交給它自己過期。
+ */
+async function bumpContentEpoch(env: Env): Promise<void> {
+  await setSetting(env, SETTING_CONTENT_EPOCH, String(Date.now()));
 }
 
 /** 訪客看不看得到足跡地圖。沒設定過＝關 */
@@ -2473,8 +2508,10 @@ if (method === "POST" && pathname === "/api/verify-password") {
        const albumsActor = await currentActor(request, env);
        // 快取 60 秒，剛好對齊下面預覽圖的分鐘種子 —— 種子換人時快取也正好過期，
        // 不會出現「快取裡的舊種子」與「新算出來的種子」互相打架的空窗
+       // 預覽圖會濾掉不開放的照片，所以這份清單要跟著版本號走（見 bumpContentEpoch）
+       const albumsEpoch = albumsActor !== null ? null : await contentEpoch(env);
        return withEdgeCache(request, ctx,
-         { browserMaxAge: 60, edgeMaxAge: 60, skip: albumsActor !== null },
+         { browserMaxAge: 10, edgeMaxAge: 60, skip: albumsActor !== null, epoch: albumsEpoch },
          async () => {
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 20) || 20, 1), 60);
         const offset = Math.max(Number(url.searchParams.get("offset") ?? 0) || 0, 0);
@@ -2812,8 +2849,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
         // 同樣有座標差異，管理員跳過快取
         const albumActor = await currentActor(request, env);
         const albumIsAdmin = albumActor !== null;
+        const albumEpoch = albumIsAdmin ? null : await contentEpoch(env);
         return withEdgeCache(request, ctx,
-          { browserMaxAge: 30, edgeMaxAge: 300, skip: albumIsAdmin },
+          { browserMaxAge: 10, edgeMaxAge: 300, skip: albumIsAdmin, epoch: albumEpoch },
           async () => {
         const parts = pathname.split("/");
         const albumId = parts[3];
@@ -2893,8 +2931,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
        // 跳過邊緣快取，否則家人會從共用快取裡撈到私密相簿的經緯度
        const searchActor = await currentActor(request, env);
        const searchIsAdmin = searchActor !== null;
+       const searchEpoch = searchIsAdmin ? null : await contentEpoch(env);
        return withEdgeCache(request, ctx,
-         { browserMaxAge: 30, edgeMaxAge: 300, skip: searchIsAdmin },
+         { browserMaxAge: 10, edgeMaxAge: 300, skip: searchIsAdmin, epoch: searchEpoch },
          async () => {
         const rawQuery = (url.searchParams.get("q") ?? "").trim();
         const tagIds = (url.searchParams.get("tags") ?? "")
@@ -3415,6 +3454,13 @@ if (method === "POST" && pathname === "/api/verify-password") {
           // 舊網址在這個機房的邊緣快取殘影，順手清一次（只清得到當下這一個機房）
           for (const u of new Set(staleUrls)) ctx.waitUntil(cache.delete(new Request(u, { method: "GET" })));
         }
+
+        /*
+         * ⚠️ **兩個方向都要推版本號。** 標成不開放要讓訪客那份還留著它的舊清單
+         *    失效；取消不開放也要 —— 不然那張照片得等快取自己過期才回得來，
+         *    站長會以為開關壞了。
+         */
+        await bumpContentEpoch(env);
 
         const updated = res.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
         return new Response(JSON.stringify({ success: true, updated, rotated, restricted: value }), { headers });
@@ -4703,8 +4749,9 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         }
         // 這條的隱私過濾是寫在 SQL 的 WHERE 裡（不是 applyGeoPrivacy），但結果同樣
         // 依身分而異，一樣不能讓管理員的版本落進共用的邊緣快取
+        const footprintEpoch = isAdmin ? null : await contentEpoch(env);
         return withEdgeCache(request, ctx,
-          { browserMaxAge: 30, edgeMaxAge: 300, skip: isAdmin },
+          { browserMaxAge: 10, edgeMaxAge: 300, skip: isAdmin, epoch: footprintEpoch },
           async () => {
         const conds = ["p.lat IS NOT NULL", "p.lng IS NOT NULL"];
         const binds: any[] = [];
