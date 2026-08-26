@@ -1580,10 +1580,18 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const canViewComments = actor !== null ? actor.canViewComments : await guestCanViewComments(env);
         let unread = 0;
         if (actor?.uid != null && actor.canViewComments) {
+          /*
+           * ⚠️ 未讀數要跟 /api/notifications 那支**用同一套條件**，不然紅點會停在
+           *    一個點進去什麼都沒有的數字上（跟 drive-pending 的清單與 COUNT 是
+           *    同一個道理）。
+           */
+          const unreadRestricted = canSeeRestricted(actor) ? "" : `
+               AND EXISTS (SELECT 1 FROM Comment c JOIN Photo p ON p.id = c.photo_id
+                            WHERE c.id = CommentNotify.comment_id AND p.restricted = 0)`;
           const row = await env.DB.prepare(`
             SELECT COUNT(*) AS n FROM CommentNotify
              WHERE user_id = ?
-               AND created_at > COALESCE((SELECT notif_seen_at FROM User WHERE id = ?), '')
+               AND created_at > COALESCE((SELECT notif_seen_at FROM User WHERE id = ?), '')${unreadRestricted}
           `).bind(actor.uid, actor.uid).first<any>();
           unread = Number(row?.n ?? 0);
         }
@@ -2617,31 +2625,21 @@ if (method === "POST" && pathname === "/api/verify-password") {
           && pathname.endsWith("/full") && pathname.split("/").length === 5) {
         const photoId = pathname.split("/")[3];
         const cache = caches.default;
-        /*
-         * 這張票是不是升級版（見 mintMediaToken）。<img src> 帶不了 Authorization，
-         * 所以「不開放的照片給不給看」只能靠票的粒度；真的用 fetch 帶 token 進來的
-         * 也認（那時 currentActor 才會去查 D1，一般的 <img> 路徑一次都不查）。
-         */
-        const fullElevated = (await requestMediaScope(request, url, env)) === 'admin'
-          || canSeeRestricted(await currentActor(request, env));
-        /*
-         * cache key 把 mt 拿掉。閘門已經驗過了，留在 key 裡只會讓每個人、每次登入
-         * 都是一份獨立的邊緣快取 —— 同一張照片的 Drive 取檔次數直接乘上人數。
-         * 圖片位元組不隨身分變化，所以共用一份是對的。
-         *
-         * ⚠️ 唯一的分岔是「不開放」那幾張：它們的位元組**只能存在升級版那把 key
-         *    底下**，否則一般人下一次請求就會從共用快取裡直接命中，繞過下面的檢查。
-         *    所以 adm 一定要**先 delete 再由伺服器自己 set** —— 照抄請求裡的
-         *    `?adm=1` 等於讓任何人自己指定要讀哪一份快取。
-         */
-        const keyUrl = new URL(request.url);
-        keyUrl.searchParams.delete("mt");
-        keyUrl.searchParams.delete("adm");
-        if (fullElevated) keyUrl.searchParams.set("adm", "1");
-        const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
-        const hit = await cache.match(cacheKey);
-        if (hit) return hit;
 
+        /*
+         * ⚠️ **D1 一定要查在 cache.match 之前，順序不能倒回去。**
+         *
+         * 曾經是反過來的（先撈邊緣快取、撈不到才查 D1），那是「不開放」的一個破口：
+         * 一張照片在還沒被標成不開放之前只要有人開過燈箱，那份 4K 就以 immutable
+         * 一年躺在共用的邊緣快取裡；之後才標成不開放的話，後面的請求在快取那一行
+         * 就回去了，底下的檢查根本沒機會跑。**邊緣快取沒辦法從這裡精準清掉**
+         * （cache.delete 只作用在當下這一個機房），所以只能把順序倒過來。
+         *
+         * 代價是每看一次大圖多一次 D1 讀取（主鍵單列，不是掃描）。換來的除了
+         * 正確性還有一件好事：**沒有不開放的照片現在全站共用同一份快取** ——
+         * 舊版把 adm 掛進 key，等於管理員自己一份、其他人一份，同一張照片的
+         * Drive 取檔次數直接翻倍。
+         */
         const photo = await env.DB.prepare(
           // url 現在跟 thumb_url 是同一顆物件，但舊照片（Google 同步進來的那批）
           // 只有 url，所以還是照 COALESCE 的順序逐級退
@@ -2650,13 +2648,40 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (!photo) {
           return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
         }
+
         /*
          * 不開放的照片對其他人來說**不存在**，所以回 404 而不是 403 ——
          * 403 等於告訴對方「這個編號上有東西，只是你不能看」。
+         *
+         * <img src> 帶不了 Authorization，所以這裡認的是票的粒度（見 mintMediaToken）；
+         * 真的用 fetch 帶 token 進來的也認。**只有不開放的那幾張需要問這件事**，
+         * 一般照片一次都不問 —— currentActor 因此完全不會被叫去查 D1。
          */
-        if (Number(photo.restricted) === 1 && !fullElevated) {
-          return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+        const isRestricted = Number(photo.restricted) === 1;
+        if (isRestricted) {
+          const elevated = (await requestMediaScope(request, url, env)) === 'admin'
+            || canSeeRestricted(await currentActor(request, env));
+          if (!elevated) {
+            return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+          }
         }
+
+        /*
+         * cache key 把 mt 拿掉。閘門已經驗過了，留在 key 裡只會讓每個人、每次登入
+         * 都是一份獨立的邊緣快取 —— 同一張照片的 Drive 取檔次數直接乘上人數。
+         * 圖片位元組不隨身分變化，所以共用一份是對的。
+         *
+         * 不開放的那幾張另外掛 adm=1，把它們的位元組跟公開照片分開存（上面已經
+         * 擋掉了，這純粹是多一層保險）。⚠️ adm 一定要**先 delete 再由伺服器自己
+         * set** —— 照抄請求裡的 `?adm=1` 等於讓任何人自己指定要讀哪一份快取。
+         */
+        const keyUrl = new URL(request.url);
+        keyUrl.searchParams.delete("mt");
+        keyUrl.searchParams.delete("adm");
+        if (isRestricted) keyUrl.searchParams.set("adm", "1");
+        const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
+        const hit = await cache.match(cacheKey);
+        if (hit) return hit;
 
         const fallback = () => new Response(null, {
           status: 302,
@@ -3345,8 +3370,54 @@ if (method === "POST" && pathname === "/api/verify-password") {
             ).bind(...c)),
           );
         }
+        /*
+         * 換掉 R2 縮圖的物件鍵（見 rotateThumbKeys）。SQL 過濾只讓照片從清單上
+         * 消失，**已經發出去的縮圖網址不會因此失效** —— 那條路在進站閘門的白名單上。
+         *
+         * 一次最多換 RESTRICT_ROTATE_MAX 張：搬一顆物件是一次 R2 讀＋一次寫＋一次刪，
+         * 燈箱那顆開關送的永遠是一張，這個上限只是不讓「多選一整本」把單次請求撐爆。
+         * 沒輪到的那些照樣是不開放的（擋人的是 SQL 與 /full，不是這裡），只是舊網址
+         * 還活著 —— 回應把 rotated 講出來，不要讓它變成一件沒人知道的事。
+         */
+        let rotated = 0;
+        if (value === 1) {
+          const RESTRICT_ROTATE_MAX = 8;
+          const origin = new URL(request.url).origin;
+          const cache = caches.default;
+          const toRotate = ids.slice(0, RESTRICT_ROTATE_MAX);
+          const { results: rows } = await env.DB.prepare(
+            `SELECT id, file_name, url, thumb_url, thumb_sm_url FROM Photo WHERE id IN (${placeholdersFor(toRotate)})`
+          ).bind(...toRotate).all();
+          const rewrites: D1PreparedStatement[] = [];
+          const staleKeys: string[] = [];
+          const staleUrls: string[] = [];
+          for (const row of rows as any[]) {
+            const moved = await rotateThumbKeys(env, origin, row);
+            if (!moved) continue;
+            const cols = Object.keys(moved.sets);
+            rewrites.push(env.DB.prepare(
+              `UPDATE Photo SET ${cols.map((c) => `${c} = ?`).join(", ")} WHERE id = ?`
+            ).bind(...cols.map((c) => moved.sets[c]), row.id));
+            staleKeys.push(...moved.movedFrom);
+            // 舊網址可能是早年匯進來的怪值（甚至字串 "null"），new Request 會直接丟例外
+            for (const u of [row.url, row.thumb_url, row.thumb_sm_url]) {
+              if (typeof u === "string" && /^https?:\/\//.test(u)) staleUrls.push(u);
+            }
+            rotated++;
+          }
+          /*
+           * ⚠️ **順序：先把新網址寫進 D1，再刪舊物件。** 反過來的話，D1 那一批
+           *    寫失敗就等於照片指向一顆已經刪掉的物件 —— 相簿裡直接破圖，而且
+           *    救不回來。照這個順序最壞只是留下幾顆孤兒物件。
+           */
+          if (rewrites.length > 0) await env.DB.batch(rewrites);
+          for (const k of new Set(staleKeys)) await env.BUCKET.delete(k);
+          // 舊網址在這個機房的邊緣快取殘影，順手清一次（只清得到當下這一個機房）
+          for (const u of new Set(staleUrls)) ctx.waitUntil(cache.delete(new Request(u, { method: "GET" })));
+        }
+
         const updated = res.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
-        return new Response(JSON.stringify({ success: true, updated, restricted: value }), { headers });
+        return new Response(JSON.stringify({ success: true, updated, rotated, restricted: value }), { headers });
       }
 
       /*
@@ -3575,6 +3646,59 @@ function r2KeysForPhoto(photo: any): string[] {
     r2KeyFromViewUrl(photo?.thumb_sm_url),
   ].filter((k): k is string => !!k);
   return [...new Set(keys)];
+}
+
+/**
+ * 把一張照片在 R2 上的縮圖搬到**新的物件鍵**，回傳要寫回 D1 的欄位與搬過的舊鍵。
+ *
+ * 為什麼需要這件事：`/api/photos/view/<key>` **在進站閘門的白名單上**，它唯一的
+ * 護欄是「網址猜不到」（見 CLAUDE.md「後端的請求流程」）。可是一張照片在被標成
+ * 不開放**之前**，縮圖網址早就隨相簿 JSON 發給每一個進得了站的人了 —— 標成不開放
+ * 之後 SQL 過濾讓它從清單上消失，那些**已經發出去的網址卻還是活的**。換一把鍵
+ * 就是把發出去的那些全部作廢。
+ *
+ * ⚠️ 這收不回「已經下載到對方瀏覽器裡的那幾個位元組」，也清不掉舊網址殘留在邊緣
+ *    快取裡的影子（cache.delete 只作用在當下這一個機房，呼叫端會順手試一次）。
+ *    能保證的是：**新網址沒有任何人拿過，而舊物件已經不存在**。
+ *
+ * 順序是 get → put →（呼叫端寫 D1）→ delete 舊的。中途失敗最壞留下一顆孤兒物件，
+ * 佔一點額度但不會讓照片壞掉；反過來先刪再複製就會把照片弄丟。
+ */
+async function rotateThumbKeys(
+  env: Env, origin: string, photo: any,
+): Promise<{ sets: Record<string, string>; movedFrom: string[] } | null> {
+  const cols = ["url", "thumb_url", "thumb_sm_url"] as const;
+  const keyByCol = new Map<string, string>();
+  for (const c of cols) {
+    const k = r2KeyFromViewUrl(photo?.[c]);
+    if (k) keyByCol.set(c, k);
+  }
+  // file_name 跟 url 指的是同一顆物件（見上傳那條路由），一起換掉才不會對不上
+  const fileName = typeof photo?.file_name === "string" ? photo.file_name : null;
+
+  const moved = new Map<string, string>();   // 舊鍵 -> 新鍵，同一顆只搬一次
+  for (const oldKey of new Set([...keyByCol.values(), ...(fileName ? [fileName] : [])])) {
+    const obj = await env.BUCKET.get(oldKey);
+    if (!obj) continue;                      // 早就不在了，沒什麼好搬的
+    const dot = oldKey.lastIndexOf(".");
+    const ext = dot > 0 ? oldKey.slice(dot) : "";
+    // 前綴只認我們自己產的那兩種，其餘（早年匯進來的）一律歸到 thumb，
+    // 不能拿整個舊檔名當前綴 —— 那等於把要作廢的名字又抄一次進新鍵裡
+    const head = oldKey.split("_")[0];
+    const prefix = head === "thumb" || head === "thumbsm" ? head : "thumb";
+    const newKey = `${prefix}_${Date.now()}_${crypto.randomUUID().replace(/-/g, "")}${ext}`;
+    await env.BUCKET.put(newKey, obj.body, { httpMetadata: obj.httpMetadata });
+    moved.set(oldKey, newKey);
+  }
+  if (moved.size === 0) return null;
+
+  const sets: Record<string, string> = {};
+  for (const [col, oldKey] of keyByCol) {
+    const nk = moved.get(oldKey);
+    if (nk) sets[col] = `${origin}/api/photos/view/${encodeURIComponent(nk)}`;
+  }
+  if (fileName && moved.has(fileName)) sets.file_name = moved.get(fileName)!;
+  return Object.keys(sets).length > 0 ? { sets, movedFrom: [...moved.keys()] } : null;
 }
 
 /**
@@ -3948,12 +4072,24 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         if (!canView) {
           return new Response(JSON.stringify({ error: "沒有權限看留言", reason: "forbidden" }), { status: 403, headers });
         }
+        /*
+         * **不開放的照片連留言都不給看。** 相簿清單裡本來就找不到那個 id，
+         * 但直接打這一支還是問得到 —— 而留言帶著家人的名字與內容，等於把
+         * 「這張照片存在、還有人在上面聊天」整個講出來。
+         *
+         * 條件折進同一句 SQL 的 EXISTS 裡，**不另外查一次 Photo** —— 每開一次
+         * 燈箱多一趟 D1 是這個站最不該花的額度。回的是空清單不是 403，
+         * 理由同 /full：403 等於承認那個編號上有東西。
+         */
+        const commentsRestricted = canSeeRestricted(actor)
+          ? ""
+          : " AND EXISTS (SELECT 1 FROM Photo p WHERE p.id = c.photo_id AND p.restricted = 0)";
         const { results } = await env.DB.prepare(`
           SELECT c.id, c.parent_id, c.user_id, c.body, c.created_at,
                  u.name AS user_name, u.track_color, u.avatar_key
             FROM Comment c
             JOIN User u ON u.id = c.user_id
-           WHERE c.photo_id = ?
+           WHERE c.photo_id = ?${commentsRestricted}
            ORDER BY c.id ASC
         `).bind(photoId).all();
         const comments = (results as any[]).map((r) => ({
@@ -4026,11 +4162,12 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         }
 
         const photo = await env.DB.prepare(`
-          SELECT p.id, p.uploaded_by, p.album_id, a.user_id AS album_owner
+          SELECT p.id, p.uploaded_by, p.album_id, p.restricted, a.user_id AS album_owner
             FROM Photo p LEFT JOIN Album a ON a.id = p.album_id
            WHERE p.id = ?
         `).bind(photoId).first<any>();
-        if (!photo) {
+        // 不開放的照片對其他人不存在，所以留不了言也問不出它存不存在（404 不是 403）
+        if (!photo || (Number(photo.restricted) === 1 && !canSeeRestricted(actor))) {
           return new Response(JSON.stringify({ error: "找不到這張照片" }), { status: 404, headers });
         }
 
@@ -4160,6 +4297,12 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         const me = await env.DB.prepare("SELECT notif_seen_at FROM User WHERE id = ?")
           .bind(actor.uid).first<any>();
         const seenAt: string | null = me?.notif_seen_at ?? null;
+        /*
+         * 每一則通知都帶著縮圖、相簿名與留言內文 —— 照片被標成不開放之後，
+         * 那幾則就不該再出現在別人的清單上。查詢本來就 JOIN 了 Photo p，
+         * 多這一段條件不多花任何一次讀取。
+         */
+        const notifRestricted = canSeeRestricted(actor) ? "" : " AND p.restricted = 0";
         const { results } = await env.DB.prepare(`
           SELECT n.comment_id, n.reason, n.created_at,
                  c.photo_id, c.body, c.parent_id,
@@ -4172,7 +4315,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
             JOIN User au    ON au.id = c.user_id
             JOIN Photo p    ON p.id  = c.photo_id
             LEFT JOIN Album al ON al.id = p.album_id
-           WHERE n.user_id = ?
+           WHERE n.user_id = ?${notifRestricted}
            ORDER BY n.created_at DESC, n.comment_id DESC
            LIMIT 30
         `).bind(actor.uid).all();
