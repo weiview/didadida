@@ -939,6 +939,13 @@ function AlbumContent() {
      * **每一個失敗都要留下痕跡**。
      */
     failures: string[];
+    /**
+     * 網站上早就有了、只是 Drive 缺一半，這一趟**直接補上去**的那幾個。
+     *
+     * ⚠️ 補了要講出來。它跟「重複、跳過了」在畫面上長得一模一樣（都沒有新照片
+     * 出現在相簿裡），不講的話使用者只會覺得「我重傳了，什麼事都沒發生」。
+     */
+    backfilled: string[];
     reauth: GoogleReauthError | null;
   };
 
@@ -971,7 +978,38 @@ function AlbumContent() {
     // 後端判定跟相簿裡撞了的那幾張。**它們一個位元組都還沒寫進去**，跑完再統一問
     const dupes: PendingDuplicate[] = [];
     const failures: string[] = [];
+    const backfilled: string[] = [];
     let reauth: GoogleReauthError | null = null;
+
+    /*
+     * 「這個檔網站上已經有了，但 Drive 上缺一半」—— 回那一列，代表**直接補**，
+     * 不要跳重複視窗。
+     *
+     * ⚠️ **只認 `same_file`（hash 一樣＝位元組層級的同一個檔），不認 `same_time`。**
+     * 時間相同只說明 EXIF 的快門秒數一樣，連拍很容易撞在同一秒 —— 拿 A 的原始檔
+     * 去填 B 的欄位，之後燈箱點開的大圖就是別張照片，而且錯得很安靜。
+     *
+     * ⚠️ 也**只認剛好命中一列**。同一個檔在同一本裡本來就不該有兩列，真的有
+     * （以前選過「全部保留」）就該讓使用者自己看一眼決定要補哪一列。
+     *
+     * 媒體種類對不上也退回問人：影片的封面圖跟某張照片 hash 相同的話，
+     * 拿影片檔去補照片的原始檔欄位就完全錯了。
+     */
+    const incompleteTwin = (
+      existing: DuplicateMatch[], isVideo: boolean,
+    ): DuplicateMatch | null => {
+      const hits = existing.filter((e) => e.same_file);
+      if (hits.length !== 1) return null;
+      const twin = hits[0];
+      if ((twin.media_type === 'video') !== isVideo) return null;
+      // 兩份都齊 ＝ 真的是重複，該問人（這是視窗現在唯一還會跳出來的情況）
+      if (twin.has_4k && twin.has_original) return null;
+      return twin;
+    };
+
+    /** 補上去之後要講的那句話：到底補了哪一半 */
+    const needLabel = (need: { fourK?: boolean; original?: boolean }) =>
+      [need.fourK ? '4K' : '', need.original ? '原始檔' : ''].filter(Boolean).join(' ＋ ');
 
     const drive = await prepareDrive();
     // 重複那幾張稍後才決定要不要傳，那時不該再跑一次 bootstrap，沿用這批的位置
@@ -996,6 +1034,26 @@ function AlbumContent() {
           const meta = { fileName: rawFile.name, durationMs };
           const result = await uploadPhoto(id as string, poster, undefined, undefined, false, meta);
           if (result.status === 'duplicate') {
+            /*
+             * 這支影片站上已經有了，只是 Drive 上沒有原始檔（上傳當下 Drive 斷線，
+             * 或是傳上去了但 recordDriveIds 那一趟沒回來）。封面圖不必再產一次，
+             * 直接把原始檔補上那一列就好 —— 相簿裡不會多一格。
+             */
+            const twin = incompleteTwin(result.existing, true);
+            if (twin) {
+              if (!drive) {
+                failures.push(`${source.name}：這支影片站上已經有了，但 Drive 沒接上，原始檔補不了`);
+              } else {
+                try {
+                  await pushVideoToDrive(drive, twin.id, rawFile,
+                    (sent, size) => onProgress(i + 1, total, source.name, { sent, total: size }));
+                  backfilled.push(`${source.name}：補上了 Drive 的影片原始檔`);
+                } catch (err) {
+                  failures.push(`${source.name}：影片原始檔沒補上 Drive（${errText(err)}）`);
+                }
+              }
+              continue;
+            }
             dupes.push({
               key: `${Date.now()}-${i}-${source.name}`,
               file: rawFile, resized: poster, previewUrl: URL.createObjectURL(poster),
@@ -1055,6 +1113,45 @@ function AlbumContent() {
             }
           } else missedDrive.push({ photoId: result.photo.id, file: rawFile });
         } else if (result.status === 'duplicate') {
+          /*
+           * 網站上有這張、Drive 上缺一半 —— **直接補缺的那一半就好**。
+           *
+           * 以前這裡一律跳重複視窗，而視窗給的兩條路都補不好這件事：
+           * 「全部保留」多一列＋多兩顆 R2 物件，缺的那半照樣缺；「取代」補得起來
+           * 但會換一個新的照片 id，標籤、留言、Story、手動修過的座標與時間全沒了。
+           * 補的是**既有那一列**，id 不動，什麼都不會掉。
+           */
+          const twin = incompleteTwin(result.existing, false);
+          if (twin) {
+            const need = { fourK: !twin.has_4k, original: !twin.has_original };
+            if (!drive) {
+              // Drive 沒接上：交給橫幅那顆「補傳這批」，別把使用者晾在這裡
+              missedDrive.push({ photoId: twin.id, file: rawFile, need });
+              backfilled.push(`${source.name}：站上已經有了，Drive 缺 ${needLabel(need)}，已排進待補清單`);
+            } else {
+              try {
+                const res = await pushPhotoToDrive(drive, twin.id, rawFile, need);
+                if (res.ok) {
+                  backfilled.push(`${source.name}：補上了 Drive 的 ${needLabel(need)}`);
+                } else {
+                  // 半套照樣進待補清單，`need` 只留這次還是沒成功的那一半
+                  missedDrive.push({
+                    photoId: twin.id, file: rawFile,
+                    need: {
+                      fourK: need.fourK && res.fourK !== 'ok',
+                      original: need.original && res.original !== 'ok',
+                    },
+                  });
+                  failures.push(`${source.name}：Drive 缺的那份沒補成功（${res.reason || 'Drive 上傳失敗'}）`);
+                }
+              } catch (err) {
+                missedDrive.push({ photoId: twin.id, file: rawFile, need });
+                failures.push(`${source.name}：Drive 缺的那份沒補成功（${errText(err)}）`);
+              }
+            }
+            continue;
+          }
+
           // 縮好的 file 一起留著：使用者若選「照樣上傳」，不必再解一次圖
           dupes.push({
             key: `${Date.now()}-${i}-${source.name}`,
@@ -1075,19 +1172,38 @@ function AlbumContent() {
     // 累加而不是覆蓋：連傳兩批都沒接上 Drive 時，第一批不該被第二批洗掉
     if (missedDrive.length > 0) setPendingDriveBatch((prev) => [...prev, ...missedDrive]);
 
-    return { uploaded, dupes, failures, reauth };
+    return { uploaded, dupes, failures, backfilled, reauth };
   };
 
   /** 匯入收尾。視窗順序是固定的：重複清單疊在補地點上面，先決定要不要傳 */
   const finishIngest = async (result: IngestResult) => {
     if (result.reauth) setGoogleReauth(result.reauth.message);
-    else if (result.failures.length > 0) {
-      // 逐行列出哪一個、為什麼。太多就只列前 10 行，剩下的用數字帶過 ——
-      // alert 塞不下五十行，而前十行通常就足以看出全部是同一個原因
-      const shown = result.failures.slice(0, 10).join('\n');
-      const rest = result.failures.length - 10;
-      alert(`有 ${result.failures.length} 個檔案沒上傳成功：\n\n${shown}`
-        + (rest > 0 ? `\n…另外還有 ${rest} 個` : ''));
+    else {
+      /*
+       * 一次講完。**兩件事都要講**：
+       *   失敗的 —— 逐行列出哪一個、為什麼（HEIC 再試一百次也是一樣，光說「請稍後
+       *   再試」是句假話）。
+       *   自動補上的 —— 那幾個檔畫面上什麼都沒多出來（照片本來就在相簿裡），
+       *   不講的話使用者只會覺得「我重傳了，結果什麼都沒發生」。
+       * 太多就只列前 10 行，剩下的用數字帶過 —— alert 塞不下五十行，而前十行
+       * 通常就足以看出全部是同一個原因。
+       */
+      const section = (title: string, lines: string[]) => {
+        const shown = lines.slice(0, 10).join('\n');
+        const rest = lines.length - 10;
+        return `${title}\n\n${shown}` + (rest > 0 ? `\n…另外還有 ${rest} 個` : '');
+      };
+      const blocks: string[] = [];
+      if (result.failures.length > 0) {
+        blocks.push(section(`有 ${result.failures.length} 個檔案沒上傳成功：`, result.failures));
+      }
+      if (result.backfilled.length > 0) {
+        blocks.push(section(
+          `有 ${result.backfilled.length} 個檔案站上已經有了，缺的備份已經自動補上：`,
+          result.backfilled,
+        ));
+      }
+      if (blocks.length > 0) alert(blocks.join('\n\n'));
     }
 
     await loadData(); // 重新整理照片。要 await，補件視窗才拿得到縮圖

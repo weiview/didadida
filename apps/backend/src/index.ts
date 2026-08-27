@@ -1391,6 +1391,12 @@ const DRIVE_AUDIT_ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 /** 一本相簿一次最多丟幾個孤兒進佇列（每個都是一次 D1 寫入，別一次灌爆） */
 const DRIVE_AUDIT_MAX_ORPHANS = 50;
 
+/**
+ * 一輪最多把幾份「檔名對得上、D1 卻沒記著」的備份接回來。
+ * 每一筆都是 D1 寫入，剩下的下一輪再接，不必一次追平。
+ */
+const DRIVE_AUDIT_MAX_LINKS = 200;
+
 /** 一次最多向 Drive 追問幾個「對不上」的檔。一次一個 subrequest */
 const DRIVE_AUDIT_MAX_PROBES = 8;
 
@@ -1408,6 +1414,12 @@ interface DriveAuditAlbumReport {
   /** D1 就是 NULL：從來沒傳成功過。補傳 Drive 補得回來 */
   missing_4k: number;
   missing_original: number;
+  /**
+   * 檔案照命名規則好端端躺在資料夾裡，只是 D1 沒記著（或記著的是個過期的 id）——
+   * 已經把 file id 寫回去了。這是「上傳成功、recordDriveIds 那一趟沒回來」的下場，
+   * 以前會同時變成一筆假的「缺 4K」**和**一個假孤兒（然後被搬進 trash/）。
+   */
+  linked: number;
   /** D1 有 id，Drive 的清單裡卻沒有 */
   gone: number;
   /** 追問過 Drive、確認真的沒了，D1 那一欄已清成 NULL（於是補傳清單看得到它） */
@@ -1431,7 +1443,7 @@ interface DriveAuditState {
   albums_done: number;
   totals: {
     albums: number; photos: number;
-    missing_4k: number; missing_original: number;
+    missing_4k: number; missing_original: number; linked: number;
     gone: number; cleared: number; moved: number;
     orphans_queued: number; foreign: number;
   };
@@ -1443,7 +1455,7 @@ interface DriveAuditState {
 const emptyDriveAuditState = (): DriveAuditState => ({
   cursor: 0, started_at: null, finished_at: null, last_run_at: null, albums_done: 0,
   totals: {
-    albums: 0, photos: 0, missing_4k: 0, missing_original: 0,
+    albums: 0, photos: 0, missing_4k: 0, missing_original: 0, linked: 0,
     gone: 0, cleared: 0, moved: 0, orphans_queued: 0, foreign: 0,
   },
   reports: [], last_error: null,
@@ -1453,8 +1465,16 @@ async function loadDriveAuditState(env: Env): Promise<DriveAuditState> {
   const raw = await getSetting(env, SETTING_DRIVE_AUDIT);
   if (!raw) return emptyDriveAuditState();
   try {
-    // 壞掉的 JSON 不該讓 cron 每十分鐘噴一次 —— 當成沒跑過，重新開一輪
-    return { ...emptyDriveAuditState(), ...(JSON.parse(raw) as DriveAuditState) };
+    /*
+     * 壞掉的 JSON 不該讓 cron 每十分鐘噴一次 —— 當成沒跑過，重新開一輪。
+     *
+     * ⚠️ `totals` **要自己再攤一層**。外層那個 spread 是淺的，存起來的那份直接把
+     * 整個 totals 換掉 —— 加了新計數欄位（例如 linked）之後，舊的那列 JSON 裡沒有它，
+     * `state.totals.linked += n` 當場變成 NaN，而且會一路存回 AppSetting。
+     */
+    const saved = JSON.parse(raw) as DriveAuditState;
+    const base = emptyDriveAuditState();
+    return { ...base, ...saved, totals: { ...base.totals, ...(saved.totals ?? {}) } };
   } catch {
     return emptyDriveAuditState();
   }
@@ -1513,7 +1533,7 @@ async function auditDriveAlbum(
 ): Promise<DriveAuditAlbumReport> {
   const rep: DriveAuditAlbumReport = {
     album_id: album.id, name: album.name, photos: 0,
-    missing_4k: 0, missing_original: 0, gone: 0, cleared: 0, moved: 0,
+    missing_4k: 0, missing_original: 0, linked: 0, gone: 0, cleared: 0, moved: 0,
     orphans_queued: 0, foreign: 0,
   };
 
@@ -1542,26 +1562,101 @@ async function auditDriveAlbum(
 
   const { files, truncated } = await listFolderFiles(env.GOOGLE_DRIVE_SA_KEY!, album.drive_folder_id);
   if (truncated) rep.truncated = true;
+  type FolderFile = (typeof files)[number];
+
+  /*
+   * ⚠️ **對帳比的是檔名，不是只有 Drive id。**
+   *
+   * 只比 id 的話，「檔案好端端在資料夾裡、但 D1 沒記著它」這個狀態會被判成兩件
+   * 互相矛盾的事：那一列算「缺 4K／缺原始檔」（於是出現在補傳清單上，使用者再傳
+   * 一份），**而且**那個檔沒有人指著、變成孤兒被搬進 trash/ —— 好好的備份被丟掉。
+   * 這不是假想：recordDriveIds 是上傳的最後一趟，它失敗的時候檔案早就在 Drive 上了
+   * （見 frontend pushPhotoToDrive 那段註解）。
+   *
+   * 命名規則就是對應關係：`<photoId>_<檔名>_4k.webp` 與 `<photoId>_<原始檔名>`
+   * （影片只有後者）。所以照檔名開頭那個 id 分組，再看結尾分成兩格。
+   */
+  const recorded = new Set<string>();
+  for (const p of photos) {
+    for (const [, val] of slotsOf(p)) if (typeof val === "string" && val) recorded.add(val);
+  }
+  /** 資料夾裡有哪些 id。命名規則之前傳的舊檔認不出檔名，只認得出 id */
   const onDrive = new Set(files.map((f) => f.id));
 
-  /** 這本相簿的 Photo 列指到的所有 Drive id。孤兒＝資料夾裡不在這份裡面的 */
+  const byPhoto = new Map<number, { drive_file_id: FolderFile[]; drive_original_id: FolderFile[] }>();
+  for (const f of files) {
+    const m = /^(\d+)_/.exec(f.name);
+    if (!m) {
+      // 名字不符我們的規則。**已經有人指著的不算外來檔** —— 命名規則之前傳的舊檔
+      if (!recorded.has(f.id)) rep.foreign++;
+      continue;
+    }
+    const pid = Number(m[1]);
+    let g = byPhoto.get(pid);
+    if (!g) { g = { drive_file_id: [], drive_original_id: [] }; byPhoto.set(pid, g); }
+    (/_4k\.webp$/i.test(f.name) ? g.drive_file_id : g.drive_original_id).push(f);
+  }
+
+  /** 這一輪確認有人在用的 Drive id（含這次剛接回來的）。孤兒＝資料夾裡不在這份裡的 */
   const referenced = new Set<string>();
   const suspects: { photoId: number; column: string; driveId: string }[] = [];
+  /** 檔名對得上、D1 卻沒記著（或記著過期的 id）—— 把 id 寫回去 */
+  const relinks: { photoId: number; column: string; driveId: string; had: string | null }[] = [];
 
   for (const p of photos) {
+    const pid = Number(p.id);
+    const group = byPhoto.get(pid);
     for (const [col, val] of slotsOf(p)) {
       const id = typeof val === "string" && val ? val : null;
+      const named = group ? group[col] : [];
+
+      /*
+       * 記著的那個就在這個資料夾裡 —— 這一格沒事。
+       * ⚠️ 這裡比的是 **id 在不在資料夾裡**，不是「檔名對不對得上」。
+       * 命名規則（`<photoId>_…`）之前傳上去的舊檔認不出檔名，硬要檔名也對得上的話
+       * 每一張老照片都會被判成對不上，然後白花一次 probe 再回報成「被搬走了」。
+       */
+      if (id && onDrive.has(id)) { referenced.add(id); continue; }
+
+      /*
+       * 檔名對得上但 id 不對。**這是正面證據，清單有沒有看完都算數**
+       * （truncated 只讓我們不敢說「沒有」，不會讓看到的東西變假）。
+       * 同名有好幾份時取第一個，多出來的留給下面孤兒那段收掉。
+       */
+      if (named.length > 0) {
+        relinks.push({ photoId: pid, column: col, driveId: named[0].id, had: id });
+        referenced.add(named[0].id);
+        continue;
+      }
+
       if (!id) {
         if (col === "drive_file_id") rep.missing_4k++; else rep.missing_original++;
         continue;
       }
       referenced.add(id);
       // 清單沒看完的時候，「不在清單裡」什麼都證明不了
-      if (!truncated && !onDrive.has(id)) {
+      if (!truncated) {
         rep.gone++;
-        suspects.push({ photoId: Number(p.id), column: col, driveId: id });
+        suspects.push({ photoId: pid, column: col, driveId: id });
       }
     }
+  }
+
+  /*
+   * 把接回來的 id 寫回 D1。條件帶上「原本是什麼」是為了不覆蓋掉這中間別人寫進去的值
+   * （上傳跟對帳是同時在跑的）。一輪最多寫 DRIVE_AUDIT_MAX_LINKS 筆，剩下的下一輪
+   * 再說 —— 這是 D1 寫入，不是讀取。
+   */
+  for (let i = 0; i < relinks.length && i < DRIVE_AUDIT_MAX_LINKS; i += 50) {
+    const chunk = relinks.slice(i, Math.min(i + 50, DRIVE_AUDIT_MAX_LINKS));
+    await env.DB.batch(chunk.map((r) => (
+      r.had === null
+        ? env.DB.prepare(`UPDATE Photo SET ${r.column} = ? WHERE id = ? AND ${r.column} IS NULL`)
+            .bind(r.driveId, r.photoId)
+        : env.DB.prepare(`UPDATE Photo SET ${r.column} = ? WHERE id = ? AND ${r.column} = ?`)
+            .bind(r.driveId, r.photoId, r.had)
+    )));
+    rep.linked += chunk.length;
   }
 
   /*
@@ -1600,8 +1695,9 @@ async function auditDriveAlbum(
     const candidates: { photoId: number; driveId: string }[] = [];
     for (const f of files) {
       if (referenced.has(f.id)) continue;
+      // 外來檔在上面編檔名索引的時候就算過了，這裡只是跳過
       const m = /^(\d+)_/.exec(f.name);
-      if (!m) { rep.foreign++; continue; }
+      if (!m) continue;
       const created = f.createdTime ? Date.parse(f.createdTime) : NaN;
       if (!Number.isFinite(created) || now - created < DRIVE_AUDIT_ORPHAN_MIN_AGE_MS) continue;
       candidates.push({ photoId: Number(m[1]), driveId: f.id });
@@ -1630,7 +1726,7 @@ async function auditDriveAlbum(
 
 /** 這份報告值不值得留下來給人看（沒問題的相簿不佔位子） */
 const driveAuditWorthReporting = (r: DriveAuditAlbumReport): boolean =>
-  r.missing_4k > 0 || r.missing_original > 0 || r.gone > 0 || r.cleared > 0
+  r.missing_4k > 0 || r.missing_original > 0 || r.linked > 0 || r.gone > 0 || r.cleared > 0
   || r.orphans_queued > 0 || r.foreign > 0 || Boolean(r.truncated) || Boolean(r.error);
 
 /**
@@ -1683,6 +1779,7 @@ async function runDriveAudit(env: Env, albums: number, force: boolean): Promise<
       state.totals.photos += rep.photos;
       state.totals.missing_4k += rep.missing_4k;
       state.totals.missing_original += rep.missing_original;
+      state.totals.linked += rep.linked;
       state.totals.gone += rep.gone;
       state.totals.cleared += rep.cleared;
       state.totals.moved += rep.moved;
@@ -4411,7 +4508,8 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
            */
           const dupTakenAt = uploadTakenAt && uploadTakenAt !== 'null' ? uploadTakenAt : null;
           const { results: dupes } = await env.DB.prepare(
-            `SELECT id, title, thumb_sm_url, thumb_url, url, taken_at, file_hash
+            `SELECT id, title, thumb_sm_url, thumb_url, url, taken_at, file_hash,
+                    media_type, drive_file_id, drive_original_id
                FROM Photo
               WHERE album_id = ?
                 AND (file_hash = ? OR (? IS NOT NULL AND taken_at = ?))
@@ -4419,6 +4517,21 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           ).bind(albumId, fileHash, dupTakenAt, dupTakenAt).all<any>();
 
           if (dupes.length > 0) {
+            /*
+             * ⚠️ 每一筆都要講出**它的備份到底缺不缺**（`has_4k`／`has_original`，
+             * 欄位名跟 /api/photos/drive-pending 那支一致）。
+             *
+             * 「網站有這張、Drive 上卻缺一半」是很常見的半套狀態：上傳當下 Drive
+             * 斷線、或是檔案傳上去了但 recordDriveIds 那一趟沒回來。使用者重傳同一個檔
+             * 想補救時，以前跳的是重複視窗 —— 而視窗給的兩條路都不對：「全部保留」多一列
+             * ＋多兩顆 R2 物件、缺的那半還是缺；「取代」雖然補得起來，但會換一個新的
+             * 照片 id，標籤、留言、Story、手動修過的座標與時間全部跟著沒了。
+             *
+             * 所以前端拿到這幾個旗標之後，**只有整份都齊的才跳視窗**，缺的直接補上去
+             * （見 frontend ingestSources 的自動補那段）。影片沒有 4K 這一份，
+             * `has_4k` 一律回 true，不然它永遠看起來像缺一半。
+             */
+            const isVideoRow = (d: any) => String(d.media_type) === 'video';
             return new Response(JSON.stringify({
               duplicate: true,
               // 讓前端講得出「哪裡像」：hash 一樣是同一個檔，只有時間一樣就是疑似
@@ -4428,6 +4541,11 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
                 title: d.title,
                 thumb_url: d.thumb_sm_url || d.thumb_url || d.url,
                 taken_at: d.taken_at,
+                media_type: isVideoRow(d) ? 'video' : 'photo',
+                // 這一筆是不是**位元組層級**的同一個檔（hash 一樣）。只有它才敢自動補
+                same_file: d.file_hash === fileHash,
+                has_4k: isVideoRow(d) ? true : Boolean(d.drive_file_id),
+                has_original: Boolean(d.drive_original_id),
               })),
             }), { headers });
           }

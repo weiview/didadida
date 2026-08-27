@@ -717,6 +717,11 @@ export interface DriveAuditAlbumReport {
   truncated?: boolean;
   missing_4k: number;
   missing_original: number;
+  /**
+   * 檔案照命名規則就在資料夾裡，只是 D1 沒記著（或記著過期的 id），已經接回來了。
+   * 這種以前會同時算成一筆假的「缺 4K」和一個假孤兒（然後被搬進 trash/）。
+   */
+  linked: number;
   /** D1 記著 id、Drive 上找不到 */
   gone: number;
   /** 確認真的不在了，已經把 D1 那一欄清成 NULL（於是它會出現在補傳清單上） */
@@ -739,7 +744,7 @@ export interface DriveAuditState {
   albums_done: number;
   totals: {
     albums: number; photos: number;
-    missing_4k: number; missing_original: number;
+    missing_4k: number; missing_original: number; linked: number;
     gone: number; cleared: number; moved: number;
     orphans_queued: number; foreign: number;
   };
@@ -1440,12 +1445,25 @@ export interface UploadedPhoto {
   lng: number | null;
 }
 
-/** 後端判定「這張跟相簿裡某幾張撞了」時回報的那幾張 */
+/**
+ * 後端判定「這張跟相簿裡某幾張撞了」時回報的那幾張。
+ *
+ * 除了「長得像」之外還要講**它的備份齊不齊** —— 「網站上有、Drive 上缺一半」
+ * 是使用者重傳同一個檔想補救的常見情況，那種要直接補，不是跳視窗問他
+ * （視窗的兩條路都不對，見後端重複偵測那段註解）。
+ */
 export interface DuplicateMatch {
   id: number;
   title: string | null;
   thumb_url: string | null;
   taken_at: string | null;
+  media_type: 'photo' | 'video';
+  /** 這一列跟手上這個檔是**位元組層級**的同一份（file_hash 一樣）。只有它才敢自動補 */
+  same_file: boolean;
+  /** Drive 上有沒有那份 4K。**影片一律 true** —— 影片沒有 4K 這一份 */
+  has_4k: boolean;
+  /** Drive 上有沒有原始檔 */
+  has_original: boolean;
 }
 
 /**
@@ -1568,7 +1586,22 @@ export async function uploadPhoto(
       return {
         status: 'duplicate',
         reason: data.reason === 'same_file' ? 'same_file' : 'same_time',
-        existing: Array.isArray(data.existing) ? data.existing : [],
+        /*
+         * ⚠️ 那幾個旗標**一定要在這裡補上預設值**，不能直接把 JSON 丟出去。
+         * 邊快取裡還躺著舊版後端的回應時它們是 undefined，而 `!undefined` 是 true
+         * —— 自動補那段會拿一個空的 need 去傳，或是把齊的那張當成缺。
+         * 預設一律往「不要自動動手」倒：same_file 當 false、兩份都當已經有。
+         */
+        existing: (Array.isArray(data.existing) ? data.existing : []).map((e: any) => ({
+          id: Number(e?.id),
+          title: e?.title ?? null,
+          thumb_url: e?.thumb_url ?? null,
+          taken_at: e?.taken_at ?? null,
+          media_type: e?.media_type === 'video' ? 'video' : 'photo',
+          same_file: e?.same_file === true,
+          has_4k: e?.has_4k !== false,
+          has_original: e?.has_original !== false,
+        })) as DuplicateMatch[],
       };
     }
     if (typeof data?.id !== 'number') {

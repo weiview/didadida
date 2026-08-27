@@ -915,6 +915,10 @@ export default function AdminPage() {
                 <span className={styles.detailNum}>{audit.totals.missing_original}</span>
               </div>
               <div className={styles.detailRow}>
+                <span className={styles.detailName}>檔案在、記錄漏掉（已自動接回來）</span>
+                <span className={styles.detailNum}>{audit.totals.linked ?? 0}</span>
+              </div>
+              <div className={styles.detailRow}>
                 <span className={styles.detailName}>Drive 上找不到（已清掉記錄，會出現在補傳清單）</span>
                 <span className={styles.detailNum}>{audit.totals.cleared}</span>
               </div>
@@ -933,6 +937,11 @@ export default function AdminPage() {
             </div>
 
             <p className={styles.hint}>
+              對帳比的是<strong>檔名</strong>：站上每一張該有的
+              <span className={styles.mono}>&lt;編號&gt;_&lt;檔名&gt;</span>
+              在那本相簿的 Drive 資料夾裡是不是都找得到。
+              找得到卻沒記錄的會直接接回來（那是「傳上去了、網站沒記到」的下場，
+              以前會變成一筆假的缺件<strong>加上</strong>一個假孤兒）。
               「缺 4K／缺原始檔」要補的話，到那本相簿裡按<strong>「補傳 Drive」</strong>
               重新選一次原始檔 —— 真正的 4K 只編得出來一次，R2 上那份 2000px 補不了。
               孤兒檔是<strong>搬進 <span className={styles.mono}>didadida/trash/</span></strong>
@@ -959,6 +968,7 @@ export default function AdminPage() {
                                 `${r.photos} 張`,
                                 r.missing_4k > 0 ? `缺 4K ${r.missing_4k}` : "",
                                 r.missing_original > 0 ? `缺原始檔 ${r.missing_original}` : "",
+                                r.linked > 0 ? `接回記錄 ${r.linked}` : "",
                                 r.cleared > 0 ? `Drive 上不見了 ${r.cleared}` : "",
                                 r.moved > 0 ? `被搬走 ${r.moved}` : "",
                                 r.orphans_queued > 0 ? `孤兒 ${r.orphans_queued}` : "",
