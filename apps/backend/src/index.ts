@@ -1403,6 +1403,78 @@ const DRIVE_AUDIT_MAX_PROBES = 8;
 /** 報告裡最多留幾本相簿的細節（只留有問題的），AppSetting 那一列不該長成幾百 KB */
 const DRIVE_AUDIT_MAX_REPORTS = 40;
 
+/**
+ * 「單獨對一本」時，逐張明細最多列幾筆（items／extras／dups 各自一份）。
+ *
+ * ⚠️ 明細**只在單獨對一本時產生，而且不進 AppSetting** —— 它是直接回給呼叫者的。
+ * cron 那條走的是同一支 auditDriveAlbum 但 detail=false，存回去的仍然只有數字，
+ * 那一列 JSON 不會因為這次的改動長大。
+ */
+const DRIVE_AUDIT_MAX_DETAIL = 300;
+
+/**
+ * 逐張明細的一筆＝「某一張照片的某一份備份怎麼了」。
+ *
+ * 只列**有事情發生**的那幾格；兩份都好端端在的不列（一本幾千張全列出來沒有人看得完），
+ * 那些算進 `ok`。「哪些要補」＝ missing / cleared / gone，「哪些不用」＝ ok 那個數字。
+ */
+interface DriveAuditItem {
+  photo_id: number;
+  title: string;
+  media_type: string;
+  /** 這一格是哪一份：4K 衍生版，還是原始檔（影片只有 original） */
+  slot: "4k" | "original";
+  /**
+   * missing ＝ D1 就是空的，從來沒傳成功過 —— 補傳 Drive 補得回來
+   * linked  ＝ 檔案照命名規則在資料夾裡、只是記錄漏掉，**這一趟已經接回來了**
+   * linking ＝ 同上，但這一輪的寫回額度用完了，下一輪才寫得回去。
+   *            **備份本身是好的**（檔案就在資料夾裡），所以這一格不算要補
+   * cleared ＝ 追問過 Drive 確認真的沒了，記錄已清成 NULL，它會出現在補傳清單上
+   * gone    ＝ D1 有 id、清單裡沒有，但這一輪的追問額度用完了，還沒確認
+   * moved   ＝ 檔案被搬到別的資料夾，**備份是好的**，沒有動它
+   */
+  state: "missing" | "linked" | "linking" | "cleared" | "gone" | "moved";
+}
+
+/** Drive 上多出來的檔（沒有任何一列指著它，或是根本不照我們的命名規則） */
+interface DriveAuditExtra {
+  name: string;
+  drive_id: string;
+  /** queued ＝ 已排進待搬佇列（搬進 trash/，不是刪除）；kept ＝ 三道閘沒過，不碰 */
+  action: "queued" | "kept";
+  /**
+   * kept 的理由：
+   *   foreign  ＝ 檔名不符 `<編號>_…`，別人放進去的，一律不碰
+   *   too_new  ＝ 建立不到 24 小時，可能是剛傳完還沒回報 id 的檔
+   *   in_use   ＝ 那個編號的照片還指著它（照片搬去別本相簿了）
+   *   queued_before ＝ 早就在待搬佇列裡了
+   *   over_limit ＝ 這一輪的額度用完，下一輪再處理
+   */
+  reason?: string;
+}
+
+/**
+ * 站上（D1）自己重複的那幾列。
+ *
+ * ⚠️ **只列出來，絕不自動刪。** 刪一列 Photo ＝ 那一格從相簿消失，連同它的標籤、
+ * 留言、Story、手動修過的座標與時間，而且它的 Drive 檔會被排進 trash/。
+ * 哪一列該留是人才判斷得了的事（舊的那列往往帶著標籤與留言），程式猜錯沒有退路。
+ */
+interface DriveAuditDupGroup {
+  /**
+   * same_hash ＝ 位元組層級同一個檔，幾乎確定是重複的
+   * same_name ＝ 只有檔名一樣。Google 相簿匯入拿到的是 Google 轉檔後的位元組，
+   *              hash 對不上，只認得出檔名 —— 但**不同相機的 IMG_0001 也會撞名**，
+   *              所以這一類是「請你自己看一眼」，不是斷定。
+   */
+  kind: "same_hash" | "same_name";
+  key: string;
+  photos: {
+    id: number; title: string; media_type: string;
+    has_4k: boolean; has_original: boolean; created_at: string;
+  }[];
+}
+
 interface DriveAuditAlbumReport {
   album_id: number;
   name: string;
@@ -1430,7 +1502,25 @@ interface DriveAuditAlbumReport {
   orphans_queued: number;
   /** 多出來但名字不符我們的命名規則，不敢動，列出來給人看 */
   foreign: number;
+  /**
+   * 該有的幾份備份**全都在**的照片數 —— 也就是「不用補的有幾張」。
+   * 一本相簿的照片數扣掉這個就是還要處理的張數。
+   */
+  ok: number;
   error?: string;
+
+  /* ── 以下只有「單獨對一本」才有（detail=true），不會存進 AppSetting ── */
+
+  /** 逐張明細：有事情發生的那幾格 */
+  items?: DriveAuditItem[];
+  /** 明細超過上限，還有幾筆沒列 */
+  items_more?: number;
+  /** Drive 上多出來的檔 */
+  extras?: DriveAuditExtra[];
+  extras_more?: number;
+  /** 站上重複的那幾組（只列，不刪） */
+  dups?: DriveAuditDupGroup[];
+  dups_more?: number;
 }
 
 interface DriveAuditState {
@@ -1445,7 +1535,7 @@ interface DriveAuditState {
     albums: number; photos: number;
     missing_4k: number; missing_original: number; linked: number;
     gone: number; cleared: number; moved: number;
-    orphans_queued: number; foreign: number;
+    orphans_queued: number; foreign: number; ok: number;
   };
   /** 只留有問題的那幾本 */
   reports: DriveAuditAlbumReport[];
@@ -1456,7 +1546,7 @@ const emptyDriveAuditState = (): DriveAuditState => ({
   cursor: 0, started_at: null, finished_at: null, last_run_at: null, albums_done: 0,
   totals: {
     albums: 0, photos: 0, missing_4k: 0, missing_original: 0, linked: 0,
-    gone: 0, cleared: 0, moved: 0, orphans_queued: 0, foreign: 0,
+    gone: 0, cleared: 0, moved: 0, orphans_queued: 0, foreign: 0, ok: 0,
   },
   reports: [], last_error: null,
 });
@@ -1521,7 +1611,82 @@ async function driveIdsAlreadyQueued(env: Env, driveIds: string[]): Promise<Set<
 }
 
 /**
+ * 站上（D1）自己重複的那幾列 —— **只挑出來，不刪任何東西。**
+ *
+ * 「多餘的」在這個站有兩種，處理方式**刻意不同**：
+ *   - **Drive 上多出來的檔**：沒有任何一列指著它，過三道閘之後自動排進 `trash/`
+ *     （見下面孤兒那一段）。搬進垃圾桶是可逆的，反悔去 Drive 搬回來就好。
+ *   - **站上多出來的列**（這一支）：`Photo` 少一列＝相簿裡少一格，連同它的標籤、
+ *     留言、Story、手動修過的座標與時間，而且它的 Drive 檔會被排進 trash/。
+ *     哪一列該留是人才判斷得了的（舊的那一列往往帶著標籤與留言），**所以只列出來**。
+ *
+ * 兩種訊號，強度不一樣：
+ *   - `same_hash`：`file_hash` 一樣＝位元組層級同一個檔。幾乎確定是重複的。
+ *     ⚠️ hash 算的是**上傳進來的那份位元組**（縮到 2000px 的照片／canvas 畫出來的
+ *     影片封面），不是相機原始檔 —— 所以同一張照片換一台機器、換一個瀏覽器重傳，
+ *     hash 不見得一樣。這一類**抓得到的都是真的，抓不到的不代表沒有**。
+ *   - `same_name`：只有檔名一樣。Google 相簿匯入拿到的是 Google 轉檔後的位元組，
+ *     hash 一定對不上，只認得出檔名 —— 但**不同相機的 `IMG_0001.jpg` 也會撞名**，
+ *     所以這一類是「請你自己看一眼」，不是斷定。同一組已經被 hash 抓到的不重複列。
+ *
+ * 純記憶體運算，用的是對帳本來就撈出來的那些列，**不多打任何一次 D1**。
+ */
+function findDuplicateRows(photos: any[]): DriveAuditDupGroup[] {
+  const shape = (p: any) => ({
+    id: Number(p.id),
+    title: String(p?.title || p?.file_name || `#${p?.id}`),
+    media_type: String(p.media_type ?? "photo"),
+    has_4k: typeof p.drive_file_id === "string" && !!p.drive_file_id,
+    has_original: typeof p.drive_original_id === "string" && !!p.drive_original_id,
+    created_at: String(p.created_at ?? ""),
+  });
+
+  const out: DriveAuditDupGroup[] = [];
+
+  const byHash = new Map<string, any[]>();
+  for (const p of photos) {
+    const h = typeof p.file_hash === "string" ? p.file_hash.trim() : "";
+    if (!h) continue;
+    const g = byHash.get(h);
+    if (g) g.push(p); else byHash.set(h, [p]);
+  }
+  /** 已經被 same_hash 那一組認領走的照片，別再用檔名報一次 */
+  const claimed = new Map<number, string>();
+  for (const [h, g] of byHash) {
+    if (g.length < 2) continue;
+    for (const p of g) claimed.set(Number(p.id), h);
+    out.push({ kind: "same_hash", key: h, photos: g.map(shape) });
+  }
+
+  const byName = new Map<string, any[]>();
+  for (const p of photos) {
+    const n = String(p?.title || p?.file_name || "").trim().toLowerCase();
+    if (!n) continue;
+    // 影片封面跟某張照片同名時，那不是同一件東西
+    const key = `${String(p.media_type ?? "photo")}::${n}`;
+    const g = byName.get(key);
+    if (g) g.push(p); else byName.set(key, [p]);
+  }
+  for (const [key, g] of byName) {
+    if (g.length < 2) continue;
+    /*
+     * 整組都已經被同一個 hash 認領走了＝上面那一組講的就是這件事，不重複列。
+     * 只要有一張不在那一組裡（例如 Google 匯入那份轉檔過的），這一組就有話要說。
+     */
+    const hashes = new Set(g.map((p) => claimed.get(Number(p.id)) ?? ""));
+    if (hashes.size === 1 && !hashes.has("")) continue;
+    out.push({ kind: "same_name", key: key.split("::").slice(1).join("::"), photos: g.map(shape) });
+  }
+
+  return out;
+}
+
+/**
  * 對一本相簿。
+ *
+ * `detail=true` 是「單獨對這一本」用的：除了數字，還會把**逐張明細**、Drive 上
+ * 多出來的檔、以及站上重複的那幾組一起帶回去。⚠️ 那幾份**不會存進 AppSetting**
+ * ——cron 那條走的是同一支但 detail=false，存回去的仍然只有數字。
  *
  * 影片與照片的期望值不一樣：照片要 4K ＋ 原始檔兩份，**影片只有原始檔一份**
  * （沒有衍生版，id 記在 drive_original_id，drive_file_id 永遠是 NULL —— 見 0019）。
@@ -1530,17 +1695,75 @@ async function driveIdsAlreadyQueued(env: Env, driveIds: string[]): Promise<Set<
 async function auditDriveAlbum(
   env: Env,
   album: { id: number; name: string; drive_folder_id: string | null },
+  detail = false,
 ): Promise<DriveAuditAlbumReport> {
   const rep: DriveAuditAlbumReport = {
     album_id: album.id, name: album.name, photos: 0,
     missing_4k: 0, missing_original: 0, linked: 0, gone: 0, cleared: 0, moved: 0,
-    orphans_queued: 0, foreign: 0,
+    orphans_queued: 0, foreign: 0, ok: 0,
   };
 
   const { results: photos } = await env.DB.prepare(
-    "SELECT id, media_type, drive_file_id, drive_original_id FROM Photo WHERE album_id = ?"
+    `SELECT id, title, file_name, media_type, file_hash, created_at,
+            drive_file_id, drive_original_id
+       FROM Photo WHERE album_id = ?`
   ).bind(album.id).all<any>();
   rep.photos = photos.length;
+
+  const titleOf = (p: any): string => String(p?.title || p?.file_name || `#${p?.id}`);
+
+  /*
+   * 「這一張還有沒有沒處理完的格子」。**先記帳，最後才換算成 ok** ——
+   * 追問 Drive 那一段會把「不見了」翻案成「只是被搬走」（備份是好的），
+   * 在逐格的迴圈裡就下結論會少算幾張。
+   */
+  const bad = new Map<number, number>();
+  const markBad = (pid: number) => bad.set(pid, (bad.get(pid) ?? 0) + 1);
+  const unmarkBad = (pid: number) => {
+    const n = (bad.get(pid) ?? 0) - 1;
+    if (n > 0) bad.set(pid, n); else bad.delete(pid);
+  };
+
+  /** 逐張明細。只有 detail 才收，而且**只收有事情發生的那幾格** */
+  const items: DriveAuditItem[] = [];
+  /** 追問那一段要回頭改狀態，所以留一份 `<照片 id>:<欄位>` 的索引 */
+  const itemAt = new Map<string, DriveAuditItem>();
+  const note = (p: any, col: string, state: DriveAuditItem["state"]) => {
+    if (!detail) return;
+    const it: DriveAuditItem = {
+      photo_id: Number(p.id), title: titleOf(p),
+      media_type: String(p.media_type ?? "photo"),
+      slot: col === "drive_file_id" ? "4k" : "original",
+      state,
+    };
+    items.push(it);
+    itemAt.set(`${p.id}:${col}`, it);
+  };
+
+  const extras: DriveAuditExtra[] = [];
+  const noteExtra = (
+    name: string, driveId: string, action: DriveAuditExtra["action"], reason?: string,
+  ) => { if (detail) extras.push({ name, drive_id: driveId, action, reason }); };
+
+  /**
+   * 收工：算出 ok，把明細夾到上限再掛回報告上。
+   * ⚠️ 一定要走這一支 —— 直接把陣列塞進 rep，幾千張的相簿會回一份幾 MB 的 JSON。
+   */
+  const finish = (): DriveAuditAlbumReport => {
+    let okCount = 0;
+    for (const p of photos) if (!bad.has(Number(p.id))) okCount++;
+    rep.ok = okCount;
+    if (detail) {
+      rep.items = items.slice(0, DRIVE_AUDIT_MAX_DETAIL);
+      if (items.length > DRIVE_AUDIT_MAX_DETAIL) rep.items_more = items.length - DRIVE_AUDIT_MAX_DETAIL;
+      rep.extras = extras.slice(0, DRIVE_AUDIT_MAX_DETAIL);
+      if (extras.length > DRIVE_AUDIT_MAX_DETAIL) rep.extras_more = extras.length - DRIVE_AUDIT_MAX_DETAIL;
+      const dups = findDuplicateRows(photos);
+      rep.dups = dups.slice(0, DRIVE_AUDIT_MAX_DETAIL);
+      if (dups.length > DRIVE_AUDIT_MAX_DETAIL) rep.dups_more = dups.length - DRIVE_AUDIT_MAX_DETAIL;
+    }
+    return rep;
+  };
 
   /** 這一列該有哪幾份備份。回的是 [欄位名, 目前的值] */
   const slotsOf = (p: any): ["drive_file_id" | "drive_original_id", any][] =>
@@ -1555,9 +1778,11 @@ async function auditDriveAlbum(
       for (const [col, val] of slotsOf(p)) {
         if (typeof val === "string" && val) continue;
         if (col === "drive_file_id") rep.missing_4k++; else rep.missing_original++;
+        markBad(Number(p.id));
+        note(p, col, "missing");
       }
     }
-    return rep;
+    return finish();
   }
 
   const { files, truncated } = await listFolderFiles(env.GOOGLE_DRIVE_SA_KEY!, album.drive_folder_id);
@@ -1588,7 +1813,7 @@ async function auditDriveAlbum(
     const m = /^(\d+)_/.exec(f.name);
     if (!m) {
       // 名字不符我們的規則。**已經有人指著的不算外來檔** —— 命名規則之前傳的舊檔
-      if (!recorded.has(f.id)) rep.foreign++;
+      if (!recorded.has(f.id)) { rep.foreign++; noteExtra(f.name, f.id, "kept", "foreign"); }
       continue;
     }
     const pid = Number(m[1]);
@@ -1617,6 +1842,7 @@ async function auditDriveAlbum(
        * 每一張老照片都會被判成對不上，然後白花一次 probe 再回報成「被搬走了」。
        */
       if (id && onDrive.has(id)) { referenced.add(id); continue; }
+      markBad(pid);
 
       /*
        * 檔名對得上但 id 不對。**這是正面證據，清單有沒有看完都算數**
@@ -1626,17 +1852,30 @@ async function auditDriveAlbum(
       if (named.length > 0) {
         relinks.push({ photoId: pid, column: col, driveId: named[0].id, had: id });
         referenced.add(named[0].id);
+        // 檔案在 Drive 上 —— 這一格是好的，不算要補
+        unmarkBad(pid);
+        /*
+         * ⚠️ 一輪最多寫回 `DRIVE_AUDIT_MAX_LINKS` 筆，超出的**這一輪還沒真的寫回去**。
+         * 明細上不能一律寫成「已經接回來了」—— 那是下一輪的事，使用者照著這份報告
+         * 去看 D1 會發現對不上。
+         */
+        note(p, col, relinks.length <= DRIVE_AUDIT_MAX_LINKS ? "linked" : "linking");
         continue;
       }
 
       if (!id) {
         if (col === "drive_file_id") rep.missing_4k++; else rep.missing_original++;
+        note(p, col, "missing");
         continue;
       }
       referenced.add(id);
       // 清單沒看完的時候，「不在清單裡」什麼都證明不了
-      if (!truncated) {
+      if (truncated) {
+        // 這一本的判定不算數，不要留下一筆會誤導人的「不見了」
+        unmarkBad(pid);
+      } else {
         rep.gone++;
+        note(p, col, "gone");
         suspects.push({ photoId: pid, column: col, driveId: id });
       }
     }
@@ -1669,13 +1908,22 @@ async function auditDriveAlbum(
   for (const s of suspects.slice(0, DRIVE_AUDIT_MAX_PROBES)) {
     try {
       const probe = await probeDriveFile(env.GOOGLE_DRIVE_SA_KEY!, s.driveId);
-      if (probe && !probe.trashed) { rep.moved++; rep.gone--; continue; }
+      if (probe && !probe.trashed) {
+        // 只是被搬去別的資料夾 —— 備份是好的，這一格翻案成沒事
+        rep.moved++; rep.gone--;
+        unmarkBad(s.photoId);
+        const mv = itemAt.get(`${s.photoId}:${s.column}`);
+        if (mv) mv.state = "moved";
+        continue;
+      }
       // 真的沒了（404 或已在垃圾桶）：清掉那一欄，補傳清單才看得到這張
       await env.DB.prepare(
         `UPDATE Photo SET ${s.column} = NULL WHERE id = ? AND ${s.column} = ?`
       ).bind(s.photoId, s.driveId).run();
       rep.cleared++;
       if (s.column === "drive_file_id") rep.missing_4k++; else rep.missing_original++;
+      const cl = itemAt.get(`${s.photoId}:${s.column}`);
+      if (cl) cl.state = "cleared";
     } catch (e) {
       // 追問失敗就維持原狀 —— 寧可下一輪再看，也不要憑一次網路錯誤清掉備份
       rep.error = e instanceof Error ? e.message : String(e);
@@ -1692,26 +1940,42 @@ async function auditDriveAlbum(
    */
   if (!truncated) {
     const now = Date.now();
-    const candidates: { photoId: number; driveId: string }[] = [];
+    const candidates: { photoId: number; driveId: string; name: string }[] = [];
     for (const f of files) {
       if (referenced.has(f.id)) continue;
       // 外來檔在上面編檔名索引的時候就算過了，這裡只是跳過
       const m = /^(\d+)_/.exec(f.name);
       if (!m) continue;
       const created = f.createdTime ? Date.parse(f.createdTime) : NaN;
-      if (!Number.isFinite(created) || now - created < DRIVE_AUDIT_ORPHAN_MIN_AGE_MS) continue;
-      candidates.push({ photoId: Number(m[1]), driveId: f.id });
-      if (candidates.length >= DRIVE_AUDIT_MAX_ORPHANS) break;
+      if (!Number.isFinite(created) || now - created < DRIVE_AUDIT_ORPHAN_MIN_AGE_MS) {
+        noteExtra(f.name, f.id, "kept", "too_new");
+        continue;
+      }
+      if (candidates.length >= DRIVE_AUDIT_MAX_ORPHANS) {
+        // 這一輪的額度用完了，下一輪再處理 —— 但要講出來，不然數字對不起來
+        noteExtra(f.name, f.id, "kept", "over_limit");
+        continue;
+      }
+      candidates.push({ photoId: Number(m[1]), driveId: f.id, name: f.name });
     }
 
     if (candidates.length > 0) {
       const used = await driveIdsStillUsed(env, candidates);
-      const fresh = candidates.filter((c) => !used.has(c.driveId));
+      const fresh = candidates.filter((c) => {
+        if (!used.has(c.driveId)) return true;
+        noteExtra(c.name, c.driveId, "kept", "in_use");
+        return false;
+      });
       const queued = fresh.length > 0
         ? await driveIdsAlreadyQueued(env, fresh.map((c) => c.driveId))
         : new Set<string>();
-      const orphans = fresh.filter((c) => !queued.has(c.driveId));
+      const orphans = fresh.filter((c) => {
+        if (!queued.has(c.driveId)) return true;
+        noteExtra(c.name, c.driveId, "kept", "queued_before");
+        return false;
+      });
       if (orphans.length > 0) {
+        for (const o of orphans) noteExtra(o.name, o.driveId, "queued");
         const stmt = env.DB.prepare("INSERT INTO DriveTrash (drive_id, photo_id) VALUES (?, NULL)");
         for (let i = 0; i < orphans.length; i += 100) {
           await env.DB.batch(orphans.slice(i, i + 100).map((o) => stmt.bind(o.driveId)));
@@ -1721,7 +1985,7 @@ async function auditDriveAlbum(
     }
   }
 
-  return rep;
+  return finish();
 }
 
 /** 這份報告值不值得留下來給人看（沒問題的相簿不佔位子） */
@@ -1785,6 +2049,7 @@ async function runDriveAudit(env: Env, albums: number, force: boolean): Promise<
       state.totals.moved += rep.moved;
       state.totals.orphans_queued += rep.orphans_queued;
       state.totals.foreign += rep.foreign;
+      state.totals.ok += rep.ok;
       if (driveAuditWorthReporting(rep) && state.reports.length < DRIVE_AUDIT_MAX_REPORTS) {
         state.reports.push(rep);
       }
@@ -2448,6 +2713,16 @@ if (method === "POST" && pathname === "/api/verify-password") {
             "SELECT id, drive_id, photo_id, attempts, last_error, created_at FROM DriveTrash WHERE attempts >= 3 ORDER BY id LIMIT 20"
           ).all<any>();
 
+          /*
+           * 相簿清單，給後台那個「單獨對一本」的下拉選單用。
+           *
+           * 刻意不叫前端去打 `/api/albums` —— 那一支每一本都要撈封面與預覽圖，
+           * 而這裡只需要 id 跟名字。一句沒有 JOIN 的查詢，比那邊便宜得多。
+           */
+          const { results: albumList } = await env.DB.prepare(
+            "SELECT id, name FROM Album ORDER BY name"
+          ).all<any>();
+
           return new Response(JSON.stringify({
             ...state,
             trash: {
@@ -2455,13 +2730,49 @@ if (method === "POST" && pathname === "/api/verify-password") {
               gave_up: Number(trash?.gave_up ?? 0),
               stuck,
             },
+            albums: albumList.map((a: any) => ({ id: Number(a.id), name: String(a.name ?? "") })),
           }), { headers });
         }
 
         if (method === "POST") {
           const body = await request.json().catch(() => ({})) as {
-            reset?: unknown; albums?: unknown; retry_trash?: unknown;
+            reset?: unknown; albums?: unknown; retry_trash?: unknown; album_id?: unknown;
           };
+
+          /*
+           * 「單獨對這一本，而且要看逐張明細」。
+           *
+           * 跟 cron 那條走**同一支 auditDriveAlbum**（三段判定只能有一份實作，
+           * 分兩份寫遲早會走鐘），差別只在 detail=true 會多帶明細回來。
+           *
+           * ⚠️ **這一趟不碰 AppSetting**：不推游標、不累加 totals、不塞進 reports。
+           * 它是使用者站在某一本相簿前面問的一次性問題，把它算進「整輪掃描」的
+           * 進度裡只會讓那份報告的數字對不起來（同一本被算兩次）。
+           * 副作用照舊會發生（接回漏記的 id、清掉真的沒了的、排孤兒進待搬佇列）
+           * —— 那些是修資料，本來就該做。
+           */
+          if (body.album_id !== undefined && body.album_id !== null) {
+            const aid = Number(body.album_id);
+            if (!Number.isFinite(aid) || aid <= 0) {
+              return new Response(JSON.stringify({ error: "album_id 不正確" }), { status: 400, headers });
+            }
+            if (!env.GOOGLE_DRIVE_SA_KEY) {
+              return new Response(JSON.stringify({ error: "沒有設定 GOOGLE_DRIVE_SA_KEY，無法對帳" }), { status: 503, headers });
+            }
+            const album = await env.DB.prepare(
+              "SELECT id, name, drive_folder_id FROM Album WHERE id = ?"
+            ).bind(aid).first<any>();
+            if (!album) {
+              return new Response(JSON.stringify({ error: "找不到這本相簿" }), { status: 404, headers });
+            }
+            const report = await auditDriveAlbum(env, {
+              id: Number(album.id),
+              name: String(album.name ?? ""),
+              drive_folder_id: typeof album.drive_folder_id === "string" && album.drive_folder_id
+                ? album.drive_folder_id : null,
+            }, true);
+            return new Response(JSON.stringify({ success: true, report }), { headers });
+          }
 
           /*
            * 「重試放棄的搬移」：把 attempts 歸零讓它們回到佇列。

@@ -394,3 +394,20 @@
   border: 1px solid rgba(254, 202, 202, 0.9);
   color: #991b1b;
 }
+
+/* 「單獨對一本」的相簿選單。跟 .field input 同一套外觀 ——
+   同一格裡兩種輸入長得不一樣會很奇怪 */
+.select {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.7);
+  font-size: 0.95rem;
+  color: inherit;
+  max-width: 100%;
+}
+
+.select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

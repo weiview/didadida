@@ -706,6 +706,48 @@ export interface TrackFolderSync {
 
 /* ── Drive 備份對帳 ───────────────────────────────────────────────────────── */
 
+/**
+ * 逐張明細的一筆。**只有「單獨對一本」才有** —— 整輪掃描存的仍然只有數字。
+ * 只列有事情發生的那幾格；兩份都在的不列，那些是報告裡的 `ok`。
+ */
+export interface DriveAuditItem {
+  photo_id: number;
+  title: string;
+  media_type: string;
+  /** 哪一份備份：4K 衍生版或原始檔（影片只有 original） */
+  slot: '4k' | 'original';
+  /**
+   * missing ＝ 從來沒傳成功過，補傳 Drive 補得回來
+   * linked  ＝ 檔案在、記錄漏掉，已經自動接回來了
+   * linking ＝ 同上，但這一輪的寫回額度用完了，下一輪才寫得回去（備份是好的）
+   * cleared ＝ 確認 Drive 上真的沒了，記錄已清掉，會出現在補傳清單上
+   * gone    ＝ 記錄有、清單裡沒有，這一輪的追問額度用完還沒確認
+   * moved   ＝ 被搬到別的資料夾，備份是好的
+   */
+  state: 'missing' | 'linked' | 'linking' | 'cleared' | 'gone' | 'moved';
+}
+
+/** Drive 上多出來的檔 */
+export interface DriveAuditExtra {
+  name: string;
+  drive_id: string;
+  /** queued ＝ 已排進待搬佇列（搬進 trash/，不是刪除）；kept ＝ 這次不動它 */
+  action: 'queued' | 'kept';
+  /** kept 的理由：foreign／too_new／in_use／queued_before／over_limit */
+  reason?: string;
+}
+
+/** 站上（D1）重複的那幾列。**只列出來，不會自動刪** */
+export interface DriveAuditDupGroup {
+  /** same_hash ＝ 位元組層級同一個檔；same_name ＝ 只有檔名一樣，不一定是同一張 */
+  kind: 'same_hash' | 'same_name';
+  key: string;
+  photos: {
+    id: number; title: string; media_type: string;
+    has_4k: boolean; has_original: boolean; created_at: string;
+  }[];
+}
+
 /** 一本相簿對完的結果。數字都是「這一輪掃到的」，不是歷史累計 */
 export interface DriveAuditAlbumReport {
   album_id: number;
@@ -732,7 +774,18 @@ export interface DriveAuditAlbumReport {
   orphans_queued: number;
   /** 檔名不符合本站規則的檔（別人放進去的）。一律不碰，只報數 */
   foreign: number;
+  /** 該有的備份**全都在**的照片數 —— 也就是「不用補的有幾張」 */
+  ok: number;
   error?: string;
+
+  /* ── 以下只有「單獨對一本」才有 ── */
+
+  items?: DriveAuditItem[];
+  items_more?: number;
+  extras?: DriveAuditExtra[];
+  extras_more?: number;
+  dups?: DriveAuditDupGroup[];
+  dups_more?: number;
 }
 
 export interface DriveAuditState {
@@ -746,7 +799,7 @@ export interface DriveAuditState {
     albums: number; photos: number;
     missing_4k: number; missing_original: number; linked: number;
     gone: number; cleared: number; moved: number;
-    orphans_queued: number; foreign: number;
+    orphans_queued: number; foreign: number; ok: number;
   };
   reports: DriveAuditAlbumReport[];
   last_error: string | null;
@@ -760,6 +813,8 @@ export interface DriveAuditState {
       attempts: number; last_error: string | null; created_at: string;
     }[];
   };
+  /** 相簿清單，給「單獨對一本」的下拉選單用（GET 才有） */
+  albums?: { id: number; name: string }[];
 }
 
 /**
@@ -794,6 +849,26 @@ export async function runDriveAudit(
   });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '對帳失敗');
   return await res.json();
+}
+
+/**
+ * 單獨對一本相簿，而且要**逐張明細**：哪幾張還缺哪一份、Drive 上多出來哪幾個檔、
+ * 站上有沒有重複的列。
+ *
+ * ⚠️ 這一趟**不算進整輪掃描的進度**（不推游標、不累加 totals）—— 它回的是一份
+ * 獨立的報告，不是新的 DriveAuditState。修資料的副作用照舊會發生（接回漏記的 id、
+ * 清掉真的沒了的、把孤兒排進待搬佇列）。
+ */
+export async function auditOneAlbum(albumId: number): Promise<DriveAuditAlbumReport> {
+  const res = await fetch(`${API_BASE_URL}/admin/drive-audit`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ album_id: albumId }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '對帳失敗');
+  const data = await res.json();
+  if (!data?.report) throw new Error('對帳失敗');
+  return data.report as DriveAuditAlbumReport;
 }
 
 /** 掃一遍分享給服務帳號的 Drive 資料夾，照信箱自動綁到人身上。站長限定 */
