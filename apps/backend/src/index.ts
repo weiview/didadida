@@ -2,7 +2,11 @@ import {
   normalizeGeo, formatWallClock, utcFromLocal,
   parseExifDateTime, geoOverwriteGuard, DEFAULT_TZ_OFFSET_MINUTES,
 } from './geo';
-import { listGpxFiles, listSharedFolders, fetchDriveMedia, fetchDriveMediaRange, moveDriveFile, renameDriveFolder, serviceAccountEmail } from './drive';
+import {
+  listGpxFiles, listSharedFolders, fetchDriveMedia, fetchDriveMediaRange,
+  moveDriveFile, renameDriveFolder, serviceAccountEmail,
+  listFolderFiles, probeDriveFile,
+} from './drive';
 import { syncFtsForPhotos, deleteFtsForPhotos, ftsMatchExpr } from './fts';
 
 export interface Env {
@@ -1348,6 +1352,359 @@ async function drainDriveTrash(env: Env, limit: number): Promise<{
   return { ok: true, moved, failed, remaining, gave_up: Number(counts?.gave_up ?? 0), done: remaining === 0 };
 }
 
+
+/* ── Drive 備份對帳 ────────────────────────────────────────────────────────
+ *
+ * 「網站上一張照片，Drive 上就該有一份 4K ＋ 一份原始檔」——
+ * 這件事沒有任何地方在保證。上傳的 Drive 那一段是**在瀏覽器裡**跑的，
+ * 網頁關掉、分頁睡著、token 過期、recordPhotoDrive 那一下剛好斷線，
+ * 每一種都會留下一半的結果，而且**兩邊都安靜**：
+ *
+ *   D1 有、Drive 沒有 → 照片看起來好好的，直到某天想看原圖才發現沒了
+ *   Drive 有、D1 沒有 → 檔案永遠躺在那裡佔空間，沒有任何一列指著它
+ *
+ * 所以要有人定期去對。這支就是那個人：cron 每次挑**一本**相簿，
+ * 把 D1 那本的 Photo 列跟 Drive 資料夾的實際內容兩邊比對。
+ *
+ * 為什麼一次一本：Workers 免費版單次呼叫 50 個 subrequest，而列一頁檔就是一次。
+ * 分次做完一輪之後閒置 24 小時（DRIVE_AUDIT_IDLE_MS），閒著的那些 tick
+ * 只花一次 AppSetting 讀取 —— 免費額度是最高宗旨。
+ *
+ * ⚠️ 這支**會動 Drive 上的檔**（把孤兒丟進待搬佇列），三道閘一道都不能拿掉，
+ *    見 auditDriveAlbum 裡的說明。它一樣不呼叫 files.delete —— 走的是既有的
+ *    DriveTrash → moveDriveFile → `didadida/trash/`，連重試都是現成的。
+ */
+const SETTING_DRIVE_AUDIT = "drive_audit";
+
+/** 一輪掃完之後閒置多久才開始下一輪 */
+const DRIVE_AUDIT_IDLE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 孤兒檔至少要這麼舊才敢動。
+ *
+ * 這是三道閘裡最重要的一道：照片是「先傳 Drive，再回報 id 給 D1」，
+ * 中間那個空窗期檔案在 Drive 上、D1 還沒有 —— 長得跟孤兒一模一樣。
+ * 空窗正常只有幾秒，但補傳失敗的人可能隔天才回來按重試。留一天綽綽有餘。
+ */
+const DRIVE_AUDIT_ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** 一本相簿一次最多丟幾個孤兒進佇列（每個都是一次 D1 寫入，別一次灌爆） */
+const DRIVE_AUDIT_MAX_ORPHANS = 50;
+
+/** 一次最多向 Drive 追問幾個「對不上」的檔。一次一個 subrequest */
+const DRIVE_AUDIT_MAX_PROBES = 8;
+
+/** 報告裡最多留幾本相簿的細節（只留有問題的），AppSetting 那一列不該長成幾百 KB */
+const DRIVE_AUDIT_MAX_REPORTS = 40;
+
+interface DriveAuditAlbumReport {
+  album_id: number;
+  name: string;
+  photos: number;
+  /** 這本沒有 drive_folder_id —— 整本從來沒備份過，或是分資料夾之前的老相簿 */
+  no_folder?: boolean;
+  /** 檔案太多，這次沒看完。孤兒與「不見了」的判定**整個跳過**（半份清單會誤判） */
+  truncated?: boolean;
+  /** D1 就是 NULL：從來沒傳成功過。補傳 Drive 補得回來 */
+  missing_4k: number;
+  missing_original: number;
+  /** D1 有 id，Drive 的清單裡卻沒有 */
+  gone: number;
+  /** 追問過 Drive、確認真的沒了，D1 那一欄已清成 NULL（於是補傳清單看得到它） */
+  cleared: number;
+  /** 檔還在，只是被搬去別的資料夾了 —— 不動它，備份是好的 */
+  moved: number;
+  /** Drive 上多出來、已丟進待搬佇列 */
+  orphans_queued: number;
+  /** 多出來但名字不符我們的命名規則，不敢動，列出來給人看 */
+  foreign: number;
+  error?: string;
+}
+
+interface DriveAuditState {
+  /** 掃到哪一本了（Album.id），0 ＝ 從頭開始 */
+  cursor: number;
+  started_at: string | null;
+  finished_at: string | null;
+  /** 上一次真的跑過的時間，給前端顯示 */
+  last_run_at: string | null;
+  albums_done: number;
+  totals: {
+    albums: number; photos: number;
+    missing_4k: number; missing_original: number;
+    gone: number; cleared: number; moved: number;
+    orphans_queued: number; foreign: number;
+  };
+  /** 只留有問題的那幾本 */
+  reports: DriveAuditAlbumReport[];
+  last_error: string | null;
+}
+
+const emptyDriveAuditState = (): DriveAuditState => ({
+  cursor: 0, started_at: null, finished_at: null, last_run_at: null, albums_done: 0,
+  totals: {
+    albums: 0, photos: 0, missing_4k: 0, missing_original: 0,
+    gone: 0, cleared: 0, moved: 0, orphans_queued: 0, foreign: 0,
+  },
+  reports: [], last_error: null,
+});
+
+async function loadDriveAuditState(env: Env): Promise<DriveAuditState> {
+  const raw = await getSetting(env, SETTING_DRIVE_AUDIT);
+  if (!raw) return emptyDriveAuditState();
+  try {
+    // 壞掉的 JSON 不該讓 cron 每十分鐘噴一次 —— 當成沒跑過，重新開一輪
+    return { ...emptyDriveAuditState(), ...(JSON.parse(raw) as DriveAuditState) };
+  } catch {
+    return emptyDriveAuditState();
+  }
+}
+
+/**
+ * 那幾個 Drive 檔還有沒有人在用。
+ *
+ * ⚠️ **用照片 id 反查，不要用 drive id。** 我們的檔名開頭就是照片 id
+ * （`<photoId>_<檔名>`、`<photoId>_<檔名>_4k.webp`，見 frontend/src/lib/drive.ts），
+ * 所以這裡查得到主鍵；改成 `WHERE drive_file_id IN (...)` 那兩欄沒有索引，
+ * 每問一次就是整張 Photo 掃一遍。
+ *
+ * 這一道閘擋的是「照片搬到別本相簿了，檔案還留在原資料夾」—— 那不是孤兒，
+ * 是好備份，搬走就等於使用者哪天想找原圖時找不到。
+ */
+async function driveIdsStillUsed(env: Env, items: { photoId: number; driveId: string }[]): Promise<Set<string>> {
+  const used = new Set<string>();
+  const ids = [...new Set(items.map((i) => i.photoId))];
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    const { results } = await env.DB.prepare(
+      `SELECT drive_file_id AS a, drive_original_id AS b FROM Photo WHERE id IN (${chunk.map(() => "?").join(",")})`
+    ).bind(...chunk).all<any>();
+    for (const r of results) {
+      if (typeof r?.a === "string" && r.a) used.add(r.a);
+      if (typeof r?.b === "string" && r.b) used.add(r.b);
+    }
+  }
+  return used;
+}
+
+/** 已經排在待搬佇列裡的，不要再排一次（佇列沒有 drive_id 的唯一索引） */
+async function driveIdsAlreadyQueued(env: Env, driveIds: string[]): Promise<Set<string>> {
+  const queued = new Set<string>();
+  for (let i = 0; i < driveIds.length; i += 100) {
+    const chunk = driveIds.slice(i, i + 100);
+    const { results } = await env.DB.prepare(
+      `SELECT drive_id FROM DriveTrash WHERE drive_id IN (${chunk.map(() => "?").join(",")})`
+    ).bind(...chunk).all<any>();
+    for (const r of results) if (typeof r?.drive_id === "string") queued.add(r.drive_id);
+  }
+  return queued;
+}
+
+/**
+ * 對一本相簿。
+ *
+ * 影片與照片的期望值不一樣：照片要 4K ＋ 原始檔兩份，**影片只有原始檔一份**
+ * （沒有衍生版，id 記在 drive_original_id，drive_file_id 永遠是 NULL —— 見 0019）。
+ * 把影片當照片對，每一支都會被算成「缺 4K」，那個數字永遠歸不了零。
+ */
+async function auditDriveAlbum(
+  env: Env,
+  album: { id: number; name: string; drive_folder_id: string | null },
+): Promise<DriveAuditAlbumReport> {
+  const rep: DriveAuditAlbumReport = {
+    album_id: album.id, name: album.name, photos: 0,
+    missing_4k: 0, missing_original: 0, gone: 0, cleared: 0, moved: 0,
+    orphans_queued: 0, foreign: 0,
+  };
+
+  const { results: photos } = await env.DB.prepare(
+    "SELECT id, media_type, drive_file_id, drive_original_id FROM Photo WHERE album_id = ?"
+  ).bind(album.id).all<any>();
+  rep.photos = photos.length;
+
+  /** 這一列該有哪幾份備份。回的是 [欄位名, 目前的值] */
+  const slotsOf = (p: any): ["drive_file_id" | "drive_original_id", any][] =>
+    String(p?.media_type) === "video"
+      ? [["drive_original_id", p.drive_original_id]]
+      : [["drive_file_id", p.drive_file_id], ["drive_original_id", p.drive_original_id]];
+
+  // 沒有資料夾 id：不必去 Drive，D1 自己就答得出「誰沒有備份」
+  if (!album.drive_folder_id) {
+    rep.no_folder = true;
+    for (const p of photos) {
+      for (const [col, val] of slotsOf(p)) {
+        if (typeof val === "string" && val) continue;
+        if (col === "drive_file_id") rep.missing_4k++; else rep.missing_original++;
+      }
+    }
+    return rep;
+  }
+
+  const { files, truncated } = await listFolderFiles(env.GOOGLE_DRIVE_SA_KEY!, album.drive_folder_id);
+  if (truncated) rep.truncated = true;
+  const onDrive = new Set(files.map((f) => f.id));
+
+  /** 這本相簿的 Photo 列指到的所有 Drive id。孤兒＝資料夾裡不在這份裡面的 */
+  const referenced = new Set<string>();
+  const suspects: { photoId: number; column: string; driveId: string }[] = [];
+
+  for (const p of photos) {
+    for (const [col, val] of slotsOf(p)) {
+      const id = typeof val === "string" && val ? val : null;
+      if (!id) {
+        if (col === "drive_file_id") rep.missing_4k++; else rep.missing_original++;
+        continue;
+      }
+      referenced.add(id);
+      // 清單沒看完的時候，「不在清單裡」什麼都證明不了
+      if (!truncated && !onDrive.has(id)) {
+        rep.gone++;
+        suspects.push({ photoId: Number(p.id), column: col, driveId: id });
+      }
+    }
+  }
+
+  /*
+   * 對不上的**要再問一次本人**才敢清 D1。
+   *
+   * 「不在這個資料夾的清單裡」有兩種可能：真的沒了，或是被搬到別的資料夾
+   * （相簿改名、有人手動整理）。後者那份備份是好的，把 D1 清成 NULL 等於
+   * 叫使用者重傳一份，Drive 上再多一個垃圾。一次只追問幾個，剩下的下一輪再說。
+   */
+  for (const s of suspects.slice(0, DRIVE_AUDIT_MAX_PROBES)) {
+    try {
+      const probe = await probeDriveFile(env.GOOGLE_DRIVE_SA_KEY!, s.driveId);
+      if (probe && !probe.trashed) { rep.moved++; rep.gone--; continue; }
+      // 真的沒了（404 或已在垃圾桶）：清掉那一欄，補傳清單才看得到這張
+      await env.DB.prepare(
+        `UPDATE Photo SET ${s.column} = NULL WHERE id = ? AND ${s.column} = ?`
+      ).bind(s.photoId, s.driveId).run();
+      rep.cleared++;
+      if (s.column === "drive_file_id") rep.missing_4k++; else rep.missing_original++;
+    } catch (e) {
+      // 追問失敗就維持原狀 —— 寧可下一輪再看，也不要憑一次網路錯誤清掉備份
+      rep.error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  /*
+   * 孤兒：資料夾裡有、沒有任何一列指著它。三道閘全過才敢動，順序也是刻意的
+   * （便宜的先擋，最貴的那次 D1 查詢留到最後）：
+   *   ① 名字要符合我們自己的命名規則 `<photoId>_…` —— 使用者自己丟進去的東西不歸我們管
+   *   ② 至少 24 小時前建的 —— 剛傳完還沒回報 id 的檔長得跟孤兒一模一樣
+   *   ③ 問 D1「這個照片 id 現在指到哪」—— 照片搬去別本相簿時檔案會留在原資料夾
+   * 清單沒看完就整段跳過：半份清單去清孤兒會清掉好檔。
+   */
+  if (!truncated) {
+    const now = Date.now();
+    const candidates: { photoId: number; driveId: string }[] = [];
+    for (const f of files) {
+      if (referenced.has(f.id)) continue;
+      const m = /^(\d+)_/.exec(f.name);
+      if (!m) { rep.foreign++; continue; }
+      const created = f.createdTime ? Date.parse(f.createdTime) : NaN;
+      if (!Number.isFinite(created) || now - created < DRIVE_AUDIT_ORPHAN_MIN_AGE_MS) continue;
+      candidates.push({ photoId: Number(m[1]), driveId: f.id });
+      if (candidates.length >= DRIVE_AUDIT_MAX_ORPHANS) break;
+    }
+
+    if (candidates.length > 0) {
+      const used = await driveIdsStillUsed(env, candidates);
+      const fresh = candidates.filter((c) => !used.has(c.driveId));
+      const queued = fresh.length > 0
+        ? await driveIdsAlreadyQueued(env, fresh.map((c) => c.driveId))
+        : new Set<string>();
+      const orphans = fresh.filter((c) => !queued.has(c.driveId));
+      if (orphans.length > 0) {
+        const stmt = env.DB.prepare("INSERT INTO DriveTrash (drive_id, photo_id) VALUES (?, NULL)");
+        for (let i = 0; i < orphans.length; i += 100) {
+          await env.DB.batch(orphans.slice(i, i + 100).map((o) => stmt.bind(o.driveId)));
+        }
+        rep.orphans_queued = orphans.length;
+      }
+    }
+  }
+
+  return rep;
+}
+
+/** 這份報告值不值得留下來給人看（沒問題的相簿不佔位子） */
+const driveAuditWorthReporting = (r: DriveAuditAlbumReport): boolean =>
+  r.missing_4k > 0 || r.missing_original > 0 || r.gone > 0 || r.cleared > 0
+  || r.orphans_queued > 0 || r.foreign > 0 || Boolean(r.truncated) || Boolean(r.error);
+
+/**
+ * 跑一次對帳：從 cursor 往後挑幾本相簿對完，把進度寫回 AppSetting。
+ *
+ * `force` 是手動按下去用的（跳過 24 小時的閒置檢查）。cron 那條一定要留著
+ * 閒置檢查，不然一天 144 次、每次都整輪掃過去，讀取額度會被吃掉。
+ */
+async function runDriveAudit(env: Env, albums: number, force: boolean): Promise<DriveAuditState> {
+  const state = await loadDriveAuditState(env);
+  if (!env.GOOGLE_DRIVE_SA_KEY) {
+    state.last_error = "沒有設定 GOOGLE_DRIVE_SA_KEY，無法對帳";
+    return state;
+  }
+
+  // 上一輪掃完了而且還沒到下一輪的時間 —— 這個 tick 只花了一次 AppSetting 讀取
+  if (!force && state.cursor === 0 && state.finished_at
+      && Date.now() - Date.parse(state.finished_at) < DRIVE_AUDIT_IDLE_MS) {
+    return state;
+  }
+
+  if (state.cursor === 0) {
+    // 新的一輪：計數與報告全部歸零，不然數字會一輪疊一輪
+    const fresh = emptyDriveAuditState();
+    fresh.started_at = new Date().toISOString();
+    fresh.last_run_at = state.last_run_at;
+    Object.assign(state, fresh);
+  }
+
+  for (let n = 0; n < albums; n++) {
+    const album = await env.DB.prepare(
+      "SELECT id, name, drive_folder_id FROM Album WHERE id > ? ORDER BY id LIMIT 1"
+    ).bind(state.cursor).first<any>();
+
+    if (!album) {
+      // 掃完一輪
+      state.cursor = 0;
+      state.finished_at = new Date().toISOString();
+      break;
+    }
+
+    try {
+      const rep = await auditDriveAlbum(env, {
+        id: Number(album.id),
+        name: String(album.name ?? ""),
+        drive_folder_id: typeof album.drive_folder_id === "string" && album.drive_folder_id
+          ? album.drive_folder_id : null,
+      });
+      state.totals.albums++;
+      state.totals.photos += rep.photos;
+      state.totals.missing_4k += rep.missing_4k;
+      state.totals.missing_original += rep.missing_original;
+      state.totals.gone += rep.gone;
+      state.totals.cleared += rep.cleared;
+      state.totals.moved += rep.moved;
+      state.totals.orphans_queued += rep.orphans_queued;
+      state.totals.foreign += rep.foreign;
+      if (driveAuditWorthReporting(rep) && state.reports.length < DRIVE_AUDIT_MAX_REPORTS) {
+        state.reports.push(rep);
+      }
+    } catch (e) {
+      // 一本壞掉不該讓整輪停在那裡 —— 記下來，cursor 照樣往前走
+      state.last_error = `相簿 ${album.id}：${e instanceof Error ? e.message : String(e)}`;
+    }
+
+    state.cursor = Number(album.id);
+    state.albums_done++;
+  }
+
+  state.last_run_at = new Date().toISOString();
+  await setSetting(env, SETTING_DRIVE_AUDIT, JSON.stringify(state));
+  return state;
+}
+
 /**
  * 這個 Google access token 的主人可不可以當管理員。
  *
@@ -1960,6 +2317,88 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }
       }
 
+
+      /* ── 站長專用：Drive 備份對帳 ──────────────────────────────────────────
+       *
+       * 「站上一張照片，Drive 上就該有一份 4K ＋ 一份原始檔」的自動巡邏。
+       * 引擎在 runDriveAudit（見上面那一大段），這裡只是看報告與手動催。
+       *
+       * 歸 canManageOthers 而不是 isOwner：它看的是全站內容的備份狀態，
+       * 跟「誰進得來」無關，跟待搬佇列那支（drain-drive-trash）同一個層級。
+       */
+      if (pathname === "/api/admin/drive-audit") {
+        const auditActor = await currentActor(request, env);
+        if (!auditActor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!auditActor.canManageOthers) {
+          return forbidden(headers, "這是全站共用的資料，只有可以管理別人內容的帳號能看");
+        }
+
+        if (method === "GET") {
+          const state = await loadDriveAuditState(env);
+          /*
+           * 待搬佇列的現況一起回。放棄的那幾筆（attempts >= 3）是這次要修的重點
+           * 之一 —— 以前它們只是靜靜留在表裡，站上任何一個畫面都看不到，
+           * 於是「Drive 刪除失敗」那句話跳完就再也沒有下文。
+           */
+          const trash = await env.DB.prepare(`
+            SELECT SUM(CASE WHEN attempts < 3 THEN 1 ELSE 0 END) AS remaining,
+                   SUM(CASE WHEN attempts >= 3 THEN 1 ELSE 0 END) AS gave_up
+              FROM DriveTrash
+          `).first<any>();
+          const { results: stuck } = await env.DB.prepare(
+            "SELECT id, drive_id, photo_id, attempts, last_error, created_at FROM DriveTrash WHERE attempts >= 3 ORDER BY id LIMIT 20"
+          ).all<any>();
+
+          return new Response(JSON.stringify({
+            ...state,
+            trash: {
+              remaining: Number(trash?.remaining ?? 0),
+              gave_up: Number(trash?.gave_up ?? 0),
+              stuck,
+            },
+          }), { headers });
+        }
+
+        if (method === "POST") {
+          const body = await request.json().catch(() => ({})) as {
+            reset?: unknown; albums?: unknown; retry_trash?: unknown;
+          };
+
+          /*
+           * 「重試放棄的搬移」：把 attempts 歸零讓它們回到佇列。
+           *
+           * 這是使用者真的踩到的那一個 —— 刪照片時 Drive 那一下失敗，
+           * 試三次之後就永遠躺在表裡。失敗常常是暫時的（Drive 5xx、網路），
+           * 但沒有任何地方按得到重試。
+           */
+          if (body.retry_trash) {
+            const reset = await env.DB.prepare(
+              "UPDATE DriveTrash SET attempts = 0, last_error = NULL WHERE attempts >= 3"
+            ).run();
+            const drained = await drainDriveTrash(env, 10);
+            return new Response(JSON.stringify({
+              success: true,
+              revived: Number((reset as any)?.meta?.changes ?? 0),
+              drained,
+            }), { headers });
+          }
+
+          // reset：把游標歸零，下一次（含這一次）從第一本重新對
+          if (body.reset) await setSetting(env, SETTING_DRIVE_AUDIT, JSON.stringify(emptyDriveAuditState()));
+
+          /*
+           * 手動跑幾本。上限 5 —— 一本要列一次（可能好幾次）Drive，
+           * 而單次呼叫的 subrequest 免費版只有 50 個。想整輪掃完就多按幾次，
+           * 進度存在 AppSetting 裡不會掉。
+           */
+          const want = Math.min(Math.max(Number(body.albums ?? 3) || 3, 1), 5);
+          const state = await runDriveAudit(env, want, true);
+          return new Response(JSON.stringify(state), { headers });
+        }
+      }
+
       /* ── 站長專用：白名單管理 ──────────────────────────────────────────────
        *
        * 只有 role='owner' 進得來。can_manage_others 給的是「動別人的內容」，
@@ -2299,15 +2738,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             : [];
           const photoIds = photos.map((p) => Number(p.id));
 
-          // 3. R2 的實體檔案（主檔 + 800px + 400px）。一次最多 1000 個鍵
-          if (photos.length > 0) {
-            const keys = photos.flatMap((p) => r2KeysForPhoto(p));
-            for (let i = 0; i < keys.length; i += 1000) {
-              await env.BUCKET.delete(keys.slice(i, i + 1000));
-            }
-          }
-
-          // 4. Drive：整本刪掉的相簿搬資料夾，其餘（別人相簿裡的照片、
+          // 3. Drive：整本刪掉的相簿搬資料夾，其餘（別人相簿裡的照片、
           //    還有分資料夾之前的舊相簿）才逐檔登記。兩條路都不呼叫 files.delete
           if (folderRows.length > 0) {
             const stmt = env.DB.prepare("INSERT INTO DriveTrash (drive_id, photo_id) VALUES (?, NULL)");
@@ -2347,6 +2778,22 @@ if (method === "POST" && pathname === "/api/verify-password") {
             }
             // PhotoFts 是虛擬表，沒有 FK，不會跟著 Photo 一起消失
             await deleteFtsForPhotos(env.DB, photoIds);
+
+            /*
+             * 4. **D1 收乾淨之後才刪 R2**（主檔 + 800px + 400px），一次最多 1000 個鍵。
+             *
+             * 跟刪照片、刪相簿同一個順序。R2 排在前面的話，它丟一次暫時性的錯誤
+             * 就會讓整支路由 500，而照片那些列還在 —— 帳號刪了一半，畫面上留下
+             * 一堆點開是破圖的照片。反過來最壞只是 R2 留下幾顆沒人指著的縮圖。
+             */
+            try {
+              const keys = photos.flatMap((p) => r2KeysForPhoto(p));
+              for (let i = 0; i < keys.length; i += 1000) {
+                await env.BUCKET.delete(keys.slice(i, i + 1000));
+              }
+            } catch (e) {
+              console.error(`清除帳號 ${targetId} 的內容時，R2 物件沒刪乾淨（列已經刪了）`, e);
+            }
           }
 
           // 5. 相簿本身。一條 statement 就掃完，不必按 id 切塊
@@ -2369,14 +2816,19 @@ if (method === "POST" && pathname === "/api/verify-password") {
             ).bind(targetId).all<any>();
             deletedTrackDays = dayRows.length;
             if (dayRows.length > 0) {
-              const keys = dayRows.flatMap((d) => [
-                typeof d.raw_key === "string" && d.raw_key ? d.raw_key : rawTrackKey(d.day_key),
-                matchedKey(d.day_key),
-              ]);
-              for (let i = 0; i < keys.length; i += 1000) {
-                await env.BUCKET.delete(keys.slice(i, i + 1000));
-              }
               await env.DB.prepare("DELETE FROM TrackDay WHERE user_id = ?").bind(targetId).run();
+              // 列先收掉再刪 R2，理由同上（R2 失敗不該讓整個清除半路 500）
+              try {
+                const keys = dayRows.flatMap((d) => [
+                  typeof d.raw_key === "string" && d.raw_key ? d.raw_key : rawTrackKey(d.day_key),
+                  matchedKey(d.day_key),
+                ]);
+                for (let i = 0; i < keys.length; i += 1000) {
+                  await env.BUCKET.delete(keys.slice(i, i + 1000));
+                }
+              } catch (e) {
+                console.error(`清除帳號 ${targetId} 的軌跡時，R2 物件沒刪乾淨（列已經刪了）`, e);
+              }
             }
           }
 
@@ -3124,7 +3576,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
       }
 
       /*
-       * 路由：還沒搬上 Drive 的照片（「補傳 Drive」批次動作的來源）。
+       * 路由：還沒搬上 Drive 的照片與影片（「補傳 Drive」批次動作的來源）。
        *
        * 上傳時 Drive 失敗不會擋下照片（drive_file_id 留 NULL），舊照片也全都是
        * NULL，兩者在這裡看起來一樣 —— 本來就該一樣，補傳的動作完全相同。
@@ -3153,20 +3605,39 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const albumClause = (albumId ? " AND album_id = ?" : "") + drivePendingRestricted;
 
         /*
-         * ⚠️ **一定要排除影片。** 影片的 Drive id 記在 drive_original_id，
-         *    drive_file_id 對它們永遠是 NULL（見 0019）—— 不擋的話每一支影片都會
-         *    賴在待補清單上永遠補不完，而且補傳會拿影片去跑 encode4kWebp。
+         * ⚠️ **影片與照片的「有沒有備份」是兩個不同的問題，不能寫成同一句。**
+         *
+         *   照片：4K（drive_file_id）＋ 原始檔（drive_original_id）**兩份都要**。
+         *   影片：只有原始檔一份，drive_file_id 對它永遠是 NULL（見 0019）。
+         *
+         * 以前這裡是 `drive_file_id IS NULL AND media_type = 'photo'`，兩邊都漏：
+         *   ① 影片整類被排除掉 —— 上傳時 Drive 失敗的影片**永遠不會出現在補傳清單上**，
+         *      使用者手上只剩一張封面圖，而站上沒有任何地方講得出這件事。
+         *      （當初排除是對的，因為不排除的話每支影片都會賴著補不完，
+         *        而且補傳會拿影片去跑 encode4kWebp —— 正解是分開判斷，不是整類丟掉。）
+         *   ② 照片只看 4K —— 「4K 上去了、原始檔失敗」的那些一輩子看不到。
+         *      pushPhotoToDrive 兩份是分開 try 的，這種半套結果本來就會發生。
+         *
+         * ⚠️ 列表與 COUNT **必須用同一個條件**，不然「剩幾張」永遠歸不了零。
+         *    共用底下這個字串就是為了讓它們沒辦法不一致。
          */
+        const drivePendingCond = `(
+             (media_type = 'video' AND drive_original_id IS NULL)
+          OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NULL))
+        )`;
+
         const { results: photos } = await env.DB.prepare(`
-          SELECT id, url, file_name, title
+          SELECT id, url, file_name, title, media_type, thumb_url,
+                 drive_file_id IS NOT NULL AS has_4k,
+                 drive_original_id IS NOT NULL AS has_original
             FROM Photo
-           WHERE id > ? AND drive_file_id IS NULL AND media_type = 'photo'${albumClause}
+           WHERE id > ? AND ${drivePendingCond}${albumClause}
            ORDER BY id LIMIT ?
         `).bind(...(albumId ? [cursor, albumId, limit] : [cursor, limit])).all();
 
         // 剩幾張要另外算：photos 只是這一批，進度條需要總數
         const remaining = await env.DB.prepare(
-          `SELECT COUNT(*) AS n FROM Photo WHERE drive_file_id IS NULL AND media_type = 'photo'${albumClause}`
+          `SELECT COUNT(*) AS n FROM Photo WHERE ${drivePendingCond}${albumClause}`
         ).bind(...(albumId ? [albumId] : [])).first<any>();
 
         return new Response(JSON.stringify({
@@ -3652,14 +4123,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         ).bind(albumId).all();
 
         if (photos.length > 0) {
-          // 2. 從 R2 刪除實體檔案（主檔 + 800px + 400px）
-          //    R2 的 delete 一次最多吃 1000 個鍵，一本相簿可能上千張，得分批
-          const keys = photos.flatMap((p) => r2KeysForPhoto(p));
-          for (let i = 0; i < keys.length; i += 1000) {
-            await env.BUCKET.delete(keys.slice(i, i + 1000));
-          }
-
-          // 4. 刪除所有這些照片的 Tag 關聯
+          // 2. 刪除所有這些照片的 Tag 關聯
           await env.DB.prepare(`DELETE FROM PhotoTag WHERE photo_id IN (SELECT id FROM Photo WHERE album_id = ?)`).bind(albumId).run();
         }
 
@@ -3687,14 +4151,33 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }
 
 
-        // 5. 刪除這些照片紀錄
+        // 4. 刪除這些照片紀錄
         await env.DB.prepare("DELETE FROM Photo WHERE album_id = ?").bind(albumId).run();
 
-        // 6. 刪除相簿本身
+        // 5. 刪除相簿本身
         await env.DB.prepare("DELETE FROM Album WHERE id = ?").bind(albumId).run();
 
-        // 7. PhotoFts 是虛擬表，沒有 FK，不會跟著 Photo 一起被刪掉
+        // 6. PhotoFts 是虛擬表，沒有 FK，不會跟著 Photo 一起被刪掉
         await deleteFtsForPhotos(env.DB, photos.map((p: any) => Number(p.id)));
+
+        /*
+         * 7. **最後才刪 R2**（主檔 + 800px + 400px），而且失敗不算整件事失敗。
+         *
+         * 跟單張刪除同一個理由：R2 排在前面的話，它丟一次暫時性的錯誤就會讓整支
+         * 路由 500，而 Album 與 Photo 那些列還在 —— 使用者眼中是「刪不掉」，
+         * 重新整理卻看到一本整本都是破圖的相簿。反過來最壞只是 R2 留下一批
+         * 沒人指著的物件（縮圖幾十 KB），而且這裡會記進 log。
+         *
+         * R2 的 delete 一次最多吃 1000 個鍵，一本相簿可能上千張，得分批。
+         */
+        try {
+          const keys = photos.flatMap((p) => r2KeysForPhoto(p));
+          for (let i = 0; i < keys.length; i += 1000) {
+            await env.BUCKET.delete(keys.slice(i, i + 1000));
+          }
+        } catch (e) {
+          console.error(`相簿 ${albumId} 的 R2 物件沒刪乾淨（列已經刪了）`, e);
+        }
 
         return new Response(JSON.stringify({ success: true }), { headers });
       }
@@ -4053,17 +4536,35 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         ).bind(photoId).first();
         if (!photo) return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
 
-        // 主檔 + 兩張縮圖一起刪，只刪 file_name 會留下孤兒縮圖佔 R2 額度
-        await env.BUCKET.delete(r2KeysForPhoto(photo));
-        // Drive 的兩個檔登記待搬。務必在 DELETE FROM Photo 之前
+        /*
+         * ⚠️ **順序：Drive 登記 → 收掉 D1 → 最後才刪 R2。**
+         *
+         * 以前 R2 是第一步。R2 那一下丟出錯誤的話（暫時的 5xx 就夠了）整支路由
+         * 500，Photo 那一列還在 —— 使用者眼中是「刪不掉」，而下一次重新整理
+         * 會看到一格**點開是破圖**的照片：位元組已經沒了，列還在。
+         *
+         * 反過來就沒有這個問題。最壞情況是 R2 留下三顆沒人指著的物件（縮圖幾十 KB，
+         * 而且會被下面的 catch 記下來），比起「相簿裡多一格壞掉的東西」便宜太多。
+         * Drive 那份永遠是最後一道後悔藥，先登記進待搬佇列（務必在 DELETE 之前 ——
+         * 列一刪，那兩個 drive id 就沒有任何地方記得了）。
+         */
         await queueDriveTrash(env, [photo]);
-        // 單張刪除就當場搬進 trash/ —— 回應照樣先送出去，搬移在背景做
-        ctx.waitUntil(drainDriveTrash(env, 10).catch((e) => console.error("Drive 待搬佇列", e)));
         await env.DB.prepare("DELETE FROM PhotoTag WHERE photo_id = ?").bind(photoId).run();
         // 如果該照片是某個相簿的封面，則清除該相簿的封面
         await env.DB.prepare("UPDATE Album SET cover_photo_url = NULL WHERE cover_photo_url = ?").bind(photo.url).run();
         await env.DB.prepare("DELETE FROM Photo WHERE id = ?").bind(photoId).run();
         await deleteFtsForPhotos(env.DB, [Number(photoId)]);
+
+        // 主檔 + 兩張縮圖一起刪，只刪 file_name 會留下孤兒縮圖佔 R2 額度。
+        // 這一步失敗不該讓整個刪除變成失敗 —— 列已經沒了，照片在站上就是消失了
+        try {
+          await env.BUCKET.delete(r2KeysForPhoto(photo));
+        } catch (e) {
+          console.error(`照片 ${photoId} 的 R2 物件沒刪掉（列已經刪了）`, e);
+        }
+
+        // Drive 當場搬進 trash/ —— 回應照樣先送出去，搬移在背景做
+        ctx.waitUntil(drainDriveTrash(env, 10).catch((e) => console.error("Drive 待搬佇列", e)));
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
@@ -6217,23 +6718,41 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
   },
 
   /**
-   * Cron：清 Drive 待搬佇列的尾巴。
+   * Cron：清 Drive 待搬佇列的尾巴，佇列空了就順便對帳。
    *
    * 刪除當下已經會搬掉前幾個，這裡負責整本相簿刪除留下的長尾。一次仍然只搬
    * 一小批 —— 免費版單次呼叫 50 個 subrequest，一個檔要兩次 Drive 往返。
    * 佇列空的時候這支只花一個 D1 查詢，一天 288 次對免費額度沒感覺。
    *
+   * ⚠️ **兩件事一定要分先後，不可以並排跑。** 搬 20 個檔就是 40 個 subrequest，
+   *    對帳再去列 Drive 資料夾就會撞上單次 50 個的上限，而撞上的表現是
+   *    「後面那幾個請求安靜地失敗」—— 對帳結果會憑空多出一堆假的「不見了」。
+   *    所以：先排佇列，**佇列真的空了**（remaining === 0 且這次沒搬東西）
+   *    才輪到對帳，那時候整份額度都是它的。
+   *
    * 本機 `wrangler dev` 不會自己跑 cron，要測就打 http://localhost:8787/__scheduled
    */
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(
-      drainDriveTrash(env, 20)
-        .then((r) => {
-          if (r.ok && (r.moved > 0 || r.failed.length > 0)) {
-            console.log(`Drive 待搬：搬走 ${r.moved}，失敗 ${r.failed.length}，還剩 ${r.remaining}`);
-          }
-        })
-        .catch((e) => console.error("Drive 待搬佇列（cron）", e))
-    );
+    ctx.waitUntil((async () => {
+      try {
+        const r = await drainDriveTrash(env, 20);
+        if (r.ok && (r.moved > 0 || r.failed.length > 0)) {
+          console.log(`Drive 待搬：搬走 ${r.moved}，失敗 ${r.failed.length}，還剩 ${r.remaining}`);
+        }
+        // 佇列還有東西就把這個 tick 全讓給它，對帳等下一次（十分鐘後）
+        if (!r.ok || r.moved > 0 || r.remaining > 0) return;
+      } catch (e) {
+        console.error("Drive 待搬佇列（cron）", e);
+        return;
+      }
+
+      try {
+        // 一次一本。上一輪掃完了就會在 runDriveAudit 裡直接返回（只花一次 D1 讀取）
+        const state = await runDriveAudit(env, 1, false);
+        if (state.last_error) console.error("Drive 對帳", state.last_error);
+      } catch (e) {
+        console.error("Drive 對帳（cron）", e);
+      }
+    })());
   },
 };

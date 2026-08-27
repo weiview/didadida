@@ -5,10 +5,10 @@ import Link from "next/link";
 import styles from "./admin.module.css";
 import {
   CONVOY_PCT_DEFAULT, CONVOY_PCT_MAX, CONVOY_PCT_MIN,
-  PurgePreview, TrackFolderSync, UserContributions, WhitelistUser, addWhitelistUser,
-  fetchPurgePreview, fetchSiteSettings, fetchUserContributions,
-  fetchWhitelist, purgeWhitelistUser, removeWhitelistUser, syncTrackFolders,
-  updateSiteSettings, updateWhitelistUser,
+  DriveAuditState, PurgePreview, TrackFolderSync, UserContributions, WhitelistUser,
+  addWhitelistUser, fetchDriveAudit, fetchPurgePreview, fetchSiteSettings,
+  fetchUserContributions, fetchWhitelist, purgeWhitelistUser, removeWhitelistUser,
+  runDriveAudit, syncTrackFolders, updateSiteSettings, updateWhitelistUser,
 } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
@@ -48,6 +48,44 @@ export default function AdminPage() {
    */
   const [newCanUseTools, setNewCanUseTools] = useState(false);
   const [adding, setAdding] = useState(false);
+
+  /*
+   * Drive 備份對帳。**這一份是唯讀報告，跑對帳的是 cron**（十分鐘一次、一次一本，
+   * 掃完一輪就休息一天）—— 這裡只是把結果拿回來看，外加三顆手動的按鈕。
+   *
+   * 不在進頁時自動抓：這一頁平常是來加人、改權限的，多打一次請求沒必要。
+   */
+  const [audit, setAudit] = useState<DriveAuditState | null>(null);
+  const [auditBusy, setAuditBusy] = useState<null | "load" | "run" | "reset" | "trash">(null);
+  const [auditError, setAuditError] = useState<string | null>(null);
+  const [auditNote, setAuditNote] = useState<string | null>(null);
+
+  const withAudit = async (
+    kind: "load" | "run" | "reset" | "trash",
+    fn: () => Promise<DriveAuditState & { revived?: number }>,
+  ) => {
+    if (auditBusy) return;
+    setAuditBusy(kind);
+    setAuditError(null);
+    setAuditNote(null);
+    try {
+      const state = await fn();
+      setAudit(state);
+      if (kind === "trash") {
+        setAuditNote(
+          state.revived
+            ? `救回 ${state.revived} 筆待搬，已經重新試過一次`
+            : "沒有放棄的待搬項目",
+        );
+        // 救回來的那幾筆是待搬佇列的事，報告本身沒變 —— 重抓一次才看得到新的數字
+        setAudit(await fetchDriveAudit());
+      }
+    } catch (e) {
+      setAuditError(e instanceof Error ? e.message : "對帳失敗");
+    } finally {
+      setAuditBusy(null);
+    }
+  };
 
   /** 正在確認移除的那個人 */
   const [removing, setRemoving] = useState<WhitelistUser | null>(null);
@@ -809,6 +847,173 @@ export default function AdminPage() {
               </div>
             );
           })
+        )}
+      </section>
+
+      {/*
+        Drive 備份對帳。站上一張照片，Drive 上就該有一份 4K ＋ 一份原始檔
+        （影片只有原始檔一份）。上傳與刪除都可能在半路失敗，兩邊因此會慢慢走鐘，
+        而走鐘是**安靜的** —— 這一格就是把它變成看得見的數字。
+      */}
+      <section className={`glass-panel ${styles.card}`}>
+        <h2 className={styles.sectionTitle}>Drive 備份對帳</h2>
+        <p className={styles.hint}>
+          站上一張照片，Drive 上就該有<strong>一份 4K ＋ 一份原始檔</strong>
+          （影片沒有 4K，只有原始檔一份）。系統每十分鐘自己對一本相簿，
+          對完一輪休息一天。這裡看得到最近一輪的結果，也可以手動催。
+        </p>
+
+        <div className={styles.formRow}>
+          <button
+            className={styles.button}
+            disabled={auditBusy !== null}
+            onClick={() => withAudit("load", fetchDriveAudit)}
+          >
+            {auditBusy === "load" ? "讀取中…" : "看最新結果"}
+          </button>
+          <button
+            className={`${styles.button} ${styles.primary}`}
+            disabled={auditBusy !== null}
+            onClick={() => withAudit("run", () => runDriveAudit({ albums: 3 }))}
+          >
+            {auditBusy === "run" ? "對帳中…" : "現在對 3 本"}
+          </button>
+          <button
+            className={styles.button}
+            disabled={auditBusy !== null}
+            onClick={() => withAudit("reset", () => runDriveAudit({ reset: true, albums: 3 }))}
+          >
+            {auditBusy === "reset" ? "重來中…" : "從第一本重新對"}
+          </button>
+        </div>
+
+        {auditError && <p className={`${styles.message} ${styles.err}`}>{auditError}</p>}
+        {auditNote && <p className={`${styles.message} ${styles.ok}`}>{auditNote}</p>}
+
+        {audit && (
+          <>
+            <p className={styles.hint}>
+              {audit.finished_at
+                ? `上一輪對完於 ${new Date(audit.finished_at).toLocaleString("zh-TW")}`
+                : audit.cursor > 0
+                  ? `對到一半（已經對過 ${audit.albums_done} 本，下次從 id > ${audit.cursor} 接著）`
+                  : "還沒對過"}
+              {audit.last_run_at && `，最近一次執行 ${new Date(audit.last_run_at).toLocaleString("zh-TW")}`}
+            </p>
+
+            <div className={styles.detail}>
+              <div className={styles.detailRow}>
+                <span className={styles.detailName}>對過的相簿 / 照片</span>
+                <span className={styles.detailNum}>{audit.totals.albums} / {audit.totals.photos}</span>
+              </div>
+              <div className={styles.detailRow}>
+                <span className={styles.detailName}>缺 4K</span>
+                <span className={styles.detailNum}>{audit.totals.missing_4k}</span>
+              </div>
+              <div className={styles.detailRow}>
+                <span className={styles.detailName}>缺原始檔</span>
+                <span className={styles.detailNum}>{audit.totals.missing_original}</span>
+              </div>
+              <div className={styles.detailRow}>
+                <span className={styles.detailName}>Drive 上找不到（已清掉記錄，會出現在補傳清單）</span>
+                <span className={styles.detailNum}>{audit.totals.cleared}</span>
+              </div>
+              <div className={styles.detailRow}>
+                <span className={styles.detailName}>只是被搬到別的資料夾（備份還在，沒動它）</span>
+                <span className={styles.detailNum}>{audit.totals.moved}</span>
+              </div>
+              <div className={styles.detailRow}>
+                <span className={styles.detailName}>沒人指著的檔，已排進 trash/</span>
+                <span className={styles.detailNum}>{audit.totals.orphans_queued}</span>
+              </div>
+              <div className={styles.detailRow}>
+                <span className={styles.detailName}>不是本站放的檔（一律不碰）</span>
+                <span className={styles.detailNum}>{audit.totals.foreign}</span>
+              </div>
+            </div>
+
+            <p className={styles.hint}>
+              「缺 4K／缺原始檔」要補的話，到那本相簿裡按<strong>「補傳 Drive」</strong>
+              重新選一次原始檔 —— 真正的 4K 只編得出來一次，R2 上那份 2000px 補不了。
+              孤兒檔是<strong>搬進 <span className={styles.mono}>didadida/trash/</span></strong>
+              不是刪除，反悔隨時去 Drive 搬回來。
+            </p>
+
+            {audit.last_error && (
+              <p className={`${styles.message} ${styles.err}`}>上次出錯：{audit.last_error}</p>
+            )}
+
+            {audit.reports.length > 0 && (
+              <details className={styles.guide}>
+                <summary className={styles.guideSummary}>逐本相簿的結果（{audit.reports.length}）</summary>
+                <div className={styles.guideBody}>
+                  {audit.reports.map((r) => (
+                    <div key={r.album_id} className={styles.detailRow}>
+                      <span className={styles.detailName}>{r.name}</span>
+                      <span className={styles.detailNote}>
+                        {r.error
+                          ? `出錯：${r.error}`
+                          : r.no_folder
+                            ? `${r.photos} 張，Drive 上還沒有這本的資料夾`
+                            : [
+                                `${r.photos} 張`,
+                                r.missing_4k > 0 ? `缺 4K ${r.missing_4k}` : "",
+                                r.missing_original > 0 ? `缺原始檔 ${r.missing_original}` : "",
+                                r.cleared > 0 ? `Drive 上不見了 ${r.cleared}` : "",
+                                r.moved > 0 ? `被搬走 ${r.moved}` : "",
+                                r.orphans_queued > 0 ? `孤兒 ${r.orphans_queued}` : "",
+                                r.foreign > 0 ? `外來檔 ${r.foreign}` : "",
+                                r.truncated ? "（檔案太多沒列完，這本的判定不算數）" : "",
+                              ].filter(Boolean).join("、")}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+
+            {/*
+              待搬佇列。刪照片時 Drive 那一下失敗會試三次，三次都失敗就永遠躺在表裡 ——
+              以前站上沒有任何地方看得到它，「Drive 刪除失敗」跳完就再也沒有下文。
+            */}
+            {audit.trash && (
+              <>
+                <p className={styles.hint}>
+                  Drive 待搬（刪掉的照片要搬進 <span className={styles.mono}>trash/</span>）：
+                  排隊中 <strong>{audit.trash.remaining}</strong>、
+                  已放棄 <strong style={{ color: audit.trash.gave_up > 0 ? "#b91c1c" : undefined }}>
+                    {audit.trash.gave_up}
+                  </strong>。
+                </p>
+                {audit.trash.gave_up > 0 && (
+                  <>
+                    <div className={styles.formRow}>
+                      <button
+                        className={`${styles.button} ${styles.primary}`}
+                        disabled={auditBusy !== null}
+                        onClick={() => withAudit("trash", () => runDriveAudit({ retryTrash: true }))}
+                      >
+                        {auditBusy === "trash" ? "重試中…" : `重試放棄的 ${audit.trash.gave_up} 筆`}
+                      </button>
+                    </div>
+                    <details className={styles.guide}>
+                      <summary className={styles.guideSummary}>看卡住的是哪幾筆</summary>
+                      <div className={styles.guideBody}>
+                        {audit.trash.stuck.map((t) => (
+                          <div key={t.id} className={styles.detailRow}>
+                            <span className={styles.mono}>{t.drive_id}</span>
+                            <span className={styles.detailNote}>
+                              試了 {t.attempts} 次{t.last_error ? `：${t.last_error}` : ""}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  </>
+                )}
+              </>
+            )}
+          </>
         )}
       </section>
 

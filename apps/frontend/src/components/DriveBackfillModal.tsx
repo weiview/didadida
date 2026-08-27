@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchDrivePending, type DrivePendingPhoto } from '@/lib/api';
-import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive } from '@/lib/drive';
+import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive, pushVideoToDrive } from '@/lib/drive';
+import { ACCEPTED_VIDEO_TYPES } from '@/lib/videoUtils';
 
 interface Props {
   isOpen: boolean;
@@ -21,12 +22,39 @@ interface Match {
   file: File;
 }
 
+/** 影片的 Drive id 記在 drive_original_id，沒有 4K 那一份（見 0019） */
+const isVideoRow = (p: DrivePendingPhoto) => p.media_type === 'video';
+
+/**
+ * 這一列還缺哪幾份。
+ *
+ * 補傳只補缺的那一半 —— 已經上去的那份再傳一次，Drive 上就會多一個同名檔
+ * （Drive 不會去重），而且白白多編一次 4K。
+ */
+const missingHalves = (p: DrivePendingPhoto): { fourK: boolean; original: boolean } =>
+  isVideoRow(p)
+    ? { fourK: false, original: !p.has_original }
+    : { fourK: !p.has_4k, original: !p.has_original };
+
+/** 清單上那一行右邊的小字：缺 4K、缺原始檔，還是兩份都缺 */
+const missingLabel = (p: DrivePendingPhoto): string => {
+  const m = missingHalves(p);
+  if (isVideoRow(p)) return '影片';
+  if (m.fourK && m.original) return '';
+  return m.fourK ? '只缺 4K' : '只缺原始檔';
+};
+
 /**
  * 「補傳 Drive」：把上傳當下沒送上 Drive 的照片補一份 4K + 原始檔。
  *
  * **為什麼要人重選檔案，不由後端自動補。** R2 上只有 2000px 的 JPEG，
  * 拿它去補等於把一張 2000px 送上 Drive 叫做 4K —— 畫質跟現況一模一樣，
  * 名實不符。真正的 4K 只能從相機原始檔重新編，而原始檔只在使用者的硬碟上。
+ *
+ * ⚠️ **影片也在這份清單裡**，而且對影片來說這不是備份是救命 —— R2 上只有一張
+ *    封面圖，Drive 那份沒上去就等於沒有影片。影片走 pushVideoToDrive（分塊上傳、
+ *    沒有 4K 那一份），**絕對不能拿去跑 pushPhotoToDrive** —— 那會對幾 GB 的檔
+ *    跑 encode4kWebp。
  *
  * Drive 的授權在管理員登入時就一起拿到了，這裡不會有任何授權彈窗；
  * 手上沒 token 只代表登入過期，重新登入即可。
@@ -37,7 +65,9 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
   const [files, setFiles] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<{ current: number; total: number; name: string } | null>(null);
-  const [result, setResult] = useState<{ ok: number; failed: number; error?: string } | null>(null);
+  const [result, setResult] = useState<
+    { ok: number; failed: number; error?: string; failures?: string[] } | null
+  >(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [copied, setCopied] = useState(false);
 
@@ -149,22 +179,31 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
     }
 
     let ok = 0;
-    let failed = 0;
+    const failures: string[] = [];
     for (let i = 0; i < matches.length; i++) {
       const { photo, file } = matches[i];
       setProgress({ current: i + 1, total: matches.length, name: file.name });
       try {
-        if (await pushPhotoToDrive(drive, photo.id, file)) ok++;
-        else failed++;
+        if (isVideoRow(photo)) {
+          // 影片沒有 4K 那一份，而且要走分塊上傳（幾 GB 的檔不能整份塞進一次請求）
+          await pushVideoToDrive(drive, photo.id, file);
+          ok++;
+        } else {
+          const res = await pushPhotoToDrive(drive, photo.id, file, missingHalves(photo));
+          if (res.ok) ok++;
+          else failures.push(`${file.name}：${res.reason ?? 'Drive 上傳失敗'}`);
+        }
       } catch (e) {
         console.warn(`照片 ${photo.id} 補傳失敗`, e);
-        failed++;
+        failures.push(`${file.name}：${e instanceof Error ? e.message : String(e)}`);
       }
     }
 
     setProgress(null);
     setBusy(false);
-    setResult({ ok, failed });
+    // ⚠️ 失敗一律逐檔講原因。「失敗 N 張」對 HEIC 這種永遠編不出 4K 的檔是句假話，
+    //    再試一百次都一樣，而使用者只能一直重試
+    setResult({ ok, failed: failures.length, failures });
     setFiles([]);
     await load();
     await onDone();
@@ -203,7 +242,8 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
         <div style={{ padding: '16px 20px', borderBottom: '1px solid #f1f5f9' }}>
           <strong style={{ fontSize: 16 }}>補傳 Drive 備份</strong>
           <div style={{ ...note, marginTop: 4 }}>
-            重新選一次原始檔，補上 4K 與原始檔備份。照片本身不會動，只是多一份備份。
+            重新選一次原始檔，補上缺的那幾份。相簿裡的照片本身不會動。
+            影片也在這份清單裡 —— 影片的 Drive 那份不是備份，沒上去就等於沒有影片。
           </div>
         </div>
 
@@ -224,9 +264,17 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                 <span style={{ color: '#b91c1c' }}>Drive 沒接上：{result.error}</span>
               ) : (
                 <>
-                  補傳完成：成功 <strong style={{ color: '#15803d' }}>{result.ok}</strong> 張
+                  補傳完成：成功 <strong style={{ color: '#15803d' }}>{result.ok}</strong> 個
                   {result.failed > 0 && (
-                    <>，失敗 <strong style={{ color: '#b91c1c' }}>{result.failed}</strong> 張（可以再試一次）</>
+                    <>，失敗 <strong style={{ color: '#b91c1c' }}>{result.failed}</strong> 個</>
+                  )}
+                  {result.failures && result.failures.length > 0 && (
+                    <details style={{ color: '#b91c1c', marginTop: 4 }}>
+                      <summary style={{ cursor: 'pointer' }}>看失敗的原因</summary>
+                      <div style={{ ...note, color: '#b91c1c', paddingLeft: 14 }}>
+                        {result.failures.map((f, i) => <div key={i}>{f}</div>)}
+                      </div>
+                    </details>
                   )}
                 </>
               )}
@@ -239,7 +287,7 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                 fontSize: 14, marginBottom: 8,
                 display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
               }}>
-                <span>有 <strong>{pending.length}</strong> 張照片還沒有 Drive 備份：</span>
+                <span>有 <strong>{pending.length}</strong> 個檔案還沒有完整的 Drive 備份：</span>
                 <button
                   type="button"
                   onClick={copyNames}
@@ -286,6 +334,13 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                       }}>
                         {name}
                       </span>
+                      {missingLabel(p) && (
+                        <span style={{
+                          color: isVideoRow(p) ? '#7c3aed' : '#64748b', flexShrink: 0, fontSize: 11.5,
+                        }}>
+                          {missingLabel(p)}
+                        </span>
+                      )}
                       {isDup && (
                         <span style={{ color: '#92400e', flexShrink: 0 }}>同名多張</span>
                       )}
@@ -306,7 +361,7 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                 type="file"
                 ref={fileInputRef}
                 style={{ display: 'none' }}
-                accept="image/jpeg, image/png, image/webp, image/heic, image/heif"
+                accept={`image/jpeg, image/png, image/webp, image/heic, image/heif, ${ACCEPTED_VIDEO_TYPES}`}
                 multiple
                 onChange={(e) => {
                   setFiles(Array.from(e.target.files ?? []));
@@ -368,7 +423,8 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                 標著「同名多張」的那幾張不猜也不碰 —— 猜錯會把 A 的原始檔記成 B 的備份，
                 而那是查不出來的錯。要補的話先把其中幾張改名再回來。
                 <br />
-                每張要重新編一次 4K 再傳兩個檔，數量多會跑一陣子，請不要關掉這個視窗。
+                每張照片要重新編一次 4K 再傳兩個檔（只缺一份的就只補那一份），
+                影片是整份原始檔分塊上傳。數量多會跑一陣子，請不要關掉這個視窗。
               </div>
             </>
           )}

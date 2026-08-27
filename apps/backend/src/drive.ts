@@ -167,6 +167,89 @@ export async function listGpxFiles(saKeyJson: string, folderId: string): Promise
   return files.filter((f) => typeof f.name === 'string' && f.name.toLowerCase().endsWith('.gpx'));
 }
 
+/** 對帳用：相簿資料夾底下的一個檔。`createdTime` 是「太新的不要動」那道閘要看的 */
+export interface DriveChild {
+  id: string;
+  name: string;
+  /** RFC3339。孤兒判定要靠它避開「剛傳完、還來不及回報 id」的檔 */
+  createdTime: string | null;
+}
+
+/**
+ * 列出一個資料夾底下的所有檔（對帳用）。
+ *
+ * 跟 listGpxFiles 的差別有三個，都是刻意的：
+ *   1. **會翻頁** —— 一本相簿上千張＝兩千個檔，一頁 1000 筆裝不下，
+ *      少拿的那幾頁會被誤判成「Drive 上不見了」，那是最糟的假警報。
+ *   2. **不過濾副檔名** —— 對帳要看的就是「這裡到底有什麼」，包含不該在的東西。
+ *   3. 帶回 `createdTime`，孤兒判定要用。
+ *
+ * `maxPages` 是保險絲：一頁一次 subrequest，而 Workers 免費版單次呼叫只有 50 個。
+ * 撞到上限就回 `truncated: true`，呼叫端**必須當成「這次看不完」而不是「就這些」**
+ * —— 拿半份清單去刪孤兒會刪掉好檔。
+ */
+export async function listFolderFiles(
+  saKeyJson: string, folderId: string, maxPages = 5,
+): Promise<{ files: DriveChild[]; truncated: boolean }> {
+  const token = await getAccessToken(saKeyJson);
+  const out: DriveChild[] = [];
+  let pageToken: string | null = null;
+
+  for (let page = 0; page < maxPages; page++) {
+    const params = new URLSearchParams({
+      q: `'${folderId}' in parents and trashed = false`,
+      fields: 'nextPageToken,files(id,name,createdTime)',
+      pageSize: '1000',
+    });
+    if (pageToken) params.set('pageToken', pageToken);
+
+    const res = await fetch(`${DRIVE_FILES_URL}?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`Drive 列檔失敗 (${res.status})`);
+
+    const data: any = await res.json();
+    for (const f of (Array.isArray(data?.files) ? data.files : [])) {
+      if (!f?.id) continue;
+      out.push({
+        id: String(f.id),
+        name: String(f.name ?? ''),
+        createdTime: typeof f.createdTime === 'string' ? f.createdTime : null,
+      });
+    }
+    pageToken = typeof data?.nextPageToken === 'string' ? data.nextPageToken : null;
+    if (!pageToken) return { files: out, truncated: false };
+  }
+  return { files: out, truncated: true };
+}
+
+/**
+ * 這個檔還在不在（對帳的第二意見）。
+ *
+ * 用途只有一個：清單裡對不上的時候，**再問一次本人**再決定要不要把 D1 那一欄
+ * 清成 NULL。只靠「不在這個資料夾的清單裡」是不夠的 —— 檔案被搬到別的資料夾
+ * （相簿改名、手動整理）一樣不會出現，那份備份其實好好的，清掉就等於叫使用者
+ * 重傳一份，Drive 上多一個垃圾。
+ *
+ * 回 `null` ＝ Drive 說沒有這個檔（404）；有回值就照實回報 trashed 與 parents。
+ */
+export async function probeDriveFile(
+  saKeyJson: string, fileId: string,
+): Promise<{ trashed: boolean; parents: string[] } | null> {
+  const token = await getAccessToken(saKeyJson);
+  const res = await fetch(
+    `${DRIVE_FILES_URL}/${encodeURIComponent(fileId)}?fields=id,trashed,parents`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Drive 查檔失敗 (${res.status})`);
+  const data: any = await res.json();
+  return {
+    trashed: Boolean(data?.trashed),
+    parents: Array.isArray(data?.parents) ? data.parents.map(String) : [],
+  };
+}
+
 /**
  * 列出**別人分享給這個 service account** 的所有資料夾。
  *

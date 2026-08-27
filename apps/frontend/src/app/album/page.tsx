@@ -135,8 +135,14 @@ function AlbumContent() {
    * 不必請人再選一次，也不必靠檔名對回照片（id 是上傳當下回傳的，不會對錯）。
    * File 物件在沒重整頁面、原檔沒被移動的前提下一直有效。
    * 重整之後就沒了，那時只剩「補傳 Drive」那條重選檔案的路。
+   *
+   * `need` 記的是**還缺哪一半**（4K／原始檔）。上傳那兩份是分開試的，
+   * 常常是一份上去了另一份失敗 —— 補傳時整份重來的話，成功的那一半會在
+   * Drive 上再多一個同名檔（Drive 不會去重）。
    */
-  const [pendingDriveBatch, setPendingDriveBatch] = useState<{ photoId: number; file: File }[]>([]);
+  const [pendingDriveBatch, setPendingDriveBatch] = useState<
+    { photoId: number; file: File; need?: { fourK?: boolean; original?: boolean } }[]
+  >([]);
   const [driveBatchProgress, setDriveBatchProgress] = useState<{ current: number; total: number } | null>(null);
   /**
    * 後端擋下來的重複照片，跑完一批之後一張一張問，用的是 Google 匯入那套
@@ -644,22 +650,39 @@ function AlbumContent() {
       return;
     }
 
-    // 沒補成功的留在佇列裡，按鈕可以再按一次；成功的不要重傳，會在 Drive 上留兩份
-    const stillMissing: { photoId: number; file: File }[] = [];
+    /*
+     * 沒補成功的留在佇列裡，按鈕可以再按一次；成功的不要重傳，會在 Drive 上留兩份。
+     *
+     * ⚠️ **半套要留下「還缺哪一半」**，下一次才不會把已經上去的那份再傳一遍。
+     */
+    const stillMissing: typeof batch = [];
+    const reasons: string[] = [];
     for (let i = 0; i < batch.length; i++) {
       setDriveBatchProgress({ current: i + 1, total: batch.length });
+      const item = batch[i];
       try {
-        if (!(await pushPhotoToDrive(drive, batch[i].photoId, batch[i].file))) stillMissing.push(batch[i]);
+        const res = await pushPhotoToDrive(drive, item.photoId, item.file, item.need ?? {});
+        if (!res.ok) {
+          stillMissing.push({
+            ...item,
+            need: { fourK: res.fourK !== 'ok', original: res.original !== 'ok' },
+          });
+          reasons.push(`${item.file.name}：${res.reason ?? 'Drive 上傳失敗'}`);
+        }
       } catch (err) {
-        console.warn(`照片 ${batch[i].photoId} 補傳失敗`, err);
-        stillMissing.push(batch[i]);
+        console.warn(`照片 ${item.photoId} 補傳失敗`, err);
+        stillMissing.push(item);
+        reasons.push(`${item.file.name}：${errText(err)}`);
       }
     }
 
     setDriveBatchProgress(null);
     setPendingDriveBatch(stillMissing);
     if (stillMissing.length === 0) setDriveNeedsLink(false);
-    setDriveError(stillMissing.length > 0 ? `還有 ${stillMissing.length} 張沒補成功，可以再按一次` : null);
+    // 逐張講原因：「還有 N 張沒補成功」查不出 N 張各自卡在哪
+    setDriveError(stillMissing.length > 0
+      ? `還有 ${stillMissing.length} 張沒補成功，可以再按一次。\n${reasons.slice(0, 5).join('\n')}`
+      : null);
     await loadData();
   };
 
@@ -739,8 +762,12 @@ function AlbumContent() {
           await pushVideoToDrive(driveRef.current, result.photo.id, item.file);
         } catch (err) {
           console.error('影片沒送上 Drive，收掉剛建的那一列', err);
-          await deletePhoto(result.photo.id);
-          alert('這支影片沒送上 Drive，先跳過。');
+          // ⚠️ 回滾自己也會失敗。沒收掉就等於相簿裡留下一格點開只有靜止畫面的東西，
+          //    而使用者以為「跳過了」—— 講出來，讓他知道要手動刪
+          const rolled = await deletePhoto(result.photo.id);
+          alert(rolled
+            ? `這支影片沒送上 Drive，先跳過。\n\n${errText(err)}`
+            : `這支影片沒送上 Drive，而且剛建的那一格也沒收掉，請手動刪除。\n\n${errText(err)}`);
           return;
         }
         dupUploadedRef.current.push(result.photo);
@@ -749,7 +776,14 @@ function AlbumContent() {
         // Drive 沿用整批那次的授權；沒有就記進待補清單，跟一般上傳一樣
         if (driveRef.current) {
           try {
-            await pushPhotoToDrive(driveRef.current, result.photo.id, item.file);
+            // 半套也要進待補清單，只是記著缺的是哪一半
+            const res = await pushPhotoToDrive(driveRef.current, result.photo.id, item.file);
+            if (!res.ok) {
+              setPendingDriveBatch((prev) => [...prev, {
+                photoId: result.photo.id, file: item.file,
+                need: { fourK: res.fourK !== 'ok', original: res.original !== 'ok' },
+              }]);
+            }
           } catch (err) {
             console.warn('新照片沒送上 Drive', err);
             setPendingDriveBatch((prev) => [...prev, { photoId: result.photo.id, file: item.file }]);
@@ -820,7 +854,7 @@ function AlbumContent() {
     const total = sources.length;
     const uploaded: UploadedPhoto[] = [];
     // Drive 沒接上時，把「哪張照片配哪個原始檔」留下來給橫幅那顆按鈕用
-    const missedDrive: { photoId: number; file: File }[] = [];
+    const missedDrive: { photoId: number; file: File; need?: { fourK?: boolean; original?: boolean } }[] = [];
     // 後端判定跟相簿裡撞了的那幾張。**它們一個位元組都還沒寫進去**，跑完再統一問
     const dupes: PendingDuplicate[] = [];
     const failures: string[] = [];
@@ -864,8 +898,11 @@ function AlbumContent() {
               uploaded.push(result.photo);
             } catch (err) {
               console.error(`影片 ${rawFile.name} 沒送上 Drive，收掉剛建的那一列`, err);
-              await deletePhoto(result.photo.id);
-              failures.push(`${source.name}：影片沒送上 Drive（${errText(err)}）`);
+              // 回滾失敗要另外講：那一格還在相簿裡，而且點開只有靜止畫面
+              const rolled = await deletePhoto(result.photo.id);
+              failures.push(rolled
+                ? `${source.name}：影片沒送上 Drive（${errText(err)}）`
+                : `${source.name}：影片沒送上 Drive，而且那一格沒收掉，請手動刪除（${errText(err)}）`);
             }
           } else {
             failures.push(`${source.name}：${result.reason}`);
@@ -887,7 +924,18 @@ function AlbumContent() {
            */
           if (drive) {
             try {
-              await pushPhotoToDrive(drive, result.photo.id, rawFile);
+              /*
+               * ⚠️ 半套（例如 4K 上去了、原始檔失敗）以前會被當成成功 ——
+               *    回的是 boolean 而且「有一份就算 true」，於是那張照片再也
+               *    不會出現在任何補傳清單上，使用者以為備份好了。
+               */
+              const res = await pushPhotoToDrive(drive, result.photo.id, rawFile);
+              if (!res.ok) {
+                missedDrive.push({
+                  photoId: result.photo.id, file: rawFile,
+                  need: { fourK: res.fourK !== 'ok', original: res.original !== 'ok' },
+                });
+              }
             } catch (err) {
               console.warn('新照片沒送上 Drive，記進待補清單', err);
               missedDrive.push({ photoId: result.photo.id, file: rawFile });

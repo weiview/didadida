@@ -704,6 +704,93 @@ export interface TrackFolderSync {
   unmatched: { name: string; ownerEmail: string | null }[];
 }
 
+/* ── Drive 備份對帳 ───────────────────────────────────────────────────────── */
+
+/** 一本相簿對完的結果。數字都是「這一輪掃到的」，不是歷史累計 */
+export interface DriveAuditAlbumReport {
+  album_id: number;
+  name: string;
+  photos: number;
+  /** 這本相簿在 Drive 上還沒有資料夾（多半是整本都沒備份過） */
+  no_folder?: boolean;
+  /** Drive 的檔案清單沒列完（超過上限）。這一本的「不見了」與孤兒都不算數 */
+  truncated?: boolean;
+  missing_4k: number;
+  missing_original: number;
+  /** D1 記著 id、Drive 上找不到 */
+  gone: number;
+  /** 確認真的不在了，已經把 D1 那一欄清成 NULL（於是它會出現在補傳清單上） */
+  cleared: number;
+  /** 只是被搬到別的資料夾，備份還在，沒有動它 */
+  moved: number;
+  /** 沒人指著的檔，已經排進待搬佇列（會搬進 trash/，不是刪除） */
+  orphans_queued: number;
+  /** 檔名不符合本站規則的檔（別人放進去的）。一律不碰，只報數 */
+  foreign: number;
+  error?: string;
+}
+
+export interface DriveAuditState {
+  /** 掃到哪一本（Album.id）。0 ＝ 從頭開始 */
+  cursor: number;
+  started_at: string | null;
+  finished_at: string | null;
+  last_run_at: string | null;
+  albums_done: number;
+  totals: {
+    albums: number; photos: number;
+    missing_4k: number; missing_original: number;
+    gone: number; cleared: number; moved: number;
+    orphans_queued: number; foreign: number;
+  };
+  reports: DriveAuditAlbumReport[];
+  last_error: string | null;
+  /** Drive 待搬佇列的現況（GET 才有） */
+  trash?: {
+    remaining: number;
+    /** 試了三次還是失敗、已經放棄的。這是「Drive 刪除失敗」跳完之後的下落 */
+    gave_up: number;
+    stuck: {
+      id: number; drive_id: string; photo_id: number | null;
+      attempts: number; last_error: string | null; created_at: string;
+    }[];
+  };
+}
+
+/**
+ * 讀對帳報告。站長（可管理全站內容的人）限定。
+ *
+ * 這一支不跑對帳，只是把 AppSetting 裡那份狀態拿回來 —— 對帳是 cron 一次一本
+ * 慢慢跑的（見後端 runDriveAudit），因為列一次 Drive 資料夾就是一次外部請求。
+ */
+export async function fetchDriveAudit(): Promise<DriveAuditState> {
+  const res = await fetch(`${API_BASE_URL}/admin/drive-audit`, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取對帳結果失敗');
+  return await res.json();
+}
+
+/**
+ * 手動催對帳。`albums` 是這一次要對幾本（1–5，後端會夾住）。
+ *
+ * `reset` 把游標歸零從第一本重新對；`retry_trash` 是另一件事 ——
+ * 把「試了三次放棄」的待搬項目救回佇列再試一次。
+ */
+export async function runDriveAudit(
+  opts: { albums?: number; reset?: boolean; retryTrash?: boolean } = {},
+): Promise<DriveAuditState & { revived?: number }> {
+  const res = await fetch(`${API_BASE_URL}/admin/drive-audit`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({
+      albums: opts.albums,
+      reset: opts.reset || undefined,
+      retry_trash: opts.retryTrash || undefined,
+    }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '對帳失敗');
+  return await res.json();
+}
+
 /** 掃一遍分享給服務帳號的 Drive 資料夾，照信箱自動綁到人身上。站長限定 */
 export async function syncTrackFolders(): Promise<TrackFolderSync> {
   const res = await fetch(`${API_BASE_URL}/tracks/drive/sync-folders`, {
@@ -1610,12 +1697,18 @@ export async function saveDriveFolders(photosFolderId: string, trashFolderId: st
 /**
  * 把 Drive 的 file id 記回 D1。兩個都是選填 —— 只成功一個也要記，
  * 後端用 COALESCE 保護已有的值，重跑不會把上次的成果洗成 NULL。
+ *
+ * ⚠️ **這一支失敗是所有孤兒檔的來源。** 檔案已經躺在使用者的 Drive 上了，
+ * 這一趟沒回來就沒有任何一列指著它 —— 站上看起來是「沒有備份」，而 Drive 上
+ * 是一個誰也認不出來的檔。所以回的不是單純的 true/false，而是**值不值得重試**：
+ * 網路斷掉、5xx 要重試；403/404（照片剛被刪掉、沒權限）重試一百次都一樣。
+ * 重試那一圈寫在 lib/drive.ts 的 recordDriveIds()。
  */
 export async function recordPhotoDrive(
   photoId: number,
   ids: { driveFileId?: string | null; driveOriginalId?: string | null },
-): Promise<boolean> {
-  if (!ids.driveFileId && !ids.driveOriginalId) return false;
+): Promise<{ ok: boolean; retryable: boolean; status?: number }> {
+  if (!ids.driveFileId && !ids.driveOriginalId) return { ok: false, retryable: false };
   try {
     const res = await fetch(`${API_BASE_URL}/photos/${photoId}/drive`, {
       method: 'POST',
@@ -1625,10 +1718,12 @@ export async function recordPhotoDrive(
         drive_original_id: ids.driveOriginalId ?? undefined,
       }),
     });
-    return res.ok;
+    // 429 也算暫時的：那是「太快了」不是「不行」
+    return { ok: res.ok, retryable: !res.ok && (res.status >= 500 || res.status === 429), status: res.status };
   } catch (error) {
+    // fetch 自己丟＝根本沒送出去（斷線、DNS）。這種最值得重試
     console.error(error);
-    return false;
+    return { ok: false, retryable: true };
   }
 }
 
@@ -1668,10 +1763,16 @@ export interface DrivePendingPhoto {
   file_name: string;
   /** 上傳當下的客戶端檔名。補傳時靠這個對回重選的原始檔 */
   title: string;
+  /** 'photo' | 'video'。影片只缺一份原始檔，而且補傳要走 pushVideoToDrive */
+  media_type?: string;
+  /** 已經有 4K 了（0/1）。缺哪一半就只補哪一半，不要整份重來 */
+  has_4k?: number;
+  /** 已經有原始檔了（0/1） */
+  has_original?: number;
 }
 
 /**
- * 還沒搬上 Drive 的照片。舊照片與上傳時 Drive 失敗的照片在這裡看起來一樣。
+ * 還沒搬上 Drive 的照片與影片。舊照片與上傳時 Drive 失敗的在這裡看起來一樣。
  * 帶 albumId 就只看那本相簿（補傳從相簿頁進去時該帶）。
  */
 export async function fetchDrivePending(

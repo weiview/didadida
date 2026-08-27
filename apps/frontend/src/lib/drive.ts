@@ -369,29 +369,97 @@ export async function ensureAlbumFolder(
  *    POST 出去」：幾 GB 的檔要嘛中途斷線整份重來、要嘛在手機上直接把分頁
  *    撐爆，而且完全沒有進度可以回報。
  */
+/** Drive 回了一個非 2xx。帶著 status 是為了讓重試判斷得出「這值不值得再試」 */
+export class DriveHttpError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = 'DriveHttpError';
+  }
+}
+
+/**
+ * 這個錯誤再試一次有沒有意義。
+ *
+ * 5xx 與 429 是 Drive 那邊的暫時狀況，網路層自己丟出來的（斷線、DNS）更是 ——
+ * 那種連請求都沒送出去。**4xx 一律不重試**：403 是權限、404 是資料夾被搬走，
+ * 重試一百次結果一樣，只是把使用者多晾幾秒。
+ */
+const driveRetryable = (e: unknown): boolean =>
+  !(e instanceof DriveHttpError) || e.status >= 500 || e.status === 429;
+
+/** 重試幾次（含第一次）。3 次配上 1s／2s 的等待，涵蓋得了大多數瞬間的抖動 */
+const DRIVE_MAX_TRIES = 3;
+
+/**
+ * 包一層重試。
+ *
+ * 為什麼非有不可：上傳這條路整段跑在**瀏覽器**裡，行動網路切換、Wi-Fi 掉一下、
+ * Drive 偶爾的 503，每一種都會讓一張照片留下半套結果（R2 有、Drive 沒有），
+ * 而使用者只會看到「失敗」兩個字。試三次幾乎都能救回來。
+ *
+ * ⚠️ 等待用指數退避而不是固定間隔：真的是 Drive 忙不過來時，一秒後再壓一次
+ *    只會讓它更忙。
+ */
+async function withDriveRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= DRIVE_MAX_TRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (attempt >= DRIVE_MAX_TRIES || !driveRetryable(e)) break;
+      console.warn(`${label} 第 ${attempt} 次失敗，${attempt} 秒後重試`, e);
+      await sleep(attempt * 1000);
+    }
+  }
+  throw lastErr;
+}
+
 export async function uploadToDrive(
   token: string,
   blob: Blob,
   name: string,
   folderId: string,
 ): Promise<string> {
-  const metadata = { name, parents: [folderId] };
-  const form = new FormData();
-  form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
-  form.append('file', blob);
+  return await withDriveRetry(`上傳 ${name}`, async () => {
+    const metadata = { name, parents: [folderId] };
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+    form.append('file', blob);
 
-  const res = await fetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
+    const res = await fetch(`${DRIVE_UPLOAD}?uploadType=multipart&fields=id`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new DriveHttpError(res.status, `Drive 上傳失敗 ${res.status}: ${detail.slice(0, 200)}`);
+    }
+    const data = await res.json();
+    if (!data?.id) throw new Error('Drive 上傳沒有回傳 file id');
+    return data.id;
   });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(`Drive 上傳失敗 ${res.status}: ${detail.slice(0, 200)}`);
+}
+
+/**
+ * 把 file id 記回 D1，記不成就重試。
+ *
+ * **這一步比上傳本身更不能掉。** 檔案已經在 Drive 上了，這一趟沒回來就變成
+ * 一個沒有任何一列指著的孤兒檔：站上看起來「沒有備份」（於是使用者去補傳，
+ * Drive 上再多一份），而那個孤兒要等背景對帳（後端 runDriveAudit）隔天才收得掉。
+ */
+async function recordDriveIds(
+  photoId: number,
+  ids: { driveFileId?: string | null; driveOriginalId?: string | null },
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= DRIVE_MAX_TRIES; attempt++) {
+    const res = await recordPhotoDrive(photoId, ids);
+    if (res.ok) return true;
+    if (!res.retryable) return false;
+    if (attempt < DRIVE_MAX_TRIES) await sleep(attempt * 1000);
   }
-  const data = await res.json();
-  if (!data?.id) throw new Error('Drive 上傳沒有回傳 file id');
-  return data.id;
+  return false;
 }
 
 /**
@@ -430,23 +498,27 @@ export async function uploadToDriveResumable(
   folderId: string,
   onProgress?: (sent: number, total: number) => void,
 ): Promise<string> {
-  const start = await fetch(`${DRIVE_UPLOAD}?uploadType=resumable&fields=id`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json; charset=UTF-8',
-      // 先報總長度與型別，Drive 才知道要開多大的工作階段
-      'X-Upload-Content-Type': file.type || 'application/octet-stream',
-      'X-Upload-Content-Length': String(file.size),
-    },
-    body: JSON.stringify({ name, parents: [folderId] }),
+  // 開工作階段這一趟很短但很關鍵，失敗就整支傳不了 —— 包一層重試
+  const session = await withDriveRetry(`開上傳工作階段 ${name}`, async () => {
+    const start = await fetch(`${DRIVE_UPLOAD}?uploadType=resumable&fields=id`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+        // 先報總長度與型別，Drive 才知道要開多大的工作階段
+        'X-Upload-Content-Type': file.type || 'application/octet-stream',
+        'X-Upload-Content-Length': String(file.size),
+      },
+      body: JSON.stringify({ name, parents: [folderId] }),
+    });
+    if (!start.ok) {
+      const detail = await start.text().catch(() => '');
+      throw new DriveHttpError(start.status, `Drive 開上傳工作階段失敗 ${start.status}: ${detail.slice(0, 200)}`);
+    }
+    const location = start.headers.get('Location');
+    if (!location) throw new Error('Drive 沒有回傳上傳工作階段的網址');
+    return location;
   });
-  if (!start.ok) {
-    const detail = await start.text().catch(() => '');
-    throw new Error(`Drive 開上傳工作階段失敗 ${start.status}: ${detail.slice(0, 200)}`);
-  }
-  const session = start.headers.get('Location');
-  if (!session) throw new Error('Drive 沒有回傳上傳工作階段的網址');
 
   let offset = 0;
   let attempt = 0;
@@ -543,7 +615,29 @@ export async function pushVideoToDrive(
   const driveOriginalId = await uploadToDriveResumable(
     target.token, file, `${photoId}_${file.name}`, target.folderId, onProgress,
   );
-  return await recordPhotoDrive(photoId, { driveFileId: null, driveOriginalId });
+  /*
+   * ⚠️ 記不回 D1 也要**丟出去**，不能回 false 了事。
+   *
+   * 檔案已經在 Drive 上了，但站上那一列不知道 —— 影片在 R2 只有一張封面，
+   * 於是相簿裡多一格點開只有靜止畫面的東西。呼叫端收到錯誤才會把那一列收掉，
+   * 使用者看到的是「失敗」，而 Drive 上那個孤兒檔由背景對帳收尾。
+   */
+  if (!(await recordDriveIds(photoId, { driveFileId: null, driveOriginalId }))) {
+    throw new Error('影片傳上 Drive 了，但沒能記回網站（可以稍後用「補傳 Drive」重來）');
+  }
+  return true;
+}
+
+/** pushPhotoToDrive 的結果。**半套也要講清楚是哪一半**，不然沒人查得出來 */
+export interface DrivePushResult {
+  /** 該傳的都傳了，而且記進 D1 了 */
+  ok: boolean;
+  /** 4K 這一份的下場 */
+  fourK: 'ok' | 'skipped' | 'failed';
+  /** 原始檔這一份的下場 */
+  original: 'ok' | 'skipped' | 'failed';
+  /** ok 為 false 時一定有：給人看的一句話 */
+  reason?: string;
 }
 
 /**
@@ -552,11 +646,16 @@ export async function pushVideoToDrive(
  * **兩份分開處理，一份失敗不影響另一份。** 後端的 COALESCE 收得下只有一個 id
  * 的情況，能存多少算多少 —— 照片在 R2 那邊早就存在了，這裡純粹是加分。
  *
- * 檔名前面加照片 id，是為了在 Drive 上直接看得出哪個檔對應哪張照片；
- * 真正的對應關係還是靠 D1 的 drive_file_id，不靠檔名解析。
+ * ⚠️ **但半套不算成功。** 以前這裡只回一個 boolean，而且「兩份裡有一份上去了」
+ *    就回 true —— 於是「原始檔傳失敗」在畫面上跟全成功長得一模一樣，
+ *    使用者以為備份好了。回 DrivePushResult 就是為了讓半套講得出口。
  *
- * 上傳與補傳共用同一條路 —— 補傳餵的就是同一批原始檔，沒有第二種語意。
- * 回傳「有沒有記進 D1」，補傳畫面要靠它算成功幾張。
+ * `need` 給補傳用：清單已經知道缺的是哪一半，把已經有的那一份再傳一次
+ * 只會在 Drive 上多一個同名檔（Drive 不會去重）。預設兩份都傳。
+ *
+ * 檔名前面加照片 id，是為了在 Drive 上直接看得出哪個檔對應哪張照片；
+ * 真正的對應關係還是靠 D1 的 drive_file_id，不靠檔名解析
+ * （唯一的例外是後端對帳的孤兒判定，見 runDriveAudit）。
  *
  * `folderId` 是**相簿的**資料夾，不是 `didadida/` 根目錄（見 ensureAlbumFolder）。
  */
@@ -564,30 +663,56 @@ export async function pushPhotoToDrive(
   target: { folderId: string; token: string },
   photoId: number,
   rawFile: File,
-): Promise<boolean> {
+  need: { fourK?: boolean; original?: boolean } = {},
+): Promise<DrivePushResult> {
   const { folderId, token } = target;
   const base = rawFile.name.replace(/\.[^/.]+$/, '');
+  const want4k = need.fourK !== false;
+  const wantOriginal = need.original !== false;
+  const reasons: string[] = [];
 
   let driveFileId: string | null = null;
-  try {
-    // 一定要餵原始檔：resizeImageFile 的產物只有 2000px，放大成 4K 又大又糊
-    const webp4k = await encode4kWebp(rawFile);
-    if (webp4k) {
-      driveFileId = await uploadToDrive(token, webp4k, `${photoId}_${base}_4k.webp`, folderId);
+  let fourK: DrivePushResult['fourK'] = want4k ? 'failed' : 'skipped';
+  if (want4k) {
+    try {
+      // 一定要餵原始檔：resizeImageFile 的產物只有 2000px，放大成 4K 又大又糊
+      const webp4k = await encode4kWebp(rawFile);
+      if (webp4k) {
+        driveFileId = await uploadToDrive(token, webp4k, `${photoId}_${base}_4k.webp`, folderId);
+        fourK = 'ok';
+      } else {
+        reasons.push('這個格式編不出 4K WebP');
+      }
+    } catch (err) {
+      console.warn(`照片 ${photoId} 的 4K 沒送上 Drive`, err);
+      reasons.push(`4K：${err instanceof Error ? err.message : String(err)}`);
     }
-  } catch (err) {
-    console.warn(`照片 ${photoId} 的 4K 沒送上 Drive`, err);
   }
 
   let driveOriginalId: string | null = null;
-  try {
-    driveOriginalId = await uploadToDrive(token, rawFile, `${photoId}_${rawFile.name}`, folderId);
-  } catch (err) {
-    console.warn(`照片 ${photoId} 的原始檔沒送上 Drive`, err);
+  let original: DrivePushResult['original'] = wantOriginal ? 'failed' : 'skipped';
+  if (wantOriginal) {
+    try {
+      driveOriginalId = await uploadToDrive(token, rawFile, `${photoId}_${rawFile.name}`, folderId);
+      original = 'ok';
+    } catch (err) {
+      console.warn(`照片 ${photoId} 的原始檔沒送上 Drive`, err);
+      reasons.push(`原始檔：${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
-  if (!driveFileId && !driveOriginalId) return false;
-  return await recordPhotoDrive(photoId, { driveFileId, driveOriginalId });
+  if (driveFileId || driveOriginalId) {
+    if (!(await recordDriveIds(photoId, { driveFileId, driveOriginalId }))) {
+      // 檔案上去了、網站不知道 —— 這是孤兒的來源，要講出來
+      return {
+        ok: false, fourK: 'failed', original: 'failed',
+        reason: '傳上 Drive 了，但沒能記回網站（可以稍後再補傳一次）',
+      };
+    }
+  }
+
+  const ok = fourK !== 'failed' && original !== 'failed';
+  return { ok, fourK, original, ...(ok ? {} : { reason: reasons.join('；') || 'Drive 上傳失敗' }) };
 }
 
 /* ---- 診斷（已移除）----

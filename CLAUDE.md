@@ -496,8 +496,8 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   照片那兩欄的意思是「衍生的 4K」與「相機原始檔」，而影片沒有衍生版 —— 傳上去的
   就是原始檔。這樣 `recordPhotoDrive`、`DriveTrash` 刪除、記錄路由全部零修改沿用。
   代價是「`drive_file_id` 是不是 NULL」對影片不代表「沒備份」，已知會咬人的有兩處，
-  都處理過了：`/api/photos/drive-pending`（列表與 COUNT 都加了 `AND media_type = 'photo'`，
-  不然每支影片都會永遠卡在補傳清單裡，而補傳會對影片跑 `encode4kWebp`）、
+  都處理過了：`/api/photos/drive-pending`（**按 `media_type` 分開判斷**，見「補傳清單」——
+  不是把影片整類排除掉，那會讓 Drive 失敗的影片永遠沒人看得到）、
   以及燈箱那句「Drive 沒接上，顯示 800px 縮圖」（先用 `isVideo()` 分岔掉）。
 - **上傳走瀏覽器直傳 Drive 的 resumable 分塊**（`uploadToDriveResumable`，8MB 一塊，
   必須是 256KB 的整數倍）。⚠️ **不要改成經過 Worker** —— Worker 請求體上限 100MB，
@@ -564,6 +564,84 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   刻意只存 R2、**完全不進 D1**，也不參與 `geo_source` 那套權威排序 |
 
 ⚠️ Google 時間軸的原始檔**在瀏覽器裡解析完才上傳結果**（`lib/googleTimeline.ts`），原始檔不經過後端。
+
+## 兩邊對不對得起來：Drive 備份對帳
+
+「站上一張照片 → Drive 上一份 4K ＋ 一份原始檔」（**影片只有原始檔一份**）。
+上傳與刪除都在瀏覽器／Worker 的半路上，每一步都可能單獨失敗，而失敗是**安靜的** ——
+這一整套就是把安靜的走鐘變成看得見的數字，以及自動收尾。
+
+- **引擎**：`runDriveAudit()`／`auditDriveAlbum()`（`index.ts`），狀態整包塞在
+  `AppSetting.drive_audit` 的一列 JSON 裡（k/v，**不需要 migration**）。
+  cron 每 10 分鐘**一次一本**，掃完一輪 `cursor` 歸零並記 `finished_at`，
+  之後閒置 24 小時（`DRIVE_AUDIT_IDLE_MS`）—— 閒著的 tick 只花一次 D1 讀取。
+- ⚠️ **cron 一定是「先排待搬佇列，佇列真的空了才對帳」**，不可以並排。
+  搬 20 個檔＝40 個 subrequest，免費版單次上限 50；撞上的表現是「後面幾個請求安靜地失敗」，
+  於是對帳會**憑空生出一堆假的「不見了」**。
+- **孤兒（Drive 上有、沒有任何一列指著）自動搬進 `trash/`**，走既有的 `DriveTrash` 佇列
+  （＝仍然不呼叫 `files.delete`）。動手前有**三道閘，順序是刻意的**（便宜的先擋，
+  最貴的那次 D1 查詢留到最後）：
+  ① 檔名要符合我們自己的 `^(\d+)_` 規則，不符合的算 `foreign`，**一律不碰**；
+  ② Drive 的 `createdTime` 至少 24 小時前 —— 剛傳完、還來不及回報 id 的檔長得跟孤兒一模一樣；
+  ③ 拿檔名裡那個**照片 id 查主鍵**確認沒人指著它。
+  ⚠️ **不要改成 `WHERE drive_file_id IN (…)`** —— 那兩欄沒有索引，每問一次就整張 Photo 掃一遍。
+- **「不在資料夾清單裡」不等於「不見了」**：可能只是被搬去別的資料夾（相簿改名、有人手動整理）。
+  所以要用 `probeDriveFile()` 再問一次本人，404／已在垃圾桶才把 D1 那一欄清成 NULL
+  （清掉之後它就會出現在補傳清單上）。只是搬走的算 `moved`，**不動它**。
+  一次最多追問 `DRIVE_AUDIT_MAX_PROBES`（8）個，剩下的下一輪再說。
+- ⚠️ `listFolderFiles()` **一定要翻頁**，而且 `truncated: true` 的意思是「**沒看完**」不是
+  「就這些」—— 半份清單去判「不見了」與「孤兒」會清掉好資料，所以 truncated 時**兩段整個跳過**。
+- **後台**：`/admin`「Drive 備份對帳」那一格（`GET/POST /api/admin/drive-audit`，認
+  `canManageOthers`）。看報告、手動對 3 本、從第一本重來，以及**重試放棄的搬移**
+  —— `DriveTrash` 試三次就放棄（`attempts >= 3`），在這之前站上**沒有任何地方看得到它們**，
+  「Drive 刪除失敗」跳完就再也沒有下文。那顆按鈕把 `attempts` 歸零讓它們回佇列。
+
+### 刪除的順序：D1 先收乾淨，R2 留到最後
+
+刪照片、刪相簿、清帳號內容三條路都是同一個順序：
+**Drive 登記待搬 → 收 D1（PhotoTag／封面／Photo／FTS）→ 最後才 `BUCKET.delete`，而且包在 try/catch 裡**。
+
+⚠️ R2 排在前面的話，它丟一次暫時性的錯誤就會讓整支路由 500，而那些列還在 ——
+使用者眼中是「刪不掉」，重新整理卻看到**點開是破圖**的照片（位元組沒了、列還在）。
+反過來最壞只是 R2 留下幾顆沒人指著的縮圖（幾十 KB，而且有 log），便宜太多。
+⚠️ `queueDriveTrash()` **務必排在 `DELETE FROM Photo` 之前** —— 列一刪，那兩個 drive id 就沒有任何地方記得了。
+
+### 補傳清單（`/api/photos/drive-pending`）
+
+⚠️ **影片與照片的「有沒有備份」是兩個不同的問題，不能寫成同一句。** 現在是：
+
+```sql
+   (media_type = 'video' AND drive_original_id IS NULL)
+OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NULL))
+```
+
+以前是 `drive_file_id IS NULL AND media_type = 'photo'`，兩邊都漏：
+① **影片整類被排除** —— 上傳時 Drive 失敗的影片永遠不會出現在補傳清單上，
+使用者手上只剩一張封面圖，而站上沒有任何地方講得出這件事（當初排除是對的，
+因為影片的 `drive_file_id` 永遠是 NULL 會賴著補不完、而且補傳會拿它跑 `encode4kWebp`
+—— 正解是分開判斷，不是整類丟掉）；② **照片只看 4K** ——「4K 上去了、原始檔失敗」
+那些一輩子看不到。列表與 COUNT **共用同一個字串**，不然「剩幾張」永遠歸不了零。
+
+前端 `DriveBackfillModal` 因此要吃 `media_type`／`has_4k`／`has_original`：
+影片走 `pushVideoToDrive`（**絕不能走 `pushPhotoToDrive`**），照片**只補缺的那一半**
+（已經上去的再傳一次，Drive 不會去重，只是多一個同名檔＋白編一次 4K）。
+
+### 上傳這條路的重試與半套
+
+- `withDriveRetry()`（`frontend/src/lib/drive.ts`）：**5xx／429／網路層丟出來的**才重試，
+  3 次、1s→2s 指數退避。**4xx 一律不重試**（403 是權限、404 是資料夾被搬走，試一百次一樣）。
+  蓋住 `uploadToDrive`、resumable 的開工作階段那一趟（分塊 PUT 本來就有自己的重試）。
+- `recordDriveIds()`：**把 file id 記回 D1 這一步比上傳本身更不能掉。** 檔案已經在 Drive 上了，
+  這一趟沒回來就變成一個沒有任何一列指著的孤兒（站上看起來「沒備份」→ 使用者去補傳 →
+  Drive 上再多一份）。`recordPhotoDrive` 因此回的是 `{ok, retryable}` 不是 boolean。
+- `pushPhotoToDrive` 回 `DrivePushResult`（`ok`／`fourK`／`original`／`reason`），
+  ⚠️ **半套不算成功** —— 以前「兩份裡有一份上去了」就回 `true`，於是那張照片再也不會
+  出現在任何補傳清單上，使用者以為備份好了。呼叫端（`ingestSources`、`resolveDuplicate`、
+  橫幅那顆補傳、`DriveBackfillModal`）**都要看回傳值**，並把「還缺哪一半」記進
+  `pendingDriveBatch` 的 `need`。
+- 影片 `pushVideoToDrive` 記不回 D1 **要往外丟**（不是回 false）：呼叫端才會把剛建的那一列收掉。
+  ⚠️ 那個回滾 `deletePhoto()` **自己也會失敗，要驗回傳值** —— 沒收掉就是相簿裡留下一格
+  點開只有靜止畫面的東西，而使用者以為「跳過了」。
 
 ## 一進來就該知道的坑
 
