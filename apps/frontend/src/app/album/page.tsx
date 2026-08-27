@@ -68,6 +68,42 @@ function formatBytes(n: number): string {
   return `${Math.max(1, Math.round(n / 1024))} KB`;
 }
 
+/** 相簿格線的排序方式 */
+type SortMode = "custom" | "upload_date" | "taken_date";
+
+/**
+ * 預設排序＝**拍攝時間**（新到舊），沒有拍攝時間的那一疊排在最前面。
+ *
+ * 為什麼不是自訂排序：`sort_order` 記的是「上傳進來的先後」，跟照片什麼時候拍的
+ * 完全無關 —— 同一趟旅行分三次傳就散在三段。而「沒有拍攝時間的浮到最上面」是
+ * 刻意的：那一疊是影片（封面圖是 canvas 畫的，沒有 EXIF）與掃描的老照片，
+ * 要有人手動指定時間才排得進去，沉到最底下就再也不會有人發現它們還沒補。
+ */
+const DEFAULT_SORT: SortMode = "taken_date";
+
+/** 這張照片的拍攝時刻（毫秒）。沒有或解不出來一律 null，**不要退回 created_at** */
+function takenMs(p: Photo): number | null {
+  if (!p.taken_at) return null;
+  const t = new Date(p.taken_at).getTime();
+  return isNaN(t) ? null : t;
+}
+
+/**
+ * 這張照片在時間軸上算哪一天。**一定要跟格線正在用的排序依據同一個欄位。**
+ *
+ * 以前不管怎麼排都取 `taken_at || created_at`：按上傳日期排的時候軌上寫的卻是
+ * 拍攝月份，兩者對不起來，看起來就是年月一路跳來跳去。
+ */
+function timelineDateOf(p: Photo, sortBy: SortMode): Date | null {
+  const s = sortBy === "upload_date" ? p.created_at : p.taken_at;
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/** 時間軸上「還沒有拍攝時間」那一段的節點文字 */
+const NO_DATE_LABEL = "無日期";
+
 function AlbumContent() {
   const searchParams = useSearchParams();
   const id = searchParams.get("id");
@@ -150,7 +186,21 @@ function AlbumContent() {
    */
   const [duplicateItems, setDuplicateItems] = useState<PendingDuplicate[]>([]);
   const [duplicateIndex, setDuplicateIndex] = useState(0);
-  const [duplicateBusy, setDuplicateBusy] = useState(false);
+  /**
+   * 決定完的那幾張排在這條鏈上**在背景做完**，使用者按完立刻跳下一張。
+   *
+   * 以前是 `await` 完才換下一張：按一次就要等上傳 → Drive 4K → Drive 原始檔
+   * （幾秒到幾十秒，影片更久），一批撞到二十張就是坐在那裡按一次等一次。
+   * 而「要不要留」這個決定根本不需要那些結果。
+   *
+   * ⚠️ **是一條鏈，不是各自 fire-and-forget**：同時開二十份上傳會把記憶體與
+   *    頻寬吃光（影片那幾份尤其）。排隊做跟以前的行為一模一樣，只是不擋人。
+   */
+  const dupJobsRef = useRef<Promise<void>>(Promise.resolve());
+  /** 背景那條鏈的進度（交辦幾張／做完幾張），給進度列與視窗上那行字用 */
+  const [dupJobs, setDupJobs] = useState<{ queued: number; done: number }>({ queued: 0, done: 0 });
+  /** 背景做失敗的，**一行一個原因**，收工一次講完（同 IngestResult.failures 的規矩） */
+  const dupFailuresRef = useRef<string[]>([]);
   /** 這一批的 Drive 位置，重複那幾張決定要傳時直接沿用，不必重跑一次 bootstrap */
   const driveRef = useRef<{ folderId: string; token: string } | null>(null);
   /** 重複那幾張補傳成功的，等整個佇列走完再一起丟給補地點的視窗 */
@@ -201,7 +251,7 @@ function AlbumContent() {
   // 篩選與排序 State
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTags, setSelectedTags] = useState<number[]>([]);
-  const [sortBy, setSortBy] = useState<"custom" | "upload_date" | "taken_date">("custom");
+  const [sortBy, setSortBy] = useState<SortMode>(DEFAULT_SORT);
   const [isMobileFilterOpen, setIsMobileFilterOpen] = useState(false);
   const [isTagModalOpen, setIsTagModalOpen] = useState(false);
 
@@ -345,8 +395,20 @@ function AlbumContent() {
       if (sortBy === "custom") return a.sort_order - b.sort_order;
       if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
       if (sortBy === "taken_date") {
-        const getRealDate = (p: Photo) => p.taken_at ? new Date(p.taken_at).getTime() : new Date(p.created_at).getTime();
-        return getRealDate(b) - getRealDate(a);
+        /*
+         * 沒有拍攝時間的排**最前面**，不是退回 created_at 混在中間。
+         * 那一疊（影片、掃描的老照片）要人手動指定時間才排得進去，
+         * 混在中間就等於永遠沒有人會發現它們還沒補。
+         */
+        const at = takenMs(a);
+        const bt = takenMs(b);
+        if (at === null || bt === null) {
+          if (at !== null) return 1;
+          if (bt !== null) return -1;
+          // 兩張都沒時間：照上傳時間新的在前，剛傳完的影片就落在第一格
+          return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+        }
+        return bt - at;
       }
       return 0;
     });
@@ -394,18 +456,23 @@ function AlbumContent() {
     }
   }, [loading, displayPhotos, searchParams]);
 
-  // 整理時間軸標籤列表 (依年月或年份分類)
+  /*
+   * 右側時間軸那條軌 —— 它就是**格線順序的縮影**：把 displayPhotos 由上往下走一遍，
+   * 年月換了就插一個節點。所以順序不是照時間排的時候，軌上的年月本來就會跳來跳去
+   * （自訂排序的 sort_order 跟時間毫無關係）。那不是壞掉，是這條軌在那個模式下
+   * 沒有意義 —— 而且點下去會把人送到一個跟標籤對不上的位置，所以整條收起來。
+   */
   const timelineGroup = useMemo(() => {
-    if (displayPhotos.length === 0) return [];
+    if (sortBy === "custom" || displayPhotos.length === 0) return [];
     const groups: { label: string; index: number }[] = [];
     let lastLabel = "";
 
     displayPhotos.forEach((photo, index) => {
-      const dateStr = photo.taken_at || photo.created_at;
-      if (!dateStr) return;
-      const dateObj = new Date(dateStr);
-      if (isNaN(dateObj.getTime())) return;
-      const label = `${dateObj.getFullYear()}/${String(dateObj.getMonth() + 1).padStart(2, '0')}`;
+      const dateObj = timelineDateOf(photo, sortBy);
+      // 沒有時間的那一疊也給一個節點：它們就排在最上面，點一下正好跳過去補時間
+      const label = dateObj
+        ? `${dateObj.getFullYear()}/${String(dateObj.getMonth() + 1).padStart(2, '0')}`
+        : NO_DATE_LABEL;
       if (label !== lastLabel) {
         lastLabel = label;
         groups.push({ label, index });
@@ -413,7 +480,7 @@ function AlbumContent() {
     });
 
     return groups;
-  }, [displayPhotos]);
+  }, [displayPhotos, sortBy]);
 
   // 監聽頁面滾動以動態計算目前畫面上可見照片的時間範圍
   useEffect(() => {
@@ -426,6 +493,8 @@ function AlbumContent() {
 
       // 收集目前在視窗範圍內 (Viewport) 的所有照片時間
       const visibleDates: Date[] = [];
+      // 畫面上有幾張還沒有拍攝時間。全都是的話氣泡不能留著上一個月份不動
+      let visibleNoDate = 0;
       const windowHeight = window.innerHeight;
 
       for (let i = 0; i < displayPhotos.length; i++) {
@@ -434,11 +503,10 @@ function AlbumContent() {
           const rect = el.getBoundingClientRect();
           // 卡片只要出現在螢幕視野內
           if (rect.bottom >= 0 && rect.top <= windowHeight) {
-            const dateStr = displayPhotos[i].taken_at || displayPhotos[i].created_at;
-            if (dateStr) {
-              const d = new Date(dateStr);
-              if (!isNaN(d.getTime())) visibleDates.push(d);
-            }
+            // 跟軌上的節點同一個欄位，不然氣泡寫的月份會跟旁邊的節點對不起來
+            const d = timelineDateOf(displayPhotos[i], sortBy);
+            if (d) visibleDates.push(d);
+            else visibleNoDate++;
           }
         }
       }
@@ -456,6 +524,9 @@ function AlbumContent() {
         } else {
           setCurrentTimelineDate(`${startStr} ~ ${endStr}`);
         }
+      } else if (visibleNoDate > 0) {
+        // 整個畫面都是還沒補時間的那一疊
+        setCurrentTimelineDate("還沒有拍攝時間");
       }
 
       // 無限滾動：當滾動距離頁面底部小於 1000px 時自動載入更多
@@ -488,7 +559,7 @@ function AlbumContent() {
       clearTimeout(timer);
       if (scrollTimeoutRef.current) clearTimeout(scrollTimeoutRef.current);
     };
-  }, [displayPhotos]);
+  }, [displayPhotos, sortBy]);
 
   const handleScrollToTimelineIndex = (photoIdx: number) => {
     // 若目標超過目前載入量，自動提升可見張數
@@ -710,11 +781,30 @@ function AlbumContent() {
     }
   };
 
-  /** 佇列走完：收拾狀態、重抓資料，該補地點的再問一次 */
+  /** 佇列走完：等背景那條鏈做完、收拾狀態、重抓資料，該補地點的再問一次 */
   const finishDuplicateQueue = async () => {
-    duplicateItems.forEach((d) => URL.revokeObjectURL(d.previewUrl));
+    const items = duplicateItems;
     setDuplicateItems([]);
     setDuplicateIndex(0);
+
+    /*
+     * ⚠️ **一定要等背景那條鏈跑完再 loadData()。** 不等的話，剛剛按完的最後
+     *    幾張還在上傳，重抓回來的清單裡沒有它們 —— 畫面上看起來就是「選了等於沒選」。
+     */
+    await dupJobsRef.current;
+    items.forEach((d) => URL.revokeObjectURL(d.previewUrl));
+    setDupJobs({ queued: 0, done: 0 });
+
+    // 背景做的事沒辦法當場 alert（會蓋在正在挑的下一張上面），所以攢到這裡一次講完
+    const failures = dupFailuresRef.current;
+    dupFailuresRef.current = [];
+    if (failures.length > 0) {
+      const shown = failures.slice(0, 10).join('\n');
+      const rest = failures.length - 10;
+      alert(`有 ${failures.length} 張重複的照片沒處理成功：\n\n${shown}`
+        + (rest > 0 ? `\n…另外還有 ${rest} 張` : ''));
+    }
+
     const uploaded = dupUploadedRef.current;
     dupUploadedRef.current = [];
     if (uploaded.length === 0) return;
@@ -724,30 +814,33 @@ function AlbumContent() {
     }
   };
 
-  const advanceDuplicate = async () => {
+  /** 換下一張；已經是最後一張就收工（收工要等背景，所以不擋在這裡） */
+  const advanceDuplicate = () => {
     if (duplicateIndex + 1 < duplicateItems.length) setDuplicateIndex(duplicateIndex + 1);
-    else await finishDuplicateQueue();
+    else void finishDuplicateQueue();
   };
 
   /**
-   * 重複視窗按下確認：`keep_both` 是兩張都留，`replace` 是傳新的、再刪掉勾選的舊照片。
+   * 真的把這一張處理掉：`keep_both` 是兩張都留，`replace` 是傳新的、再刪掉勾選的舊照片。
    *
    * **一定要先上傳成功才刪。** 反過來的話上傳失敗就變成舊的也沒了、新的也沒進來，
    * 使用者以為只是取代一下，結果照片憑空消失。
+   *
+   * ⚠️ 這支跑在背景那條鏈上，**畫面早就跳去下一張了** —— 所以出錯一律記進
+   *    `dupFailuresRef`，不可以 alert（會蓋在使用者正在挑的那一張上面）。
    */
-  const resolveDuplicate = async (decision: 'keep_both' | 'replace', replaceIds?: number[]) => {
-    const item = duplicateItems[duplicateIndex];
-    if (!id || !item || duplicateBusy) return;
-
-    setDuplicateBusy(true);
+  const runDuplicateJob = async (
+    item: PendingDuplicate,
+    decision: 'keep_both' | 'replace',
+    replaceIds?: number[],
+  ) => {
+    const name = item.file.name;
     try {
       const result = await uploadPhoto(
-        id, item.resized, item.exifData, item.takenAt, true, item.video,
+        id as string, item.resized, item.exifData, item.takenAt, true, item.video,
       );
       if (result.status !== 'ok') {
-        alert(result.status === 'error'
-          ? `這張上傳失敗，先跳過。\n\n${result.reason}`
-          : '這張上傳失敗，先跳過。');
+        dupFailuresRef.current.push(`${name}：${result.status === 'error' ? result.reason : '上傳失敗'}`);
         return;
       }
 
@@ -765,9 +858,9 @@ function AlbumContent() {
           // ⚠️ 回滾自己也會失敗。沒收掉就等於相簿裡留下一格點開只有靜止畫面的東西，
           //    而使用者以為「跳過了」—— 講出來，讓他知道要手動刪
           const rolled = await deletePhoto(result.photo.id);
-          alert(rolled
-            ? `這支影片沒送上 Drive，先跳過。\n\n${errText(err)}`
-            : `這支影片沒送上 Drive，而且剛建的那一格也沒收掉，請手動刪除。\n\n${errText(err)}`);
+          dupFailuresRef.current.push(rolled
+            ? `${name}：影片沒送上 Drive（${errText(err)}）`
+            : `${name}：影片沒送上 Drive，而且那一格沒收掉，請手動刪除（${errText(err)}）`);
           return;
         }
         dupUploadedRef.current.push(result.photo);
@@ -797,15 +890,35 @@ function AlbumContent() {
         // 刪除端點自己會處理 R2 的檔與 Drive 的待搬佇列，這裡不用另外收尾
         const failed = (await Promise.all(replaceIds.map((pid) => deletePhoto(pid))))
           .filter((ok) => !ok).length;
-        if (failed > 0) alert(`新照片已上傳，但有 ${failed} 張舊照片沒刪掉。`);
+        if (failed > 0) {
+          dupFailuresRef.current.push(`${name}：新照片已上傳，但有 ${failed} 張舊照片沒刪掉`);
+        }
       }
     } catch (err) {
       console.error(err);
-      alert('處理這張時出錯了，先跳過。');
-    } finally {
-      setDuplicateBusy(false);
-      await advanceDuplicate();
+      dupFailuresRef.current.push(`${name}：${errText(err)}`);
     }
+  };
+
+  /**
+   * 重複視窗按下確認：**排進背景那條鏈，畫面立刻跳下一張。**
+   *
+   * 使用者要決定的是「留哪一張」，那個決定不需要等上傳跑完 —— 以前每按一次
+   * 都要坐等幾秒到幾十秒，一批二十張就是被卡在那裡二十次。
+   */
+  const resolveDuplicate = (decision: 'keep_both' | 'replace', replaceIds?: number[]) => {
+    const item = duplicateItems[duplicateIndex];
+    if (!id || !item) return;
+
+    setDupJobs((prev) => ({ ...prev, queued: prev.queued + 1 }));
+    dupJobsRef.current = dupJobsRef.current
+      .then(() => runDuplicateJob(item, decision, replaceIds))
+      // 一張出錯不能把整條鏈斷掉，後面排隊的還要做（runDuplicateJob 自己也有
+      // catch，這裡是最後一道保險）
+      .catch((err) => { console.error('背景處理重複的照片時出錯', err); })
+      .then(() => { setDupJobs((prev) => ({ ...prev, done: prev.done + 1 })); });
+
+    advanceDuplicate();
   };
 
   /**
@@ -1542,7 +1655,7 @@ function AlbumContent() {
                 <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
               </svg>
               篩選與排序
-              {(selectedTags.length > 0 || sortBy !== "custom" || gridColumns !== 0) && (
+              {(selectedTags.length > 0 || sortBy !== DEFAULT_SORT || gridColumns !== 0) && (
                 <span style={{
                   background: 'var(--accent-color, #d1bfae)',
                   color: '#fff',
@@ -1558,7 +1671,7 @@ function AlbumContent() {
           <FilterBottomSheet
             isOpen={isMobileFilterOpen}
             onClose={() => setIsMobileFilterOpen(false)}
-            activeFilterCount={selectedTags.length + (sortBy !== "custom" ? 1 : 0) + (gridColumns !== 0 ? 1 : 0)}
+            activeFilterCount={selectedTags.length + (sortBy !== DEFAULT_SORT ? 1 : 0) + (gridColumns !== 0 ? 1 : 0)}
             onReset={() => {
               setSelectedTags([]);
               setSortBy("custom");
@@ -1852,6 +1965,24 @@ function AlbumContent() {
               </button>
             </div>
           )}
+        </div>
+      )}
+
+      {/*
+        重複那批的背景進度。決定完就跳下一張，所以真正在做的事只剩這條線在講；
+        最後一張按完視窗會收起來，這條就是「還沒好，別急著關頁面」的唯一提示。
+      */}
+      {dupJobs.queued > dupJobs.done && (
+        <div className={styles.progressContainer}>
+          <div className={styles.progressBar}>
+            <div
+              className={styles.progressFill}
+              style={{ width: `${(dupJobs.done / dupJobs.queued) * 100}%` }}
+            />
+          </div>
+          <p className={styles.progressText}>
+            背景處理重複的照片 ({dupJobs.done} / {dupJobs.queued})
+          </p>
         </div>
       )}
 
@@ -2177,9 +2308,11 @@ function AlbumContent() {
             taken_at: e.taken_at || undefined,
           }))}
           onResolve={(decision, replaceIds) => { resolveDuplicate(decision, replaceIds); }}
-          onSkip={() => { if (!duplicateBusy) advanceDuplicate(); }}
+          onSkip={() => advanceDuplicate()}
           counter={{ current: duplicateIndex + 1, total: duplicateItems.length }}
-          busy={duplicateBusy}
+          backgroundNote={dupJobs.queued > dupJobs.done
+            ? `背景處理中 ${dupJobs.queued - dupJobs.done} 張`
+            : undefined}
         />
       )}
 

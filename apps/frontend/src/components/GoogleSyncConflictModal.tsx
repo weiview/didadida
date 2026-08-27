@@ -24,12 +24,18 @@ interface GoogleSyncConflictModalProps {
   onSkip?: () => void;
   /** 一批有好幾張撞到時顯示「第 N / M 張」，不然使用者不知道還要按幾次 */
   counter?: { current: number; total: number };
-  /** 正在處理這張（上傳／取代），把按鈕鎖起來 */
-  busy?: boolean;
+  /**
+   * 「背景處理中 N 張」。
+   *
+   * ⚠️ 這裡**刻意不再有 `busy` 那種鎖住按鈕的狀態** —— 按下確認之後上傳是排在
+   * 背景那條鏈上做的，畫面當場跳下一張，使用者不必等。這行字只是告訴他
+   * 「還有幾張在後面跑」，不是要他停下來。
+   */
+  backgroundNote?: string;
 }
 
 export default function GoogleSyncConflictModal({
-  isOpen, tempPhoto, existingPhotos, onResolve, onSkip, counter, busy
+  isOpen, tempPhoto, existingPhotos, onResolve, onSkip, counter, backgroundNote
 }: GoogleSyncConflictModalProps) {
   const [decision, setDecision] = useState<"keep_both" | "replace" | null>(null);
   const [selectedPhotoIds, setSelectedPhotoIds] = useState<number[]>([]);
@@ -82,6 +88,11 @@ export default function GoogleSyncConflictModal({
           {counter && (
             <span style={{ marginLeft: 8, fontSize: '0.9rem', color: 'var(--text-light)', fontWeight: 400 }}>
               （第 {counter.current} / {counter.total} 張）
+            </span>
+          )}
+          {backgroundNote && (
+            <span style={{ marginLeft: 8, fontSize: '0.85rem', color: 'var(--accent-color)', fontWeight: 400 }}>
+              · {backgroundNote}
             </span>
           )}
         </h3>
@@ -177,11 +188,10 @@ export default function GoogleSyncConflictModal({
             <button
               type="button"
               onClick={onSkip}
-              disabled={busy}
               style={{
                 padding: '10px 22px', borderRadius: '25px', background: 'transparent',
                 border: '1px solid var(--border-color)', color: 'var(--text-light)',
-                cursor: busy ? 'not-allowed' : 'pointer', fontSize: '0.95rem',
+                cursor: 'pointer', fontSize: '0.95rem',
               }}
             >
               略過這張
@@ -189,7 +199,7 @@ export default function GoogleSyncConflictModal({
           )}
           <button
             onClick={handleConfirm}
-            disabled={busy || !decision || (decision === 'replace' && selectedPhotoIds.length === 0)}
+            disabled={!decision || (decision === 'replace' && selectedPhotoIds.length === 0)}
             style={{
               padding: '10px 30px', borderRadius: '25px',
               background: (!decision || (decision === 'replace' && selectedPhotoIds.length === 0)) ? '#ccc' : 'var(--accent-color)',
@@ -197,7 +207,7 @@ export default function GoogleSyncConflictModal({
               fontSize: '1rem', fontWeight: 'bold'
             }}
           >
-            {busy ? '處理中...' : '確認'}
+            確認
           </button>
         </div>
       </div>
