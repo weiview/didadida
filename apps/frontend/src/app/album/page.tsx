@@ -169,6 +169,22 @@ function AlbumContent() {
   // Google Sync State
   const [syncingGoogle, setSyncingGoogle] = useState(false);
   /**
+   * 「Picker 開著、還在等使用者挑照片」那一段。跟 `syncingGoogle` 分開，
+   * 是因為只有這一段可以取消 —— 位元組開始搬之後再喊停是另一件事。
+   */
+  const [googlePickerWaiting, setGooglePickerWaiting] = useState(false);
+  /**
+   * 取消匯入的把手。輪詢跑在 `handleGoogleSync` 的閉包裡，FAB 上那顆按鈕
+   * 只能透過這支 ref 叫它收工。
+   *
+   * ⚠️ **這顆按鈕是使用者唯一的出口**：我們沒辦法知道他是不是把 Google 那個
+   * 視窗關掉不想匯了（`popup.closed` 會說謊，見 `handleGoogleSync`）。
+   */
+  const cancelGoogleSyncRef = useRef<(() => void) | null>(null);
+  // 離開這一頁就把還在跑的輪詢收掉（計時器與那兩個喚醒監聽都掛在 document／window 上，
+  // 不收的話會一直跑到 10 分鐘逾時為止）
+  useEffect(() => () => { cancelGoogleSyncRef.current?.(); }, []);
+  /**
    * Google 那半邊的授權掉了（後端回 409 google_reauth）時要講的話。
    *
    * 這是**唯一**會把人帶去 Google 的入口了 —— 平常匯入用的是後端存的
@@ -494,6 +510,19 @@ function AlbumContent() {
    */
   const buildFabActions = (): FabAction[] => {
     if (uploading || syncingGoogle) {
+      /*
+       * 還在等使用者挑照片那一段是**可以按的**：`popup.closed` 靠不住
+       *（見 handleGoogleSync），沒有人猜得出他是關掉視窗不想匯了，
+       * 所以這顆就是他唯一的出口 —— 不然只能等 10 分鐘逾時或重整頁面。
+       */
+      if (googlePickerWaiting && !uploadProgress) {
+        return [{
+          key: 'busy',
+          label: '選相片中... 按這裡取消',
+          title: '在 Google 那個視窗選完就會自動接手，不用回來按。不想匯了才按這顆',
+          onClick: () => cancelGoogleSyncRef.current?.(),
+        }];
+      }
       // 上傳／匯入中：進度另有整條進度列，這裡只是別讓人以為按鈕不見了
       return [{
         key: 'busy',
@@ -949,6 +978,14 @@ function AlbumContent() {
    * 只有那份授權被使用者自己收回時後端才回 409，那時才出現重新登入的入口。
    */
   const handleGoogleSync = async (popup: Window | null) => {
+    /*
+     * 視窗被擋掉就當場講。沒有它整條路只是空轉：session 建了、輪詢跑滿 10 分鐘，
+     * 而使用者從頭到尾沒看到任何可以挑照片的地方。
+     */
+    if (!popup) {
+      alert("瀏覽器擋掉了選相片的視窗。請允許這個網站開啟彈出式視窗，再按一次「從 Google 相簿匯入」。");
+      return;
+    }
     try {
       // 立刻將 UI 設為載入鎖定狀態，避免異步建立 Session 期間 UI 切回
       setSyncingGoogle(true);
@@ -975,44 +1012,52 @@ function AlbumContent() {
 
       const startTime = Date.now();
       let photosProcessingStarted = false;
-      /*
-       * 使用者直接按 X 關掉選相片的視窗＝取消。**不能一看到 closed 就收工** ——
-       * pickerUri 後面接的 `/autoclose` 就是要 Google 在選完之後自己關掉那個視窗，
-       * 所以「視窗關了」同時是「取消」與「選完了」的樣子。差別只在 session 會不會
-       * 變 ready —— 先關窗、下一瞬間才 ready 的順序也真的會發生。
-       *
-       * 所以看到關掉只先記時間，寬限期內照常輪詢，撐過去還沒 ready 才當作取消。
-       * 取消不彈任何東西：是他自己關的，跳一個「已取消」只是多一次點擊。
-       *
-       * popup 被瀏覽器擋掉時是 null，這條就整個不成立，退回原本的 10 分鐘逾時。
-       */
-      let popupClosedAt = 0;
-      /*
-       * ⚠️ 關窗之後**要繼續問一段時間**，不能問一次就算了。
-       *
-       * Google 那邊「使用者按下完成」與「session 的 mediaItemsSet 變成 true」不是
-       * 同一瞬間 —— `/autoclose` 先把視窗關掉，狀態可能幾秒後才翻。原本是關窗
-       * 1.5 秒後問**一次**，不 ready 就把輪詢整個拆掉當成取消：於是使用者明明選完了，
-       * 畫面上卻什麼都沒發生、Console 也一個字都沒有。（影片更容易踩到，Google 那邊
-       * 要多花時間備妥。）
-       *
-       * 現在關窗只記時間，2 秒那支輪詢照跑；撐過這個窗還沒 ready 才當作取消。
-       */
-      const PICKER_CANCEL_AFTER_CLOSE_MS = 20000;
       // 最後一次查詢失敗的樣子。輪詢單次失敗不停（可能只是網路抖一下），
       // 但收工時要拿它講清楚 —— 不然又變成「什麼都沒發生」
       let lastPollError: string | null = null;
-      let closeLogged = false;
 
-      const pollTimer = setInterval(async () => {
+      /*
+       * ⚠️⚠️ **不要再用 `popup.closed` 判斷「使用者取消了」。那個值會說謊。**
+       *
+       * Google 的選相片頁帶著 `Cross-Origin-Opener-Policy: same-origin`：popup 一
+       * 導過去，瀏覽器就把它跟開它的這一頁切成兩個瀏覽環境群組，我們手上這個
+       * window 參考當場退化成一個斷開的代理 —— 而斷開的代理 **`closed` 一律回
+       * `true`**，視窗其實好端端開著。（會不會斷取決於中間經過哪幾頁，
+       * 所以症狀是時好時壞。）
+       *
+       * 曾經是「發現 closed 就記時間，20 秒內還沒 ready 就當作取消」：於是視窗一
+       * 導到 Google 就被判定關閉，使用者從按下匯入起**只有 20 秒可以挑照片**，
+       * 挑慢一點整批就被丟掉；而取消刻意不彈東西，看起來就是「按了沒反應」。
+       * 再前一版的「關窗 1.5 秒後問一次」是同一個坑的另一面。
+       *
+       * 現在**完全不猜**：選完了就接手（Google 那邊 `mediaItemsSet` 翻 true），
+       * 不想匯了由使用者自己按 FAB 上那顆「取消」，撐到 10 分鐘才自動收工。
+       * 這條路的規矩是「手動路徑優先，自動推論只是加分項」—— 這個推論是負分。
+       */
+
+      let pollTimer: ReturnType<typeof setInterval> | null = null;
+      let wakePoll: () => void = () => {};
+      /*
+       * 收工：拆掉輪詢與兩個喚醒監聽，並宣告「已經有人接手了」。
+       * 每一條離開輪詢的路都要走它，漏掉的話 setInterval 會一直跑下去。
+       */
+      const stopPolling = () => {
+        photosProcessingStarted = true;
+        if (pollTimer) clearInterval(pollTimer);
+        document.removeEventListener('visibilitychange', wakePoll);
+        window.removeEventListener('focus', wakePoll);
+        setGooglePickerWaiting(false);
+        cancelGoogleSyncRef.current = null;
+      };
+
+      const pollOnce = async () => {
         if (photosProcessingStarted) {
           return;
         }
 
         // 如果超過 10 分鐘，自動中斷
         if (Date.now() - startTime > 10 * 60 * 1000) {
-          clearInterval(pollTimer);
-          photosProcessingStarted = true;
+          stopPolling();
           setSyncingGoogle(false);
           alert(lastPollError
             ? `同步逾時，已自動取消。最後一次查詢的錯誤：${lastPollError}`
@@ -1027,37 +1072,19 @@ function AlbumContent() {
           res = await fetchGooglePickerPhotos(session!.id!);
           lastPollError = res.error ?? null;
         } catch (err) {
-          clearInterval(pollTimer);
-          photosProcessingStarted = true;
+          stopPolling();
           setSyncingGoogle(false);
           if (err instanceof GoogleReauthError) setGoogleReauth(err.message);
           else console.error(err);
           return;
         }
 
-        if (!res.ready && popupClosedAt) {
-          const waited = Date.now() - popupClosedAt;
-          // 一次就好，不要每 2 秒洗版
-          if (!closeLogged) {
-            closeLogged = true;
-            console.log('Picker 視窗已關閉，繼續問狀態（最多',
-              PICKER_CANCEL_AFTER_CLOSE_MS / 1000, '秒）', res);
-          }
-          if (waited > PICKER_CANCEL_AFTER_CLOSE_MS) {
-            console.warn('Picker 視窗關閉後', Math.round(waited / 1000),
-              '秒都還沒 ready，當作取消。最後一次狀態：', res);
-            clearInterval(pollTimer);
-            photosProcessingStarted = true;
-            setSyncingGoogle(false);
-            setUploadProgress(null);
-            if (lastPollError) alert(`匯入沒有開始：${lastPollError}`);
-            return;
-          }
-        }
+        // 2 秒那支跟「剛回到分頁」那一下可能同時在飛，await 回來要再確認一次
+        // 還沒有人接手 —— 不然同一批會被匯進來兩次
+        if (photosProcessingStarted) return;
 
         if (res.ready && res.mediaItems) {
-          clearInterval(pollTimer);
-          photosProcessingStarted = true;
+          stopPolling();
           setSyncingGoogle(true);
 
           try {
@@ -1161,27 +1188,35 @@ function AlbumContent() {
           }
           if (skipped.length > 0) alert(`有 ${skipped.length} 個項目沒匯進來：\n\n${skipped.join('\n')}`);
         }
-      }, 2000);
+      };
 
       /*
-       * 關窗偵測**獨立成一支 400ms 的小哨兵**，不跟 2 秒那支狀態輪詢共用一拍 ——
-       * 共用的話「發現關窗」本身就要先等最多 2 秒才知道視窗沒了。
-       *
-       * ⚠️ 這支**只記時間，不做判斷**。它曾經自己問一次狀態、不 ready 就把輪詢
-       * 整個收掉當成取消 —— 那是個競態：Google 先關窗、幾秒後才把 mediaItemsSet
-       * 翻成 true，於是選完的東西被當成取消丟掉，而且因為「取消不彈東西」，
-       * 使用者眼中是按完全沒反應、Console 一個字都沒有。判斷一律留給輪詢。
+       * 挑照片的時候我們這一頁多半是被蓋住的，而被蓋住的分頁 `setInterval` 會被
+       * 瀏覽器降頻到**一分鐘一次** —— 選完回來要乾等快一分鐘才有反應，看起來
+       * 就是「選完了卻沒動靜」。所以一回到前景就補問一次。
+       *（`/autoclose` 把 popup 關掉之後焦點會自己回來，這一下通常就接上了。）
        */
-      const closeWatcher = setInterval(() => {
-        if (photosProcessingStarted) { clearInterval(closeWatcher); return; }
-        if (!popup || !popup.closed || popupClosedAt) return;
-        popupClosedAt = Date.now();
-        clearInterval(closeWatcher);
-        // 剩下的交給 2 秒那支輪詢：ready 就接手，撐過窗口才當取消
-      }, 400);
+      wakePoll = () => {
+        if (document.visibilityState === 'visible') void pollOnce();
+      };
+      document.addEventListener('visibilitychange', wakePoll);
+      window.addEventListener('focus', wakePoll);
+      pollTimer = setInterval(() => { void pollOnce(); }, 2000);
+
+      setGooglePickerWaiting(true);
+      cancelGoogleSyncRef.current = () => {
+        console.log('使用者自己取消了 Google 匯入');
+        stopPolling();
+        setSyncingGoogle(false);
+        setUploadProgress(null);
+        // 關得掉就關。COOP 切斷之後多半關不掉，那就留給 /autoclose 或使用者自己
+        try { popup?.close(); } catch (e) {}
+      };
     } catch (err) {
       console.error(err);
       setSyncingGoogle(false);
+      setGooglePickerWaiting(false);
+      cancelGoogleSyncRef.current = null;
       setUploadProgress(null);
       popup?.close();
       if (err instanceof GoogleReauthError) setGoogleReauth(err.message);
