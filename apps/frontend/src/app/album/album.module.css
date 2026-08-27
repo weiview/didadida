@@ -205,6 +205,60 @@
 }
 
 /*
+ * 格線上的快速鎖（只有可管理全站內容的人看得到）。
+ *
+ * 位置與長相都跟燈箱左上角那顆對齊（lightbox.module.css 的 .restrictBtn）——
+ * 同一件事不該在兩個地方長成兩種東西。關著刻意很淡，不搶照片本身的注意力；
+ * 開著整顆亮起來，因為它決定的是「誰看得到」，狀態不能靠猜。
+ * 「不開放」三個字由左下角的 .restrictedBadge 寫出來，這裡不重複。
+ *
+ * 角標是 pointer-events: none（整張卡都是「打開燈箱」），這顆不是 —— 它要收得到點擊。
+ */
+.restrictLock {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.4);
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.45;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.restrictLock:hover,
+.restrictLock:focus-visible {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.65);
+}
+
+.restrictLock:disabled {
+  cursor: progress;
+  opacity: 0.3;
+}
+
+.restrictLockOn {
+  opacity: 1;
+  background: rgba(180, 83, 9, 0.85);
+}
+
+.restrictLockOn:hover {
+  background: rgba(180, 83, 9, 0.95);
+}
+
+/*
  * 不開放又開了模糊遮罩：整格的縮圖糊掉。
  *
  * ⚠️ 糊的是 .photoImage（img 本身）而不是整張卡 —— 糊整張卡會把角標與編輯用的

@@ -24,13 +24,21 @@ interface PhotoLightboxProps {
   availableTags: Tag[];
   onClose: () => void;
   onUpdate: () => void;
+  /**
+   * 切換「不開放」時**改用這個**，不要走 onUpdate。
+   *
+   * onUpdate 是整頁重抓（loadData）—— 捲軸跳回頂端，使用者要重新找剛剛那一張。
+   * 呼叫端拿到這一格的結果就地把手上那一列換掉（見 lib/api applyRestrictedPatch）。
+   * 沒給就退回 onUpdate，行為跟以前一樣。
+   */
+  onToggleRestricted?: (photoId: number, next: boolean) => Promise<boolean>;
   onPrev?: () => void;
   onNext?: () => void;
   hasPrev?: boolean;
   hasNext?: boolean;
 }
 
-export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, onUpdate, onPrev, onNext, hasPrev, hasNext }: PhotoLightboxProps) {
+export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, onUpdate, onToggleRestricted, onPrev, onNext, hasPrev, hasNext }: PhotoLightboxProps) {
   const [showExif, setShowExif] = useState(false);
   
   const [descValue, setDescValue] = useState(photo.description || "");
@@ -59,10 +67,15 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
 
   const handleToggleRestricted = async (next: boolean) => {
     setIsSavingRestricted(true);
-    const ok = await setPhotosRestricted([photo.id], next);
+    let ok: boolean;
+    if (onToggleRestricted) {
+      ok = await onToggleRestricted(photo.id, next);
+    } else {
+      ok = (await setPhotosRestricted([photo.id], next)).ok;
+      if (ok) onUpdate();
+    }
     setIsSavingRestricted(false);
-    if (ok) onUpdate();
-    else alert("設定失敗，請再試一次");
+    if (!ok) alert("設定失敗，請再試一次");
   };
 
   useEffect(() => {

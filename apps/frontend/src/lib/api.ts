@@ -2315,25 +2315,75 @@ export async function setPhotoGeoPrivacy(photoIds: number[], geoPrivate: boolean
 }
 
 /**
+ * 切換「不開放」的結果。
+ *
+ * `photos` 是**換過 R2 縮圖鍵**的那幾張的新網址（見後端 rotateThumbKeys）：
+ * 標成不開放的當下舊物件就刪掉了，呼叫端手上那一格不換網址就是破圖。
+ * 取消不開放不換鍵，所以那個方向這裡會是空的。
+ */
+export interface RestrictedResult {
+  ok: boolean;
+  /** 這一趟把它們設成什麼 */
+  restricted: boolean;
+  /** 真的換掉鍵的張數（後端一次最多 8 張） */
+  rotated: number;
+  photos: { id: number; url?: string; thumb_url?: string; thumb_sm_url?: string }[];
+}
+
+/**
  * 切換「不開放」。
  *
  * ⚠️ 後端只讓可管理全站內容的人動（其餘一律 403）—— 呼叫端要自己先用
  *    `useAdmin()` 的 canManageOthers 決定那顆開關端不端出來，不要端出來再吃 403。
  *
- * 一次收一批是為了沿用既有的批次端點；燈箱那顆開關送的就是一個 id 的陣列。
+ * 一次收一批是為了沿用既有的批次端點；那兩顆開關（格線角落、燈箱左上角）
+ * 送的都是一個 id 的陣列。
  */
-export async function setPhotosRestricted(photoIds: number[], restricted: boolean): Promise<boolean> {
+export async function setPhotosRestricted(photoIds: number[], restricted: boolean): Promise<RestrictedResult> {
+  const miss: RestrictedResult = { ok: false, restricted, rotated: 0, photos: [] };
   try {
     const res = await fetch(`${API_BASE_URL}/photos/restricted`, {
       method: 'PUT',
       headers: getAuthHeaders(),
       body: JSON.stringify({ photoIds, restricted: restricted ? 1 : 0 }),
     });
-    return res.ok;
+    if (!res.ok) return miss;
+    const data = await res.json().catch(() => null);
+    return {
+      ok: true,
+      restricted,
+      rotated: Number(data?.rotated) || 0,
+      photos: Array.isArray(data?.photos) ? data.photos : [],
+    };
   } catch (err) {
     console.error(err);
-    return false;
+    return miss;
   }
+}
+
+/**
+ * 把切換的結果就地套回手上那份清單，**不要重抓**。
+ *
+ * ⚠️ 使用者的原話：「不要每次點了鎖圖 就重新整理 這樣我要重新再找」——
+ * 重抓一次等於捲軸跳回頂端，一本幾千張的相簿要重新捲到剛剛那一格。
+ * 所以這裡是把 restricted 與（換過鍵的）新網址併回既有那一列，其餘全部原封不動。
+ */
+export function applyRestrictedPatch(
+  photos: Photo[], photoIds: number[], res: RestrictedResult,
+): Photo[] {
+  const ids = new Set(photoIds);
+  const fresh = new Map(res.photos.map((p) => [Number(p.id), p]));
+  return photos.map((p) => {
+    if (!ids.has(p.id)) return p;
+    const nu = fresh.get(p.id);
+    return {
+      ...p,
+      restricted: res.restricted ? 1 : 0,
+      ...(nu?.url ? { url: nu.url } : {}),
+      ...(nu?.thumb_url ? { thumb_url: nu.thumb_url } : {}),
+      ...(nu?.thumb_sm_url ? { thumb_sm_url: nu.thumb_sm_url } : {}),
+    };
+  });
 }
 
 export async function setAlbumMapPrivacy(albumId: number, mapPrivate: boolean): Promise<boolean> {

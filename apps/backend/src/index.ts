@@ -4025,6 +4025,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * 還活著 —— 回應把 rotated 講出來，不要讓它變成一件沒人知道的事。
          */
         let rotated = 0;
+        /*
+         * 換過鍵的那幾張的**新網址**。
+         *
+         * 前端點完那顆鎖不該整頁重抓（捲軸會跳回去，使用者要重新找那張照片），
+         * 但縮圖的鍵在這一趟就換掉了 —— 不把新網址帶回去，他手上那一格會指著
+         * 一顆剛被刪掉的 R2 物件，畫面上就是破圖。
+         */
+        const fresh: { id: number; url?: string; thumb_url?: string; thumb_sm_url?: string }[] = [];
         if (value === 1) {
           const RESTRICT_ROTATE_MAX = 8;
           const origin = new URL(request.url).origin;
@@ -4044,6 +4052,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
               `UPDATE Photo SET ${cols.map((c) => `${c} = ?`).join(", ")} WHERE id = ?`
             ).bind(...cols.map((c) => moved.sets[c]), row.id));
             staleKeys.push(...moved.movedFrom);
+            // file_name 是內部的 R2 鍵，不外流；前端只需要那三個網址
+            fresh.push({
+              id: Number(row.id),
+              url: moved.sets.url, thumb_url: moved.sets.thumb_url, thumb_sm_url: moved.sets.thumb_sm_url,
+            });
             // 舊網址可能是早年匯進來的怪值（甚至字串 "null"），new Request 會直接丟例外
             for (const u of [row.url, row.thumb_url, row.thumb_sm_url]) {
               if (typeof u === "string" && /^https?:\/\//.test(u)) staleUrls.push(u);
@@ -4069,7 +4082,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         await bumpContentEpoch(env);
 
         const updated = res.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
-        return new Response(JSON.stringify({ success: true, updated, rotated, restricted: value }), { headers });
+        return new Response(JSON.stringify({ success: true, updated, rotated, restricted: value, photos: fresh }), { headers });
       }
 
       /*

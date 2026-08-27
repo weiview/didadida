@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useMemo, useCallback } from "react";
 import styles from "./page.module.css";
 import albumStyles from "./album/album.module.css";
 import Link from "next/link";
-import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc } from "@/lib/api";
+import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc, setPhotosRestricted, applyRestrictedPatch } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
@@ -444,6 +444,34 @@ export default function Home() {
    * 篩選（相簿名／描述／底下照片命中）與排序都已經在後端做完，`albums` 拿到的
    * 就是要顯示的東西。這裡保留這個名字只是為了不用改動下面一整片 JSX。
    */
+  /** 正在改「不開放」的那一張（那顆鎖轉圈圈用） */
+  const [restrictBusyId, setRestrictBusyId] = useState<number | null>(null);
+
+  /**
+   * 切換「不開放」。搜尋結果的縮圖與燈箱共用這一支，規矩跟相簿頁那支一樣：
+   * **成功之後不重抓** —— 重抓一次搜尋結果就回頂端，剛剛那一張要重新找。
+   * 後端同一趟會換掉 R2 縮圖的鍵（舊物件當場刪掉，不換新網址就是破圖）、
+   * 清掉指著它的相簿封面，這裡都跟著對齊。
+   */
+  const handleToggleRestricted = async (photoId: number, next: boolean): Promise<boolean> => {
+    const target = displayPhotos.find((p) => p.id === photoId);
+    setRestrictBusyId(photoId);
+    const res = await setPhotosRestricted([photoId], next);
+    setRestrictBusyId(null);
+    if (!res.ok) return false;
+    setDisplayPhotos((prev) => applyRestrictedPatch(prev, [photoId], res));
+    if (next) {
+      if (target?.url) {
+        setAlbums((prev) => prev.map((a) => (
+          a.cover_photo_url === target.url ? { ...a, cover_photo_url: undefined } : a
+        )));
+      }
+      // 剛按完就整格糊掉很難理解，順手掀開它（掀開狀態重整就蓋回去）
+      revealRestricted(photoId);
+    }
+    return true;
+  };
+
   const displayAlbums = albums;
 
   /** 畫面上這些相簿裡，我真的動得了的那些。批次刪除的「全選」只認這一份 */
@@ -879,6 +907,28 @@ export default function Home() {
                       lazy
                     />
                     {/*
+                      * 快速鎖：搜尋結果上也能直接標成／取消不開放，不必先點進燈箱。
+                      * 跟相簿格線同一顆（album.module.css 的 .restrictLock）。
+                      */}
+                    {canManageOthers && (
+                      <button
+                        type="button"
+                        className={`${albumStyles.restrictLock} ${photo.restricted === 1 ? albumStyles.restrictLockOn : ''}`}
+                        disabled={restrictBusyId === photo.id}
+                        aria-pressed={photo.restricted === 1}
+                        title={photo.restricted === 1
+                          ? '目前不開放：只有可管理全站內容的人看得到。按一下改回開放'
+                          : '按一下設成不開放：只有可管理全站內容的人看得到'}
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          const ok = await handleToggleRestricted(photo.id, photo.restricted !== 1);
+                          if (!ok) alert('設定失敗，請再試一次');
+                        }}
+                      >
+                        {photo.restricted === 1 ? '🔒' : '🔓'}
+                      </button>
+                    )}
+                    {/*
                       * 不開放的角標。搜尋結果本來沒有這個 —— 但遮罩開著的時候
                       * 它同時是掀開／收回的開關，沒有它那一格就只是一片糊。
                       */}
@@ -1040,6 +1090,7 @@ export default function Home() {
           availableTags={[]}
           onClose={() => setSelectedPhotoIndex(null)}
           onUpdate={loadData}
+          onToggleRestricted={handleToggleRestricted}
           onPrev={selectedPhotoIndex > 0 ? () => setSelectedPhotoIndex(selectedPhotoIndex - 1) : undefined}
           onNext={selectedPhotoIndex < displayPhotos.length - 1 ? () => setSelectedPhotoIndex(selectedPhotoIndex + 1) : undefined}
           hasPrev={selectedPhotoIndex > 0}

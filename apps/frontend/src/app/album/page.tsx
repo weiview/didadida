@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, Suspense, useMemo } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, setPhotosRestricted, applyRestrictedPatch, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
 import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive, pushVideoToDrive } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
@@ -112,7 +112,7 @@ function AlbumContent() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const { isAdmin, isOwner, canEdit, canAddTo, canReorderIn, restrictedBlur } = useAdmin();
+  const { isAdmin, isOwner, canEdit, canAddTo, canReorderIn, canManageOthers, restrictedBlur } = useAdmin();
   /**
    * 「不開放先糊著」的遮罩：掀開了哪幾張。
    *
@@ -334,6 +334,36 @@ function AlbumContent() {
   }, [gridColumns]);
 
   const [currentCoverPhotoUrl, setCurrentCoverPhotoUrl] = useState<string | null>(null);
+
+  /** 正在改「不開放」的那一張（那顆鎖轉圈圈用），一次只會有一張 */
+  const [restrictBusyId, setRestrictBusyId] = useState<number | null>(null);
+
+  /**
+   * 切換「不開放」。格線角落那顆鎖與燈箱左上角那顆共用這一支。
+   *
+   * ⚠️ **成功之後不重抓（不呼叫 loadData）。** 使用者的原話是
+   * 「不要每次點了鎖圖 就重新整理 這樣我要重新再找」—— 重抓一次捲軸就回頂端，
+   * 一本幾千張的相簿要重新捲回剛剛那一格。改成把回來的結果併回手上那一列。
+   *
+   * 有三件事後端在同一趟裡順手做了，這裡要跟著對齊，不然畫面會跟資料對不上：
+   *   ① 縮圖的 R2 鍵換掉了，舊物件當場刪除 —— 不換新網址就是破圖（applyRestrictedPatch）。
+   *   ② 指到這張的相簿封面被清成 NULL。
+   *   ③ 遮罩開著的話它會立刻糊掉 —— 剛按完就消失在一片模糊裡很難理解，
+   *      所以順手掀開它（掀開狀態本來就只活在記憶體裡，重整就蓋回去）。
+   */
+  const handleToggleRestricted = async (photoId: number, next: boolean): Promise<boolean> => {
+    const target = photos.find((p) => p.id === photoId);
+    setRestrictBusyId(photoId);
+    const res = await setPhotosRestricted([photoId], next);
+    setRestrictBusyId(null);
+    if (!res.ok) return false;
+    setPhotos((prev) => applyRestrictedPatch(prev, [photoId], res));
+    if (next) {
+      if (target && currentCoverPhotoUrl === target.url) setCurrentCoverPhotoUrl(null);
+      revealRestricted(photoId);
+    }
+    return true;
+  };
 
   /** 回傳重抓到的照片，讓呼叫端不必等 state 生效就能依最新資料做決定 */
   const loadData = async (): Promise<Photo[]> => {
@@ -2250,6 +2280,34 @@ function AlbumContent() {
                   <span className={styles.restrictedBadge}>🔒 不開放</span>
                 )
               )}
+              {/*
+                * 快速鎖：不必點進燈箱就能把一張標成／取消不開放。
+                *
+                * 位置跟燈箱那顆一樣在左上角，長相也沿用同一套語彙（關著很淡、
+                * 開著整顆亮起來）—— 同一件事不要在兩個地方長成兩種東西。
+                * 「不開放」三個字由左下角那個角標負責寫出來，這裡不重複一次。
+                *
+                * ⚠️ 編輯模式下不端出來：左上角那個位置已經是勾選框了，
+                *    而且那個模式的每一下點擊都是在選照片／設封面。
+                */}
+              {canManageOthers && !isEditingPhotos && (
+                <button
+                  type="button"
+                  className={`${styles.restrictLock} ${photo.restricted === 1 ? styles.restrictLockOn : ""}`}
+                  disabled={restrictBusyId === photo.id}
+                  aria-pressed={photo.restricted === 1}
+                  title={photo.restricted === 1
+                    ? "目前不開放：只有可管理全站內容的人看得到。按一下改回開放"
+                    : "按一下設成不開放：只有可管理全站內容的人看得到"}
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    const ok = await handleToggleRestricted(photo.id, photo.restricted !== 1);
+                    if (!ok) alert("設定失敗，請再試一次");
+                  }}
+                >
+                  {photo.restricted === 1 ? "🔒" : "🔓"}
+                </button>
+              )}
               {/* 當每排 3 欄 (含) 以上時，照片上隱藏文字與標籤資訊，只呈現純淨照片縮圖 */}
               {(gridColumns === 1 || gridColumns === 2) && (
                 <div className={styles.photoOverlay}>
@@ -2312,6 +2370,7 @@ function AlbumContent() {
           availableTags={availableTags}
           onClose={closeLightbox}
           onUpdate={loadData}
+          onToggleRestricted={handleToggleRestricted}
           onPrev={() => {
             if (selectedPhotoIndex > 0) setSelectedPhotoIndex(selectedPhotoIndex - 1);
           }}
