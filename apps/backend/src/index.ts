@@ -3823,6 +3823,17 @@ if (method === "POST" && pathname === "/api/verify-password") {
        *
        * 現在關鍵字交給 PhotoFts（見 fts.ts），標籤交給 idx_phototag_tag，兩者都是
        * 索引查詢，讀到的列數跟「命中幾張」成正比，而不是跟「總共有幾張」成正比。
+       *
+       * **檔名本來就搜得到，不需要另外做一支。** PhotoFts 的 title 欄位存的是
+       * `Photo.title`，而 title 就是上傳當下的客戶端檔名，**寫進去之後沒有任何一條
+       * 路徑改得動它**（站上沒有「重新命名照片」這件事）。`bigram()` 把英數字的
+       * 連續段整段當成一個 token，所以 `IMG_20240815_123456.jpg` 進索引是
+       * 「img 20240815 123456 jpg」，把同一串貼進搜尋框跑同一支切分函式，
+       * 四個 token 一一對上。
+       * ⚠️ 但比對是**從 token 的開頭**開始（最後一個 token 才有 `*` 前綴），
+       *    所以「檔名的中間一段」比不到 —— `05502` 找不到 `DON05502.jpg`。
+       *    要整段亂比只能改成 LIKE '%…%'，那是一次全表掃描，不做。
+       *    相簿頁那個搜尋框是純前端 `includes()`，反而沒有這個限制。
        */
       if (method === "GET" && pathname === "/api/search") {
        // 搜尋結果會跑 applyGeoPrivacy，管理員與訪客拿到的座標不同 —— 管理員一律
@@ -3993,6 +4004,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
        * 而 title 存的就是上傳當下的客戶端檔名（file_name 是加了時間戳的 R2 鍵，對不上）。
        * 會透露照片總數與上傳順序，所以跟 geo-pending 一樣鎖管理員。
        *
+       * album_id 一起回來是給清單上那顆「看照片」用的（前端組成
+       * `/album/<album_id>?photo=<id>` 直接開燈箱）——「這個檔名是哪一張」
+       * 本來要人自己複製檔名去首頁搜尋，而這裡明明就握著 id。
+       * ⚠️ 多帶一欄**不多花任何讀取額度**，D1 算的是讀了幾列不是幾欄。
+       *
        * album_id 是選填的。補傳從相簿頁進去時帶上，一來清單短很多，
        * 二來避免不同相簿裡剛好同名的檔案互相對錯。
        */
@@ -4035,7 +4051,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         )`;
 
         const { results: photos } = await env.DB.prepare(`
-          SELECT id, url, file_name, title, media_type, thumb_url,
+          SELECT id, album_id, url, file_name, title, media_type, thumb_url,
                  drive_file_id IS NOT NULL AS has_4k,
                  drive_original_id IS NOT NULL AS has_original
             FROM Photo

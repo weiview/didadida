@@ -607,7 +607,7 @@ export default function Home() {
             <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
               <input 
                 type="text" 
-                placeholder="搜尋相簿或照片 Story..." 
+                placeholder="搜尋相簿、Story 或檔名..." 
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
                 className={styles.searchInput}

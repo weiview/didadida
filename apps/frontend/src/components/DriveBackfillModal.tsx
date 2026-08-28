@@ -287,7 +287,7 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
             <>
               <div style={{ fontSize: 14, marginBottom: 8 }}>
                 有 <strong>{pending.length}</strong> 個檔案還沒有完整的 Drive 備份
-                <span style={{ color: '#64748b', fontSize: 12.5 }}>（點檔名複製那一個）</span>：
+                <span style={{ color: '#64748b', fontSize: 12.5 }}>（點檔名複製那一個、點「看照片」開燈箱）</span>：
               </div>
 
               {/*
@@ -297,6 +297,8 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                 *
                 * 只列文字不列縮圖：一次幾百張縮圖就是幾百次 Workers 請求，
                 * 而這裡要回答的問題是「我該去找哪個檔」，檔名就夠了。
+                * 想確認「這個檔名到底是哪一張」的時候才按右邊那顆「看照片」——
+                * 一次只開一張，而且是使用者自己要求的。
                 */}
               <div style={{
                 maxHeight: 190, overflowY: 'auto', margin: '0 0 14px',
@@ -308,50 +310,78 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                   const isDup = dupNames.has(baseKey(name));
                   const justCopied = copiedId === p.id;
                   /*
-                   * 整列就是那顆按鈕（不是旁邊再擺一顆小圖示）—— 檔名本身很長，
-                   * 已經佔滿一整列，要點的目標就是它。用 <button> 而不是 div
-                   * 是為了鍵盤也按得到。
+                   * 一列有兩個目標：**檔名本身**（點了複製，拿去硬碟的搜尋框找那個檔）
+                   * 與右邊那顆**「看照片」**（點了開那一張的燈箱，回答「這個檔名是
+                   * 哪一張」）。
+                   * ⚠️ 外層是 div 不是 button —— button 裡面不能再放 button／a。
                    */
                   return (
-                    <button
+                    <div
                       key={p.id}
-                      type="button"
-                      title={`${name}（點一下複製檔名）`}
-                      onClick={() => copyName(p.id, name)}
                       style={{
-                        display: 'flex', alignItems: 'center', gap: 8, width: '100%',
-                        padding: '5px 10px', fontSize: 12.5, lineHeight: 1.5,
-                        borderBottom: '1px solid #eef2f7', textAlign: 'left',
-                        borderTop: 'none', borderLeft: 'none', borderRight: 'none',
+                        display: 'flex', alignItems: 'center',
+                        borderBottom: '1px solid #eef2f7',
                         background: justCopied ? '#ecfdf5' : 'transparent',
-                        color: isMatched ? '#15803d' : '#334155',
-                        cursor: 'pointer', font: 'inherit',
                       }}
                     >
-                      <span style={{ width: 14, flexShrink: 0 }}>{isMatched ? '✓' : ''}</span>
-                      <span style={{
-                        flex: 1, overflow: 'hidden',
-                        textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                      }}>
-                        {name}
-                      </span>
-                      {justCopied ? (
-                        <span style={{ color: '#15803d', flexShrink: 0, fontSize: 11.5 }}>已複製 ✓</span>
-                      ) : (
-                        <>
-                          {missingLabel(p) && (
-                            <span style={{
-                              color: isVideoRow(p) ? '#7c3aed' : '#64748b', flexShrink: 0, fontSize: 11.5,
-                            }}>
-                              {missingLabel(p)}
-                            </span>
-                          )}
-                          {isDup && (
-                            <span style={{ color: '#92400e', flexShrink: 0 }}>同名多張</span>
-                          )}
-                        </>
-                      )}
-                    </button>
+                      <button
+                        type="button"
+                        title={`${name}（點一下複製檔名）`}
+                        onClick={() => copyName(p.id, name)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 8,
+                          flex: 1, minWidth: 0,
+                          padding: '5px 4px 5px 10px', fontSize: 12.5, lineHeight: 1.5,
+                          textAlign: 'left', border: 'none', background: 'transparent',
+                          color: isMatched ? '#15803d' : '#334155',
+                          cursor: 'pointer', font: 'inherit',
+                        }}
+                      >
+                        <span style={{ width: 14, flexShrink: 0 }}>{isMatched ? '✓' : ''}</span>
+                        <span style={{
+                          flex: 1, minWidth: 0, overflow: 'hidden',
+                          textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        }}>
+                          {name}
+                        </span>
+                        {justCopied ? (
+                          <span style={{ color: '#15803d', flexShrink: 0, fontSize: 11.5 }}>已複製 ✓</span>
+                        ) : (
+                          <>
+                            {missingLabel(p) && (
+                              <span style={{
+                                color: isVideoRow(p) ? '#7c3aed' : '#64748b', flexShrink: 0, fontSize: 11.5,
+                              }}>
+                                {missingLabel(p)}
+                              </span>
+                            )}
+                            {isDup && (
+                              <span style={{ color: '#92400e', flexShrink: 0 }}>同名多張</span>
+                            )}
+                          </>
+                        )}
+                      </button>
+                      {/*
+                        * 另開分頁 —— 這個視窗開著的時候人通常正在挑檔案，
+                        * 把他整個帶走等於要他重來一次。
+                        * ⚠️ album_id 是後端新加的欄位，邊快取裡還躺著舊版回應時
+                        *    會是 undefined，那就不端這顆（不要組出 /album/undefined）。
+                        */}
+                      {p.album_id ? (
+                        <a
+                          href={`/album/${p.album_id}?photo=${p.id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="在新分頁打開這一張"
+                          style={{
+                            flexShrink: 0, padding: '5px 10px', fontSize: 11.5,
+                            color: '#2563eb', textDecoration: 'none', whiteSpace: 'nowrap',
+                          }}
+                        >
+                          看照片 ↗
+                        </a>
+                      ) : null}
+                    </div>
                   );
                 })}
               </div>

@@ -409,7 +409,14 @@ function AlbumContent() {
   // 計算經過篩選與排序的照片
   const displayPhotos = useMemo(() => {
     return photos.filter(photo => {
-      // 關鍵字篩選 (搜尋照片 Story/描述 或 標題)
+      /*
+       * 關鍵字篩選：Story／描述，以及 **title**。
+       * ⚠️ `title` 存的就是上傳當下的原始檔名，而且**上傳之後沒有任何一條路徑改得動它**
+       *    —— 所以「把補傳 Drive 那份清單上的檔名貼進來」就是這裡的主要用途之一，
+       *    輸入框的 placeholder 要把「檔名」講出來，不然沒有人會想到可以這樣用。
+       *    這一頁是純前端 includes()，所以檔名的**任何一段**都比得到（首頁那個
+       *    走 FTS，只能從 token 的開頭比）。
+       */
       if (searchQuery) {
         const q = searchQuery.toLowerCase().trim();
         const matchTitle = photo.title?.toLowerCase().includes(q);
@@ -1733,7 +1740,7 @@ function AlbumContent() {
             <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
               <input 
                 type="text" 
-                placeholder="搜尋照片 Story..." 
+                placeholder="搜尋 Story 或檔名..." 
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
                 className={styles.searchInput}

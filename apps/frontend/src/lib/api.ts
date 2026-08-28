@@ -1871,6 +1871,8 @@ export async function saveAlbumDriveFolder(
 
 export interface DrivePendingPhoto {
   id: number;
+  /** 它在哪一本相簿。清單上那顆「看照片」用它組 /album/<album_id>?photo=<id> */
+  album_id?: number;
   url: string;
   /** 加了時間戳的 R2 鍵，不是使用者看到的檔名 */
   file_name: string;
