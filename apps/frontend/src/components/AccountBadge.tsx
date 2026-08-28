@@ -396,7 +396,10 @@ export default function AccountBadge() {
                 </div>
               )}
 
-              {isOwner && (
+              {/* 「可管理全站內容」＝共同站長，後台每一格都給（見 /admin 那一頁
+                  的註解）。這顆是站上唯一通往 /admin 的連結，跟著一起放行，
+                  不然他只能靠自己打網址。 */}
+              {canManageOthers && (
                 <Link
                   href="/admin"
                   onClick={() => setOpen(false)}

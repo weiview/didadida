@@ -314,6 +314,23 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 - **白名單就是 D1 的 `User` 表**，沒有 `ADMIN_EMAILS` 之類的後路。清掉 `User` = 沒有人登得進去，站長也一樣。
 - 站長在 `/admin` 加人、給權限、停權。移出白名單是**停權（`active=0`）不是刪列**。
+- ⚠️ **`/admin` 認的是 `canManageOthers`，不是 `isOwner`**（2026-08-28 使用者拍板：
+  「可管理全站內容」＝**共同站長**，後台每一格都給，含白名單與站台開關）。
+  在那之前整頁鎖 `isOwner`，於是勾了那一格的人連進都進不來 —— 而後端的
+  Drive 比對那兩支本來就對他開著，等於功能在、入口沒有。改的是四支路由的閘
+  （`/api/admin/settings`、`/api/admin/users*`、`/api/tracks/drive/sync-folders`、
+  代設頭像的 `/api/users/:id/avatar`）＋ `/admin` 那一頁 ＋ `AccountBadge` 上
+  那顆唯一通往後台的連結。**後端只剩兩種身分做得到的事不同：沒有。**
+  站長與共同站長的差別現在只在「動不動得了對方那一列」，見下面兩道閂。
+- ⚠️⚠️ 白名單那條路只剩**兩道閂**，兩道都非有不可，而且 `PUT/DELETE /api/admin/users/:id`
+  與 `POST /api/admin/users`（把移出白名單的人加回來也是 UPDATE，是同一條後門）
+  **兩支都要寫**：
+  ① **站長那一列動不得** —— 不然共同站長可以把站長降權、停權、改名。
+  ② **自己那一列也動不得** —— 開放之前不需要這條（那時只有站長進得來，而站長被
+  ① 擋著），現在他碰得到自己了：關掉自己的 `can_manage_others` 或 `active`
+  就是當場自我上鎖，而唯一的復原辦法是請站長進來或直接開 D1 主控台。
+  `/purge` 那一支本來就有 ②。前端白名單那一列跟著把**自己**連同站長一起 disable，
+  並標一顆「你自己」的標籤 —— 端出來再吃 400 比不端出來難懂。
 - 真的要刪帳號時，`Album.user_id` 是 `NOT NULL + CASCADE`，**改掛站長一定要排在刪 `User` 之前**。
 - 前端判斷是不是管理員**只能用 `useAdmin()`**（context，Provider 在 `layout.tsx`，走 `GET /api/auth/me`）。
   不要自己讀 localStorage —— 那裡只有 `admin_token`（進站 JWT）與 `media_token`（圖片簽章），

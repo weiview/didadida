@@ -40,7 +40,7 @@ const fmtUtc = (s: string) =>
   new Date(s.endsWith("Z") ? s : `${s.replace(" ", "T")}Z`).toLocaleString();
 
 export default function AdminPage() {
-  const { isOwner, checking, isAdmin, user: me, setMyAvatar } = useAdmin();
+  const { canManageOthers, checking, isAdmin, user: me, setMyAvatar } = useAdmin();
 
   /*
    * 誰現在在線上。**只是看**，輪詢由全站唯一的 <PresenceToasts /> 開
@@ -166,9 +166,9 @@ export default function AdminPage() {
   }, []);
 
   useEffect(() => {
-    if (!checking && isOwner) load();
+    if (!checking && canManageOthers) load();
     else if (!checking) setLoading(false);
-  }, [checking, isOwner, load]);
+  }, [checking, canManageOthers, load]);
 
   const handleAdd = async () => {
     const email = newEmail.trim();
@@ -356,18 +356,23 @@ export default function AdminPage() {
   if (checking) return <div className={styles.container} />;
 
   /*
-   * 不是站長就什麼都不解釋。訪客只會是自己打網址進來的（站內沒有任何連結指到這裡），
-   * 對他講「請以站長身分登入」等於在提示還有別的身分可以換 —— 使用者要的是
-   * 訪客只有看跟登出。家庭成員則講清楚，免得以為是壞掉了。
+   * ⚠️ 這一頁認的是 **canManageOthers**，不是 isOwner（2026-08-28 使用者拍板：
+   * 「可管理全站內容」＝共同站長，後台每一格都給，含白名單）。在那之前整頁
+   * 鎖 isOwner，於是勾了那一格的人連進都進不來 —— 而後端的 Drive 比對那兩支
+   * 本來就對他開著，等於功能在、入口沒有。
+   *
+   * 進不來的人什麼都不解釋。訪客只會是自己打網址進來的（站內沒有任何連結指到
+   * 這裡），對他講「請以站長身分登入」等於在提示還有別的身分可以換 —— 使用者
+   * 要的是訪客只有看跟登出。家庭成員則講清楚，免得以為是壞掉了。
    */
-  if (!isOwner) {
+  if (!canManageOthers) {
     return (
       <div className={styles.container}>
         <Link href="/" className={styles.back}>← 回相簿</Link>
         <h1 className={styles.title}>找不到這一頁</h1>
         {isAdmin && (
           <p className={styles.hint}>
-            後台設定只有站長看得到。你可以管理自己的相簿與照片，但白名單不在你的權限範圍內。
+            後台設定要「可管理全站內容」才看得到。你可以管理自己的相簿與照片，但全站設定與白名單不在你的權限範圍內。
           </p>
         )}
       </div>
@@ -539,6 +544,14 @@ export default function AdminPage() {
         ) : (
           users.map((user) => {
             const owner = user.role === "owner";
+            /*
+             * ⚠️ 自己那一列跟站長那一列一樣鎖起來（後端也會擋，400）。
+             * 開放共同站長之前不需要這一條：那時只有站長進得來，而站長
+             * 被 `owner` 擋著。現在共同站長碰得到自己了，關掉自己的
+             * 「可管理全站內容」就是當場把自己鎖在後台外面。
+             */
+            const self = me?.id === user.id;
+            const locked = owner || self;
             const busy = busyId === user.id;
             return (
               <div key={user.id} className={styles.userRow}>
@@ -562,6 +575,7 @@ export default function AdminPage() {
                   <div className={styles.userName}>
                     {user.name || "（未命名）"}
                     {owner && <span className={styles.tag}>站長</span>}
+                    {self && !owner && <span className={styles.tag}>你自己</span>}
                     {!owner && user.active !== 1 && (
                       <span className={`${styles.tag} ${styles.tagOff}`}>已停權</span>
                     )}
@@ -693,11 +707,11 @@ export default function AdminPage() {
                 <div className={styles.actions}>
                   {/* 站長的權限不能在這裡改（後端也會擋）—— 唯一的站長把自己降權之後
                       就沒有人能改回來了 */}
-                  <label className={styles.checkbox} title={owner ? "站長本來就是全開" : undefined}>
+                  <label className={styles.checkbox} title={owner ? "站長本來就是全開" : self ? "不能改自己的權限" : undefined}>
                     <input
                       type="checkbox"
                       checked={owner || user.can_manage_others === 1}
-                      disabled={owner || busy || user.active !== 1}
+                      disabled={locked || busy || user.active !== 1}
                       onChange={(e) => patch(user, { can_manage_others: e.target.checked })}
                     />
                     可管理全站內容
@@ -718,7 +732,7 @@ export default function AdminPage() {
                     <input
                       type="checkbox"
                       checked={owner || user.can_manage_others === 1 || user.can_add_to_others === 1}
-                      disabled={owner || busy || user.active !== 1 || user.can_manage_others === 1}
+                      disabled={locked || busy || user.active !== 1 || user.can_manage_others === 1}
                       onChange={(e) => patch(user, { can_add_to_others: e.target.checked })}
                     />
                     可加照片到別人的相簿
@@ -731,7 +745,7 @@ export default function AdminPage() {
                     <input
                       type="checkbox"
                       checked={owner || user.can_manage_others === 1 || user.can_reorder_others === 1}
-                      disabled={owner || busy || user.active !== 1 || user.can_manage_others === 1}
+                      disabled={locked || busy || user.active !== 1 || user.can_manage_others === 1}
                       onChange={(e) => patch(user, { can_reorder_others: e.target.checked })}
                     />
                     可排序別人的相簿
@@ -751,7 +765,7 @@ export default function AdminPage() {
                     <input
                       type="checkbox"
                       checked={owner || user.can_view_comments === 1}
-                      disabled={owner || busy || user.active !== 1}
+                      disabled={locked || busy || user.active !== 1}
                       onChange={(e) => patch(user, { can_view_comments: e.target.checked })}
                     />
                     可看留言
@@ -764,7 +778,7 @@ export default function AdminPage() {
                     <input
                       type="checkbox"
                       checked={owner || user.can_comment === 1}
-                      disabled={owner || busy || user.active !== 1}
+                      disabled={locked || busy || user.active !== 1}
                       onChange={(e) => patch(user, { can_comment: e.target.checked })}
                     />
                     可留言
@@ -784,7 +798,7 @@ export default function AdminPage() {
                     <input
                       type="checkbox"
                       checked={owner || user.can_view_map === 1}
-                      disabled={owner || busy || user.active !== 1}
+                      disabled={locked || busy || user.active !== 1}
                       onChange={(e) => patch(user, { can_view_map: e.target.checked })}
                     />
                     可看足跡
@@ -806,13 +820,13 @@ export default function AdminPage() {
                     <input
                       type="checkbox"
                       checked={owner || user.can_use_tools === 1}
-                      disabled={owner || busy || user.active !== 1}
+                      disabled={locked || busy || user.active !== 1}
                       onChange={(e) => patch(user, { can_use_tools: e.target.checked })}
                     />
                     可用足跡工具
                   </label>
 
-                  {!owner && user.active !== 1 && (
+                  {!locked && user.active !== 1 && (
                     <button
                       type="button"
                       className={styles.button}
@@ -823,7 +837,7 @@ export default function AdminPage() {
                     </button>
                   )}
 
-                  {!owner && user.active === 1 && (
+                  {!locked && user.active === 1 && (
                     <button
                       type="button"
                       className={`${styles.button} ${styles.danger}`}
@@ -836,7 +850,7 @@ export default function AdminPage() {
 
                   {/* 停權中的人也刪得掉 —— 「不讓他進來」跟「把他抹掉」是兩件事，
                       而且通常是先停權觀望一陣子才決定要不要真的刪 */}
-                  {!owner && (
+                  {!locked && (
                     <button
                       type="button"
                       className={`${styles.button} ${styles.danger}`}

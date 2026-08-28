@@ -2669,11 +2669,13 @@ if (method === "POST" && pathname === "/api/verify-password") {
       }
 
       /*
-       * 路由：換掉／移除某個人的頭像。**本人或站長**，沒有第三種。
+       * 路由：換掉／移除某個人的頭像。**本人，或可管理全站內容的人**。
        *
-       * 刻意不吃 canManageOthers —— 那一欄講的是「動得了別人的相簿與照片」，
-       * 頭像是那個人自己的臉，能改它的只有他本人跟站長（站長那條是為了幫
-       * 不會用的家人代設，也是為了能把不合適的圖拿掉）。
+       * 代設別人的頭像是為了幫不會用的家人設好，也是為了能把不合適的圖拿掉 ——
+       * 那是後台白名單那一列上的一顆按鈕，而後台現在是共同站長也進得來的
+       * （2026-08-28）。⚠️ 這一條以前刻意寫成 isOwner，理由是「頭像是那個人
+       * 自己的臉」；改成 canManageOthers 是為了不要端出一顆按下去吃 403 的
+       * 選擇器 —— 入口跟權限要對得起來。
        *
        * body 是原始的圖檔位元組，不是 multipart —— 只有一個檔案，包一層 FormData
        * 兩邊都變麻煩。舊檔在更新完 D1 之後才刪，而且是 best-effort：
@@ -2689,7 +2691,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (!Number.isInteger(targetId) || targetId <= 0) {
           return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });
         }
-        if (!actor.isOwner && actor.uid !== targetId) {
+        if (!actor.canManageOthers && actor.uid !== targetId) {
           return forbidden(headers, "只能換自己的頭像");
         }
         const target = await env.DB.prepare("SELECT id, avatar_key FROM User WHERE id = ?")
@@ -2765,18 +2767,19 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }))), { headers });
       }
 
-      /* ── 站長專用：站台開關 ────────────────────────────────────────────────
+      /* ── 後台：站台開關 ────────────────────────────────────────────────────
        *
-       * 目前只有一個：訪客能不能看足跡地圖。跟白名單同一個理由歸站長 ——
-       * 「訪客看得到什麼」是站的門，不是編輯權限。
+       * 訪客能不能看足跡地圖／留言、不開放的照片要不要糊掉、一起出遊的門檻。
+       * 認的是 **canManageOthers**（站長與 can_manage_others=1）——
+       * 「可管理全站內容」在這個站的意思就是共同站長，後台每一格都碰得到。
        */
       if (pathname === "/api/admin/settings") {
         const actor = await currentActor(request, env);
         if (!actor) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
-        if (!actor.isOwner) {
-          return new Response(JSON.stringify({ error: "只有站長可以改站台設定" }), { status: 403, headers });
+        if (!actor.canManageOthers) {
+          return new Response(JSON.stringify({ error: "只有站長或可管理全站內容的人可以改站台設定" }), { status: 403, headers });
         }
 
         if (method === "GET") {
@@ -2951,18 +2954,25 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }
       }
 
-      /* ── 站長專用：白名單管理 ──────────────────────────────────────────────
+      /* ── 後台：白名單管理 ──────────────────────────────────────────────────
        *
-       * 只有 role='owner' 進得來。can_manage_others 給的是「動別人的內容」，
-       * **不包含「決定誰進得來」** —— 那是站的鑰匙，不是編輯權限。
+       * ⚠️ 認 **canManageOthers**，不是 isOwner（2026-08-28 使用者拍板：
+       * 「可管理全站內容」＝共同站長，連「決定誰進得來」也一起給）。
+       * 剩下的兩道護欄因此變得更要緊，兩道都在下面的 :id 路由裡：
+       *   ① 站長那一列動不得（降權／停權／刪除都擋）——
+       *      不然共同站長可以把站長本人踢掉。
+       *   ② **自己那一列也動不得** —— 共同站長以前碰不到自己（那時只有站長
+       *      進得來，而站長被 ① 擋著），現在碰得到了：把自己的
+       *      can_manage_others 關掉或 active 設 0 就是當場自我上鎖，
+       *      而唯一的復原辦法是請站長進來或直接開 D1 主控台。
        */
       if (pathname === "/api/admin/users" || pathname.startsWith("/api/admin/users/")) {
         const actor = await currentActor(request, env);
         if (!actor) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
-        if (!actor.isOwner) {
-          return new Response(JSON.stringify({ error: "只有站長可以管理白名單" }), { status: 403, headers });
+        if (!actor.canManageOthers) {
+          return new Response(JSON.stringify({ error: "只有站長或可管理全站內容的人可以管理白名單" }), { status: 403, headers });
         }
 
         /*
@@ -3039,8 +3049,21 @@ if (method === "POST" && pathname === "/api/verify-password") {
           const freeColor = TRACK_PALETTE.find((c) => !used.has(c)) ?? null;
 
           const existing = await env.DB.prepare(
-            "SELECT id, active, track_color FROM User WHERE lower(email) = ?"
+            "SELECT id, active, role, track_color FROM User WHERE lower(email) = ?"
           ).bind(email).first<any>();
+          /*
+           * ⚠️ 「加人」這條路也會 UPDATE 既有那一列（把移出白名單的人加回來），
+           * 所以它同時是一條**繞過 PUT /:id 那兩道閂的後門** —— 只要填對信箱，
+           * 就能改掉站長的顯示名稱與旗標，或是把自己的 can_manage_others 關掉。
+           * 開放共同站長之後這件事有人做得到了，兩道閂在這裡照抄一次。
+           */
+          if (existing && (existing.role === 'owner' || Number(existing.id) === actor.uid)) {
+            return new Response(JSON.stringify({
+              error: existing.role === 'owner'
+                ? "站長已經在名單上了，他的權限不能在這裡修改"
+                : "這是你自己的信箱，權限不能自己改",
+            }), { status: 400, headers });
+          }
           if (existing) {
             // 曾經被移出白名單的人再加回來 —— 就是把 active 打開，他的相簿都還在。
             // 顏色只在他從來沒有過的時候才補（COALESCE）：以前挑過什麼就還他什麼
@@ -3447,6 +3470,16 @@ if (method === "POST" && pathname === "/api/verify-password") {
            */
           if (target.role === 'owner') {
             return new Response(JSON.stringify({ error: "站長的權限不能在這裡修改" }), { status: 400, headers });
+          }
+          /*
+           * 自己那一列也動不得，理由跟上面同一個 —— 只是以前不需要寫：
+           * 那時只有站長進得來，而站長被上面那一行擋著。開放共同站長之後
+           * 他碰得到自己了，關掉自己的 can_manage_others 或 active＝當場
+           * 把自己鎖在後台外面，而他自己救不回來（要站長或 D1 主控台）。
+           * /purge 那一支早就有同一道閂（`targetId === actor.uid`）。
+           */
+          if (targetId === actor.uid) {
+            return new Response(JSON.stringify({ error: "不能修改自己的權限或停用自己的帳號" }), { status: 400, headers });
           }
 
           // 路由：改權限／改名／停權復權
@@ -6778,8 +6811,8 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         if (!actor) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
-        if (!actor.isOwner) {
-          return new Response(JSON.stringify({ error: "只有站長可以綁定軌跡資料夾" }), { status: 403, headers });
+        if (!actor.canManageOthers) {
+          return new Response(JSON.stringify({ error: "只有站長或可管理全站內容的人可以綁定軌跡資料夾" }), { status: 403, headers });
         }
         if (!env.GOOGLE_DRIVE_SA_KEY) {
           return new Response(JSON.stringify({ error: "尚未設定 GOOGLE_DRIVE_SA_KEY" }), { status: 503, headers });
