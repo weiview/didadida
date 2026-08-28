@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   previewGeoBatch, assignGeoBatch, searchPlace, reverseGeocode, fetchFootprint,
-  type GeoPreview,
+  fetchPlaces, deletePlace,
+  type GeoPreview, type SavedPlace,
 } from '@/lib/api';
 import PlacePickerMap from './PlacePickerMap';
 import styles from './assignPlace.module.css';
@@ -54,6 +55,14 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
   /** 這本相簿已定位照片的位置，開圖時直接跳過去，省得從整個台灣拖起 */
   const [anchor, setAnchor] = useState<{ lat: number; lng: number } | null>(null);
 
+  /**
+   * 地點簿：以前套用過的地點（全站共用一份，見 migrations/0023）。
+   * 同一家店不必每一本相簿都重新搜尋、重新在地圖上找一次。
+   */
+  const [places, setPlaces] = useState<SavedPlace[]>([]);
+  /** 沒在搜尋的時候只先露幾筆，按了才全部攤開 —— 三百筆會把地圖推到看不見 */
+  const [showAllPlaces, setShowAllPlaces] = useState(false);
+
   const [createSegment, setCreateSegment] = useState(true);
   const [includeAlsoInRange, setIncludeAlsoInRange] = useState(false);
   const [overwriteExif, setOverwriteExif] = useState(false);
@@ -72,10 +81,15 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
     nameTouchedRef.current = false;
     setCreateSegment(true); setIncludeAlsoInRange(false); setOverwriteExif(false);
 
+    setShowAllPlaces(false);
+
     setLoadingPreview(true);
     previewGeoBatch(photoIds)
       .then(setPreview)
       .finally(() => setLoadingPreview(false));
+
+    // 每次開都重讀：上一次套用可能剛好新增了一個地點，別人在別的分頁存的也會進來
+    fetchPlaces().then(setPlaces);
   }, [isOpen, photoIds]);
 
   // 問這本相簿的既有足跡，拿來當開圖的落點
@@ -97,21 +111,70 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
   }, []);
 
   /**
-   * 要送出去的地點：圖上那根釘子就是答案，不另外存一份 state。
+   * 要送出去的地點：圖上那根釘子就是位置，不另外存一份 state。
    *
-   * 原本中間卡了一顆「使用這個位置」要按，釘好了卻發現「套用地點」還是灰的，
-   * 而灰掉的按鈕按下去就是完全沒反應 —— 沒人看得出自己少按了哪一步。
-   * 釘子本身就是選擇，不需要再確認一次。
+   * ⚠️ **座標與名稱兩個都要有**才算數。以前沒取名字就拿座標當名字頂上，
+   *    於是相簿裡會留下一串 `25.03396, 121.56447` 認不出是哪裡；而地點簿
+   *    （0023）是**照名字認人**的，沒有名字就存不進去給別本相簿選。
+   *    後端 `/api/photos/geo/batch` 也擋著，那一道才是真的關。
+   * ⚠️ 缺什麼一定要**寫在按鈕旁邊**（見底下的 blockReason）——
+   *    灰掉的按鈕按下去完全沒反應，沒人看得出自己少做了哪一步。
+   *    這支元件以前就踩過一次（那顆多餘的「使用這個位置」）。
    */
+  const trimmedName = pinName.trim();
   const place = useMemo<PlaceHit | null>(() => {
-    if (!pin) return null;
-    // 沒取名字就用座標當名字，總比留白好認
-    const name = pinName.trim() || `${pin.lat.toFixed(5)}, ${pin.lng.toFixed(5)}`;
-    return { name, lat: pin.lat, lng: pin.lng };
-  }, [pin, pinName]);
+    if (!pin || !trimmedName) return null;
+    return { name: trimmedName, lat: pin.lat, lng: pin.lng };
+  }, [pin, trimmedName]);
+
+  /** 還差什麼才套得下去。null＝可以套了 */
+  const blockReason = !pin
+    ? '還沒選位置 —— 在地圖上點一下、或貼上座標'
+    : !trimmedName
+      ? '還沒填打卡地點名稱'
+      : null;
 
   /** 搜尋框裡打的是座標而不是地名時，就是這個值 */
   const typedCoords = useMemo(() => parseLatLng(query), [query]);
+
+  /**
+   * 地點簿裡符合目前輸入的那幾筆。**跟地名搜尋共用同一個輸入框**，
+   * 不另外做一個過濾框 —— 使用者要做的事是同一件：找出那個地點。
+   *
+   * 貼座標的時候整段不列：那是「我就是要這一點」，翻舊地點只是雜訊。
+   * 純記憶體過濾，不打任何一次 API（清單開視窗時就整份拿回來了）。
+   */
+  const placeHits = useMemo(() => {
+    if (typedCoords) return [];
+    const q = query.trim().toLowerCase();
+    if (q) return places.filter((pl) => pl.name.toLowerCase().includes(q)).slice(0, 8);
+    return showAllPlaces ? places : places.slice(0, 6);
+  }, [places, query, typedCoords, showAllPlaces]);
+
+  /** 選一個存過的地點：座標與名字一起帶進來，就是一步到位 */
+  const usePlace = useCallback((pl: SavedPlace) => {
+    setHits([]);
+    setPin({ lat: pl.lat, lng: pl.lng });
+    setPinName(pl.name);
+    // 這是使用者自己挑的名字，不讓反查蓋掉
+    nameTouchedRef.current = true;
+  }, []);
+
+  /**
+   * 從地點簿移除。清單是每套用一次就自己長一列的，打錯字的那筆得有人收得掉。
+   * ⚠️ 話要講清楚：刪的只是捷徑，已經標好的照片完全不受影響。
+   */
+  const removePlace = useCallback(async (pl: SavedPlace) => {
+    const yes = window.confirm(
+      `把「${pl.name}」從地點簿移除？\n\n只是收掉這個捷徑，已經標好的照片座標與地名都不會動。`
+    );
+    if (!yes) return;
+    if (await deletePlace(pl.id)) {
+      setPlaces((cur) => cur.filter((x) => x.id !== pl.id));
+    } else {
+      window.alert('移除失敗，請稍後再試');
+    }
+  }, []);
 
   // 地名搜尋做防抖，避免每打一個字就打一次外部 API
   useEffect(() => {
@@ -240,6 +303,76 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
             </p>
           )}
 
+          {/*
+            * 地點簿排在 OSM 搜尋結果**前面**：自己標過的名字（「阿婆麵店」）
+            * 比 OSM 收錄的東西貼近使用者要找的，而且選下去座標與名字一起帶進來。
+            */}
+          {places.length > 0 && !typedCoords && (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 12.5, color: '#64748b', margin: '4px 0 6px' }}>
+                用過的地點{query.trim() ? '' : `（共 ${places.length} 個）`}
+              </div>
+
+              {placeHits.length === 0 ? (
+                <p style={{ fontSize: 13, color: '#94a3b8', margin: '0 0 4px' }}>
+                  地點簿裡沒有符合的，往下看搜尋結果或自己在地圖上點。
+                </p>
+              ) : (
+                <div style={{ border: '1px solid #e2e8f0', borderRadius: 8, overflow: 'hidden' }}>
+                  {placeHits.map((pl, i) => (
+                    /*
+                      * ⚠️ 一列是 div 包兩顆 button —— button 裡面不能再放 button。
+                      *    一列有兩個各自獨立的目標：選它，或把它從地點簿收掉。
+                      */
+                    <div
+                      key={pl.id}
+                      style={{
+                        display: 'flex', alignItems: 'center', background: '#fff',
+                        borderTop: i === 0 ? 'none' : '1px solid #f1f5f9',
+                      }}
+                    >
+                      <button
+                        onClick={() => usePlace(pl)}
+                        style={{
+                          flex: '1 1 auto', minWidth: 0, textAlign: 'left', padding: '9px 12px',
+                          border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 13.5,
+                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {pl.name}
+                        <span style={{ color: '#94a3b8', fontSize: 12 }}>
+                          {'  '}{pl.lat.toFixed(4)}, {pl.lng.toFixed(4)}
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => removePlace(pl)}
+                        title="從地點簿移除（不會動到已經標好的照片）"
+                        style={{
+                          flex: 'none', border: 'none', background: 'transparent',
+                          color: '#94a3b8', cursor: 'pointer', fontSize: 15, padding: '9px 12px',
+                        }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {!query.trim() && !showAllPlaces && places.length > placeHits.length && (
+                <button
+                  onClick={() => setShowAllPlaces(true)}
+                  style={{
+                    marginTop: 6, border: 'none', background: 'transparent', padding: 0,
+                    color: '#2563eb', cursor: 'pointer', fontSize: 13,
+                  }}
+                >
+                  顯示全部 {places.length} 個
+                </button>
+              )}
+            </div>
+          )}
+
           {hits.length > 0 && (
             <div style={{ border: '1px solid #e2e8f0', borderRadius: 8, marginBottom: 12, overflow: 'hidden' }}>
               {hits.map((h, i) => (
@@ -286,6 +419,10 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
 
             <label style={{ display: 'block', fontSize: 13.5, fontWeight: 600, margin: '12px 0 6px' }}>
               打卡地點名稱
+              <span style={{ color: '#b91c1c', marginLeft: 4 }}>*</span>
+              <span style={{ fontWeight: 400, color: '#64748b', marginLeft: 6, fontSize: 12.5 }}>
+                套用之後會存進地點簿，其他相簿的照片就選得到
+              </span>
             </label>
             <input
               value={pinName}
@@ -297,13 +434,9 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
               }}
             />
 
-            <div style={{ fontSize: 12.5, marginTop: 10, color: pin ? '#64748b' : '#b45309' }}>
-              {!pin
-                ? '尚未選定位置 —— 在地圖上點一下、或貼上座標'
-                // 沒取名字時 place.name 本來就是座標，印兩次很蠢
-                : pinName.trim()
-                  ? `已選：${pinName.trim()}（${pin.lat.toFixed(5)}, ${pin.lng.toFixed(5)}）`
-                  : `已選：${pin.lat.toFixed(5)}, ${pin.lng.toFixed(5)}`}
+            {/* 座標與名稱兩格都齊了才是「已選」，缺哪一格就直說缺哪一格 */}
+            <div style={{ fontSize: 12.5, marginTop: 10, color: blockReason ? '#b45309' : '#64748b' }}>
+              {blockReason ?? `已選：${trimmedName}（${pin!.lat.toFixed(5)}, ${pin!.lng.toFixed(5)}）`}
             </div>
           </div>
 
@@ -354,6 +487,18 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
         </div>
 
         <div className={styles.foot}>
+          {/*
+            * 缺什麼要講在按鈕旁邊 —— 「套用地點」灰著的時候按下去完全沒反應，
+            * 使用者看不出自己少填了名稱還是少點了位置。
+            */}
+          {blockReason && (
+            <span style={{
+              marginRight: 'auto', alignSelf: 'center', fontSize: 13,
+              color: '#b45309', lineHeight: 1.4,
+            }}>
+              {blockReason}
+            </span>
+          )}
           <button
             onClick={onClose}
             style={{

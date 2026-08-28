@@ -4330,6 +4330,29 @@ if (method === "POST" && pathname === "/api/verify-password") {
       }
 
       /*
+       * 路由：地點簿 —— 「指定地點」用過的地點清單（0023）。
+       *
+       * 全站共用一份（使用者拍板），排序照「最近用過」走 idx_place_last_used。
+       * 表本身只有幾十到幾百列，一句 SELECT 就整份回去，前端自己在記憶體裡過濾
+       * —— 每打一個字打一次 API 對這個大小的清單完全是浪費。
+       *
+       * ⚠️ 訪客拿不到（`currentActor` 對訪客一律回 null）：這是一份「家人去過
+       *    哪些地方」的清單，跟軌跡同一個等級。
+       * ⚠️ 不包 `withEdgeCache` —— 內容每次套用地點都在變，而且只給成員看。
+       */
+      if (method === "GET" && pathname === "/api/places") {
+        const actor = await currentActor(request, env);
+        if (!actor) return forbidden(headers);
+        const { results } = await env.DB.prepare(
+          `SELECT id, name, lat, lng, use_count, last_used_at
+             FROM Place ORDER BY last_used_at DESC LIMIT 300`
+        ).all<any>();
+        return new Response(JSON.stringify({ places: results ?? [] }), {
+          headers: { ...headers, "Cache-Control": "no-store" },
+        });
+      }
+
+      /*
        * 以下路由需要驗證。
        *
        * 這裡只回答「是不是站上的管理員」；「動不動得了這一本／這一張」是另一回事，
@@ -6230,7 +6253,18 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         }
         if (!(await canTouchPhotos(ids))) return forbidden(headers);
 
-        const placeName = typeof body.placeName === 'string' ? body.placeName : null;
+        /*
+         * 打卡地點**名稱是必填**，座標與名字兩個都要有才套得下去。
+         *
+         * 以前沒名字就拿座標頂上（`25.03396, 121.56447`），於是相簿裡會留下一串
+         * 認不出是哪裡的數字；而 0023 的地點簿又是**照名字認人**的，沒有名字就
+         * 沒辦法存進去給別本相簿選。前端那顆「套用地點」也擋著，但**這一道才是
+         * 真的關** —— 直接打這支 API 繞得過前端。
+         */
+        const placeName = typeof body.placeName === 'string' ? body.placeName.trim() : '';
+        if (!placeName) {
+          return new Response(JSON.stringify({ error: "打卡地點名稱是必填的" }), { status: 400, headers });
+        }
         const overwriteExif = body.overwriteExif === true;
 
         // 這是使用者親手指定，權威最高，唯一預設不動的是照片自帶的 GPS。
@@ -6246,6 +6280,30 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         );
         const changed = updChunks.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
 
+        /*
+         * 把這個打卡地點記進地點簿（0023），讓**別本相簿**的照片直接選得到。
+         *
+         * ⚠️ 名字就是身分，衝突時**座標更新成這一次的**（使用者拍板：選了一個
+         *    地點會自動帶出座標與名字，但如果他這次把釘子移到別的位置再套用，
+         *    那個地點的座標就該跟著更新）。
+         * ⚠️ 不看 `changed` —— 全部因為自帶 GPS 而被跳過時，使用者一樣是親手挑了
+         *    這個地點，那份捷徑照樣該留下來。
+         * ⚠️ 包在 try 裡：地點簿是「下次比較好按」的加分項，它掛掉不該讓已經寫進去
+         *    的座標整支路由 500（那會變成照片改好了、畫面卻說失敗）。
+         */
+        try {
+          await env.DB.prepare(`
+            INSERT INTO Place (name, lat, lng) VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+              lat = excluded.lat,
+              lng = excluded.lng,
+              use_count = use_count + 1,
+              last_used_at = datetime('now')
+          `).bind(placeName, lat, lng).run();
+        } catch (e) {
+          console.error('save place failed', e);
+        }
+
         // 推導時間區段
         const selChunks = await env.DB.batch(
           chunkIds(ids).map((c) => env.DB.prepare(`
@@ -6259,7 +6317,8 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
 
         let segmentId: number | null = null;
         if (body.createSegment === true && startLocal && endLocal) {
-          const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : (placeName || '未命名地點');
+          // placeName 上面已經擋成必填，這裡不再需要「未命名地點」那個退路
+          const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : placeName;
           const tz = Number.isFinite(body.tzOffsetMinutes) ? body.tzOffsetMinutes : null;
           const albumId = Number.isFinite(body.albumId) ? body.albumId : null;
           const res = await env.DB.prepare(`
@@ -6277,6 +6336,22 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           endLocal,
           segmentId,
         }), { headers });
+      }
+
+      /*
+       * 路由：從地點簿刪掉一個地點。
+       *
+       * 刪的只是**捷徑** —— 照片自己的 lat／lng／place_name、以及已經建好的
+       * TripSegment 全部不動，所以這一支刻意不限站長：清單是每套用一次就自己
+       * 長一列的，打錯字的那一筆得有人收得掉，不然它會永遠掛在每個人的選單上。
+       */
+      if (method === "DELETE" && pathname.startsWith("/api/places/") && pathname.split("/").length === 4) {
+        const placeId = Number(pathname.split("/")[3]);
+        if (!Number.isFinite(placeId)) {
+          return new Response(JSON.stringify({ error: "Invalid id" }), { status: 400, headers });
+        }
+        await env.DB.prepare("DELETE FROM Place WHERE id = ?").bind(placeId).run();
+        return new Response(JSON.stringify({ success: true }), { headers });
       }
 
       // 路由：把行程段套用到還沒有座標的照片

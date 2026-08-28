@@ -2565,6 +2565,52 @@ export async function setAlbumMapPrivacy(albumId: number, mapPrivate: boolean): 
   }
 }
 
+/** 地點簿裡的一筆（0023 的 Place）。全站共用，名字就是身分 */
+export interface SavedPlace {
+  id: number;
+  name: string;
+  lat: number;
+  lng: number;
+  use_count: number;
+  last_used_at: string;
+}
+
+/**
+ * 「指定地點」用過的地點清單，讓別本相簿的照片直接選得到。
+ *
+ * 整份回來（最多 300 筆）在記憶體裡過濾 —— 表只有幾十到幾百列，
+ * 每打一個字打一次 API 對這個大小完全是浪費。
+ * 訪客拿不到（後端 403），失敗一律回空陣列：這是「下次比較好按」的加分項，
+ * 讀不到就當沒有，不該讓整個指定地點的視窗壞掉。
+ */
+export async function fetchPlaces(): Promise<SavedPlace[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/places`, { headers: getAuthHeaders() });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.places) ? data.places : [];
+  } catch (err) {
+    console.error(err);
+    return [];
+  }
+}
+
+/**
+ * 從地點簿刪掉一筆。刪的只是捷徑 —— 照片自己的座標與地名完全不動。
+ */
+export async function deletePlace(id: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/places/${id}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error(err);
+    return false;
+  }
+}
+
 /**
  * 搜尋地名（Photon，免費且免 API key）。回傳前幾筆候選讓使用者挑。
  *

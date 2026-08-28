@@ -263,12 +263,13 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0022）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0023）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
 現有表：`User`／`Album`／`Photo`／`PhotoFts`(FTS5, bigram)／`Tag`／`PhotoTag`／`Favorite`／
-`TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`／`Comment`／`CommentNotify`。
+`TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`／`Comment`／`CommentNotify`／
+`Place`（打卡地點簿，0023，見「指定地點」）。
 **沒有多餘的表**—— `ShareLink`（從沒實作的分享連結）與 `TrackSegment`（拿掉的逐段交通工具）
 已由 0012 刪除，`database/schema.sql` 裡那兩塊 `CREATE TABLE` 也一併移除了。
 
@@ -303,9 +304,10 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - `LOCAL_TIME_EXPR` = `COALESCE(p.taken_at_local, …)`，用到它的 SQL **必須把 Photo 別名為 `p`**。
 - `geo_source` 權威由高而低：`manual` > `exif` > `track` > `timeline` > `segment` > `interpolated`。
 - `TrackDay.day_key` 是**不透明字串**（多身分之後還帶使用者前綴），**不要拿去解析日期**。
-- `Comment`／`CommentNotify` 見「留言」一節。
+- `Comment`／`CommentNotify` 見「留言」一節；`Place` 見「指定地點」一節。
 - **DROP TABLE 要由子表往父表**：`CommentNotify→Comment→Favorite→PhotoTag→TripSegment→
-  Photo→Album→TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→User`。開著外鍵時照字母序刪
+  Photo→Album→TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→User`（`Place` 沒有外鍵，
+  排哪裡都行）。開著外鍵時照字母序刪
   會 FK failed，而且是**跑到一半才炸**（`d1 execute --file` 是單一交易，會整包回滾）。
 
 ## 身分與權限
@@ -571,6 +573,36 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   「搜尋照片 Story...」的時候沒有人會想到可以貼檔名進去，看起來就像沒有這個功能。
 - 典型用途：從 `/admin`「缺 Drive 備份的檔案」那份清單複製一個檔名，貼進來看是哪一張
   （更直接的路是那一列右邊的「看照片 ↗」，見「補傳清單」）。
+
+## 指定地點：座標＋名稱都要有，套用完存進地點簿
+
+寫入只有一條路：`AssignPlaceModal` → `POST /api/photos/geo/batch`。
+補地點視窗（`PlaceCheckinModal`）自己**不寫座標**，挑完照片一樣交回這一支
+——「多做一套 UI」的反面教材不要再犯。
+
+- ⚠️ **座標與名稱兩個都要有才套得下去**（2026-08-28）。以前沒取名字就拿座標
+  頂上（`25.03396, 121.56447`），相簿裡於是留下一串認不出是哪裡的數字；而地點簿
+  是**照名字認人**的，沒名字就存不進去。前端 `blockReason` 擋著並**把缺的那一格
+  寫在按鈕旁邊**（灰掉的按鈕按下去沒反應，這支元件為了同一個理由已經拆過一顆
+  多餘的「使用這個位置」），後端那道 400 才是真的關 —— 直接打 API 繞得過前端。
+- **地點簿 `Place`（0023）：套用完就把那個地點記下來，讓別本相簿的照片選得到。**
+  - **全站共用一份**（使用者拍板）。家族相簿裡同一個地點本來就會被不同人拍到。
+  - ⚠️ **名字就是身分**（`name` UNIQUE）。使用者拍板的規則：選一個存過的地點會
+    自動帶出它的座標與名字；**如果這次把釘子移到別的位置再套用，那個地點的座標
+    就更新成最新這一次** —— 所以 upsert 一律 `ON CONFLICT(name) DO UPDATE`。
+    同名的連鎖店（7-11）會被併成一筆，要分開得自己取「7-11 中華店」。
+  - ⚠️ 寫入**不看 `changed`**：整批都因為自帶 GPS 被跳過時，使用者一樣是親手挑了
+    這個地點，捷徑照樣該留下。而且**包在 try 裡** —— 地點簿是「下次比較好按」的
+    加分項，它掛掉不該讓已經寫進去的座標整支路由 500（照片改好了、畫面卻說失敗）。
+  - `GET /api/places` **整份回去**（上限 300 筆），前端在記憶體裡過濾，
+    **跟地名搜尋共用同一個輸入框**，不另外做過濾框也不逐字打 API。
+    訪客拿不到（`currentActor` 對訪客回 null）—— 那是「家人去過哪些地方」的清單。
+    **不包 `withEdgeCache`**，每套用一次就變。
+  - `DELETE /api/places/:id` **刻意不限站長**：清單每套用一次就自己長一列，
+    打錯字的那筆得有人收得掉。刪的只是**捷徑**，照片自己的
+    `lat`／`lng`／`place_name` 與已建好的 `TripSegment` 完全不動 —— 確認視窗要講出來。
+  - 清單排在 OSM 搜尋結果**前面**：自己標過的「阿婆麵店」比 OSM 收錄的貼近使用者
+    要找的東西。貼座標時整段不列（那是「我就是要這一點」）。
 
 ## 相簿格線：排序、右邊那條時間軸、重複的那幾張
 
