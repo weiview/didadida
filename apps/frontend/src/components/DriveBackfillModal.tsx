@@ -69,7 +69,8 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
     { ok: number; failed: number; error?: string; failures?: string[] } | null
   >(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [copied, setCopied] = useState(false);
+  // 剛剛複製了哪一列的檔名（給那一列一個短暫的「已複製 ✓」）
+  const [copiedId, setCopiedId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setPending(null);
@@ -142,21 +143,22 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
   }, [pending, files]);
 
   /**
-   * 把待補的檔名整份複製走。
+   * 複製**單一**檔名（點清單上那一列）。
    *
-   * 有清單還不夠 —— 幾十張的時候人要拿著它去硬碟裡一個一個找，用貼的比用看的快。
+   * 有清單還不夠 —— 人要拿著檔名去硬碟的搜尋框裡找那個檔，用貼的比照著打快。
+   * ⚠️ 刻意**不做「複製全部」** —— 一次貼幾十個檔名進搜尋框是找不到東西的，
+   *    實際的動作永遠是「找一個、選一個」，整份複製只會讓人再自己切一次。
    * 剪貼簿被擋掉（權限、非安全來源）就直接 prompt 攤開來讓人自己選取，
    * 不要只 console.error：那又是一次「按了沒反應」。
    */
-  const copyNames = async () => {
-    const text = (pending ?? []).map((p) => p.title || p.file_name).join('\n');
-    if (!text) return;
+  const copyName = async (id: number, name: string) => {
+    if (!name) return;
     try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
+      await navigator.clipboard.writeText(name);
+      setCopiedId(id);
+      setTimeout(() => setCopiedId((cur) => (cur === id ? null : cur)), 1600);
     } catch {
-      window.prompt('複製不了，請自己選取這段文字：', text);
+      window.prompt('複製不了，請自己選取這段文字：', name);
     }
   };
 
@@ -283,21 +285,9 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
 
           {pending !== null && pending.length > 0 && (
             <>
-              <div style={{
-                fontSize: 14, marginBottom: 8,
-                display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
-              }}>
-                <span>有 <strong>{pending.length}</strong> 個檔案還沒有完整的 Drive 備份：</span>
-                <button
-                  type="button"
-                  onClick={copyNames}
-                  style={{
-                    padding: '3px 10px', borderRadius: 6, border: '1px solid #cbd5e1',
-                    background: '#fff', color: '#334155', fontSize: 12.5, cursor: 'pointer',
-                  }}
-                >
-                  {copied ? '已複製 ✓' : '複製全部檔名'}
-                </button>
+              <div style={{ fontSize: 14, marginBottom: 8 }}>
+                有 <strong>{pending.length}</strong> 個檔案還沒有完整的 Drive 備份
+                <span style={{ color: '#64748b', fontSize: 12.5 }}>（點檔名複製那一個）</span>：
               </div>
 
               {/*
@@ -316,15 +306,26 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                   const name = p.title || p.file_name;
                   const isMatched = matchedIds.has(p.id);
                   const isDup = dupNames.has(baseKey(name));
+                  const justCopied = copiedId === p.id;
+                  /*
+                   * 整列就是那顆按鈕（不是旁邊再擺一顆小圖示）—— 檔名本身很長，
+                   * 已經佔滿一整列，要點的目標就是它。用 <button> 而不是 div
+                   * 是為了鍵盤也按得到。
+                   */
                   return (
-                    <div
+                    <button
                       key={p.id}
-                      title={name}
+                      type="button"
+                      title={`${name}（點一下複製檔名）`}
+                      onClick={() => copyName(p.id, name)}
                       style={{
-                        display: 'flex', alignItems: 'center', gap: 8,
+                        display: 'flex', alignItems: 'center', gap: 8, width: '100%',
                         padding: '5px 10px', fontSize: 12.5, lineHeight: 1.5,
-                        borderBottom: '1px solid #eef2f7',
+                        borderBottom: '1px solid #eef2f7', textAlign: 'left',
+                        borderTop: 'none', borderLeft: 'none', borderRight: 'none',
+                        background: justCopied ? '#ecfdf5' : 'transparent',
                         color: isMatched ? '#15803d' : '#334155',
+                        cursor: 'pointer', font: 'inherit',
                       }}
                     >
                       <span style={{ width: 14, flexShrink: 0 }}>{isMatched ? '✓' : ''}</span>
@@ -334,17 +335,23 @@ export default function DriveBackfillModal({ isOpen, albumId, onClose, onDone }:
                       }}>
                         {name}
                       </span>
-                      {missingLabel(p) && (
-                        <span style={{
-                          color: isVideoRow(p) ? '#7c3aed' : '#64748b', flexShrink: 0, fontSize: 11.5,
-                        }}>
-                          {missingLabel(p)}
-                        </span>
+                      {justCopied ? (
+                        <span style={{ color: '#15803d', flexShrink: 0, fontSize: 11.5 }}>已複製 ✓</span>
+                      ) : (
+                        <>
+                          {missingLabel(p) && (
+                            <span style={{
+                              color: isVideoRow(p) ? '#7c3aed' : '#64748b', flexShrink: 0, fontSize: 11.5,
+                            }}>
+                              {missingLabel(p)}
+                            </span>
+                          )}
+                          {isDup && (
+                            <span style={{ color: '#92400e', flexShrink: 0 }}>同名多張</span>
+                          )}
+                        </>
                       )}
-                      {isDup && (
-                        <span style={{ color: '#92400e', flexShrink: 0 }}>同名多張</span>
-                      )}
-                    </div>
+                    </button>
                   );
                 })}
               </div>

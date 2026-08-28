@@ -803,6 +803,11 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
 —— 正解是分開判斷，不是整類丟掉）；② **照片只看 4K** ——「4K 上去了、原始檔失敗」
 那些一輩子看不到。列表與 COUNT **共用同一個字串**，不然「剩幾張」永遠歸不了零。
 
+⚠️ 清單上**點一列就複製那一個檔名**（`copyName`），刻意**沒有「複製全部」** ——
+實際的動作永遠是「拿一個檔名去硬碟的搜尋框找一個檔」，整份貼進搜尋框找不到東西。
+剪貼簿被擋掉（權限、非安全來源）要 `window.prompt` 把字攤開來讓人自己選，
+只 console.error 又是一次「按了沒反應」。
+
 前端 `DriveBackfillModal` 因此要吃 `media_type`／`has_4k`／`has_original`：
 影片走 `pushVideoToDrive`（**絕不能走 `pushPhotoToDrive`**），照片**只補缺的那一半**
 （已經上去的再傳一次，Drive 不會去重，只是多一個同名檔＋白編一次 4K）。
