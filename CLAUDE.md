@@ -276,7 +276,8 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 - `Photo.taken_at`（UTC 瞬間）／`taken_at_local`（牆上時間）／`tz_offset_minutes`，
   不變量是 **`taken_at = taken_at_local − tz`**。
-- 批次改時間有**三支**，前端共用同一個 `FixTimeModal`（三個分頁）：
+- 批次改時間有**三支**，前端共用同一個 `FixTimeModal`（三個分頁；燈箱那個入口
+  用 `initialMode="set"` ＋ `lockMode` 只端出「指定時間」那一頁）：
   `POST /api/photos/geo/shift-time`（平移：兩欄一起加減，tz 不動）、
   `POST /api/photos/geo/set-timezone`（改時區：瞬間不動，重算牆上時間）、
   `POST /api/photos/geo/set-time`（**指定**：牆上時間與時區都由使用者給）。
@@ -284,10 +285,18 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   影片（封面圖是 canvas 畫的，不帶 EXIF）、掃描的老照片本來就是 NULL，
   **只有第三支補得了**，那也是它存在的唯一理由。三支一律寫 `time_source = manual`。
   換算共用 `parseExifDateTime`／`formatWallClock`／`utcFromLocal`，**不要在路由裡自己拼字串**
-  —— 不變式只能有一個實作。`parseExifDateTime` **硬性要求秒數**，所以前端 `datetime-local`
-  沒填秒數時要自己補 `:00`，否則被當成無效字串退 400。
+  —— 不變式只能有一個實作。`parseExifDateTime` **硬性要求秒數**。
+  「指定時間」那一頁是**年／月／日／時／分／秒六個 select ＋ 時區 select**，
+  不是 `<input type="datetime-local">`：秒數在 datetime-local 上要靠 `step` 才出得來、
+  各家瀏覽器長得還不一樣，而掃描的老照片要調到 1970 年代時日曆一頁一頁翻不完。
+  換月換年之後**日要夾回該月最後一天**（1/31 → 2 月），不然送出去的是一個不存在的日期。
+  時區清單跟「改時區」那一頁**共用 `TZ_OPTIONS`**，兩邊顯示格式因此完全一致。
   前端會拿原始檔名（`VID_20260824_143000.mp4`）猜一個**預填值**，⚠️ **`PXL_` 開頭刻意不猜** ——
   Pixel 那串數字是 **UTC**，當牆上時間填進去會整整差一個時區，而且錯得很安靜。
+  ⚠️⚠️ **那兩個正規表示式的 `\d` 曾經整批掉成 `d`**（`(d{4})`、`/^d{4}-d{2}-…/`），
+  於是 `canSubmit` 永遠是 false、「指定時間」的**套用鈕從上線那天起就一直是灰的** ——
+  功能看起來像「不見了」。改這一檔如果經過任何會處理跳脫字元的腳本，
+  **改完一定要 grep 一次 `[^\\]d{`**。
 - `Photo` 除了基本欄位還有：`drive_file_id`／`drive_original_id`（Drive 上的 4K 與原始檔）、
   `thumb_url`／`thumb_sm_url`（R2 的 800／400 WebP）、`uploaded_by`（誰傳的，見「身分與權限」）、
   `file_hash`／`phash`（去重）、`shuffle_key`（隨機排序用的固定亂數）。
@@ -576,9 +585,17 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - 燈箱裡拖時間軸時，`VideoPlayer` 的外框**擋掉 touch 事件冒泡**，不然手機上會被
   燈箱當成「滑到下一張」。
 - **訪客看不到影片**這件事目前沒有另外的開關 —— 整站進站閘門本來就擋著。
+- ⚠️ **燈箱不端影片的 EXIF**：封面圖是瀏覽器 canvas 畫出來的，相機／鏡頭／光圈
+  那一整格必定是空的，連那顆開關都不出現。**但「拍攝時間」那一格要留著** ——
+  影片正是最需要它的那一類。
 - **影片的拍攝時間是 NULL，要由使用者自己指定**（封面圖是 canvas 畫的，沒有 EXIF）：
-  相簿裡選起來 →「拍攝時間」→「指定時間」分頁，走 `POST /api/photos/geo/set-time`
-  （見「資料模型」那三支）。⚠️ 平移與改時區那兩支**對影片沒有作用**（`taken_at IS NOT NULL`）。
+  燈箱右欄「拍攝時間」那顆按鈕（沒有時間時寫「指定時間」，有的話寫「修改」，
+  只給改得動這張的人），或相簿裡選起來 →「拍攝時間」→「指定時間」分頁，
+  都走 `POST /api/photos/geo/set-time`（見「資料模型」那三支）。
+  ⚠️ 燈箱那個入口開著的時候**左右鍵、Esc、滾輪要整組讓開** —— 視窗裡全是
+  `<select>`，而 select 不是 INPUT／TEXTAREA，燈箱既有那道「在輸入框裡不換照片」
+  的防護攔不住它：在年份選單上按左右鍵會一邊改年份一邊把燈箱換到下一張。
+  ⚠️ 平移與改時區那兩支**對影片沒有作用**（`taken_at IS NOT NULL`）。
   沒給時間的影片在相簿格線不受影響（那支照 `sort_order`），但**會沉到搜尋結果最底**
   （`ORDER BY p.taken_at DESC`，NULL 在 DESC 排最後）。
 - 轉檔／第二種畫質（P4）**使用者明確延後**，先看實際讀取速度再決定。
@@ -832,7 +849,14 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
     ⚠️ **首頁相簿封面是 CSS 背景圖，不要改成 `<img>` 套 PhotoImage** ——
     背景圖＋延後掛載（`mountedCount`）省掉的是「相簿數 × 預覽張數」次 Workers 請求。
     那裡用離線 `new Image()` 探載入狀態，配 `PhotoSpinner`。
-12. **上傳的收尾一定要寫在 `finally` 裡**（`handleFileChange`／Google 匯入那條都是）。
+12. **燈箱的 EXIF 開關是「站台層級的偏好」，不是那一張照片的 state**
+    （`lib/exifPref.ts`，module 層 store ＋ `useSyncExternalStore` ＋ localStorage）。
+    以前是 `useState(false)`：換一張就收回去、關掉燈箱再開也收回去，想一路看
+    相機參數得一張按一次，看起來像開關壞了。使用者要的是「打開之後整本相簿都是
+    展開的」。⚠️ 它跟 `restrictedReveal` 的取捨**刻意相反** —— 那個是遮眼睛用的
+    所以只活在記憶體裡，這個是顯示偏好，重整後回到收起來只會讓人再按一次。
+    刻意**不進 D1**：多一欄就是每次 `/api/auth/me` 多讀一列，而這件事不需要跨裝置。
+13. **上傳的收尾一定要寫在 `finally` 裡**（`handleFileChange`／Google 匯入那條都是）。
     漏掉的話一個沒預料到的錯誤會同時做兩件事：`uploading`／`syncingGoogle` 永遠停在 true
     （FAB 從此只剩一行「上傳中...」），而且 `<input type="file">` 的 `value` 沒清掉 ——
     **再選同一批檔案瀏覽器不認為值變了，`change` 事件根本不會來**。使用者眼中就是

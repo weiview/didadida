@@ -3,9 +3,11 @@ import styles from "./lightbox.module.css";
 import PhotoComments from "./PhotoComments";
 import PhotoImage from "@/components/PhotoImage";
 import VideoPlayer from "@/components/VideoPlayer";
+import FixTimeModal from "@/components/FixTimeModal";
 import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, isVideo, setPhotosRestricted } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
+import { setExifExpanded, useExifExpanded } from "@/lib/exifPref";
 import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
 
@@ -39,7 +41,13 @@ interface PhotoLightboxProps {
 }
 
 export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, onUpdate, onToggleRestricted, onPrev, onNext, hasPrev, hasNext }: PhotoLightboxProps) {
-  const [showExif, setShowExif] = useState(false);
+  /*
+   * EXIF 面板的開合是**站台層級的偏好**，不是這一張照片的狀態（見 lib/exifPref）。
+   * 以前是 useState(false)：每換一張就收回去，想一路看相機參數得一張按一次。
+   */
+  const showExif = useExifExpanded();
+  // 「拍攝時間」那顆按鈕開的視窗。用的是相簿頁那支 FixTimeModal，只是鎖在「指定時間」
+  const [showFixTime, setShowFixTime] = useState(false);
   
   const [descValue, setDescValue] = useState(photo.description || "");
   const [isSavingDesc, setIsSavingDesc] = useState(false);
@@ -127,6 +135,13 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
      * 打錯字想按左鍵回去改，結果整張照片換掉、打到一半的留言也沒了。
      */
     const guarded = (e: KeyboardEvent) => {
+      /*
+       * ⚠️ 「指定時間」的視窗開著的時候，整組快捷鍵要讓開。那個視窗裡全是
+       *    <select>，而 select 不是 INPUT／TEXTAREA —— 下面那道防護攔不住它：
+       *    在年份選單上按左右鍵會一邊改年份、一邊把燈箱換到下一張照片。
+       *    Esc 也一樣，該收掉的是視窗不是整個燈箱。
+       */
+      if (showFixTime) return;
       const el = e.target as HTMLElement | null;
       const tag = el?.tagName;
       if (tag === "TEXTAREA" || tag === "INPUT" || el?.isContentEditable) {
@@ -143,10 +158,12 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
       document.body.style.overflow = originalStyle;
       window.removeEventListener("keydown", guarded);
     };
-  }, [hasPrev, hasNext, onPrev, onNext, onClose]);
+  }, [hasPrev, hasNext, onPrev, onNext, onClose, showFixTime]);
 
   // 支援滑鼠滾輪切換照片 (滾輪往下: 下一張; 滾輪往上: 上一張)
   const handleWheel = (e: React.WheelEvent) => {
+    // 「指定時間」的視窗開著時不換照片（同鍵盤那邊的理由）
+    if (showFixTime) return;
     // 若在編輯框或輸入框內滾動則不觸發切換
     if ((e.target as HTMLElement).tagName === 'TEXTAREA' || (e.target as HTMLElement).tagName === 'INPUT') {
       return;
@@ -467,26 +484,49 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
 
           {/* 「不開放」的開關在照片左上角（見 imageContainer 裡那顆），不在這一欄 */}
 
+          {/*
+            * 拍攝時間**搬出 EXIF 面板**，理由有兩個：
+            *   ① 影片根本沒有 EXIF（封面圖是 canvas 畫的），偏偏它最需要這一格 ——
+            *      沒有拍攝時間的東西在相簿裡永遠浮在最前面，要人指定才排得進去；
+            *   ② 相機參數是收得起來的閒聊，拍攝時間是排序依據，不是同一個層級。
+            * 「時間來源」留在面板裡，那個是診斷用的。
+            */}
+          <div className={styles.section}>
+            <div className={styles.sectionHeader}>
+              <h3>拍攝時間</h3>
+              {isAdmin && (
+                <button className={styles.btn} onClick={() => setShowFixTime(true)}>
+                  {displayDate ? '修改' : '指定時間'}
+                </button>
+              )}
+            </div>
+            <span className={styles.exifValue}>
+              {displayDate
+                || (isVideo(photo)
+                    ? '未指定 —— 影片沒有 EXIF，要自己指定才排得進相簿的時間順序'
+                    : '未知')}
+            </span>
+          </div>
+
+          {/*
+            * ⚠️ 影片**整塊不端 EXIF**：封面圖是瀏覽器 canvas 畫出來的，
+            *    裡面不會有相機、鏡頭、光圈這些東西，端出來就是一排「—」。
+            */}
+          {!isVideo(photo) && (
           <div className={styles.exifToggleRow}>
             <div className={styles.switchWrapper}>
               <span>顯示照片資訊 (EXIF)</span>
               <label className={styles.switch}>
-                <input type="checkbox" checked={showExif} onChange={(e) => setShowExif(e.target.checked)} />
+                <input type="checkbox" checked={showExif} onChange={(e) => setExifExpanded(e.target.checked)} />
                 <span className={styles.slider}></span>
               </label>
             </div>
           </div>
+          )}
 
-          {showExif && (
+          {!isVideo(photo) && showExif && (
             <div className={styles.exifContainer}>
               <div className={styles.exifGrid}>
-                {/* 拍攝時間整合至 EXIF 區域首位。要改時間請在相簿頁選取照片後用「修正時間」，
-                    那裡才會一起維護牆上時間與時區的對應關係 */}
-                <div className={styles.exifItem}>
-                  <span className={styles.exifLabel}>拍攝時間</span>
-                  <span className={styles.exifValue}>{displayDate || "未知"}</span>
-                </div>
-
                 {/* 時間來源決定這張照片的時間可不可信 —— assumed 的照片不該拿去比對 GPS 軌跡 */}
                 <div className={styles.exifItem}>
                   <span className={styles.exifLabel}>時間來源</span>
@@ -503,7 +543,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                     </div>
                   ))
                 ) : (
-                  !displayDate && <div className={styles.exifItem}><span className={styles.exifValue} style={{ color: '#888' }}>此照片無其他 EXIF 參數</span></div>
+                  <div className={styles.exifItem}><span className={styles.exifValue} style={{ color: '#888' }}>此照片無其他 EXIF 參數</span></div>
                 )}
               </div>
             </div>
@@ -518,6 +558,25 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
         <div className={styles.commentsPane}>
           <PhotoComments photoId={photo.id} />
         </div>
+
+        {/*
+          * 指定／修改這一張的拍攝時間。用的就是相簿頁那支 FixTimeModal（鎖在
+          * 「指定時間」那個模式），不另外做一套 —— 換算牆上時間與時區的規則
+          * 只能有一份實作。
+          * ⚠️ 它擺在 styles.content 裡面，那一層有 stopPropagation，
+          *    所以在視窗裡點來點去不會把燈箱一起關掉。
+          */}
+        <FixTimeModal
+          isOpen={showFixTime}
+          photoIds={[photo.id]}
+          titles={[photo.title || '']}
+          initialMode="set"
+          lockMode
+          initialWall={wallClock}
+          initialTz={photo.tz_offset_minutes}
+          onClose={() => setShowFixTime(false)}
+          onDone={() => onUpdate()}
+        />
       </div>
     </div>
   );

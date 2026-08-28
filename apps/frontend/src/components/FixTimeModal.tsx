@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { shiftPhotoTime, setPhotoTimezone, setPhotoTime } from '@/lib/api';
-import { TZ_OPTIONS, tzOptionLabel } from '@/lib/tz';
+import { TZ_OPTIONS, tzOptionLabel, tzOptionsIncluding } from '@/lib/tz';
 
 interface Props {
   isOpen: boolean;
@@ -12,6 +12,24 @@ interface Props {
    * 選填 —— 沒給就只是少了預填，功能照樣完整。
    */
   titles?: string[];
+  /**
+   * 打開時停在哪個分頁。燈箱那個入口直接進 'set'（那裡就是為了補時間才點的）。
+   */
+  initialMode?: Mode;
+  /**
+   * 只給一個分頁，把上面那排分頁鈕整個收起來。
+   * ⚠️ 這是**介面上的收斂，不是另做一套** —— 三種操作的語意與 API 都沒有變，
+   *    燈箱只是不需要「平移／改時區」那兩個批次操作的入口。
+   */
+  lockMode?: boolean;
+  /**
+   * 「指定時間」的預填牆上時間，'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DDTHH:MM:SS'。
+   * 從燈箱編輯既有時間時給它，不然使用者要從今天的日期一路調回去。
+   * 它的優先序**高於檔名猜出來的值** —— 資料庫裡已經有的東西比猜的可信。
+   */
+  initialWall?: string | null;
+  /** 預填時區（`Photo.tz_offset_minutes`）。沒給就用台灣 */
+  initialTz?: number | null;
   onClose: () => void;
   onDone: (result: { updated: number; skippedNoTime: number; what: string }) => void;
 }
@@ -35,7 +53,7 @@ type Mode = 'shift' | 'timezone' | 'set';
 function guessWallClockFromName(name: string | undefined): string | 'utc' | null {
   if (!name) return null;
   if (/^PXL_/i.test(name)) return 'utc';
-  const m = name.match(/(?:^|[^0-9])(d{4})(d{2})(d{2})[_-]?(d{2})(d{2})(d{2})(?![0-9])/);
+  const m = name.match(/(?:^|[^0-9])(\d{4})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{2})(?![0-9])/);
   if (!m) return null;
   const [, y, mo, d, h, mi, s] = m;
   const yy = Number(y);
@@ -45,46 +63,90 @@ function guessWallClockFromName(name: string | undefined): string | 'utc' | null
   return `${y}-${mo}-${d}T${h}:${mi}:${s}`;
 }
 
-/**
- * datetime-local 的值（'YYYY-MM-DDTHH:MM' 或 '…:SS'）→ 後端要的
- * 'YYYY-MM-DD HH:MM:SS'。沒填秒數時補 :00 —— 後端的 parseExifDateTime
- * 硬性要求秒數，少了會被當成無效字串退回 400。
- */
-function toWallClockString(v: string): string {
-  const [date, time = ''] = v.split('T');
-  const parts = time.split(':');
-  while (parts.length < 3) parts.push('00');
-  return `${date} ${parts.slice(0, 3).map((n) => n.padStart(2, '0')).join(':')}`;
+/** 拍攝時間的六個欄位。年月日時分秒都是數字，時區另外一個 select */
+interface WallParts { y: number; mo: number; d: number; h: number; mi: number; s: number }
+
+const pad2 = (n: number) => String(n).padStart(2, '0');
+
+/** 那個月有幾天。閏年交給 Date 自己算（第 0 天＝上個月最後一天） */
+function daysInMonth(y: number, mo: number): number {
+  return new Date(y, mo, 0).getDate();
 }
 
-export default function FixTimeModal({ isOpen, photoIds, titles, onClose, onDone }: Props) {
-  const [mode, setMode] = useState<Mode>('shift');
+/**
+ * 'YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DDTHH:MM:SS' → 六個數字。
+ * 解不出來回 null，呼叫端自己決定退到哪個預設值。
+ */
+function parseWallParts(v: string | null | undefined): WallParts | null {
+  if (!v) return null;
+  const m = v.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  return {
+    y: Number(m[1]), mo: Number(m[2]), d: Number(m[3]),
+    h: Number(m[4]), mi: Number(m[5]), s: Number(m[6] ?? 0),
+  };
+}
+
+/** 六個數字 → 後端要的 'YYYY-MM-DD HH:MM:SS'（`parseExifDateTime` 硬性要求秒數） */
+function toWallClockString(p: WallParts): string {
+  return `${p.y}-${pad2(p.mo)}-${pad2(p.d)} ${pad2(p.h)}:${pad2(p.mi)}:${pad2(p.s)}`;
+}
+
+/** 沒有任何線索時的預設值：今天，00:00:00 */
+function todayParts(): WallParts {
+  const now = new Date();
+  return { y: now.getFullYear(), mo: now.getMonth() + 1, d: now.getDate(), h: 0, mi: 0, s: 0 };
+}
+
+const range = (from: number, to: number) => {
+  const out: number[] = [];
+  for (let i = from; i <= to; i++) out.push(i);
+  return out;
+};
+
+export default function FixTimeModal({
+  isOpen, photoIds, titles, initialMode, lockMode, initialWall, initialTz, onClose, onDone,
+}: Props) {
+  const [mode, setMode] = useState<Mode>(initialMode ?? 'shift');
   const [hours, setHours] = useState(0);
   const [minutes, setMinutes] = useState(0);
   const [tz, setTz] = useState(480);
-  // datetime-local 的值：'YYYY-MM-DDTHH:MM:SS'
-  const [wall, setWall] = useState('');
+  // 「指定時間」那六個欄位。一律是完整的值，不會有「還沒選」的狀態
+  const [wall, setWall] = useState<WallParts>(todayParts);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // 檔名猜出來的預填值。開著的時候算一次就好，選取內容不會中途改變
   const guess = isOpen ? guessWallClockFromName(titles?.[0]) : null;
   const guessed = guess === 'utc' ? null : guess;
+  // 資料庫裡已經有的時間比猜的可信，兩個都沒有才退到今天
+  const seeded = parseWallParts(initialWall) ?? parseWallParts(guessed);
 
   useEffect(() => {
     if (!isOpen) return;
-    setMode('shift');
+    setMode(initialMode ?? 'shift');
     setHours(0); setMinutes(0);
-    setTz(480);
-    setWall(guessed ?? '');
+    setTz(initialTz ?? 480);
+    setWall(seeded ?? todayParts());
     setError(null);
-    // guessed 由 titles 算出來，開啟當下就定了，不需要進相依陣列
+    // seeded／guessed 由 props 算出來，開啟當下就定了，不需要進相依陣列
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
   if (!isOpen) return null;
 
   const totalMinutes = hours * 60 + minutes;
+
+  // 換年或換月之後，原本選的日可能不存在了（1/31 → 2 月）。夾回該月最後一天，
+  // 不然送出去的是一個不存在的日期，而且畫面上看不出哪裡不對
+  const setWallPart = (patch: Partial<WallParts>) => {
+    setWall((prev) => {
+      const next = { ...prev, ...patch };
+      const max = daysInMonth(next.y, next.mo);
+      if (next.d > max) next.d = max;
+      return next;
+    });
+  };
 
   const handleSubmit = async () => {
     setSubmitting(true);
@@ -94,7 +156,6 @@ export default function FixTimeModal({ isOpen, photoIds, titles, onClose, onDone
       ? await shiftPhotoTime(photoIds, totalMinutes)
       : mode === 'timezone'
         ? await setPhotoTimezone(photoIds, tz)
-        // 後端要的是 YYYY-MM-DD HH:MM:SS；datetime-local 沒填秒數時要自己補
         : await setPhotoTime(photoIds, toWallClockString(wall), tz);
 
     setSubmitting(false);
@@ -110,11 +171,8 @@ export default function FixTimeModal({ isOpen, photoIds, titles, onClose, onDone
     onClose();
   };
 
-  const canSubmit = mode === 'shift'
-    ? totalMinutes !== 0
-    : mode === 'set'
-      ? /^d{4}-d{2}-d{2}Td{2}:d{2}/.test(wall)
-      : true;
+  // 「指定時間」的六個欄位永遠是有效值（選單選的），所以只有平移那個模式要擋
+  const canSubmit = mode === 'shift' ? totalMinutes !== 0 : true;
 
   const tabStyle = (active: boolean) => ({
     flex: 1,
@@ -133,11 +191,34 @@ export default function FixTimeModal({ isOpen, photoIds, titles, onClose, onDone
     border: '1px solid #cbd5e1', fontSize: 14,
   } as const;
 
+  const selectStyle = {
+    padding: '8px 10px', borderRadius: 8, border: '1px solid #cbd5e1',
+    fontSize: 14, background: '#fff', color: '#0f172a',
+  } as const;
+
+  /** 年月日時分秒共用的一格：標題 + 選單 */
+  const partSelect = (
+    label: string, value: number, values: number[],
+    onPick: (n: number) => void, fmt: (n: number) => string = String,
+  ) => (
+    <label style={{ fontSize: 12.5, color: '#475569' }}>
+      <div style={{ marginBottom: 4 }}>{label}</div>
+      <select value={value} onChange={(e) => onPick(Number(e.target.value))} style={selectStyle}>
+        {values.map((n) => <option key={n} value={n}>{fmt(n)}</option>)}
+      </select>
+    </label>
+  );
+
+  // 年份範圍：掃描的老照片可能是 1900 年代，上限給到明年（相機時鐘設錯會跑到未來）
+  const thisYear = new Date().getFullYear();
+  const years = range(1900, thisYear + 1).reverse();
+
   return (
     <div
       onClick={onClose}
       style={{
-        position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 1000,
+        // ⚠️ 要蓋得住燈箱（lightbox.module.css 最高 3250），從燈箱點「修改」開的
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 4000,
         display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
       }}
     >
@@ -153,19 +234,21 @@ export default function FixTimeModal({ isOpen, photoIds, titles, onClose, onDone
           已選取 {photoIds.length} 張
         </p>
 
-        <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
-          <button onClick={() => setMode('shift')} style={tabStyle(mode === 'shift')}>
-            平移時間
-          </button>
-          <button onClick={() => setMode('timezone')} style={tabStyle(mode === 'timezone')}>
-            改時區
-          </button>
-          <button onClick={() => setMode('set')} style={tabStyle(mode === 'set')}>
-            指定時間
-          </button>
-        </div>
+        {!lockMode && (
+          <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+            <button onClick={() => setMode('shift')} style={tabStyle(mode === 'shift')}>
+              平移時間
+            </button>
+            <button onClick={() => setMode('timezone')} style={tabStyle(mode === 'timezone')}>
+              改時區
+            </button>
+            <button onClick={() => setMode('set')} style={tabStyle(mode === 'set')}>
+              指定時間
+            </button>
+          </div>
+        )}
 
-        {mode === 'shift' ? (
+        {mode === 'shift' && (
           <>
             <p style={{ fontSize: 13, color: '#64748b', lineHeight: 1.7, margin: '0 0 12px' }}>
               相機時鐘本身走差了（例如 D800 每年約慢一分鐘）。拍攝時間會整批往前或往後移動，
@@ -200,7 +283,9 @@ export default function FixTimeModal({ isOpen, photoIds, titles, onClose, onDone
               這個操作會把時間標記為「使用者修正」，之後任何自動流程都不會再改動它。
             </p>
           </>
-        ) : (
+        )}
+
+        {mode === 'timezone' && (
           <>
             <p style={{ fontSize: 13, color: '#64748b', lineHeight: 1.7, margin: '0 0 12px' }}>
               出國拍照但機身時區沒改的情況。相機記的時刻本身沒錯，錯的只是「該用哪個時區去讀它」，
@@ -208,11 +293,7 @@ export default function FixTimeModal({ isOpen, photoIds, titles, onClose, onDone
             </p>
             <label style={{ fontSize: 13, display: 'block', marginBottom: 18 }}>
               <div style={{ marginBottom: 4, color: '#475569' }}>照片當時所在地的時區</div>
-              <select
-                value={tz}
-                onChange={(e) => setTz(Number(e.target.value))}
-                style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 14 }}
-              >
+              <select value={tz} onChange={(e) => setTz(Number(e.target.value))} style={selectStyle}>
                 {TZ_OPTIONS.map((o) => (
                   <option key={o.minutes} value={o.minutes}>{tzOptionLabel(o)}</option>
                 ))}
@@ -228,31 +309,34 @@ export default function FixTimeModal({ isOpen, photoIds, titles, onClose, onDone
               掃描的老照片、被 App 洗掉 EXIF 的圖。上面兩個操作都需要一個原本的時間當基準，
               對這些一律跳過。
             </p>
-            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
-              <label style={{ fontSize: 13 }}>
-                <div style={{ marginBottom: 4, color: '#475569' }}>拍攝當下的時間</div>
-                <input
-                  type="datetime-local"
-                  step={1}
-                  value={wall}
-                  onChange={(e) => setWall(e.target.value)}
-                  style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 14 }}
-                />
-              </label>
-              <label style={{ fontSize: 13 }}>
-                <div style={{ marginBottom: 4, color: '#475569' }}>當時所在地的時區</div>
-                <select
-                  value={tz}
-                  onChange={(e) => setTz(Number(e.target.value))}
-                  style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 14 }}
-                >
-                  {TZ_OPTIONS.map((o) => (
-                    <option key={o.minutes} value={o.minutes}>{tzOptionLabel(o)}</option>
-                  ))}
-                </select>
-              </label>
+            {/*
+              * 六個選單而不是一格 datetime-local：
+              *   ① 秒數在 datetime-local 上要靠 step 才出得來，而且各家瀏覽器長得不一樣；
+              *   ② 掃描的老照片要調到 1970 年代，日曆一頁一頁翻不完，年份直接選比較快。
+              * 時區沿用「改時區」那個清單，兩邊的顯示格式因此完全一致。
+              */}
+            <div style={{ marginBottom: 4, fontSize: 13, color: '#475569' }}>拍攝當下的時間</div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+              {partSelect('年', wall.y, years, (n) => setWallPart({ y: n }))}
+              {partSelect('月', wall.mo, range(1, 12), (n) => setWallPart({ mo: n }))}
+              {partSelect('日', wall.d, range(1, daysInMonth(wall.y, wall.mo)), (n) => setWallPart({ d: n }))}
+              {partSelect('時', wall.h, range(0, 23), (n) => setWallPart({ h: n }), pad2)}
+              {partSelect('分', wall.mi, range(0, 59), (n) => setWallPart({ mi: n }), pad2)}
+              {partSelect('秒', wall.s, range(0, 59), (n) => setWallPart({ s: n }), pad2)}
             </div>
-            {guessed && (
+            <label style={{ fontSize: 13, display: 'block', marginBottom: 10 }}>
+              <div style={{ marginBottom: 4, color: '#475569' }}>當時所在地的時區</div>
+              <select value={tz} onChange={(e) => setTz(Number(e.target.value))} style={selectStyle}>
+                {tzOptionsIncluding(initialTz).map((o) => (
+                  <option key={o.minutes} value={o.minutes}>{tzOptionLabel(o)}</option>
+                ))}
+              </select>
+            </label>
+            <p style={{ fontSize: 12.5, color: '#334155', margin: '0 0 10px', lineHeight: 1.6 }}>
+              會存成 <code>{toWallClockString(wall)}</code>
+              　{tzOptionLabel({ minutes: tz, hint: '' })}
+            </p>
+            {!initialWall && guessed && (
               <p style={{ fontSize: 12.5, color: '#15803d', margin: '0 0 10px', lineHeight: 1.6 }}>
                 已從檔名 <code>{titles?.[0]}</code> 預填，確認一下對不對再套用。
               </p>
