@@ -1189,7 +1189,7 @@ export interface PhotoComment {
   /** 內文。@ 某人是 `@[uid]` 標記，要用 renderCommentBody 換成名字才顯示 */
   body: string;
   created_at: string;
-  /** 端不端出刪除鈕。規則跟後端一致：作者本人或站長 */
+  /** 端不端出刪除鈕。規則跟後端一致：作者本人，或可管理全站內容的人 */
   can_delete: boolean;
 }
 

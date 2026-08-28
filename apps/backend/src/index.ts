@@ -5490,8 +5490,9 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           avatar: avatarUrl(url.origin, r.avatar_key),
           body: r.body,
           created_at: r.created_at,
-          // 前端據此決定要不要端出刪除鈕。規則跟底下的 DELETE 一致：作者本人或站長
-          can_delete: !!actor && (actor.isOwner || actor.uid === Number(r.user_id)),
+          // 前端據此決定要不要端出刪除鈕。規則跟底下的 DELETE 一致：
+          // 作者本人，或可管理全站內容的人（站長與共同站長）
+          can_delete: !!actor && (actor.canManageOthers || actor.uid === Number(r.user_id)),
         }));
         /*
          * 這串留言裡被 @ 到的人。內文存的是 `@[uid]`，要有名字才顯示得出來。
@@ -5623,7 +5624,12 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
       }
 
       /*
-       * 路由：刪留言。**作者本人或站長**，沒有第三種人（使用者拍板）。
+       * 路由：刪留言。**作者本人，或可管理全站內容的人**，沒有第三種（使用者拍板）。
+       *
+       * ⚠️ 2026-08-28 從 isOwner 放寬成 canManageOthers —— 那一格的意思已經是
+       * 「共同站長」（後台整頁都給他了），而「拿掉不合適的留言」正是那件事。
+       * 上面 GET 回的 `can_delete` 要**跟這裡同一個條件**，不然刪除鈕會出現在
+       * 一個按下去吃 403 的地方，或是該有的時候不出現。
        *
        * 硬刪，回覆跟著 FK CASCADE 一起消失，不留「此留言已刪除」的墓碑 ——
        * 那需要多一個狀態欄位與一套顯示規則，而這個站不需要保留刪除痕跡。
@@ -5640,7 +5646,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         if (!row) {
           return new Response(JSON.stringify({ error: "找不到這則留言" }), { status: 404, headers });
         }
-        if (!actor.isOwner && actor.uid !== Number(row.user_id)) {
+        if (!actor.canManageOthers && actor.uid !== Number(row.user_id)) {
           return forbidden(headers, "只能刪自己的留言");
         }
         await env.DB.prepare("DELETE FROM Comment WHERE id = ?").bind(commentId).run();

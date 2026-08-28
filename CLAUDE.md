@@ -609,7 +609,9 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - 成員各自兩欄：`User.can_comment`／`can_view_comments`（預設都開）。
   **這兩格不被 `can_manage_others` 短路**，各自獨立；只有站長永遠全開。
 - 看不到留言的人，燈箱裡**整塊不出現**（元件自己回 `null`），不是端出來再說沒權限。
-- **回覆只有一層**，後端擋（parent 必須是同一張照片上的主留言）。刪留言＝作者本人或站長，
+- **回覆只有一層**，後端擋（parent 必須是同一張照片上的主留言）。刪留言＝**作者本人，或可
+  管理全站內容的人**（2026-08-28 從只有站長放寬，跟後台同一個決定，見「身分與權限」）——
+  GET 回的 `can_delete` 與 DELETE 的閘**必須同一個條件**，
   硬刪、回覆走 FK CASCADE，沒有墓碑。
 - `@` 某人在內文裡存 `@[uid]`（改名後舊留言跟著更新）。**mention 一律由後端 `parseMentions()`
   解析**，不收前端傳的名單。顯示要用的名字跟著 `GET /api/photos/:id/comments` 的 `people` 回來
