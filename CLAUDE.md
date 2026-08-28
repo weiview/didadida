@@ -624,6 +624,16 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 ## 儲存模型
 
 - **R2 一張照片只有兩顆縮圖：800px ＋ 400px WebP。** 2000px 那顆已經拿掉。
+- **收得進來的格式：JPEG／PNG／WebP／HEIC／HEIF ＋ mp4／mov／webm。GIF 不收**
+  （2026-08-28 查證，現況如此，不是漏掉）。三道關卡：選檔視窗的 `accept`
+  （`album/page.tsx`）不列 GIF；`resizeImageFile()` 除了「本來就是 JPEG 且長邊
+  ≤2000」之外一律 `<img>` → canvas → `image/jpeg`，而 canvas 只畫得出**第一格**；
+  後端 `/api/upload` 的 `allowedTypes` 只有 `image/jpeg`／`image/webp`。
+  硬選進來不會報錯，會安靜地變成一張靜止的第一格 —— 只有 Drive 上那份原始檔
+  還是 GIF 本身（`pushPhotoToDrive` 傳的是 rawFile）。
+  ⚠️ 真要支援動畫**不是加一個 MIME 就好**：得先決定它走影片那條（擷封面＋原檔進
+  Drive，但 `<video>` 播不了 GIF，等於要轉檔）還是照片那條（整份 GIF 也得進 R2，
+  跟「R2 只放兩顆縮圖」的儲存模型衝突）。**先攤開取捨再動手。**
 - **大圖／原始檔在 Google Drive**，不管誰上傳都寫進**站長**同一個 Drive
   （`drive.file` 是 per-file 授權，寫入者只能有一個）。憑據就是站長那一列的
   **`User.google_refresh_token`**（0017）—— 跟「Google 相簿匯入」用的同一張，
