@@ -4823,6 +4823,16 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
          *    「直接擋」，誤判的成本只有多按一下。
          *
          * 不比 pHash：本機上傳這條路從來沒送過 phash，欄位是 NULL，比了也是白比。
+         *
+         * ⚠️⚠️ **兩個依據不是平起平坐的：特徵碼對得上就到此為止，不再往下看時間。**
+         * 一句 SQL 撈回來的是兩種命中混在一起的清單，而「拍攝時間一樣」在連拍時
+         * 一次命中好幾列是常態。hash 一樣＝位元組層級同一個檔，答案已經確定了，
+         * 這時候再把那幾列同秒的端出去只有壞處：使用者要在五張長得都像的縮圖裡
+         * 挑一張，而自動補那段（前端 `incompleteTwin` 要求**剛好命中一列**）
+         * 也會因為多出來的那幾列而放棄，於是「網站有、Drive 缺一半」補不起來。
+         * 所以 hash 有命中就**只回 hash 那幾列**，`reason` 跟著是 `same_file`。
+         * `ORDER BY (file_hash = ?) DESC` 是配套的 —— `LIMIT 5` 不能讓一串同秒的
+         * 連拍把真正對得上的那一列擠掉。
          */
         if (!allowDuplicate) {
           /*
@@ -4837,10 +4847,15 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
                FROM Photo
               WHERE album_id = ?
                 AND (file_hash = ? OR (? IS NOT NULL AND taken_at = ?))
+              ORDER BY (file_hash = ?) DESC
               LIMIT 5`
-          ).bind(albumId, fileHash, dupTakenAt, dupTakenAt).all<any>();
+          ).bind(albumId, fileHash, dupTakenAt, dupTakenAt, fileHash).all<any>();
 
-          if (dupes.length > 0) {
+          // 特徵碼有命中就只認那幾列，時間相同的那些一律不端出去（理由見上面）
+          const hashHits = dupes.filter((d: any) => d.file_hash === fileHash);
+          const matched = hashHits.length > 0 ? hashHits : dupes;
+
+          if (matched.length > 0) {
             /*
              * ⚠️ 每一筆都要講出**它的備份到底缺不缺**（`has_4k`／`has_original`，
              * 欄位名跟 /api/photos/drive-pending 那支一致）。
@@ -4859,11 +4874,19 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
             return new Response(JSON.stringify({
               duplicate: true,
               // 讓前端講得出「哪裡像」：hash 一樣是同一個檔，只有時間一樣就是疑似
-              reason: dupes.some((d: any) => d.file_hash === fileHash) ? 'same_file' : 'same_time',
-              existing: dupes.map((d: any) => ({
+              reason: hashHits.length > 0 ? 'same_file' : 'same_time',
+              existing: matched.map((d: any) => ({
                 id: d.id,
+                // `title` 存的就是原始檔名。⚠️ 視窗一定要顯示它 —— 縮到 100px 的
+                // 兩張縮圖長得幾乎一樣，檔名才是使用者判斷得了的線索
                 title: d.title,
                 thumb_url: d.thumb_sm_url || d.thumb_url || d.url,
+                /*
+                 * 點開放大時載的是 **800px 那顆**，不是格線用的 400px ——
+                 * 「是不是同一張」要看得出細節。⚠️ 刻意不給 `/full`（Drive 那份 4K）：
+                 * 每點一次就是一趟 Drive 取檔，而 800px 已經夠分辨了。
+                 */
+                thumb_lg: d.thumb_url || d.url || d.thumb_sm_url,
                 taken_at: d.taken_at,
                 media_type: isVideoRow(d) ? 'video' : 'photo',
                 // 這一筆是不是**位元組層級**的同一個檔（hash 一樣）。只有它才敢自動補

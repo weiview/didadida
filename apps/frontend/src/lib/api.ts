@@ -1529,8 +1529,12 @@ export interface UploadedPhoto {
  */
 export interface DuplicateMatch {
   id: number;
+  /** 原始檔名（`Photo.title`）。重複視窗一定要顯示它，縮圖長得都一樣 */
   title: string | null;
+  /** 格線用的 400px */
   thumb_url: string | null;
+  /** 點開放大用的 800px。⚠️ 不是 Drive 那份 4K —— 那要一趟 Drive 取檔 */
+  thumb_lg: string | null;
   taken_at: string | null;
   media_type: 'photo' | 'video';
   /** 這一列跟手上這個檔是**位元組層級**的同一份（file_hash 一樣）。只有它才敢自動補 */
@@ -1671,6 +1675,7 @@ export async function uploadPhoto(
           id: Number(e?.id),
           title: e?.title ?? null,
           thumb_url: e?.thumb_url ?? null,
+          thumb_lg: e?.thumb_lg ?? null,
           taken_at: e?.taken_at ?? null,
           media_type: e?.media_type === 'video' ? 'video' : 'photo',
           same_file: e?.same_file === true,

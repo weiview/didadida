@@ -2476,10 +2476,19 @@ function AlbumContent() {
       {duplicateItems[duplicateIndex] && (
         <GoogleSyncConflictModal
           isOpen={true}
-          tempPhoto={{ url: duplicateItems[duplicateIndex].previewUrl }}
+          reason={duplicateItems[duplicateIndex].reason}
+          tempPhoto={{
+            url: duplicateItems[duplicateIndex].previewUrl,
+            // 檔名一定要給：兩張縮圖長得幾乎一樣，這是使用者唯一分辨得出來的線索
+            name: duplicateItems[duplicateIndex].file.name,
+          }}
           existingPhotos={duplicateItems[duplicateIndex].existing.map((e) => ({
             id: e.id,
             url: e.thumb_url || '',
+            // 放大看用 800px 那顆；舊版後端沒有這個欄位時退回縮圖
+            largeUrl: e.thumb_lg || e.thumb_url || '',
+            name: e.title || undefined,
+            sameFile: e.same_file,
             taken_at: e.taken_at || undefined,
           }))}
           onResolve={(decision, replaceIds) => { resolveDuplicate(decision, replaceIds); }}
