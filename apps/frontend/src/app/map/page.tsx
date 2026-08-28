@@ -586,7 +586,12 @@ export default function MapPage() {
   const [photoDays, setPhotoDays] = useState<Set<string>>(new Set());
   useEffect(() => {
     if (from || to || albumId !== '' || points.length === 0) return;
-    setPhotoDays(new Set(points.map(p => p.local_time.slice(0, 10))));
+    // ⚠️ local_time 會是 null（「指定地點」可以只給座標不給時間，影片與掃描的
+    //    老照片就是這種）。少了這道 filter，整個 /map 會在這裡丟
+    //    「Cannot read properties of null」而被錯誤邊界接成一頁 Application error。
+    setPhotoDays(new Set(
+      points.map(p => p.local_time).filter((t): t is string => !!t).map(t => t.slice(0, 10)),
+    ));
   }, [points, from, to, albumId]);
 
   /*

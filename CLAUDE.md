@@ -620,6 +620,14 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
     - 已經有自己給的名字（打的、或從地點簿挑的）時，在地圖上點就**不再反查地名**
       —— 反正結果會被丟掉，而那是一次外部 API 請求。
   - OSM 的地名搜尋結果照舊在搜尋框底下，跟地點簿是兩個各自獨立的清單。
+- ⚠️⚠️ **指定地點之後，`/api/footprint` 的 `local_time` 會是 null。**
+  那一欄是 `LOCAL_TIME_EXPR` 從 `taken_at_local`／`taken_at` 算出來的，兩欄都空就整個
+  是 NULL —— 而這支路由本來每一點都來自 EXIF 或軌跡（一定有時間），所以前端的型別
+  一路寫成 `string`。影片與掃描的老照片只有座標沒有時間，於是「有了第一張這種照片」
+  的那一刻起 `/map` 整頁被錯誤邊界接成一頁 **Application error**
+  （`points.map(p => p.local_time.slice(0,10))`，2026-08-28 修）。
+  型別已經改成 `string | null`，**用到它一律先擋一次**。
+  症狀只在 prod 出現，因為 dev 的 D1 裡沒有這種照片。
 
 ## 相簿格線：排序、右邊那條時間軸、重複的那幾張
 

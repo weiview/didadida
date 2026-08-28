@@ -1173,7 +1173,7 @@ function cursorLabel(t: number): string {
 }
 
 /** 'YYYY-MM-DD HH:MM:SS' → 顯示用的短字串 */
-function shortTime(local: string): string {
+function shortTime(local: string | null): string {
   if (!local) return '';
   const [d, t] = local.split(' ');
   return t ? `${d} ${t.slice(0, 5)}` : d;

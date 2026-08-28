@@ -268,8 +268,15 @@ export interface FootprintPoint {
   lng: number;
   place_name: string | null;
   geo_source: GeoSource;
-  /** 顯示用的當地牆上時間 'YYYY-MM-DD HH:MM:SS' */
-  local_time: string;
+  /**
+   * 顯示用的當地牆上時間 'YYYY-MM-DD HH:MM:SS'。
+   *
+   * ⚠️ **會是 null** —— 後端那句 `LOCAL_TIME_EXPR` 是從 `taken_at_local`／`taken_at`
+   * 算出來的，兩欄都空就整個是 NULL。以前地圖上每一點都來自 EXIF 或軌跡（一定有時間），
+   * 所以這裡曾經寫成 `string`；「指定地點」上線之後，影片與掃描的老照片可以只有座標
+   * 沒有時間，那些點就會帶著 null 進來。**每一個用到它的地方都要先擋一次**。
+   */
+  local_time: string | null;
   /** UTC 瞬間。要跟 GPS 軌跡排到同一條時間軸上只能用這個 */
   taken_at: string | null;
 }
