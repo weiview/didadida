@@ -3659,8 +3659,21 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * 起點落在尾端時第一條會不足 5 筆，第二條負責繞回開頭補齊。
          * 兩條都走 idx_photo_album_shuffle 的 covering index，各自最多讀 5 列。
          */
-        // 不開放的那幾張不可以被抽成預覽圖 —— 首頁那排小圖是整個站最公開的地方
-        const previewRestricted = canSeeRestricted(albumsActor) ? "" : " AND restricted = 0";
+        /*
+         * 不開放的那幾張**一律**不抽成預覽圖，連站長與共同站長自己也不行。
+         *
+         * 這一句刻意**不看 `canSeeRestricted`**（其他幾支清單都看），因為首頁
+         * 那排小圖是整個站最公開的地方，而且它是**滑鼠移過去就自己輪播的
+         * CSS 背景圖**：`restricted_blur` 那層遮罩糊的是 `img`／`video` 本身，
+         * 背景圖它蓋不到 —— 於是看得到的人在首頁會看到**沒有糊過的原圖在自動
+         * 輪播**，旁邊剛好有人就穿幫了，而那正是那個開關要解的事。
+         * 使用者的規則是「不開放的照片不會出現在相簿輪播中」，不是「糊掉」。
+         * （封面那一張早就安全了：標成不開放時後端會把指到它的 `cover_photo_url`
+         * 清成 NULL，前端也擋掉「把不開放的設成封面」。漏的一直只有輪播這幾張。）
+         *
+         * 順帶一個好處：這句 SQL 不再隨身分改變，同一本相簿的預覽圖全站只有一種答案。
+         */
+        const previewRestricted = " AND restricted = 0";
         const previewSelect = (op: string) =>
           `SELECT COALESCE(thumb_sm_url, thumb_url, url) AS url
              FROM Photo WHERE album_id = ? AND shuffle_key ${op} ?${previewRestricted}

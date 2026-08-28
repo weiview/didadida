@@ -463,6 +463,13 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   蓋住：`/api/albums` 的預覽圖、`/api/albums/:id/photos`、`/api/search`、`/api/footprint`、
   `/api/photos/geo-pending`、`/api/photos/drive-pending`。
   ⚠️ drive-pending 的**列表與 COUNT 要用同一個條件**，不然補傳進度永遠歸不了零。
+  ⚠️⚠️ **首頁那排預覽圖（`preview_photos`）是唯一連「看得到的人」也一起濾掉的地方**
+  —— 那一句 SQL 刻意不看 `canSeeRestricted`。相簿卡片滑鼠移過去會**自動輪播**，
+  而它畫的是 **CSS 背景圖**（省掉「相簿數 × 預覽張數」次 Workers 請求，見坑 11），
+  `restricted_blur` 那層糊的是 `img`／`video` 本身，**背景圖它蓋不到** —— 於是
+  站長自己在首頁看到的會是沒有糊過的原圖在那裡輪播，旁邊剛好有人就穿幫了。
+  規則是**不出現**，不是糊掉。（封面那一張本來就安全：標成不開放時後端會把指到它的
+  `cover_photo_url` 清成 NULL，前端也擋掉把不開放的設成封面。漏的一直只有輪播這幾張。）
 - 大圖／影片位元組（`/full`、`/video`）沒有身分可看，靠 **mt 的升級票**（見「後端的請求流程」），
   或真的帶 Authorization 進來。拿不到一律回 **404 不是 403** —— 403 等於承認那個編號上有東西。
 - ⚠️⚠️ **`/full` 一定要先查 D1 再 `cache.match`，順序不能倒回去。** 反過來的話（舊版就是）
