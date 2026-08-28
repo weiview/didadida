@@ -12,6 +12,7 @@ import {
   runDriveAudit, syncTrackFolders, updateSiteSettings, updateWhitelistUser,
 } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
+import DrivePendingCard from "./DrivePendingCard";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import Avatar from "@/components/Avatar";
 import AvatarPicker from "@/components/AvatarPicker";
@@ -982,7 +983,7 @@ export default function AdminPage() {
                 <span className={styles.detailNum}>{audit.totals.linked ?? 0}</span>
               </div>
               <div className={styles.detailRow}>
-                <span className={styles.detailName}>Drive 上找不到（已清掉記錄，會出現在補傳清單）</span>
+                <span className={styles.detailName}>Drive 上找不到（已清掉記錄，會出現在下面那份清單）</span>
                 <span className={styles.detailNum}>{audit.totals.cleared}</span>
               </div>
               <div className={styles.detailRow}>
@@ -1005,8 +1006,10 @@ export default function AdminPage() {
               在那本相簿的 Drive 資料夾裡是不是都找得到。
               找得到卻沒記錄的會直接接回來（那是「傳上去了、網站沒記到」的下場，
               以前會變成一筆假的缺件<strong>加上</strong>一個假孤兒）。
-              「缺 4K／缺原始檔」要補的話，到那本相簿裡按<strong>「補傳 Drive」</strong>
-              重新選一次原始檔 —— 真正的 4K 只編得出來一次，R2 上那份 2000px 補不了。
+              「缺 4K／缺原始檔」要補的話，<strong>把同一個原始檔再拖進那本相簿一次</strong>
+              —— 站上會認出是同一個檔，直接補上缺的那一份，不會多一格
+              （是哪幾個檔看下面那格「缺 Drive 備份的檔案」）。
+              真正的 4K 只編得出來一次，R2 上那份縮圖補不了，所以非得要原始檔不可。
               孤兒檔是<strong>搬進 <span className={styles.mono}>didadida/trash/</span></strong>
               不是刪除，反悔隨時去 Drive 搬回來。
             </p>
@@ -1089,6 +1092,13 @@ export default function AdminPage() {
           </>
         )}
       </section>
+
+      {/*
+        缺 Drive 備份的檔案清單。跟上面那一格的分工：對帳是「有沒有走鐘」的
+        總數與自動修正，這一格是「**到底是哪幾個檔、誰傳的、在哪一本**」。
+        唯讀 —— 補的方法是把同一個原始檔再拖進那本相簿一次。
+      */}
+      <DrivePendingCard />
 
       {/*
         GPS 軌跡資料夾。為什麼要一個人一個資料夾：GPSLogger 只拿得到
@@ -1439,7 +1449,7 @@ function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
       {r.no_folder ? (
         <p className={styles.hint}>
           這本相簿在 Drive 上<strong>還沒有資料夾</strong> —— {r.photos} 張全都沒有備份過。
-          到相簿裡按「補傳 Drive」重新選一次原始檔就會建起來。
+          把任何一個原始檔再拖進那本相簿一次就會建起來。
         </p>
       ) : r.truncated ? (
         <p className={`${styles.message} ${styles.err}`}>
@@ -1469,7 +1479,7 @@ function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
             </div>
           ))}
           <p className={styles.hint}>
-            補的方法：到那本相簿按<strong>「補傳 Drive」</strong>重新選一次原始檔，
+            補的方法：把同一個原始檔再拖進那本相簿一次（站上會認出是同一個檔），
             它只會補缺的那一份。⚠️ 真正的 4K 只編得出來一次 ——
             R2 上那份 2000px 補不回 4K，一定要拿原始檔。
           </p>

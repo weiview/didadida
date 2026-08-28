@@ -3995,27 +3995,40 @@ if (method === "POST" && pathname === "/api/verify-password") {
       }
 
       /*
-       * 路由：還沒搬上 Drive 的照片與影片（「補傳 Drive」批次動作的來源）。
+       * 路由：還沒搬上 Drive 的照片與影片 ——「缺 Drive 備份」那份清單。
        *
        * 上傳時 Drive 失敗不會擋下照片（drive_file_id 留 NULL），舊照片也全都是
-       * NULL，兩者在這裡看起來一樣 —— 本來就該一樣，補傳的動作完全相同。
+       * NULL，兩者在這裡看起來一樣 —— 本來就該一樣。
        *
-       * 回 title 是給補傳用的：使用者重選原始檔之後靠檔名對回照片，
-       * 而 title 存的就是上傳當下的客戶端檔名（file_name 是加了時間戳的 R2 鍵，對不上）。
-       * 會透露照片總數與上傳順序，所以跟 geo-pending 一樣鎖管理員。
+       * **這份清單只是資訊，不是動作入口。** 站上沒有「補傳」按鈕了：要補就把
+       * 同一個原始檔再拖進那本相簿一次，`POST /api/upload` 的重複偵測會認出
+       * 位元組一樣（same_file），前端 `incompleteTwin()` 直接補既有那一列缺的
+       * 那一半 —— 不新增任何一列，標籤、留言、Story、手動修過的座標與時間全都留著
+       * （見 CLAUDE.md「重傳同一個檔＝自動補缺的那一半」）。所以這裡要回答的問題
+       * 只有三個：**哪個檔、誰傳的、在哪一本**。
        *
-       * album_id 一起回來是給清單上那顆「看照片」用的（前端組成
-       * `/album/<album_id>?photo=<id>` 直接開燈箱）——「這個檔名是哪一張」
-       * 本來要人自己複製檔名去首頁搜尋，而這裡明明就握著 id。
-       * ⚠️ 多帶一欄**不多花任何讀取額度**，D1 算的是讀了幾列不是幾欄。
+       * 回 title 就是那個檔名（file_name 是加了時間戳的 R2 鍵，硬碟上找不到）。
+       * album_id 給「看照片 ↗」組 `/album/<album_id>?photo=<id>` 開燈箱。
+       * album_name／uploader_name 是為了「這是誰傳的、要去哪一本重傳」——
+       * 沒有這兩欄，站長拿著一個檔名還是不知道該找誰、該開哪一本。
        *
-       * album_id 是選填的。補傳從相簿頁進去時帶上，一來清單短很多，
-       * 二來避免不同相簿裡剛好同名的檔案互相對錯。
+       * ⚠️ 名字**不用 JOIN 帶回來**：一頁最多 500 列，三個 LEFT JOIN 就是多讀
+       *    上千列。相簿與使用者兩張表本來就小（家族站），整張撈回來在 JS 裡對
+       *    反而是幾十列的固定成本。⚠️ 也不要改成 `WHERE id IN (…)`，D1 綁定參數
+       *    上限是 100。
+       *
+       * 會透露全站的照片總數、上傳順序與**誰傳的**，所以鎖 canManageOthers
+       * （跟 Drive 對帳同一級）—— 它的唯一入口就是 /admin 那一格。
+       *
+       * album_id 是選填的：帶了就只看那一本。
        */
       if (method === "GET" && pathname === "/api/photos/drive-pending") {
         const drivePendingActor = await currentActor(request, env);
         if (!drivePendingActor) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!drivePendingActor.canManageOthers) {
+          return forbidden(headers, "只有可管理全站內容的人看得到這份清單");
         }
         const cursor = Number(url.searchParams.get("cursor") ?? 0) || 0;
         const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 200) || 200, 1), 500);
@@ -4025,6 +4038,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * ⚠️ 底下的列表與 COUNT **必須用同一個條件**，不然「剩幾張」永遠歸不了零，
          *    補傳的進度條會卡在一個補不完的數字上。
          */
+        // 現在只有 canManageOthers 進得來，所以這一段實際上永遠是空字串。
+        // 留著是因為它綁的是「誰看得到不開放的照片」那條規則，不是這支路由的權限
         const drivePendingRestricted = canSeeRestricted(drivePendingActor) ? "" : " AND restricted = 0";
         const albumClause = (albumId ? " AND album_id = ?" : "") + drivePendingRestricted;
 
@@ -4051,7 +4066,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         )`;
 
         const { results: photos } = await env.DB.prepare(`
-          SELECT id, album_id, url, file_name, title, media_type, thumb_url,
+          SELECT id, album_id, uploaded_by, url, file_name, title, media_type, thumb_url,
                  drive_file_id IS NOT NULL AS has_4k,
                  drive_original_id IS NOT NULL AS has_original
             FROM Photo
@@ -4059,13 +4074,39 @@ if (method === "POST" && pathname === "/api/verify-password") {
            ORDER BY id LIMIT ?
         `).bind(...(albumId ? [cursor, albumId, limit] : [cursor, limit])).all();
 
-        // 剩幾張要另外算：photos 只是這一批，進度條需要總數
+        /*
+         * 相簿名與上傳者名。兩張表整張撈（只撈要用的欄位）再在 JS 裡對 ——
+         * 見上面那段：JOIN 會讓每一列多讀好幾列，而這兩張表是固定的幾十列。
+         *
+         * ⚠️ 上傳者的規則跟站上其他地方一致：**照片歸屬看 `Photo.uploaded_by`，
+         *    NULL 時回頭看相簿主人**（0009 之前上傳的照片那一欄都是 NULL）。
+         */
+        const [{ results: albumRows }, { results: userRows }] = await Promise.all([
+          env.DB.prepare("SELECT id, name, user_id FROM Album").all(),
+          env.DB.prepare("SELECT id, name FROM User").all(),
+        ]);
+        const albumById = new Map<number, any>();
+        for (const a of albumRows as any[]) albumById.set(Number(a.id), a);
+        const userNameById = new Map<number, string>();
+        for (const u of userRows as any[]) userNameById.set(Number(u.id), String(u.name ?? ""));
+
+        const decorated = (photos as any[]).map((p) => {
+          const album = albumById.get(Number(p.album_id));
+          const uploaderId = p.uploaded_by ?? album?.user_id ?? null;
+          return {
+            ...p,
+            album_name: album?.name ?? null,
+            uploader_name: uploaderId != null ? (userNameById.get(Number(uploaderId)) ?? null) : null,
+          };
+        });
+
+        // 剩幾張要另外算：photos 只是這一批，總數是另一個問題
         const remaining = await env.DB.prepare(
           `SELECT COUNT(*) AS n FROM Photo WHERE ${drivePendingCond}${albumClause}`
         ).bind(...(albumId ? [albumId] : [])).first<any>();
 
         return new Response(JSON.stringify({
-          photos,
+          photos: decorated,
           remaining: Number(remaining?.n ?? 0),
           next_cursor: photos.length > 0 ? Number((photos[photos.length - 1] as any).id) : cursor,
           done: photos.length < limit,

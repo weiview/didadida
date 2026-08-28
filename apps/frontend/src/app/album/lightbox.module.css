@@ -533,6 +533,28 @@ input:checked + .slider:before {
   font-weight: 500;
 }
 
+/*
+ * 「時間來源」那一格右邊的小按鈕（指定／修改拍攝時間）。
+ * 刻意做得比 .btn 小一號：它跟旁邊那行值是同一行，用 .btn 的尺寸會把整格撐開。
+ */
+.exifEditBtn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 400;
+  cursor: pointer;
+  vertical-align: 1px;
+}
+
+.exifEditBtn:hover {
+  background: var(--accent-color);
+  border-color: transparent;
+}
+
 @media (max-width: 768px) {
   .content {
     width: 100vw;

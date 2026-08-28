@@ -14,7 +14,6 @@ import AssignPlaceModal from "@/components/AssignPlaceModal";
 import FixTimeModal from "@/components/FixTimeModal";
 import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import PlaceCheckinModal from "@/components/PlaceCheckinModal";
-import DriveBackfillModal from "@/components/DriveBackfillModal";
 import { resizeImageFile } from "@/lib/imageUtils";
 import { ACCEPTED_VIDEO_TYPES, captureVideoPoster, formatDuration, isVideoFile } from "@/lib/videoUtils";
 import { useSearchParams } from "next/navigation";
@@ -155,7 +154,6 @@ function AlbumContent() {
   } | null>(null);
   /** Drive 沒接上時的原因。照片照樣傳得上去，只是少了 4K 與原始檔備份 */
   const [driveError, setDriveError] = useState<string | null>(null);
-  const [showDriveBackfill, setShowDriveBackfill] = useState(false);
   /**
    * 這次失敗是不是「後端手上沒有站長的 Drive 授權」——從來沒有，或那份過期了。
    *
@@ -170,7 +168,11 @@ function AlbumContent() {
    * 留著它，黃色橫幅那顆按鈕才能真的「補傳這批」—— 授權完直接拿這些檔案送出去，
    * 不必請人再選一次，也不必靠檔名對回照片（id 是上傳當下回傳的，不會對錯）。
    * File 物件在沒重整頁面、原檔沒被移動的前提下一直有效。
-   * 重整之後就沒了，那時只剩「補傳 Drive」那條重選檔案的路。
+   *
+   * ⚠️ **重整之後就沒了，而且站上沒有第二條補傳的路**（2026-08-28 把「補傳 Drive」
+   *    那個重選檔案的視窗整個拿掉了）。那時候的做法是把同一個原始檔再拖進來一次 ——
+   *    上傳流程會認出位元組一樣，直接補既有那一列缺的那一半（見 incompleteTwin），
+   *    不會多一格。缺備份的是哪幾個檔在 /admin 那份清單上。
    *
    * `need` 記的是**還缺哪一半**（4K／原始檔）。上傳那兩份是分開試的，
    * 常常是一份上去了另一份失敗 —— 補傳時整份重來的話，成功的那一半會在
@@ -412,7 +414,7 @@ function AlbumContent() {
       /*
        * 關鍵字篩選：Story／描述，以及 **title**。
        * ⚠️ `title` 存的就是上傳當下的原始檔名，而且**上傳之後沒有任何一條路徑改得動它**
-       *    —— 所以「把補傳 Drive 那份清單上的檔名貼進來」就是這裡的主要用途之一，
+       *    —— 所以「把 /admin 那份缺備份清單上的檔名貼進來」就是這裡的主要用途之一，
        *    輸入框的 placeholder 要把「檔名」講出來，不然沒有人會想到可以這樣用。
        *    這一頁是純前端 includes()，所以檔名的**任何一段**都比得到（首頁那個
        *    走 FTS，只能從 token 的開頭比）。
@@ -651,9 +653,9 @@ function AlbumContent() {
       {
         key: 'upload',
         label: '上傳照片',
-        // 所有「把檔案送進來」的事收成一扇門。攤在最上層並排的話，「上傳照片」
-        // 「從 Google 相簿匯入」「補傳 Drive」看起來像三件不相干的事，
-        // 其實是同一件事的三個來源
+        // 所有「把檔案送進來」的事收成一扇門。攤在最上層並排的話，
+        // 「上傳照片」與「從 Google 相簿匯入」看起來像兩件不相干的事，
+        // 其實是同一件事的兩個來源
         children: [
           {
             key: 'local',
@@ -677,19 +679,13 @@ function AlbumContent() {
             },
           },
           /*
-           * 補傳 Drive 也是上傳 —— 它做的事就是「把當初沒送上去的原始檔再送一次」。
-           * 以前它跟「地點」「編輯照片」並排在最上層，看起來像另一件事。
-           *
-           * 權限跟著這本相簿的編輯權走（別人的相簿裡只能上傳，不能替人補備份），
-           * 所以不是整組跟著 canAddToAlbum。
-           * 頁面重整之後黃色橫幅就沒了，但沒備份的照片還在 —— 這裡是它唯一的常駐入口。
+           * ⚠️ 這裡以前還有一顆「補傳 Drive」（重選一次原始檔補上缺的備份），
+           *    2026-08-28 拿掉了：**補傳就是本機上傳**。同一個原始檔再拖進來一次，
+           *    重複偵測會認出位元組一樣（same_file），直接補既有那一列缺的那一半，
+           *    相簿裡不會多一格，標籤／留言／改過的時間地點全都留著 ——
+           *    比那個視窗做得更好（它「取代」會換新 id，那些東西全沒）。
+           *    缺備份的是哪幾個檔、誰傳的、在哪一本，看 /admin 那份清單。
            */
-          ...(canEditAlbum ? [{
-            key: 'drive',
-            label: '補傳 Drive',
-            title: '重選原始檔，補上缺的 4K 與原始檔備份',
-            onClick: () => setShowDriveBackfill(true),
-          }] : []),
         ],
       },
     ];
@@ -701,7 +697,6 @@ function AlbumContent() {
         title: '整本相簿攤開，照日期看哪些照片還缺位置或地名',
         onClick: () => setShowPlaceCheckin(true),
       },
-      // 補傳 Drive 不在這裡，它收在「上傳照片」底下（見上面）
       { key: 'edit', label: '編輯照片', onClick: () => setIsEditingPhotos(true) },
     ];
 
@@ -731,18 +726,18 @@ function AlbumContent() {
   };
 
   /**
-   * 黃色橫幅那顆按鈕：把剛上傳那批的 4K 與原始檔補上去。
+   * 黃色橫幅那顆按鈕：把**剛上傳那批**的 4K 與原始檔補上去。
    *
    * 不必請人重選檔案，也不必靠檔名對回照片 —— `pendingDriveBatch` 裡的照片 id
-   * 是上傳當下後端回傳的，配對不可能錯。只有重整過頁面（File 沒了）才退回
-   * 「補傳 Drive」那條重選檔案的路。
+   * 是上傳當下後端回傳的，配對不可能錯。
+   *
+   * ⚠️ 手上沒有那批 File（重整過頁面）就**沒有這顆按鈕**了：站上唯一的另一條路
+   *    是把同一個原始檔再拖進來一次（上傳流程自己會補），所以橫幅那邊改成講這句話，
+   *    不再端一顆按了會跳視窗的按鈕出來。
    */
   const handleBackfillCurrentBatch = async () => {
     if (driveBatchProgress || !id) return;
-    if (pendingDriveBatch.length === 0) {
-      setShowDriveBackfill(true);
-      return;
-    }
+    if (pendingDriveBatch.length === 0) return;
 
     const batch = pendingDriveBatch;
     setDriveBatchProgress({ current: 0, total: batch.length });
@@ -801,7 +796,7 @@ function AlbumContent() {
    * 也不會在上傳中途跳走 —— 跳走的話使用者選好的檔案會全沒。
    *
    * 沒接上**不擋上傳** —— 照片只要 R2 的縮圖成功就算存在，Drive 是加分項。
-   * drive_file_id 留 NULL，之後用「補傳 Drive」補。
+   * drive_file_id 留 NULL，之後把同一個檔再拖進來一次就會補上。
    */
   const prepareDrive = async (): Promise<{ folderId: string; token: string } | null> => {
     try {
@@ -1128,7 +1123,7 @@ function AlbumContent() {
            *
            * ⚠️ 這裡以前沒有 try：一張的 Drive 斷線會被外層的 catch 接走、
            *    整張算成「上傳失敗」（其實它好好地在相簿裡），而且**不會**進待補
-           *    清單 —— 橫幅那顆「補傳 Drive」從此看不到它。
+           *    清單 —— 橫幅那顆「補傳這批」與 /admin 那份清單從此看不到它。
            */
           if (drive) {
             try {
@@ -2075,13 +2070,15 @@ function AlbumContent() {
              * 其他人   → 不給按鈕。按什麼都補不上，給一顆按了也沒用的按鈕比不給還糟。
              *
              * ⚠️ 按下去會離開這一頁，記在記憶體裡的 File 就沒了 —— 所以話要講在
-             * 前面：回來之後這批要用「補傳 Drive」重選檔案。**不自動跳轉。**
+             * 前面：回來之後這批要把同一批檔案再拖進來一次。**不自動跳轉。**
              */
             isOwner ? (
               <div style={{ marginTop: 8 }}>
                 <div style={{ fontSize: 13, marginBottom: 8 }}>
-                  用 Google 登入一次就會把授權收回來。這批照片要回來之後用
-                  「補傳 Drive」重選檔案補上（離開這一頁會忘記剛才選了哪些）。
+                  用 Google 登入一次就會把授權收回來。這批照片要回來之後
+                  <strong>把同一批檔案再拖進來一次</strong>補上 ——
+                  站上會認出是同一個檔，只補缺的那一份，相簿裡不會多一格
+                  （離開這一頁會忘記剛才選了哪些）。
                 </div>
                 <button
                   type="button"
@@ -2097,25 +2094,36 @@ function AlbumContent() {
             ) : (
               <div style={{ marginTop: 8, fontSize: 13 }}>
                 這要站長處理：請站長用 Google 登入一次，後端會自己把授權收回來。
-                之後回到這裡用「補傳 Drive」重選這批檔案就補得上。
+                之後回到這裡把同一批檔案再拖進來一次就補得上（不會多一格）。
               </div>
             )
           ) : (
             <div style={{ marginTop: 8 }}>
-              {/* Drive 用的是後端換來的站長寫入 token，跟按下去的人是誰無關，
-                  所以這裡不必先去登入什麼 —— 重試就好 */}
-              <button
-                type="button"
-                onClick={handleBackfillCurrentBatch}
-                style={{
-                  padding: '7px 14px', borderRadius: 7, border: 'none',
-                  background: '#b45309', color: '#fff', fontSize: 13.5, cursor: 'pointer',
-                }}
-              >
-                {pendingDriveBatch.length > 0
-                  ? `補傳這批（${pendingDriveBatch.length} 張）`
-                  : '補傳 Drive'}
-              </button>
+              {/*
+                * Drive 用的是後端換來的站長寫入 token，跟按下去的人是誰無關，
+                * 所以這裡不必先去登入什麼 —— 重試就好。
+                *
+                * ⚠️ 只有**手上還握著那批 File** 時才端這顆按鈕。重整過頁面就沒了，
+                *    那時給一顆按了什麼都不會發生的按鈕比不給還糟 —— 改成講清楚
+                *    唯一的那條路：同一批檔案再拖進來一次。
+                */}
+              {pendingDriveBatch.length > 0 ? (
+                <button
+                  type="button"
+                  onClick={handleBackfillCurrentBatch}
+                  style={{
+                    padding: '7px 14px', borderRadius: 7, border: 'none',
+                    background: '#b45309', color: '#fff', fontSize: 13.5, cursor: 'pointer',
+                  }}
+                >
+                  補傳這批（{pendingDriveBatch.length} 張）
+                </button>
+              ) : (
+                <div style={{ fontSize: 13 }}>
+                  把同一批檔案<strong>再拖進來上傳一次</strong>就補得上 ——
+                  站上會認出是同一個檔，只補缺的那一份，相簿裡不會多一格。
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -2506,18 +2514,6 @@ function AlbumContent() {
             : undefined}
         />
       )}
-
-      {/* 補傳 Drive：重選原始檔，把缺的 4K 與原始檔補上去 */}
-      <DriveBackfillModal
-        isOpen={showDriveBackfill}
-        albumId={id ? Number(id) : undefined}
-        onClose={() => setShowDriveBackfill(false)}
-        onDone={async () => {
-          // 補完了就把橫幅收掉，不然它會一直宣稱備份沒做
-          setDriveError(null);
-          await loadData();
-        }}
-      />
 
 
       {/* 相簿層級的打卡補件。同樣不自己寫座標，挑完照片交給下面的 AssignPlaceModal */}

@@ -187,7 +187,7 @@ export interface Photo {
   /**
    * Drive 上那份 4K WebP 的 file id，燈箱大圖就是它（經 Worker 代理）。
    * null ＝ 這張沒有 Drive 備份（沒接上、上傳當下失敗、或是舊資料），
-   * 燈箱會退回 800px 並在角落標示。補傳 Drive 之後就會有值。
+   * 燈箱會退回 800px 並在角落標示。把同一個原始檔再上傳一次補上之後就會有值。
    */
   drive_file_id?: string | null;
   /**
@@ -1873,14 +1873,21 @@ export interface DrivePendingPhoto {
   id: number;
   /** 它在哪一本相簿。清單上那顆「看照片」用它組 /album/<album_id>?photo=<id> */
   album_id?: number;
+  /** 那本相簿的名字。要重傳的人得知道該打開哪一本 */
+  album_name?: string | null;
+  /**
+   * 誰上傳的。後端已經套過「uploaded_by 為 NULL 就看相簿主人」那條規則，
+   * 前端不必再判斷一次
+   */
+  uploader_name?: string | null;
   url: string;
   /** 加了時間戳的 R2 鍵，不是使用者看到的檔名 */
   file_name: string;
-  /** 上傳當下的客戶端檔名。補傳時靠這個對回重選的原始檔 */
+  /** 上傳當下的客戶端檔名。要重傳的人拿它去硬碟裡找那個檔 */
   title: string;
-  /** 'photo' | 'video'。影片只缺一份原始檔，而且補傳要走 pushVideoToDrive */
+  /** 'photo' | 'video'。影片沒有 4K 那一份 */
   media_type?: string;
-  /** 已經有 4K 了（0/1）。缺哪一半就只補哪一半，不要整份重來 */
+  /** 已經有 4K 了（0/1） */
   has_4k?: number;
   /** 已經有原始檔了（0/1） */
   has_original?: number;
@@ -1888,7 +1895,11 @@ export interface DrivePendingPhoto {
 
 /**
  * 還沒搬上 Drive 的照片與影片。舊照片與上傳時 Drive 失敗的在這裡看起來一樣。
- * 帶 albumId 就只看那本相簿（補傳從相簿頁進去時該帶）。
+ *
+ * **這是一份唯讀清單**（後端鎖 canManageOthers，入口只有 /admin 那一格）——
+ * 站上沒有「補傳」按鈕了，補的方法是把同一個原始檔再拖進那本相簿一次，
+ * 上傳流程會自己認出來並補上缺的那一半（見 ingestSources 的 incompleteTwin）。
+ * 帶 albumId 就只看那本相簿。
  */
 export async function fetchDrivePending(
   cursor = 0,

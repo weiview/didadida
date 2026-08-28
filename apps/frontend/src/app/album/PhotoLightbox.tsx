@@ -204,6 +204,23 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
         : wallClock)
     : null;
 
+  /*
+   * 拍攝時間改不改得動。
+   *
+   * 規則是**本來就沒有時間的才可以指定** —— 相機（EXIF）給的時間是那張照片的
+   * 事實，不該在燈箱裡被隨手改掉；沒有時間的那些（影片的封面圖是 canvas 畫的、
+   * 掃描的老照片）則是非指定不可，不然它們永遠浮在相簿最前面排不進去。
+   *
+   * 已經是 `manual` 的還留著可以再改：那個值是人自己填進去的，打錯字的話
+   * 這是唯一改得回來的地方（鎖起來等於一次打錯就永遠錯著）。
+   * 其餘的來源（offset_tag／gps_utc／file_time／assumed）都是從檔案本身推出來的，
+   * 一律鎖住 —— 要批次修正還是走相簿頁那三支（平移／改時區／指定）。
+   *
+   * ⚠️ 判斷用 displayDate 不是 photo.taken_at：EXIF 裡有時間但 D1 沒存到的
+   *    舊資料，畫面上是看得到時間的，那也算「本來就有」。
+   */
+  const canEditTime = isAdmin && (!displayDate || photo.time_source === 'manual');
+
   const handleSaveDesc = async () => {
     setIsSavingDesc(true);
     const success = await updatePhoto(photo.id, { description: descValue });
@@ -485,53 +502,52 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           {/* 「不開放」的開關在照片左上角（見 imageContainer 裡那顆），不在這一欄 */}
 
           {/*
-            * 拍攝時間**搬出 EXIF 面板**，理由有兩個：
-            *   ① 影片根本沒有 EXIF（封面圖是 canvas 畫的），偏偏它最需要這一格 ——
-            *      沒有拍攝時間的東西在相簿裡永遠浮在最前面，要人指定才排得進去；
-            *   ② 相機參數是收得起來的閒聊，拍攝時間是排序依據，不是同一個層級。
-            * 「時間來源」留在面板裡，那個是診斷用的。
+            * 照片資訊。**影片也端這一塊**（以前整塊擋掉）—— 裡面的相機參數對它
+            * 確實是空的，但「拍攝時間」與「時間來源」那兩格對影片才是最要緊的：
+            * 影片的封面圖是瀏覽器 canvas 畫出來的，沒有 EXIF，時間得人自己指定，
+            * 不然它在相簿裡永遠浮在最前面排不進去。
             */}
-          <div className={styles.section}>
-            <div className={styles.sectionHeader}>
-              <h3>拍攝時間</h3>
-              {isAdmin && (
-                <button className={styles.btn} onClick={() => setShowFixTime(true)}>
-                  {displayDate ? '修改' : '指定時間'}
-                </button>
-              )}
-            </div>
-            <span className={styles.exifValue}>
-              {displayDate
-                || (isVideo(photo)
-                    ? '未指定 —— 影片沒有 EXIF，要自己指定才排得進相簿的時間順序'
-                    : '未知')}
-            </span>
-          </div>
-
-          {/*
-            * ⚠️ 影片**整塊不端 EXIF**：封面圖是瀏覽器 canvas 畫出來的，
-            *    裡面不會有相機、鏡頭、光圈這些東西，端出來就是一排「—」。
-            */}
-          {!isVideo(photo) && (
           <div className={styles.exifToggleRow}>
             <div className={styles.switchWrapper}>
-              <span>顯示照片資訊 (EXIF)</span>
+              <span>{isVideo(photo) ? '顯示影片資訊' : '顯示照片資訊 (EXIF)'}</span>
               <label className={styles.switch}>
                 <input type="checkbox" checked={showExif} onChange={(e) => setExifExpanded(e.target.checked)} />
                 <span className={styles.slider}></span>
               </label>
             </div>
           </div>
-          )}
 
-          {!isVideo(photo) && showExif && (
+          {showExif && (
             <div className={styles.exifContainer}>
               <div className={styles.exifGrid}>
+                {/*
+                  * 拍攝時間就在這裡，**不另外開一個區塊** —— 它跟時間來源是同一件事
+                  * 的兩半（幾點拍的、這個時間哪來的），拆成兩個地方看反而要對照。
+                  * 改不改得動看 canEditTime（見上面）：相機給的時間鎖著，
+                  * 沒有時間的才給那顆「指定時間」。
+                  */}
+                <div className={styles.exifItem}>
+                  <span className={styles.exifLabel}>拍攝時間</span>
+                  <span className={styles.exifValue}>
+                    {displayDate || (isVideo(photo) ? '未指定（影片沒有 EXIF）' : '未知')}
+                  </span>
+                </div>
+
                 {/* 時間來源決定這張照片的時間可不可信 —— assumed 的照片不該拿去比對 GPS 軌跡 */}
                 <div className={styles.exifItem}>
                   <span className={styles.exifLabel}>時間來源</span>
                   <span className={styles.exifValue}>
                     {(photo.time_source && TIME_SOURCE_LABEL[photo.time_source]) || '—'}
+                    {canEditTime && (
+                      <button
+                        type="button"
+                        className={styles.exifEditBtn}
+                        onClick={() => setShowFixTime(true)}
+                        title={displayDate ? '改掉手動填的時間' : '這一張沒有拍攝時間，指定一個'}
+                      >
+                        {displayDate ? '修改' : '指定時間'}
+                      </button>
+                    )}
                   </span>
                 </div>
 
@@ -543,7 +559,13 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                     </div>
                   ))
                 ) : (
-                  <div className={styles.exifItem}><span className={styles.exifValue} style={{ color: '#888' }}>此照片無其他 EXIF 參數</span></div>
+                  <div className={styles.exifItem}>
+                    <span className={styles.exifValue} style={{ color: '#888' }}>
+                      {isVideo(photo)
+                        ? '影片沒有相機參數（封面圖是瀏覽器畫的）'
+                        : '此照片無其他 EXIF 參數'}
+                    </span>
+                  </div>
                 )}
               </div>
             </div>

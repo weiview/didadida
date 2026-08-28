@@ -623,7 +623,7 @@ export async function pushVideoToDrive(
    * 使用者看到的是「失敗」，而 Drive 上那個孤兒檔由背景對帳收尾。
    */
   if (!(await recordDriveIds(photoId, { driveFileId: null, driveOriginalId }))) {
-    throw new Error('影片傳上 Drive 了，但沒能記回網站（可以稍後用「補傳 Drive」重來）');
+    throw new Error('影片傳上 Drive 了，但沒能記回網站（把同一個檔再拖進來上傳一次就會補上）');
   }
   return true;
 }
