@@ -209,11 +209,15 @@ export function DrivePendingList({ reloadToken = 0 }: { reloadToken?: number }) 
 
                   {/*
                     * ⚠️ album_id 有可能是 undefined（邊快取裡還躺著舊版後端的
-                    *    回應），那就不端這顆，不要組出 /album/undefined。
+                    *    回應），那就不端這顆，不要組出 /album?id=undefined。
+                    * ⚠️⚠️ 相簿頁是 /album?id=<相簿>，**不是** /album/<相簿>。
+                    *    前端是 output: "export" 的純靜態站，`src/app/album/` 底下
+                    *    沒有 [id] 這一層，多打一段路徑就是實實在在的 404
+                    *    （站上其他每一個連到相簿的地方都是 ?id=，只有這裡曾經寫錯）。
                     */}
                   {p.album_id ? (
                     <a
-                      href={`/album/${p.album_id}?photo=${p.id}`}
+                      href={`/album?id=${p.album_id}&photo=${p.id}`}
                       target="_blank"
                       rel="noopener noreferrer"
                       title="在新分頁打開這一張"
