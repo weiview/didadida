@@ -1389,6 +1389,25 @@ async function drainDriveTrash(env: Env, limit: number): Promise<{
  *    見 auditDriveAlbum 裡的說明。它一樣不呼叫 files.delete —— 走的是既有的
  *    DriveTrash → moveDriveFile → `didadida/trash/`，連重試都是現成的。
  */
+/*
+ * 「上線中」的定義：最後一次心跳在這個時間之內。
+ *
+ * 前端 60 秒打一次（PRESENCE_POLL_MS），這裡給 150 秒 ＝ 兩次半 —— 掉一次心跳
+ * （切分頁被降頻、網路抖一下）不會讓人在別人畫面上閃成離線再閃回來。
+ * 反過來說「他其實已經關掉分頁了」最多會多掛著 150 秒，這個誤差在家用相簿上
+ * 完全不重要，而縮短它要付的代價是提高輪詢頻率。
+ */
+const PRESENCE_ONLINE_MS = 150 * 1000;
+
+/*
+ * 心跳的節流：40 秒內剛寫過就不再寫。
+ *
+ * ⚠️ 這一條是為了**多分頁**。同一個人開三個分頁就是三份計時器，沒有這道
+ *    節流的話寫入次數直接乘三，而 D1 的寫入是免費額度裡真的會被吃掉的那一格。
+ *    值要小於前端的輪詢間隔（60 秒），不然正常的單分頁心跳會被自己擋掉。
+ */
+const PRESENCE_WRITE_THROTTLE_S = 40;
+
 const SETTING_DRIVE_AUDIT = "drive_audit";
 
 /** 一輪掃完之後閒置多久才開始下一輪 */
@@ -1426,6 +1445,18 @@ const DRIVE_AUDIT_MAX_REPORTS = 40;
  * 那一列 JSON 不會因為這次的改動長大。
  */
 const DRIVE_AUDIT_MAX_DETAIL = 300;
+
+/**
+ * 整輪的「已排進 trash/」清單最多留幾筆（存進 AppSetting 那一列 JSON）。
+ *
+ * ⚠️ 這是**唯一**看得到「哪些檔被搬走」的地方 —— `DriveTrash` 那張表在搬成功之後
+ *    就把列刪掉了（見 drainDriveTrash），事後查不到任何痕跡。以前站上只有一個
+ *    `orphans_queued` 數字，使用者看到「12」也不知道被搬走的是什麼。
+ *
+ * 200 筆 × 約 120 bytes ≈ 24KB，跟 reports 一樣夾在 AppSetting 那一列裡。
+ * 超出的用 trashed_more 講出來，不要靜靜截斷。
+ */
+const DRIVE_AUDIT_MAX_TRASHED = 200;
 
 /**
  * 逐張明細的一筆＝「某一張照片的某一份備份怎麼了」。
@@ -1515,6 +1546,14 @@ interface DriveAuditAlbumReport {
   moved: number;
   /** Drive 上多出來、已丟進待搬佇列 */
   orphans_queued: number;
+  /**
+   * 這一本剛剛排進待搬佇列的是哪幾個檔。
+   *
+   * ⚠️ 跟 `extras` 不一樣：extras 只有 detail=true（單獨對一本）時才有，
+   *    而這一份**每次都產**，因為它要往上累進整輪的清單。數量本來就被
+   *    DRIVE_AUDIT_MAX_ORPHANS（50）夾住了，不會爆。
+   */
+  trashed?: { name: string; drive_id: string }[];
   /** 多出來但名字不符我們的命名規則，不敢動，列出來給人看 */
   foreign: number;
   /**
@@ -1554,6 +1593,13 @@ interface DriveAuditState {
   };
   /** 只留有問題的那幾本 */
   reports: DriveAuditAlbumReport[];
+  /**
+   * 這一輪被搬進 `trash/` 的檔。**站上唯一查得到這件事的地方**（DriveTrash 搬完
+   * 就刪列了）。跟 reports 一樣，cursor 歸零開新一輪時整份清掉。
+   */
+  trashed: { album_id: number; album: string; name: string; drive_id: string }[];
+  /** 超過 DRIVE_AUDIT_MAX_TRASHED、沒列進來的還有幾筆 */
+  trashed_more: number;
   last_error: string | null;
 }
 
@@ -1563,7 +1609,7 @@ const emptyDriveAuditState = (): DriveAuditState => ({
     albums: 0, photos: 0, missing_4k: 0, missing_original: 0, linked: 0,
     gone: 0, cleared: 0, moved: 0, orphans_queued: 0, foreign: 0, ok: 0,
   },
-  reports: [], last_error: null,
+  reports: [], trashed: [], trashed_more: 0, last_error: null,
 });
 
 async function loadDriveAuditState(env: Env): Promise<DriveAuditState> {
@@ -1579,7 +1625,14 @@ async function loadDriveAuditState(env: Env): Promise<DriveAuditState> {
      */
     const saved = JSON.parse(raw) as DriveAuditState;
     const base = emptyDriveAuditState();
-    return { ...base, ...saved, totals: { ...base.totals, ...(saved.totals ?? {}) } };
+    return {
+      ...base, ...saved,
+      totals: { ...base.totals, ...(saved.totals ?? {}) },
+      // 同 totals 的理由：這一欄是後加的，舊的那列 JSON 裡沒有它，
+      // 直接 push 會炸在 undefined 上
+      trashed: Array.isArray(saved.trashed) ? saved.trashed : [],
+      trashed_more: Number(saved.trashed_more ?? 0) || 0,
+    };
   } catch {
     return emptyDriveAuditState();
   }
@@ -1997,6 +2050,11 @@ async function auditDriveAlbum(
           await env.DB.batch(orphans.slice(i, i + 100).map((o) => stmt.bind(o.driveId)));
         }
         rep.orphans_queued = orphans.length;
+        /*
+         * 檔名要留著往上帶。搬進 trash/ 是可逆的，但前提是使用者知道**搬走的是什麼**
+         * —— DriveTrash 那張表搬成功就刪列，事後沒有任何地方查得到。
+         */
+        rep.trashed = orphans.map((o) => ({ name: o.name, drive_id: o.driveId }));
       }
     }
   }
@@ -2066,6 +2124,12 @@ async function runDriveAudit(env: Env, albums: number, force: boolean): Promise<
       state.totals.orphans_queued += rep.orphans_queued;
       state.totals.foreign += rep.foreign;
       state.totals.ok += rep.ok;
+      // 這一輪搬走了哪些。滿了就只累加數字，不要靜靜丟掉
+      for (const t of rep.trashed ?? []) {
+        if (state.trashed.length < DRIVE_AUDIT_MAX_TRASHED) {
+          state.trashed.push({ album_id: rep.album_id, album: rep.name, ...t });
+        } else state.trashed_more++;
+      }
       if (driveAuditWorthReporting(rep) && state.reports.length < DRIVE_AUDIT_MAX_REPORTS) {
         state.reports.push(rep);
       }
@@ -2505,6 +2569,70 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }), { headers });
       }
 
+      /*
+       * 路由：誰在線上（順便回報「我還在」）。
+       *
+       * **一趟做兩件事**，這是整個功能只需要一支端點的原因：
+       *   ① 把我自己的 last_seen_at 推到現在（心跳）
+       *   ② 回全站成員的 last_seen_at，前端自己換算成綠燈／灰燈
+       *
+       * ⚠️ **成員限定。** 訪客沒有 User 那一列（跟留言同一個道理），
+       *    而且「家裡誰現在在線上」比照片本身敏感 —— 那是作息。訪客拿到的是
+       *    空清單，前端因此整個不輪詢、不畫燈、不跳提示。
+       *    回空清單不是 403：訪客本來就該進得了這個站，不是權限出錯。
+       *
+       * ⚠️ **不包 withEdgeCache。** 回應裡有每個家人的名字與作息，而且值本來
+       *    就是每分鐘都在變的（快取它等於這個功能不會動）。
+       *
+       * 額度：一趟 = 一次條件式 UPDATE ＋ 一次幾十列的 SELECT。前端 60 秒一次，
+       * 五個人各看兩小時 ≈ 600 次／天。詳細的取捨寫在 migrations/0022。
+       */
+      if (method === "GET" && pathname === "/api/presence") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const presenceHeaders = { ...headers, "Cache-Control": "no-store" };
+
+        /*
+         * 訪客（以及空資料庫的密碼登入，沒有列可以推）—— 不寫、不查、不回。
+         * 這一條要排在寫入前面：訪客每次進站都會經過，多一次 D1 讀取乘上
+         * 每個人的每次重整就不划算了。
+         */
+        if (actor.uid == null) {
+          return new Response(JSON.stringify({ users: [], online_ms: PRESENCE_ONLINE_MS, self: null }),
+            { headers: presenceHeaders });
+        }
+
+        // 心跳。40 秒內剛寫過就跳過（多分頁），見 PRESENCE_WRITE_THROTTLE_S
+        await env.DB.prepare(
+          `UPDATE User SET last_seen_at = datetime('now')
+            WHERE id = ?
+              AND (last_seen_at IS NULL
+                   OR last_seen_at < datetime('now', '-${PRESENCE_WRITE_THROTTLE_S} seconds'))`
+        ).bind(actor.uid).run();
+
+        /*
+         * 誰在線上。整張撈是刻意的 —— User 是幾十列的小表，而「離線的人也要
+         * 畫一顆灰燈」本來就需要全部的人。停權的不列（他登不進來，永遠是灰的）。
+         */
+        const { results: rows } = await env.DB.prepare(
+          "SELECT id, name, last_seen_at FROM User WHERE active = 1"
+        ).all<any>();
+
+        return new Response(JSON.stringify({
+          users: rows.map((r: any) => ({
+            id: Number(r.id),
+            name: String(r.name ?? ""),
+            // ISO 化：D1 存的是 'YYYY-MM-DD HH:MM:SS'（UTC），前端直接 Date.parse
+            // 會在 Safari 上得到 NaN，而且沒有時區等於當成本地時間
+            last_seen_at: r.last_seen_at ? `${String(r.last_seen_at).replace(" ", "T")}Z` : null,
+          })),
+          online_ms: PRESENCE_ONLINE_MS,
+          self: actor.uid,
+        }), { headers: presenceHeaders });
+      }
+
       /* ── 頭像 ────────────────────────────────────────────────────────────
        *
        * 一張圖兩用：留言區的圓形頭像 ＋ 地圖上坐在小車上的大頭（飛碟已退休）。
@@ -2861,7 +2989,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             SELECT u.id, u.name, u.email, u.role,
                    u.can_manage_others, u.can_add_to_others, u.can_reorder_others,
                    u.can_comment, u.can_view_comments, u.can_view_map, u.can_use_tools, u.active,
-                   u.last_login_at, u.created_at,
+                   u.last_login_at, u.last_seen_at, u.created_at,
                    u.track_color, u.avatar_key, u.track_drive_folder_id,
                    (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
                    (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id WHERE a.user_id = u.id) AS photo_count,

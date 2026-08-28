@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import styles from "./admin.module.css";
 import { fetchDrivePending, type DrivePendingPhoto } from "@/lib/api";
 
@@ -24,7 +24,7 @@ const missingLabel = (p: DrivePendingPhoto): string => {
 };
 
 /**
- * 後台那一格：**缺 Drive 備份的檔案清單**。
+ * 「Drive 比對」那一格裡的**第一份清單：缺 Drive 備份的檔案**。
  *
  * 這裡是唯讀的資訊，**沒有補傳按鈕**（2026-08-28 拿掉了）。要補的做法是把
  * 同一個原始檔再拖進那本相簿一次 —— 上傳流程的重複偵測會認出位元組一樣，
@@ -36,11 +36,14 @@ const missingLabel = (p: DrivePendingPhoto): string => {
  * 打開那一張的燈箱（回答「這個檔名到底是哪一張」）。
  *
  * ⚠️ **不在進頁時自動抓**：這一頁平常是來加人、改權限的，多打一次請求沒必要
- *    （跟 Drive 對帳那一格同一個規矩）。
+ *    （跟 Drive 比對那一格同一個規矩）。比對完之後才由上層推 `reloadToken`
+ *    叫它重讀 —— 那時候這份清單一定變了，讓使用者自己再按一次等於做了一半。
  * ⚠️ **刻意不列縮圖**：一次幾百張就是幾百次 Workers 請求。要看是哪一張是
  *    使用者一次點一張的動作，不是一開頁就全部載進來。
+ *
+ * 沒有自己的外框與標題 —— 它是 DriveCompareCard 裡的一段。
  */
-export default function DrivePendingCard() {
+export function DrivePendingList({ reloadToken = 0 }: { reloadToken?: number }) {
   const [rows, setRows] = useState<DrivePendingPhoto[] | null>(null);
   const [total, setTotal] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -92,9 +95,19 @@ export default function DrivePendingCard() {
     }
   };
 
+  /*
+   * 上層比對完就把 token 推一格，這裡跟著重讀。
+   * ⚠️ 初值（0）不能觸發 —— 那就變成「一進頁就自動抓」了，正是上面說不要的。
+   */
+  const seenToken = useRef(reloadToken);
+  useEffect(() => {
+    if (reloadToken === seenToken.current) return;
+    seenToken.current = reloadToken;
+    void load();
+  }, [reloadToken, load]);
+
   return (
-    <section className={`glass-panel ${styles.card}`}>
-      <h2 className={styles.sectionTitle}>缺 Drive 備份的檔案</h2>
+    <>
       <p className={styles.hint}>
         上傳當下 Drive 那一步失敗的照片與影片會留在這裡（很舊的照片也是）。
         <strong>要補的話：把同一個原始檔再拖進那本相簿一次就好</strong> ——
@@ -215,6 +228,6 @@ export default function DrivePendingCard() {
           </div>
         </>
       )}
-    </section>
+    </>
   );
 }

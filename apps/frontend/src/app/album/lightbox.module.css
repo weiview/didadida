@@ -629,6 +629,32 @@ input:checked + .slider:before {
   display: block;
 }
 
+/*
+ * 頭像右下角那顆上線燈。外框那圈深色是留言區的底色 —— 沒有它，燈貼在深色
+ * 頭像邊緣上會糊成一團看不出形狀。
+ */
+.avatarWrap {
+  position: relative;
+  flex: 0 0 auto;   /* 原本是 .avatar 自己扛的，包一層之後要移到外面來 */
+  display: inline-flex;
+  line-height: 0;
+}
+
+.presenceDot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #9ca3af;      /* 離線 */
+  border: 2px solid #1c1c1e; /* 燈箱右欄的底色 */
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+.presenceOn { background: #22c55e; }
+
 .commentBubbleWrap {
   display: flex;
   flex-direction: column;

@@ -40,6 +40,78 @@
   margin-bottom: 1rem;
 }
 
+/* ── 收折（見 AdminSection.tsx） ────────────────────────────────────────── */
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* 標題在收折的框裡不再需要底部留白 —— 收起來時那段空白會變成一條無來由的縫 */
+.sectionHeader .sectionTitle {
+  margin-bottom: 0;
+}
+
+.chevron {
+  display: inline-block;
+  flex: none;
+  font-size: 0.8rem;
+  color: var(--text-light);
+  transition: transform 140ms ease;
+}
+
+.chevronOpen {
+  transform: rotate(90deg);
+}
+
+.sectionBadge {
+  margin-left: auto;
+  font-size: 0.78rem;
+  color: var(--text-light);
+  white-space: nowrap;
+}
+
+.sectionBody {
+  margin-top: 1rem;
+}
+
+/* 上線燈。後台名單上「他現在在不在」比「最後上線」那串時間好讀得多 */
+.presenceDot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9ca3af;
+  margin-right: 0.3rem;
+  vertical-align: middle;
+}
+
+.presenceOn { background: #22c55e; }
+
+/* 一條細長的進度條，給「比對全部相簿」用 */
+.progressTrack {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--border-color);
+  overflow: hidden;
+  margin: 0.6rem 0 0.2rem;
+}
+
+.progressBar {
+  height: 100%;
+  background: #22c55e;
+  transition: width 200ms ease;
+}
+
 .formRow {
   display: flex;
   flex-wrap: wrap;

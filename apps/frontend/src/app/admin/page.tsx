@@ -5,14 +5,15 @@ import Link from "next/link";
 import styles from "./admin.module.css";
 import {
   CONVOY_PCT_DEFAULT, CONVOY_PCT_MAX, CONVOY_PCT_MIN,
-  DriveAuditAlbumReport, DriveAuditState, PurgePreview, TrackFolderSync,
-  UserContributions, WhitelistUser,
-  addWhitelistUser, auditOneAlbum, fetchDriveAudit, fetchPurgePreview, fetchSiteSettings,
+  PurgePreview, TrackFolderSync, UserContributions, WhitelistUser,
+  addWhitelistUser, fetchPurgePreview, fetchSiteSettings,
   fetchUserContributions, fetchWhitelist, purgeWhitelistUser, removeWhitelistUser,
-  runDriveAudit, syncTrackFolders, updateSiteSettings, updateWhitelistUser,
+  syncTrackFolders, updateSiteSettings, updateWhitelistUser,
 } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
-import DrivePendingCard from "./DrivePendingCard";
+import { isOnline, usePresence } from "@/lib/presence";
+import AdminSection from "./AdminSection";
+import DriveCompareCard from "./DriveCompareCard";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import Avatar from "@/components/Avatar";
 import AvatarPicker from "@/components/AvatarPicker";
@@ -30,8 +31,22 @@ import AvatarPicker from "@/components/AvatarPicker";
  * 這一頁是**唯一**的管理員入口 —— 不在這份名單上的 Google 帳號一律登不進來，
  * 沒有環境變數之類的第二條路。
  */
+/**
+ * D1 存的時間是 `YYYY-MM-DD HH:MM:SS`（UTC，字串裡沒有時區）——
+ * 直接餵給 `new Date()` 會被當成本地時間，差一個時區而且錯得很安靜。
+ * 已經是 ISO（結尾有 Z）的就別再補一次。
+ */
+const fmtUtc = (s: string) =>
+  new Date(s.endsWith("Z") ? s : `${s.replace(" ", "T")}Z`).toLocaleString();
+
 export default function AdminPage() {
   const { isOwner, checking, isAdmin, user: me, setMyAvatar } = useAdmin();
+
+  /*
+   * 誰現在在線上。**只是看**，輪詢由全站唯一的 <PresenceToasts /> 開
+   * （見 lib/presence.ts）—— 這一頁沒開它也照樣有值，因為那支元件掛在 layout 上。
+   */
+  const presence = usePresence();
 
   const [users, setUsers] = useState<WhitelistUser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -50,67 +65,6 @@ export default function AdminPage() {
    */
   const [newCanUseTools, setNewCanUseTools] = useState(false);
   const [adding, setAdding] = useState(false);
-
-  /*
-   * Drive 備份對帳。**這一份是唯讀報告，跑對帳的是 cron**（十分鐘一次、一次一本，
-   * 掃完一輪就休息一天）—— 這裡只是把結果拿回來看，外加三顆手動的按鈕。
-   *
-   * 不在進頁時自動抓：這一頁平常是來加人、改權限的，多打一次請求沒必要。
-   */
-  const [audit, setAudit] = useState<DriveAuditState | null>(null);
-  const [auditBusy, setAuditBusy] = useState<null | "load" | "run" | "reset" | "trash" | "one">(null);
-  const [auditError, setAuditError] = useState<string | null>(null);
-  const [auditNote, setAuditNote] = useState<string | null>(null);
-
-  /*
-   * 「單獨對一本」的結果。跟上面那份整輪報告**是兩件事**，所以另外存一份：
-   * 那一趟刻意不推游標、不累加 totals（見後端 /api/admin/drive-audit 的註解），
-   * 混在一起會讓整輪的數字看起來被算了兩次。
-   */
-  const [auditAlbumId, setAuditAlbumId] = useState<number | "">("");
-  const [albumReport, setAlbumReport] = useState<DriveAuditAlbumReport | null>(null);
-
-  const runOneAlbum = async () => {
-    if (auditBusy || auditAlbumId === "") return;
-    setAuditBusy("one");
-    setAuditError(null);
-    setAuditNote(null);
-    try {
-      setAlbumReport(await auditOneAlbum(Number(auditAlbumId)));
-    } catch (e) {
-      setAlbumReport(null);
-      setAuditError(e instanceof Error ? e.message : "對帳失敗");
-    } finally {
-      setAuditBusy(null);
-    }
-  };
-
-  const withAudit = async (
-    kind: "load" | "run" | "reset" | "trash",
-    fn: () => Promise<DriveAuditState & { revived?: number }>,
-  ) => {
-    if (auditBusy) return;
-    setAuditBusy(kind);
-    setAuditError(null);
-    setAuditNote(null);
-    try {
-      const state = await fn();
-      setAudit(state);
-      if (kind === "trash") {
-        setAuditNote(
-          state.revived
-            ? `救回 ${state.revived} 筆待搬，已經重新試過一次`
-            : "沒有放棄的待搬項目",
-        );
-        // 救回來的那幾筆是待搬佇列的事，報告本身沒變 —— 重抓一次才看得到新的數字
-        setAudit(await fetchDriveAudit());
-      }
-    } catch (e) {
-      setAuditError(e instanceof Error ? e.message : "對帳失敗");
-    } finally {
-      setAuditBusy(null);
-    }
-  };
 
   /** 正在確認移除的那個人 */
   const [removing, setRemoving] = useState<WhitelistUser | null>(null);
@@ -434,8 +388,7 @@ export default function AdminPage() {
       {error && <p className={`${styles.message} ${styles.err}`}>{error}</p>}
       {notice && <p className={`${styles.message} ${styles.ok}`}>{notice}</p>}
 
-      <section className={`glass-panel ${styles.card}`}>
-        <h2 className={styles.sectionTitle}>訪客能看到什麼</h2>
+      <AdminSection id="guest" title="訪客能看到什麼">
         <p className={styles.hint}>
           用通行密碼進站的訪客預設只看得到相簿。足跡地圖會把照片的實際位置畫在地圖上
           （已經標成不公開的相簿與照片仍然不會出現），要不要給訪客看由你決定。
@@ -463,10 +416,9 @@ export default function AdminPage() {
           訪客<strong>永遠留不了言</strong>，這格只管看不看得到。家人之間的對話會連名字一起被
           訪客看見，開之前先想一下留言區裡都講了些什麼。
         </p>
-      </section>
+      </AdminSection>
 
-      <section className={`glass-panel ${styles.card}`}>
-        <h2 className={styles.sectionTitle}>不開放的照片</h2>
+      <AdminSection id="restricted" title="不開放的照片">
         <p className={styles.hint}>
           標成「不開放」的照片<strong>只有你跟可管理全站內容的人看得到</strong>，
           其他成員與訪客的相簿、搜尋、地圖上那一格整個不存在 —— 那是權限，一直都在。
@@ -486,10 +438,9 @@ export default function AdminPage() {
           <strong>重整或關掉分頁就全部蓋回去</strong>，不會記住。
           用途是旁邊剛好有人看著螢幕的時候，捲相簿不會整片跳出來。
         </p>
-      </section>
+      </AdminSection>
 
-      <section className={`glass-panel ${styles.card}`}>
-        <h2 className={styles.sectionTitle}>足跡地圖：一起出遊的判定</h2>
+      <AdminSection id="convoy" title="足跡地圖：一起出遊的判定">
         <p className={styles.hint}>
           播放足跡時，一起出遊的人會合體成同一台車。判定的方式是拿兩個人
           <strong>貼路之後的移動路線</strong>逐趟比對：同一趟裡，走在對方那條路上
@@ -521,10 +472,15 @@ export default function AdminPage() {
           調低會讓「順路載一段」也算成一起出遊；調高則只有整趟幾乎一模一樣才合體。
           改完不必重貼路，家人下次開地圖就是新的判定。
         </p>
-      </section>
+      </AdminSection>
 
-      <section className={`glass-panel ${styles.card}`}>
-        <h2 className={styles.sectionTitle}>加入白名單</h2>
+      {/*
+        白名單。**「加入」的表單就在這一格裡面**（2026-08-28 從獨立的一格併進來）
+        —— 加人跟看名單本來就是同一件事的兩半，拆成上下兩格的結果是加完之後
+        還要自己往下捲去確認他真的進去了。
+      */}
+      <AdminSection id="whitelist" title="白名單" badge={`${users.length} 人`} defaultOpen>
+        <div className={styles.detailHead}>加入新成員</div>
         <div className={styles.formRow}>
           <div className={styles.field}>
             <label htmlFor="new-email">Google 信箱</label>
@@ -574,10 +530,8 @@ export default function AdminPage() {
             {adding ? "新增中..." : "加入"}
           </button>
         </div>
-      </section>
 
-      <section className={`glass-panel ${styles.card}`}>
-        <h2 className={styles.sectionTitle}>白名單（{users.length}）</h2>
+        <div className={styles.detailHead}>目前的名單（{users.length}）</div>
         {loading ? (
           <p className={styles.hint}>讀取中...</p>
         ) : users.length === 0 ? (
@@ -588,11 +542,21 @@ export default function AdminPage() {
             const busy = busyId === user.id;
             return (
               <div key={user.id} className={styles.userRow}>
+                {/*
+                  * 綠燈／灰燈。停權的人**不畫燈** —— 他登不進來，永遠是灰的，
+                  * 那顆燈只會跟旁邊的「已停權」標籤講同一件事。
+                  * presence 還沒回來（ready=false）也不畫，不然全部先亮一排灰的再跳。
+                  */}
                 <Avatar
                   src={user.avatar}
                   name={user.name || user.email}
                   color={user.track_color ?? "#8a7f72"}
                   size={38}
+                  presence={
+                    presence.ready && user.active === 1
+                      ? (isOnline(user.id, presence) ? "online" : "offline")
+                      : undefined
+                  }
                 />
                 <div className={styles.userMain}>
                   <div className={styles.userName}>
@@ -612,9 +576,23 @@ export default function AdminPage() {
                   <div className={styles.userMeta}>
                     建立 {user.album_count} 本相簿 · 上傳 {user.uploaded_count} 張照片
                     {" · "}
-                    {user.last_login_at
-                      ? `最後登入 ${new Date(user.last_login_at.replace(" ", "T") + "Z").toLocaleString()}`
-                      : "還沒登入過"}
+                    {/*
+                      * ⚠️ 講的是**最後一次有動靜**（last_seen_at，見 migrations/0022），
+                      *   不是 last_login_at。進站 token 有效期 7 天，天天在看照片的人
+                      *   也不會重新認證，於是這裡以前永遠寫著一週前 —— 看起來就像壞了。
+                      *   舊後端沒有這一欄（undefined），那就退回登入時間。
+                      */}
+                    {(() => {
+                      const seen = user.last_seen_at ?? null;
+                      if (seen) {
+                        return isOnline(user.id, presence)
+                          ? "現在在線上"
+                          : `最後上線 ${fmtUtc(seen)}`;
+                      }
+                      return user.last_login_at
+                        ? `最後登入 ${fmtUtc(user.last_login_at)}`
+                        : "還沒登入過";
+                    })()}
                     {(user.album_count > 0 || user.uploaded_count > 0) && (
                       <>
                         {" · "}
@@ -873,232 +851,15 @@ export default function AdminPage() {
             );
           })
         )}
-      </section>
+      </AdminSection>
 
       {/*
-        Drive 備份對帳。站上一張照片，Drive 上就該有一份 4K ＋ 一份原始檔
-        （影片只有原始檔一份）。上傳與刪除都可能在半路失敗，兩邊因此會慢慢走鐘，
-        而走鐘是**安靜的** —— 這一格就是把它變成看得見的數字。
+        Drive 比對。站上一張照片，Drive 上就該有一份 4K ＋ 一份原始檔
+        （影片與 GIF 只有原始檔一份）。上傳與刪除都可能在半路失敗，兩邊因此會
+        慢慢走鐘，而走鐘是**安靜的** —— 那一格就是把它變成看得見的兩份清單。
+        （原本拆成「Drive 備份對帳」與「缺 Drive 備份的檔案」兩格，2026-08-28 合併）
       */}
-      <section className={`glass-panel ${styles.card}`}>
-        <h2 className={styles.sectionTitle}>Drive 備份對帳</h2>
-        <p className={styles.hint}>
-          站上一張照片，Drive 上就該有<strong>一份 4K ＋ 一份原始檔</strong>
-          （影片沒有 4K，只有原始檔一份）。系統每十分鐘自己對一本相簿，
-          對完一輪休息一天。這裡看得到最近一輪的結果，也可以手動催。
-          想知道<strong>某一本到底哪幾張要補、哪幾張不用</strong>，
-          先按「看最新結果」載入相簿清單，再用下面那個選單單獨對那一本。
-        </p>
-
-        <div className={styles.formRow}>
-          <button
-            className={styles.button}
-            disabled={auditBusy !== null}
-            onClick={() => withAudit("load", fetchDriveAudit)}
-          >
-            {auditBusy === "load" ? "讀取中…" : "看最新結果"}
-          </button>
-          <button
-            className={`${styles.button} ${styles.primary}`}
-            disabled={auditBusy !== null}
-            onClick={() => withAudit("run", () => runDriveAudit({ albums: 3 }))}
-          >
-            {auditBusy === "run" ? "對帳中…" : "現在對 3 本"}
-          </button>
-          <button
-            className={styles.button}
-            disabled={auditBusy !== null}
-            onClick={() => withAudit("reset", () => runDriveAudit({ reset: true, albums: 3 }))}
-          >
-            {auditBusy === "reset" ? "重來中…" : "從第一本重新對"}
-          </button>
-        </div>
-
-        {/*
-          單獨對一本。相簿清單跟著 GET 一起回來（後端一句 SELECT id, name FROM Album）
-          —— 刻意不打 /api/albums，那一支每本都要撈封面與預覽圖，這裡只要名字。
-        */}
-        {audit?.albums && audit.albums.length > 0 && (
-          <div className={styles.formRow}>
-            <div className={styles.field}>
-              <label htmlFor="audit-album">單獨對一本（會列出逐張明細）</label>
-              <select
-                id="audit-album"
-                className={styles.select}
-                value={auditAlbumId}
-                disabled={auditBusy !== null}
-                onChange={(e) => setAuditAlbumId(e.target.value === "" ? "" : Number(e.target.value))}
-              >
-                <option value="">選一本相簿…</option>
-                {audit.albums.map((a) => (
-                  <option key={a.id} value={a.id}>{a.name}</option>
-                ))}
-              </select>
-            </div>
-            <button
-              className={`${styles.button} ${styles.primary}`}
-              disabled={auditBusy !== null || auditAlbumId === ""}
-              onClick={runOneAlbum}
-            >
-              {auditBusy === "one" ? "比對中…" : "全面比對這一本"}
-            </button>
-          </div>
-        )}
-
-        {auditError && <p className={`${styles.message} ${styles.err}`}>{auditError}</p>}
-        {auditNote && <p className={`${styles.message} ${styles.ok}`}>{auditNote}</p>}
-
-        {albumReport && <AlbumAuditReport report={albumReport} />}
-
-        {audit && (
-          <>
-            <p className={styles.hint}>
-              {audit.finished_at
-                ? `上一輪對完於 ${new Date(audit.finished_at).toLocaleString("zh-TW")}`
-                : audit.cursor > 0
-                  ? `對到一半（已經對過 ${audit.albums_done} 本，下次從 id > ${audit.cursor} 接著）`
-                  : "還沒對過"}
-              {audit.last_run_at && `，最近一次執行 ${new Date(audit.last_run_at).toLocaleString("zh-TW")}`}
-            </p>
-
-            <div className={styles.detail}>
-              <div className={styles.detailRow}>
-                <span className={styles.detailName}>對過的相簿 / 照片</span>
-                <span className={styles.detailNum}>{audit.totals.albums} / {audit.totals.photos}</span>
-              </div>
-              <div className={styles.detailRow}>
-                <span className={styles.detailName}>兩份都在（不用補）</span>
-                <span className={styles.detailNum}>{audit.totals.ok ?? 0}</span>
-              </div>
-              <div className={styles.detailRow}>
-                <span className={styles.detailName}>缺 4K</span>
-                <span className={styles.detailNum}>{audit.totals.missing_4k}</span>
-              </div>
-              <div className={styles.detailRow}>
-                <span className={styles.detailName}>缺原始檔</span>
-                <span className={styles.detailNum}>{audit.totals.missing_original}</span>
-              </div>
-              <div className={styles.detailRow}>
-                <span className={styles.detailName}>檔案在、記錄漏掉（已自動接回來）</span>
-                <span className={styles.detailNum}>{audit.totals.linked ?? 0}</span>
-              </div>
-              <div className={styles.detailRow}>
-                <span className={styles.detailName}>Drive 上找不到（已清掉記錄，會出現在下面那份清單）</span>
-                <span className={styles.detailNum}>{audit.totals.cleared}</span>
-              </div>
-              <div className={styles.detailRow}>
-                <span className={styles.detailName}>只是被搬到別的資料夾（備份還在，沒動它）</span>
-                <span className={styles.detailNum}>{audit.totals.moved}</span>
-              </div>
-              <div className={styles.detailRow}>
-                <span className={styles.detailName}>沒人指著的檔，已排進 trash/</span>
-                <span className={styles.detailNum}>{audit.totals.orphans_queued}</span>
-              </div>
-              <div className={styles.detailRow}>
-                <span className={styles.detailName}>不是本站放的檔（一律不碰）</span>
-                <span className={styles.detailNum}>{audit.totals.foreign}</span>
-              </div>
-            </div>
-
-            <p className={styles.hint}>
-              對帳比的是<strong>檔名</strong>：站上每一張該有的
-              <span className={styles.mono}>&lt;編號&gt;_&lt;檔名&gt;</span>
-              在那本相簿的 Drive 資料夾裡是不是都找得到。
-              找得到卻沒記錄的會直接接回來（那是「傳上去了、網站沒記到」的下場，
-              以前會變成一筆假的缺件<strong>加上</strong>一個假孤兒）。
-              「缺 4K／缺原始檔」要補的話，<strong>把同一個原始檔再拖進那本相簿一次</strong>
-              —— 站上會認出是同一個檔，直接補上缺的那一份，不會多一格
-              （是哪幾個檔看下面那格「缺 Drive 備份的檔案」）。
-              真正的 4K 只編得出來一次，R2 上那份縮圖補不了，所以非得要原始檔不可。
-              孤兒檔是<strong>搬進 <span className={styles.mono}>didadida/trash/</span></strong>
-              不是刪除，反悔隨時去 Drive 搬回來。
-            </p>
-
-            {audit.last_error && (
-              <p className={`${styles.message} ${styles.err}`}>上次出錯：{audit.last_error}</p>
-            )}
-
-            {audit.reports.length > 0 && (
-              <details className={styles.guide}>
-                <summary className={styles.guideSummary}>逐本相簿的結果（{audit.reports.length}）</summary>
-                <div className={styles.guideBody}>
-                  {audit.reports.map((r) => (
-                    <div key={r.album_id} className={styles.detailRow}>
-                      <span className={styles.detailName}>{r.name}</span>
-                      <span className={styles.detailNote}>
-                        {r.error
-                          ? `出錯：${r.error}`
-                          : r.no_folder
-                            ? `${r.photos} 張，Drive 上還沒有這本的資料夾`
-                            : [
-                                `${r.photos} 張`,
-                                r.missing_4k > 0 ? `缺 4K ${r.missing_4k}` : "",
-                                r.missing_original > 0 ? `缺原始檔 ${r.missing_original}` : "",
-                                r.linked > 0 ? `接回記錄 ${r.linked}` : "",
-                                r.cleared > 0 ? `Drive 上不見了 ${r.cleared}` : "",
-                                r.moved > 0 ? `被搬走 ${r.moved}` : "",
-                                r.orphans_queued > 0 ? `孤兒 ${r.orphans_queued}` : "",
-                                r.foreign > 0 ? `外來檔 ${r.foreign}` : "",
-                                r.truncated ? "（檔案太多沒列完，這本的判定不算數）" : "",
-                              ].filter(Boolean).join("、")}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </details>
-            )}
-
-            {/*
-              待搬佇列。刪照片時 Drive 那一下失敗會試三次，三次都失敗就永遠躺在表裡 ——
-              以前站上沒有任何地方看得到它，「Drive 刪除失敗」跳完就再也沒有下文。
-            */}
-            {audit.trash && (
-              <>
-                <p className={styles.hint}>
-                  Drive 待搬（刪掉的照片要搬進 <span className={styles.mono}>trash/</span>）：
-                  排隊中 <strong>{audit.trash.remaining}</strong>、
-                  已放棄 <strong style={{ color: audit.trash.gave_up > 0 ? "#b91c1c" : undefined }}>
-                    {audit.trash.gave_up}
-                  </strong>。
-                </p>
-                {audit.trash.gave_up > 0 && (
-                  <>
-                    <div className={styles.formRow}>
-                      <button
-                        className={`${styles.button} ${styles.primary}`}
-                        disabled={auditBusy !== null}
-                        onClick={() => withAudit("trash", () => runDriveAudit({ retryTrash: true }))}
-                      >
-                        {auditBusy === "trash" ? "重試中…" : `重試放棄的 ${audit.trash.gave_up} 筆`}
-                      </button>
-                    </div>
-                    <details className={styles.guide}>
-                      <summary className={styles.guideSummary}>看卡住的是哪幾筆</summary>
-                      <div className={styles.guideBody}>
-                        {audit.trash.stuck.map((t) => (
-                          <div key={t.id} className={styles.detailRow}>
-                            <span className={styles.mono}>{t.drive_id}</span>
-                            <span className={styles.detailNote}>
-                              試了 {t.attempts} 次{t.last_error ? `：${t.last_error}` : ""}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </details>
-                  </>
-                )}
-              </>
-            )}
-          </>
-        )}
-      </section>
-
-      {/*
-        缺 Drive 備份的檔案清單。跟上面那一格的分工：對帳是「有沒有走鐘」的
-        總數與自動修正，這一格是「**到底是哪幾個檔、誰傳的、在哪一本**」。
-        唯讀 —— 補的方法是把同一個原始檔再拖進那本相簿一次。
-      */}
-      <DrivePendingCard />
+      <DriveCompareCard />
 
       {/*
         GPS 軌跡資料夾。為什麼要一個人一個資料夾：GPSLogger 只拿得到
@@ -1106,8 +867,7 @@ export default function AdminPage() {
         站長的 Drive」。每個人傳進自己的 Drive，再把那個資料夾分享給站上的
         服務帳號，由這裡綁上去。
       */}
-      <section className={`glass-panel ${styles.card}`}>
-        <h2 className={styles.sectionTitle}>GPS 軌跡資料夾</h2>
+      <AdminSection id="tracks" title="GPS 軌跡資料夾">
         <p className={styles.hint}>
           每個人的 GPSLogger 都是傳進他自己的 Google Drive（手機 App 只碰得到自己建的資料夾，
           沒辦法直接傳到你這邊）。請他把那個資料夾<strong>分享</strong>給下面這個服務帳號，
@@ -1290,7 +1050,7 @@ export default function AdminPage() {
             </div>
           );
         })}
-      </section>
+      </AdminSection>
 
       <SlideConfirmModal
         isOpen={removing !== null}
@@ -1396,196 +1156,3 @@ export default function AdminPage() {
   );
 }
 
-
-/* ── 單獨對一本的結果 ─────────────────────────────────────────────────────
-
-  這一格回答的是使用者實際問的兩個問題：**「哪幾張要補、哪幾張不用」**，
-  以及**「多餘的那些怎麼了」**。
-
-  ⚠️「多餘的」在這個站有兩種，處理方式刻意不同（後端 findDuplicateRows 有長註解）：
-    - **Drive 上多出來的檔**：沒有任何一列指著它，過三道閘就自動排進 trash/。
-      搬進垃圾桶是可逆的，所以敢自動做。
-    - **站上多出來的列**：刪一列 Photo ＝ 相簿裡少一格，連同標籤、留言、Story、
-      手動修過的座標與時間一起沒。哪一列該留只有人判斷得了，**所以只列出來**。
-*/
-
-const SLOT_LABEL: Record<string, string> = { "4k": "4K", original: "原始檔" };
-
-/**
- * 影片（0019）與 GIF（0021）在 Drive 上都**只有原始檔一份** —— 沒有衍生的 4K，
- * `drive_file_id` 對它們永遠是 NULL。逐張明細那兩處的「缺哪一份」都要照這個分岔，
- * 不然一整類的檔案會永遠掛著一個補不完的「缺 4K」。
- */
-const isOneSlotMedia = (t?: string) => t === "video" || t === "gif";
-/** 明細列在檔名後面補一句它是什麼；照片不加（大多數都是照片，加了只是噪音） */
-const mediaSuffix = (t?: string) => (t === "video" ? "（影片）" : t === "gif" ? "（GIF）" : "");
-
-/** 還沒解決的那幾種，會出現在「還缺哪些」那一段 */
-const NEEDS_ACTION = new Set(["missing", "cleared", "gone"]);
-
-const ITEM_STATE_LABEL: Record<string, string> = {
-  missing: "從來沒傳成功過",
-  cleared: "Drive 上確認沒了，記錄已清掉",
-  gone: "記錄有、Drive 清單裡沒有（還沒追問到）",
-  linked: "檔案在，記錄漏掉，已自動接回來",
-  linking: "檔案在，記錄下一輪才寫得回去（備份是好的）",
-  moved: "被搬到別的資料夾，備份是好的",
-};
-
-const EXTRA_REASON_LABEL: Record<string, string> = {
-  foreign: "不是本站放的檔，一律不碰",
-  too_new: "建立不到 24 小時，可能是剛傳完還沒回報",
-  in_use: "那張照片還指著它",
-  queued_before: "早就在待搬佇列裡了",
-  over_limit: "這一輪額度用完，下一輪再處理",
-};
-
-function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
-  const items = r.items ?? [];
-  const todo = items.filter((i) => NEEDS_ACTION.has(i.state));
-  const done = items.filter((i) => !NEEDS_ACTION.has(i.state));
-  const extras = r.extras ?? [];
-  const queued = extras.filter((e) => e.action === "queued");
-  const kept = extras.filter((e) => e.action === "kept");
-  const dups = r.dups ?? [];
-
-  return (
-    <div className={styles.detail}>
-      <div className={styles.detailHead}>單獨比對：{r.name}</div>
-
-      {r.error && <p className={`${styles.message} ${styles.err}`}>出錯：{r.error}</p>}
-
-      {r.no_folder ? (
-        <p className={styles.hint}>
-          這本相簿在 Drive 上<strong>還沒有資料夾</strong> —— {r.photos} 張全都沒有備份過。
-          把任何一個原始檔再拖進那本相簿一次就會建起來。
-        </p>
-      ) : r.truncated ? (
-        <p className={`${styles.message} ${styles.err}`}>
-          這本在 Drive 上的檔案太多，這次<strong>沒有列完</strong>。
-          「不見了」與「多出來的檔」整段跳過 —— 拿半份清單去判定會清掉好資料。
-        </p>
-      ) : null}
-
-      <div className={styles.detailRow}>
-        <span className={styles.detailName}>
-          <strong>{r.ok}</strong> / {r.photos} 張<strong>不用補</strong>（該有的備份都在）
-        </span>
-        <span className={styles.detailNum}>
-          {r.photos - r.ok > 0 ? `還有 ${r.photos - r.ok} 張要處理` : "全部齊了"}
-        </span>
-      </div>
-
-      {todo.length > 0 && (
-        <>
-          <div className={styles.detailHead}>還缺哪些（{todo.length}{r.items_more ? "＋" : ""}）</div>
-          {todo.map((i) => (
-            <div key={`${i.photo_id}-${i.slot}`} className={styles.detailRow}>
-              <span className={styles.detailName}>
-                {i.title}{mediaSuffix(i.media_type)} — 缺 {SLOT_LABEL[i.slot] ?? i.slot}
-              </span>
-              <span className={styles.detailNote}>{ITEM_STATE_LABEL[i.state] ?? i.state}</span>
-            </div>
-          ))}
-          <p className={styles.hint}>
-            補的方法：把同一個原始檔再拖進那本相簿一次（站上會認出是同一個檔），
-            它只會補缺的那一份。⚠️ 真正的 4K 只編得出來一次 ——
-            R2 上那份 2000px 補不回 4K，一定要拿原始檔。
-          </p>
-        </>
-      )}
-
-      {done.length > 0 && (
-        <details className={styles.guide}>
-          <summary className={styles.guideSummary}>已經自動處理好的（{done.length}）</summary>
-          <div className={styles.guideBody}>
-            {done.map((i) => (
-              <div key={`${i.photo_id}-${i.slot}`} className={styles.detailRow}>
-                <span className={styles.detailName}>
-                  {i.title} — {SLOT_LABEL[i.slot] ?? i.slot}
-                </span>
-                <span className={styles.detailNote}>{ITEM_STATE_LABEL[i.state] ?? i.state}</span>
-              </div>
-            ))}
-          </div>
-        </details>
-      )}
-
-      {r.items_more ? (
-        <p className={styles.hint}>明細只列前面那些，另外還有 {r.items_more} 筆沒列出來。</p>
-      ) : null}
-
-      {(queued.length > 0 || kept.length > 0) && (
-        <details className={styles.guide}>
-          <summary className={styles.guideSummary}>
-            Drive 上多出來的檔（已排進 trash/ {queued.length}、這次不動 {kept.length}）
-          </summary>
-          <div className={styles.guideBody}>
-            <p>
-              「排進 trash/」是<strong>搬進 <span className={styles.code}>didadida/trash/</span></strong>
-              不是刪除，反悔隨時去 Drive 搬回來。
-            </p>
-            {queued.map((e) => (
-              <div key={e.drive_id} className={styles.detailRow}>
-                <span className={styles.detailName}>{e.name}</span>
-                <span className={styles.detailNote}>已排進 trash/</span>
-              </div>
-            ))}
-            {kept.map((e) => (
-              <div key={e.drive_id} className={styles.detailRow}>
-                <span className={styles.detailName}>{e.name}</span>
-                <span className={styles.detailNote}>
-                  {EXTRA_REASON_LABEL[e.reason ?? ""] ?? "不動它"}
-                </span>
-              </div>
-            ))}
-            {r.extras_more ? <p>另外還有 {r.extras_more} 個沒列出來。</p> : null}
-          </div>
-        </details>
-      )}
-
-      {dups.length > 0 && (
-        <details className={styles.guide}>
-          <summary className={styles.guideSummary}>站上重複的照片（{dups.length} 組，不會自動刪）</summary>
-          <div className={styles.guideBody}>
-            <p>
-              這幾組是<strong>站上（相簿裡）有兩格以上</strong>指著同一張照片。
-              <strong>不會自動刪</strong> —— 刪一格連同它的標籤、留言、Story、
-              手動修過的座標與時間一起沒，哪一格該留只有你判斷得了。
-              到相簿裡進編輯模式選起來刪掉不要的那一格就好。
-            </p>
-            {dups.map((d) => (
-              <div key={`${d.kind}-${d.key}`}>
-                <div className={styles.detailHead}>
-                  {d.kind === "same_hash"
-                    ? "同一個檔（位元組一模一樣）"
-                    : "檔名一樣（不一定是同一張，請自己看一眼）"}
-                  ：{d.key}
-                </div>
-                {d.photos.map((p) => (
-                  <div key={p.id} className={styles.detailRow}>
-                    <span className={styles.detailName}>
-                      #{p.id} {p.title}{mediaSuffix(p.media_type)}
-                    </span>
-                    <span className={styles.detailNote}>
-                      {isOneSlotMedia(p.media_type)
-                        ? (p.has_original ? "Drive 有原始檔" : "Drive 沒有備份")
-                        : `${p.has_4k ? "有 4K" : "缺 4K"}、${p.has_original ? "有原始檔" : "缺原始檔"}`}
-                      {p.created_at ? `　${p.created_at.slice(0, 10)} 加入` : ""}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ))}
-            {r.dups_more ? <p>另外還有 {r.dups_more} 組沒列出來。</p> : null}
-          </div>
-        </details>
-      )}
-
-      {todo.length === 0 && done.length === 0 && extras.length === 0 && dups.length === 0
-        && !r.no_folder && !r.truncated && (
-        <p className={styles.hint}>這一本兩邊完全對得起來，沒有要補的、也沒有多餘的。</p>
-      )}
-    </div>
-  );
-}

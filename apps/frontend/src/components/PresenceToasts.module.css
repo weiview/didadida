@@ -1,0 +1,53 @@
+/*
+ * 「XXX 上線囉」的提示條。
+ *
+ * 位置刻意選左下角：右上角是帳號牌、右下角是回到頂端鈕，塞在那兩處會蓋掉
+ * 使用者正在按的東西。左下角在每一頁都是空的。
+ */
+
+.stack {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 1200; /* 燈箱是 1000 出頭；提示要壓在它上面，不然看照片時等於沒有 */
+  display: flex;
+  flex-direction: column-reverse; /* 新的擠在最下面，靠近視線 */
+  gap: 8px;
+  /* 整疊不吃點擊 —— 它蓋在頁面上，攔下來的每一下都是使用者本來要按的東西 */
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  background: rgba(23, 23, 23, 0.92);
+  color: #fff;
+  font-size: 14px;
+  line-height: 1.2;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  animation: slideIn 220ms ease-out;
+}
+
+/* 綠燈，跟頭像右下角那顆同一個顏色 */
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22c55e;
+  flex-shrink: 0;
+}
+
+.name { font-weight: 600; }
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-12px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* 會動的東西一律問一下使用者要不要 */
+@media (prefers-reduced-motion: reduce) {
+  .toast { animation: none; }
+}

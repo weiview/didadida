@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import styles from './lightbox.module.css';
 import { useAdmin } from '@/lib/useAdmin';
+import { isOnline, usePresence } from '@/lib/presence';
 import {
   MentionableUser, PhotoComment,
   deleteComment, fetchComments, fetchMentionableUsers, postComment, renderCommentBody,
@@ -39,13 +40,37 @@ function timeAgo(iso: string): string {
  * （這裡不共用 components/Avatar.tsx：那支是行內樣式的通用版，
  * 燈箱裡的尺寸與陰影跟著 lightbox.module.css 走。）
  */
-function Avatar({ name, color, src }: { name: string | null; color: string; src?: string | null }) {
-  return (
+function Avatar({ name, color, src, uid }: {
+  name: string | null; color: string; src?: string | null;
+  /**
+   * 給誰畫上線燈。**傳了才畫** —— 這支 Avatar 只在留言區用，兩個呼叫端都有 uid，
+   * 但保持選填是為了跟 components/Avatar.tsx 同一個約定（不知道就不要畫灰燈）。
+   */
+  uid?: number | null;
+}) {
+  /*
+   * 燈跟著全站那份快照走（lib/presence.ts），這裡不開任何計時器 ——
+   * 一串留言可能有幾十顆頭像，各自輪詢會把免費額度吃光。
+   */
+  const snap = usePresence();
+  const dot = uid == null || !snap.ready ? null : isOnline(uid, snap);
+
+  const circle = (
     <span className={styles.avatar} style={{ background: src ? `${color}33` : color }} aria-hidden>
       {src
         // eslint-disable-next-line @next/next/no-img-element
         ? <img className={styles.avatarImg} src={src} alt="" />
         : (name ?? '?').trim().charAt(0) || '?'}
+    </span>
+  );
+
+  // 還沒抓到名單之前不畫燈：先畫成灰的再跳成綠的，看起來像每個人都剛上線
+  if (dot === null) return circle;
+
+  return (
+    <span className={styles.avatarWrap} title={`${name ?? ''}${dot ? '（上線中）' : '（離線）'}`}>
+      {circle}
+      <span className={`${styles.presenceDot}${dot ? ` ${styles.presenceOn}` : ''}`} />
     </span>
   );
 }
@@ -390,7 +415,7 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
 
   const Row = ({ c, isReply }: { c: PhotoComment; isReply: boolean }) => (
     <div className={isReply ? styles.commentReply : styles.commentRow}>
-      <Avatar name={c.user_name} color={c.color} src={c.avatar} />
+      <Avatar name={c.user_name} color={c.color} src={c.avatar} uid={c.user_id} />
       <div className={styles.commentBubbleWrap}>
         <div className={styles.commentBubble}>
           <span className={styles.commentAuthor}>{c.user_name ?? '（已離開）'}</span>
@@ -486,7 +511,7 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
                    */
                   onMouseDown={(e) => { e.preventDefault(); insertMention(p); }}
                 >
-                  <Avatar name={p.name} color={p.color} src={p.avatar} />
+                  <Avatar name={p.name} color={p.color} src={p.avatar} uid={p.id} />
                   <span>{p.name}</span>
                 </button>
               ))}

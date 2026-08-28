@@ -497,6 +497,33 @@ export function clampConvoyPct(v: unknown): number {
  * 但反過來（樂觀放行）更糟：畫面會進得去而每一支 API 都空手而回，
  * 使用者只會看到一個空相簿列表，完全不知道是網路斷了。
  */
+/** `GET /api/presence` 回來的一列。訪客拿到的是空清單 */
+export interface PresenceRow {
+  id: number;
+  name: string;
+  /** ISO 字串（後端已經把 D1 的 'YYYY-MM-DD HH:MM:SS' 補成 UTC）。null ＝ 還沒回來過 */
+  last_seen_at: string | null;
+}
+
+/**
+ * 誰在線上 —— 同一趟順便回報「我還在」（心跳）。
+ *
+ * 狀態與輪詢在 lib/presence.ts，這裡只負責那一趟 fetch（api.ts 是全站唯一的
+ * API 客戶端）。失敗一律往外丟，讓 presence.ts 決定要不要保留上一份快照。
+ */
+export async function fetchPresence(): Promise<{
+  users: PresenceRow[]; online_ms: number | null; self: number | null;
+}> {
+  const res = await fetch(`${API_BASE_URL}/presence`, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error(`presence ${res.status}`);
+  const data = await res.json();
+  return {
+    users: Array.isArray(data?.users) ? data.users as PresenceRow[] : [],
+    online_ms: Number(data?.online_ms) > 0 ? Number(data.online_ms) : null,
+    self: typeof data?.self === 'number' ? data.self : null,
+  };
+}
+
 export async function checkAuth(): Promise<AuthState> {
   const locked: AuthState = {
     admin: false, guest: false, canViewMap: false,
@@ -675,6 +702,13 @@ export interface WhitelistUser extends CurrentUser {
   id: number;
   active: number;
   last_login_at: string | null;
+  /**
+   * 最後一次心跳（見 migrations/0022）。**後台顯示的是這一欄**——
+   * last_login_at 只有真的重新認證那一次才動，而進站 token 有效期 7 天，
+   * 於是天天在看照片的人在後台上永遠寫著一週前。
+   * 舊後端沒有這個欄位，是 undefined，顯示時要退回 last_login_at。
+   */
+  last_seen_at?: string | null;
   created_at: string | null;
   /** 他建了幾本相簿 */
   album_count: number;
@@ -818,6 +852,15 @@ export interface DriveAuditState {
     orphans_queued: number; foreign: number; ok: number;
   };
   reports: DriveAuditAlbumReport[];
+  /**
+   * 這一輪被搬進 `trash/` 的檔（孤兒、重複補傳留下的第二份）。
+   *
+   * ⚠️ **這是站上唯一查得到「哪些檔被搬走」的地方** —— DriveTrash 那張表搬成功
+   *    就把列刪掉了。舊後端沒有這一欄，所以用的地方要當它可能是 undefined。
+   */
+  trashed?: { album_id: number; album: string; name: string; drive_id: string }[];
+  /** 超過上限沒列進來的還有幾筆 */
+  trashed_more?: number;
   last_error: string | null;
   /** Drive 待搬佇列的現況（GET 才有） */
   trash?: {

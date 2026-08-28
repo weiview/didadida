@@ -263,7 +263,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0021）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0022）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
@@ -344,6 +344,52 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   前端連 Google 時間軸紀念層也一起收（`/map` 不抓 index、開關不出現）——
   那是他自己的另一半足跡，留著就是一條沒有名字的線。
   **資料完全不動，權限開回來下一次進頁就全部復原。**
+
+## 誰在線上：綠燈與「XXX 上線囉」
+
+2026-08-28 加的。一支端點 `GET /api/presence` **同時做兩件事**：把我自己的
+`last_seen_at` 推到現在（心跳），並回全站成員的 `last_seen_at`。分成兩支等於
+每分鐘兩次請求，而它們本來就是同一個節奏。
+
+- **`User.last_seen_at`（0022）跟 `last_login_at` 是兩件事，兩欄都留著。**
+  `last_login_at` 只有真的重新認證那一次才寫，而進站 token 有效期 **7 天** ——
+  於是天天在看照片的人在後台上永遠寫著一週前，看起來像壞掉。
+  **後台顯示的是 `last_seen_at`**，NULL（還沒回來過的舊帳號）才退回 `last_login_at`。
+  刻意**不 backfill**，沒有值就照實說「還沒登入過」。
+- ⚠️ **不是 WebSocket。** 常連線在 Cloudflare 上要 Durable Objects，那是**另一個計費
+  資源**，而免費額度是這個站的最高宗旨。輪詢 60 秒一次（`POLL_MS`），
+  「上線中」的門檻 150 秒（`PRESENCE_ONLINE_MS`，＝兩次半）—— 掉一次心跳
+  （切分頁被降頻、網路抖一下）不會讓人在別人畫面上閃成離線再閃回來。
+- ⚠️ 心跳有 **40 秒的寫入節流**（`PRESENCE_WRITE_THROTTLE_S`，寫在 SQL 的 WHERE 裡，
+  不是先讀再判斷）—— 這一條是為了**多分頁**：同一個人開三個分頁就是三份計時器，
+  沒有它 D1 寫入直接乘三。值要小於前端的輪詢間隔，不然正常的單分頁心跳會被自己擋掉。
+- ⚠️ **訪客整個不參與。** 訪客沒有 `User` 那一列（跟留言同一個道理），而且「家裡誰
+  現在在線上」是**作息**，比照片座標敏感。後端在寫入**之前**就分岔掉，回
+  `{users: [], self: null}` 且**零 D1 動作**；前端因此連計時器都不開。
+  回空清單不是 403 —— 訪客本來就該進得了這個站。
+- ⚠️ 這支**不可以包 `withEdgeCache`**：回應裡有每個家人的名字與作息，而且值本來
+  就是每分鐘都在變的（快取它等於這個功能不會動）。回應 `Cache-Control: no-store`。
+- 狀態在 `lib/presence.ts`（module 層 store ＋ `useSyncExternalStore`，同 `exifPref`／
+  `restrictedReveal` 那一套）。**全站只有一份輪詢** —— `usePresence()` 只是看，
+  開輪詢的是 `usePresencePoll()`，只掛在 `components/PresenceToasts.tsx` 那一個地方。
+  ⚠️ 換值一定要「複本做好再換掉」，`useSyncExternalStore` 比的是參考。
+- 「XXX 上線囉」**三條規則都是為了不吵人**：① 第一次抓回來不跳（`ready` 為 false，
+  不然一進站就被五個人的提示蓋滿）；② 自己不跳；③ **上一份快照裡明確是離線的**
+  才跳 —— 上一份根本沒有這個人（剛加白名單、或他的 `last_seen_at` 還是 NULL）
+  不算「剛上線」，那只是我們第一次知道他。
+  ⚠️ 輪詢失敗**保留上一份快照**，不要清空：清了會讓全站的燈一起變灰再變回來，
+  而且下一次抓回來時所有人都會被當成「剛上線」跳一排提示。
+- 燈有**兩個實作**，因為頭像本來就有兩支（留言區那顆吃 `lightbox.module.css`，
+  尺寸與陰影跟著燈箱走；`components/Avatar.tsx` 是行內樣式的通用版）：
+  後台白名單用 `Avatar` 的選填 prop `presence`（`"online"`／`"offline"`），
+  留言區用 `PhotoComments.tsx` 裡那支的選填 prop `uid`。
+  ⚠️ 兩支的約定一樣：**不知道就不要畫**（`undefined`／`!snap.ready` 整顆不畫，
+  不是畫成灰的）—— 先灰再跳綠看起來像每個人都剛上線，而 AvatarPicker 的預覽、
+  地圖上的大頭跟「誰在線上」完全無關，多一顆灰點只是雜訊。
+  ⚠️ 一串留言可能有幾十顆頭像，它們**一律讀全站那份快照**（`usePresence()`），
+  自己不開任何計時器。**停權的人不畫燈** —— 他登不進來永遠是灰的，
+  而那一列旁邊已經有「已停權」的標籤了。
+- ⚠️ 登出要 `resetPresence()`。不清的話下一個登入的人會先看到上一個人的名單。
 
 ## 不開放的照片
 
@@ -745,8 +791,9 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   一次最多追問 `DRIVE_AUDIT_MAX_PROBES`（8）個，剩下的下一輪再說。
 - ⚠️ `listFolderFiles()` **一定要翻頁**，而且 `truncated: true` 的意思是「**沒看完**」不是
   「就這些」—— 半份清單去判「不見了」與「孤兒」會清掉好資料，所以 truncated 時**兩段整個跳過**。
-- **後台**：`/admin`「Drive 備份對帳」那一格（`GET/POST /api/admin/drive-audit`，認
-  `canManageOthers`）。看報告、手動對 3 本、從第一本重來，以及**重試放棄的搬移**
+- **後台**：`/admin`「**Drive 比對**」那一格（`GET/POST /api/admin/drive-audit`，認
+  `canManageOthers`；2026-08-28 與「缺 Drive 備份的檔案」合併，見「`/admin` 的版面」）。
+  一顆「比對全部相簿」、看報告，以及**重試放棄的搬移**
   —— `DriveTrash` 試三次就放棄（`attempts >= 3`），在這之前站上**沒有任何地方看得到它們**，
   「Drive 刪除失敗」跳完就再也沒有下文。那顆按鈕把 `attempts` 歸零讓它們回佇列。
 - 報告除了「缺幾張」也講 **`ok`（該有的備份全都在的張數）** —— 使用者問的是
@@ -858,8 +905,9 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ### 補傳清單（`/api/photos/drive-pending`）
 
-**這份清單在 `/admin`，而且是唯讀的**（`app/admin/DrivePendingCard.tsx`，2026-08-28 搬過去）。
-它只回答三個問題：**哪個檔、誰傳的、在哪一本**。
+**這份清單在 `/admin`「Drive 比對」那一格裡，而且是唯讀的**
+（`app/admin/DrivePendingCard.tsx` 匯出的 `DrivePendingList`，2026-08-28 搬過去、
+同日併進 `DriveCompareCard`）。它只回答三個問題：**哪個檔、誰傳的、在哪一本**。
 
 ⚠️⚠️ **沒有「補傳」按鈕，也不要再加回來。** 補的方法是**把同一個原始檔再拖進那本相簿
 一次** —— 上傳流程的重複偵測會認出位元組一樣（`same_file`），直接補既有那一列缺的
@@ -931,6 +979,37 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
 - 影片 `pushVideoToDrive` 記不回 D1 **要往外丟**（不是回 false）：呼叫端才會把剛建的那一列收掉。
   ⚠️ 那個回滾 `deletePhoto()` **自己也會失敗，要驗回傳值** —— 沒收掉就是相簿裡留下一格
   點開只有靜止畫面的東西，而使用者以為「跳過了」。
+
+## `/admin` 的版面
+
+2026-08-28 整過一次。原則：**這一頁平常是來加人、改權限的**，其他東西不該擋路。
+
+- **每一格都收得起來**（`app/admin/AdminSection.tsx`）。⚠️ 它是「按鈕 ＋ 條件式
+  render」，**不是 `<details>`** —— 收起來的內容要真的 unmount，不然那些卡片的
+  state、計時器與尚未收工的請求都還活著。開合記在
+  `localStorage['admin_section_open:<id>']`，但**第一次 render 一律用 `defaultOpen`**
+  （`output: "export"` 是靜態 HTML，讀 localStorage 會 hydration mismatch），
+  掛載後才套回存下來的值。
+- **「加入白名單」併進「白名單」那一格**：一個 `.detailHead`「加入新成員」＋表單，
+  接著「目前的名單（n）」＋列表。加人跟看名單本來就是同一件事，分兩格只是讓
+  名單被推到更下面。白名單那格 `defaultOpen`，其餘預設收起來。
+- **「Drive 備份對帳」＋「缺 Drive 備份的檔案」＝「Drive 比對」**
+  （`app/admin/DriveCompareCard.tsx`）。上面兩格問的是同一個問題的兩半，
+  分開放的時候使用者得自己在兩份數字之間對照。
+  - **一顆「比對全部相簿」**。⚠️⚠️ **那是前端的迴圈，不是一次請求** ——
+    後端把 `albums` 夾在 1–5，因為 **Workers 免費版單次呼叫上限 50 個 subrequest**，
+    一本就要好幾趟 Drive。前端 5 本一輪連續打，畫一條進度條。
+    ⚠️ 收工條件**只能看 `finished_at`**，不能看 `cursor === 0` —— 那個值同時代表
+    「還沒開始」與「剛剛跑完」。另外掛 `MAX_ROUNDS`（400）當保險絲。
+    ⚠️ 跑完要再 `GET` 一次：`POST` 的回應**不含** `trash`／`albums` 那兩段。
+  - **兩份清單**：① 缺 Drive 備份的檔（`DrivePendingList`，比對完用 `reloadToken`
+    自動重抓；⚠️ 初值 0 刻意**不觸發**，維持「不在進頁時自動抓」那條規矩）；
+    ② **被搬進 `trash/` 的檔**（名字／哪一本／「去 Drive 看 ↗」）。
+    ⚠️ 第二份清單非有不可：`DriveTrash` 那張表**搬成功就刪列**，事後沒有任何地方
+    查得到搬走的是什麼。所以檔名在對帳當下就收進 `AppSetting.drive_audit` 那列 JSON
+    （`DriveAuditState.trashed`，上限 200 ＋ `trashed_more`，**不需要 migration**）。
+  - 「單獨比對一本」＋逐張明細＋逐本結果收進一個 `<details>`。使用者要的是
+    「內容簡化」，不是把功能砍掉。
 
 ## 一進來就該知道的坑
 

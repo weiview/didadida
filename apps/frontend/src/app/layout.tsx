@@ -4,6 +4,7 @@ import ScrollOptimizer from "@/components/ScrollOptimizer";
 import ScrollToTopButton from "@/components/ScrollToTopButton";
 import AccessGate from "@/components/AccessGate";
 import AccountBadge from "@/components/AccountBadge";
+import PresenceToasts from "@/components/PresenceToasts";
 import { AuthProvider } from "@/lib/useAdmin";
 
 export const metadata: Metadata = {
@@ -37,6 +38,9 @@ export default function RootLayout({
             {/* 右上角的帳號牌。跟回到頂端鈕一樣掛在這裡而不是各頁自己做一顆 ——
                 「我現在是誰、怎麼登出」在每一頁都該問得到 */}
             <AccountBadge />
+            {/* 「XXX 上線囉」。它同時是全站唯一開上線輪詢的地方（見 lib/presence.ts）
+                —— 掛在這裡才每一頁都在，頭像上那些燈只是看同一份快照 */}
+            <PresenceToasts />
             <main>{children}</main>
             <ScrollToTopButton />
           </AccessGate>

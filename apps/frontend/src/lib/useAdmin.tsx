@@ -6,6 +6,7 @@ import {
   logout as clearTokens, markNotificationsSeen, updateMyName, updateMyTrackColor,
   verifyGuest, verifyLogin,
 } from './api';
+import { resetPresence } from './presence';
 
 /**
  * 全站共用的身分狀態。
@@ -209,6 +210,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(() => {
     clearTokens();
+    // 上線名單也要清。留著的話下一個登入的人會先看到上一個人的名單，
+    // 而且第一次抓回來會把所有人都當成「剛上線」跳一排提示
+    resetPresence();
     setState({
       admin: false, guest: false, canViewMap: false,
       canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
