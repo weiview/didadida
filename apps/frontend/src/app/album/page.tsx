@@ -14,7 +14,7 @@ import AssignPlaceModal from "@/components/AssignPlaceModal";
 import FixTimeModal from "@/components/FixTimeModal";
 import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import PlaceCheckinModal from "@/components/PlaceCheckinModal";
-import { resizeImageFile } from "@/lib/imageUtils";
+import { GIF_MAX_BYTES, isGifFile, resizeImageFile } from "@/lib/imageUtils";
 import { ACCEPTED_VIDEO_TYPES, captureVideoPoster, formatDuration, isVideoFile } from "@/lib/videoUtils";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
@@ -47,6 +47,11 @@ type PendingDuplicate = {
    * pushVideoToDrive 而不是 pushPhotoToDrive。
    */
   video?: { fileName: string; durationMs: number };
+  /**
+   * 有值就代表這一格是 GIF：`resized` 是第一格靜態圖、`file` 與這裡都是動畫本體。
+   * 「照樣上傳」時要把它一起送給 uploadPhoto，不然 R2 上只會有一張不會動的圖。
+   */
+  gif?: { file: File };
 };
 
 /**
@@ -768,7 +773,9 @@ function AlbumContent() {
         if (!res.ok) {
           stillMissing.push({
             ...item,
-            need: { fourK: res.fourK !== 'ok', original: res.original !== 'ok' },
+            // 'skipped' 是「本來就不用傳」（GIF 的 4K），不是「還缺」——
+            // 寫成 !== 'ok' 的話下一次會拿 GIF 去跑 encode4kWebp
+            need: { fourK: res.fourK === 'failed', original: res.original === 'failed' },
           });
           reasons.push(`${item.file.name}：${res.reason ?? 'Drive 上傳失敗'}`);
         }
@@ -869,7 +876,7 @@ function AlbumContent() {
     const name = item.file.name;
     try {
       const result = await uploadPhoto(
-        id as string, item.resized, item.exifData, item.takenAt, true, item.video,
+        id as string, item.resized, item.exifData, item.takenAt, true, item.video, item.gif,
       );
       if (result.status !== 'ok') {
         dupFailuresRef.current.push(`${name}：${result.status === 'error' ? result.reason : '上傳失敗'}`);
@@ -901,20 +908,26 @@ function AlbumContent() {
         // Drive 沿用整批那次的授權；沒有就記進待補清單，跟一般上傳一樣
         if (driveRef.current) {
           try {
+            // GIF 在 Drive 上只有原始檔那一份（同 ingestSources）
+            const need = item.gif ? { fourK: false } : {};
             // 半套也要進待補清單，只是記著缺的是哪一半
-            const res = await pushPhotoToDrive(driveRef.current, result.photo.id, item.file);
+            const res = await pushPhotoToDrive(driveRef.current, result.photo.id, item.file, need);
             if (!res.ok) {
               setPendingDriveBatch((prev) => [...prev, {
                 photoId: result.photo.id, file: item.file,
-                need: { fourK: res.fourK !== 'ok', original: res.original !== 'ok' },
+                need: { fourK: res.fourK === 'failed', original: res.original === 'failed' },
               }]);
             }
           } catch (err) {
             console.warn('新照片沒送上 Drive', err);
-            setPendingDriveBatch((prev) => [...prev, { photoId: result.photo.id, file: item.file }]);
+            setPendingDriveBatch((prev) => [...prev, {
+              photoId: result.photo.id, file: item.file, need: item.gif ? { fourK: false } : {},
+            }]);
           }
         } else {
-          setPendingDriveBatch((prev) => [...prev, { photoId: result.photo.id, file: item.file }]);
+          setPendingDriveBatch((prev) => [...prev, {
+            photoId: result.photo.id, file: item.file, need: item.gif ? { fourK: false } : {},
+          }]);
         }
       }
 
@@ -1025,15 +1038,16 @@ function AlbumContent() {
      * （以前選過「全部保留」）就該讓使用者自己看一眼決定要補哪一列。
      *
      * 媒體種類對不上也退回問人：影片的封面圖跟某張照片 hash 相同的話，
-     * 拿影片檔去補照片的原始檔欄位就完全錯了。
+     * 拿影片檔去補照片的原始檔欄位就完全錯了。GIF 也一樣 —— 它的縮圖是
+     * canvas 畫的第一格，跟某張照片撞上 hash 的話補進去的會是一份 .gif。
      */
     const incompleteTwin = (
-      existing: DuplicateMatch[], isVideo: boolean,
+      existing: DuplicateMatch[], kind: 'photo' | 'video' | 'gif',
     ): DuplicateMatch | null => {
       const hits = existing.filter((e) => e.same_file);
       if (hits.length !== 1) return null;
       const twin = hits[0];
-      if ((twin.media_type === 'video') !== isVideo) return null;
+      if (twin.media_type !== kind) return null;
       // 兩份都齊 ＝ 真的是重複，該問人（這是視窗現在唯一還會跳出來的情況）
       if (twin.has_4k && twin.has_original) return null;
       return twin;
@@ -1071,7 +1085,7 @@ function AlbumContent() {
              * 或是傳上去了但 recordDriveIds 那一趟沒回來）。封面圖不必再產一次，
              * 直接把原始檔補上那一列就好 —— 相簿裡不會多一格。
              */
-            const twin = incompleteTwin(result.existing, true);
+            const twin = incompleteTwin(result.existing, 'video');
             if (twin) {
               if (!drive) {
                 failures.push(`${source.name}：這支影片站上已經有了，但 Drive 沒接上，原始檔補不了`);
@@ -1113,9 +1127,34 @@ function AlbumContent() {
           continue;
         }
 
+        /*
+         * GIF 跟照片走**同一條路**，只有三點不同（見 migrations/0021）：
+         *   ① 縮圖照樣是 resizeImageFile 畫的 —— canvas 只畫得出第一格，
+         *      而第一格正好就是我們要的靜態縮圖，不必另外寫一支；
+         *   ② 動畫本體跟著同一趟 uploadPhoto 送上去，由後端整份寫進 R2；
+         *   ③ Drive 上**只放原始檔那一份**（`fourK: false`）——「4K WebP」對 GIF
+         *      是把第一格放大成一張靜態圖，存了沒有任何用途。
+         *
+         * ⚠️ **不要因此把 GIF 當成影片**：它的 Drive 失敗是**可以吞的**（動畫本體
+         *    已經在 R2 上，相簿裡那一格是完整的），跟影片相反 —— 影片沒有 Drive
+         *    就只剩一張封面。所以底下照舊記進 pendingDriveBatch，不做回滾。
+         */
+        const gifSource = isGifFile(rawFile);
+        if (gifSource && rawFile.size > GIF_MAX_BYTES) {
+          // 後端也會擋（那道才是真的關），但在這裡就講清楚，省一趟白傳的上傳
+          failures.push(`${source.name}：GIF 太大了（${Math.round(rawFile.size / 1024 / 1024)}MB），`
+            + `上限 ${Math.round(GIF_MAX_BYTES / 1024 / 1024)}MB。這種長度的動畫請錄成影片上傳`);
+          continue;
+        }
+        // GIF 在 Drive 上沒有「衍生的 4K」那一份
+        const driveNeed = gifSource ? { fourK: false } : {};
+
         // 縮圖處理 (長邊不超過 2000px)
         const { file, exifData, takenAt } = await resizeImageFile(rawFile, 2000);
-        const result = await uploadPhoto(id as string, file, exifData, takenAt || undefined);
+        const result = await uploadPhoto(
+          id as string, file, exifData, takenAt || undefined, false, undefined,
+          gifSource ? { file: rawFile } : undefined,
+        );
         if (result.status === 'ok') {
           uploaded.push(result.photo);
           /*
@@ -1132,18 +1171,20 @@ function AlbumContent() {
                *    回的是 boolean 而且「有一份就算 true」，於是那張照片再也
                *    不會出現在任何補傳清單上，使用者以為備份好了。
                */
-              const res = await pushPhotoToDrive(drive, result.photo.id, rawFile);
+              const res = await pushPhotoToDrive(drive, result.photo.id, rawFile, driveNeed);
               if (!res.ok) {
                 missedDrive.push({
                   photoId: result.photo.id, file: rawFile,
-                  need: { fourK: res.fourK !== 'ok', original: res.original !== 'ok' },
+                  // 'skipped'（GIF 的 4K）不是失敗，記成「還缺」會讓下一次補傳
+                  // 拿 GIF 去跑 encode4kWebp
+                  need: { fourK: res.fourK === 'failed', original: res.original === 'failed' },
                 });
               }
             } catch (err) {
               console.warn('新照片沒送上 Drive，記進待補清單', err);
-              missedDrive.push({ photoId: result.photo.id, file: rawFile });
+              missedDrive.push({ photoId: result.photo.id, file: rawFile, need: driveNeed });
             }
-          } else missedDrive.push({ photoId: result.photo.id, file: rawFile });
+          } else missedDrive.push({ photoId: result.photo.id, file: rawFile, need: driveNeed });
         } else if (result.status === 'duplicate') {
           /*
            * 網站上有這張、Drive 上缺一半 —— **直接補缺的那一半就好**。
@@ -1153,7 +1194,7 @@ function AlbumContent() {
            * 但會換一個新的照片 id，標籤、留言、Story、手動修過的座標與時間全沒了。
            * 補的是**既有那一列**，id 不動，什麼都不會掉。
            */
-          const twin = incompleteTwin(result.existing, false);
+          const twin = incompleteTwin(result.existing, gifSource ? 'gif' : 'photo');
           if (twin) {
             const need = { fourK: !twin.has_4k, original: !twin.has_original };
             if (!drive) {
@@ -1190,6 +1231,7 @@ function AlbumContent() {
             file: rawFile, resized: file, previewUrl: URL.createObjectURL(rawFile),
             exifData, takenAt: takenAt || undefined,
             reason: result.reason, existing: result.existing,
+            ...(gifSource ? { gif: { file: rawFile } } : {}),
           });
         } else {
           failures.push(`${source.name}：${result.reason}`);
@@ -2003,7 +2045,11 @@ function AlbumContent() {
                * 影片的格式清單刻意跟播放端同一組（見 videoUtils）：瀏覽器解不開的
                * 檔，封面擷不出來、之後也播不出來 —— 擋在選檔那一步比事後報錯好懂。
                */
-              accept={`image/jpeg, image/png, image/webp, image/heic, image/heif, ${ACCEPTED_VIDEO_TYPES}`}
+              /*
+               * GIF 收得進來，而且**不轉影片、動畫本體整份進 R2**（見 0021）。
+               * 上限 25MB（GIF_MAX_BYTES）；選檔視窗攔不了大小，由 ingestSources 擋。
+               */
+              accept={`image/jpeg, image/png, image/webp, image/gif, image/heic, image/heif, ${ACCEPTED_VIDEO_TYPES}`}
               multiple
               onChange={handleFileChange}
             />
@@ -2271,6 +2317,14 @@ function AlbumContent() {
                   <span className={styles.videoBadgeIcon} aria-hidden="true">▶</span>
                   {formatDuration(photo.duration_ms)}
                 </span>
+              )}
+              {/*
+                * GIF 在格線上是**靜止的第一格**（縮圖就是那樣產的），點開燈箱才會動。
+                * 沿用影片那顆角標的位置與樣式 —— 同一件事（「這格點下去會動」）
+                * 沒有理由做出第二種長相。
+                */}
+              {photo.media_type === 'gif' && (
+                <span className={styles.videoBadge}>GIF</span>
               )}
               {/*
                 * 不開放的那幾格只有可管理全站內容的人拿得到（後端就濾掉了，

@@ -4,7 +4,7 @@ import PhotoComments from "./PhotoComments";
 import PhotoImage from "@/components/PhotoImage";
 import VideoPlayer from "@/components/VideoPlayer";
 import FixTimeModal from "@/components/FixTimeModal";
-import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, isVideo, setPhotosRestricted } from "@/lib/api";
+import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, isVideo, isGif, setPhotosRestricted } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import { setExifExpanded, useExifExpanded } from "@/lib/exifPref";
@@ -311,7 +311,12 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             placeholderSrc={photoThumbSrc(photo, 'md')}
             alt={photo.title}
             className={styles.image}
-            pendingLabel={photo.drive_file_id ? '高畫質載入中…' : null}
+            /*
+             * GIF 也有東西可等，只是來源不是 Drive 而是 R2 那顆動畫本體
+             * （最大 25MB）—— 底下那張靜止的縮圖已經先頂著，不講的話使用者
+             * 會以為這張 GIF 壞了不會動。
+             */
+            pendingLabel={photo.drive_file_id ? '高畫質載入中…' : isGif(photo) ? '動畫載入中…' : null}
           />
           {/*
             * R2 只存縮圖，大圖唯一的來源是 Drive。沒有 drive_file_id 就代表現在看到的
@@ -319,7 +324,13 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             * 判斷依據刻意用 D1 的欄位而不是圖片實際載到哪一版：Drive 暫時掛掉是幾分鐘的事，
             * 沒有備份是永久的，後者才需要有人去補傳。
             */}
-          {!photo.drive_file_id && (
+          {/*
+            * ⚠️ GIF 要先擋掉，理由跟影片一樣（見上面）：它的動畫本體在 R2、
+            *    Drive 上只有原始檔那一份，`drive_file_id` 對它**永遠是 null**。
+            *    不擋的話每一張 GIF 都會掛上一句「顯示的是 800px 縮圖」，
+            *    而使用者眼前那張正在動的就是完整的原檔。
+            */}
+          {!isGif(photo) && !photo.drive_file_id && (
             <span className={styles.qualityNote}>
               Drive 沒接上或缺這張備份，顯示的是 800px 縮圖
             </span>
@@ -529,7 +540,9 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                 <div className={styles.exifItem}>
                   <span className={styles.exifLabel}>拍攝時間</span>
                   <span className={styles.exifValue}>
-                    {displayDate || (isVideo(photo) ? '未指定（影片沒有 EXIF）' : '未知')}
+                    {displayDate
+                      || (isVideo(photo) ? '未指定（影片沒有 EXIF）'
+                        : isGif(photo) ? '未指定（GIF 沒有 EXIF）' : '未知')}
                   </span>
                 </div>
 
@@ -563,7 +576,9 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                     <span className={styles.exifValue} style={{ color: '#888' }}>
                       {isVideo(photo)
                         ? '影片沒有相機參數（封面圖是瀏覽器畫的）'
-                        : '此照片無其他 EXIF 參數'}
+                        : isGif(photo)
+                          ? 'GIF 沒有相機參數'
+                          : '此照片無其他 EXIF 參數'}
                     </span>
                   </div>
                 )}

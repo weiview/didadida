@@ -1,0 +1,38 @@
+-- 0021：相簿收得下 GIF（動畫本體直接放 R2，不轉影片）。
+--
+-- ## 為什麼不走影片那條
+--
+-- 影片那條是「原始檔進 Drive、R2 只放封面、播放時由 Worker 代理 Range」。
+-- GIF 走不了：<video> 播不了 image/gif，要走影片那條就得先轉檔，而轉檔在
+-- 瀏覽器（ffmpeg.wasm 的 COOP/COEP 會弄壞 Picker、Drive 上傳與地圖圖磚）
+-- 與 Worker（10ms CPU）兩邊都做不到。所以 GIF 是第三種存法：
+--
+--   R2   動畫本體（gif_key 指的那顆）＋ 第一格的 800／400 WebP 縮圖
+--   Drive 原始 GIF 一份（drive_original_id）—— 只是備份，站上不從那裡讀
+--
+-- ⚠️ 這是**唯一一種位元組本身住在 R2 的媒體**（照片只有縮圖、影片只有封面）。
+--    一張照片在 R2 是 52KB，一個 GIF 是它的全尺寸 —— 所以上傳端有硬上限
+--    （後端 GIF_MAX_BYTES，目前 25MB），不然免費額度的 10GB 很快就沒了。
+--    要調就改那個常數，兩邊（前端 imageUtils、後端 index.ts）一起改。
+--
+-- ## media_type = 'gif'，而不是「photo ＋ 一個旗標」
+--
+-- 站上已經有一個三態要處理的地方（drive-pending、對帳的 slotsOf、重複視窗的
+-- has_4k）都是照 media_type 分岔的，多一個值是零成本；用旗標的話那三處都要
+-- 改成「看兩個欄位」，而且 media_type 本身會開始說謊。
+-- ⚠️ 讀取端一律比 `media_type = 'gif'` / `IN ('video','gif')`，
+--    **不要比 `!= 'photo'`**（同 0019 的規矩）。
+--
+-- ## gif_key 存的是 R2 的物件鍵，不是網址
+--
+-- 它**不對外服務**：燈箱走 /api/photos/:id/full，那條路由會先查 D1 再決定
+-- 給不給（「不開放」的判斷在那裡），而 /api/photos/view/<key> 在進站閘門的
+-- 白名單上、唯一的護欄是「網址猜不到」。動畫本體跟大圖同一個等級，該走同一條路。
+-- ⚠️ 但 `SELECT p.*` 還是會把這一欄帶進相簿 JSON，所以標成不開放時
+--    rotateThumbKeys 連它一起換鍵（跟兩顆縮圖同一個理由）。
+--
+-- ## 沒有 backfill
+--
+-- 既有的每一列都不是 GIF，NULL 就是正確答案。
+
+ALTER TABLE Photo ADD COLUMN gif_key TEXT;

@@ -4,18 +4,19 @@ import { useCallback, useState } from "react";
 import styles from "./admin.module.css";
 import { fetchDrivePending, type DrivePendingPhoto } from "@/lib/api";
 
-/** 影片的 Drive id 記在 drive_original_id，沒有 4K 那一份（見 migrations/0019） */
-const isVideoRow = (p: DrivePendingPhoto) => p.media_type === "video";
-
 /**
  * 這一列缺的是哪一份。
  *
- * ⚠️ 影片與照片是**兩個不同的問題**：照片要 4K ＋ 原始檔兩份，影片只有原始檔
- *    一份（drive_file_id 對它永遠是 NULL）。寫成同一句就會有一整類的檔案
- *    永遠補不完或永遠看不到。
+ * ⚠️ 影片、GIF 與照片是**三個不同的問題**：照片要 4K ＋ 原始檔兩份；影片與 GIF
+ *    只有原始檔一份（`drive_file_id` 對它們永遠是 NULL —— 影片見 0019、
+ *    GIF 見 0021）。寫成同一句就會有一整類的檔案永遠補不完或永遠看不到。
+ *
+ * ⚠️ 兩者「沒備份」的嚴重程度不一樣，所以字也不一樣：影片的 Drive 那份是**本體**
+ *    （R2 上只有封面），GIF 的動畫本體本來就在 R2，Drive 那份才是備份。
  */
 const missingLabel = (p: DrivePendingPhoto): string => {
-  if (isVideoRow(p)) return "影片缺原始檔";
+  if (p.media_type === "video") return "影片缺原始檔";
+  if (p.media_type === "gif") return "GIF 缺原始檔備份";
   const need4k = !p.has_4k;
   const needOrig = !p.has_original;
   if (need4k && needOrig) return "兩份都缺";
@@ -100,7 +101,8 @@ export default function DrivePendingCard() {
         站上會認出是同一個檔，直接補上缺的那一份，相簿裡不會多一格，
         原本的標籤、留言、Story、改過的時間與地點都留著。
         影片沒有 4K 那一份，但 Drive 那份對影片<strong>不是備份是本體</strong>，
-        沒上去就等於沒有影片。
+        沒上去就等於沒有影片。GIF 同樣沒有 4K 那一份，不過它的動畫本體是存在
+        R2 的，Drive 這一份純粹是備份 —— 沒上去相簿裡那一格還是會動。
       </p>
 
       <div className={styles.formRow}>

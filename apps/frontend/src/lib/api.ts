@@ -168,6 +168,17 @@ export function isVideo(photo: { media_type?: string | null }): boolean {
   return photo.media_type === 'video';
 }
 
+/**
+ * 這一格是不是 GIF（見 migrations/0021）。
+ *
+ * GIF 在燈箱裡走的是**照片那條**（`<img src={photoFullSrc()}>`，瀏覽器自己會動），
+ * 不是 `<video>`。跟照片唯一的差別是：它的大圖來源是 R2 那顆動畫本體，不是 Drive 的
+ * 4K —— 所以 `drive_file_id` 對它永遠是 null，**不可以拿那一欄去說「沒有備份」**。
+ */
+export function isGif(photo: { media_type?: string | null }): boolean {
+  return photo.media_type === 'gif';
+}
+
 export interface Photo {
   id: number;
   title: string;
@@ -197,8 +208,13 @@ export interface Photo {
    * ⚠️ 影片的 Drive file id 記在 `drive_original_id`，**`drive_file_id` 永遠是
    *    null** —— 所以燈箱那句「Drive 沒接上，顯示 800px 縮圖」對影片不成立，
    *    要先擋掉再判斷（見 migrations/0019）。
+   *
+   * `'gif'` ＝ 這一格是 GIF：**動畫本體整份在 R2**（站上唯一位元組真的躺在 R2 的
+   * 媒體），Drive 上那份只是備份。燈箱走的是照片那條（`<img src={photoFullSrc()}>`，
+   * 瀏覽器自己會動），不是 `<video>` —— `<video>` 播不了 image/gif。
+   * ⚠️ 它的 `drive_file_id` 同樣永遠是 null（沒有衍生的 4K），上面那句對它也不成立。
    */
-  media_type?: 'photo' | 'video';
+  media_type?: 'photo' | 'video' | 'gif';
   /** 影片長度（毫秒），格線右下角那個「0:42」。null ＝ 抓不到，就不畫 */
   duration_ms?: number | null;
   sort_order: number;
@@ -1536,10 +1552,10 @@ export interface DuplicateMatch {
   /** 點開放大用的 800px。⚠️ 不是 Drive 那份 4K —— 那要一趟 Drive 取檔 */
   thumb_lg: string | null;
   taken_at: string | null;
-  media_type: 'photo' | 'video';
+  media_type: 'photo' | 'video' | 'gif';
   /** 這一列跟手上這個檔是**位元組層級**的同一份（file_hash 一樣）。只有它才敢自動補 */
   same_file: boolean;
-  /** Drive 上有沒有那份 4K。**影片一律 true** —— 影片沒有 4K 這一份 */
+  /** Drive 上有沒有那份 4K。**影片與 GIF 一律 true** —— 它們沒有 4K 這一份 */
   has_4k: boolean;
   /** Drive 上有沒有原始檔 */
   has_original: boolean;
@@ -1557,12 +1573,18 @@ export type UploadResult =
   | { status: 'error'; reason: string };
 
 /**
- * 上傳一張照片 —— **影片也走這一支**。
+ * 上傳一張照片 —— **影片與 GIF 也走這一支**。
  *
  * 影片的話 `file` 給的是瀏覽器擷出來的**封面圖**（見 lib/videoUtils），
  * 再用 `video` 這個選填參數補上原始檔名與長度。R2 那兩顆縮圖、重複偵測、
  * FTS、uploaded_by 全部沿用同一條路 —— 影片與照片在相簿裡本來就是同一格。
  * 原始影片檔不經過這裡，由 pushVideoToDrive 直接送 Drive。
+ *
+ * GIF 的話 `file` 給的是 `resizeImageFile` 畫出來的**第一格靜態圖**（canvas 只畫
+ * 得出第一格，這裡剛好就是我們要的縮圖），`gif` 這個選填參數帶的才是動畫本體
+ * —— 它會跟著這一趟一起送上去、由後端整份寫進 R2（見 migrations/0021）。
+ * ⚠️ 動畫本體**跟縮圖同一個請求**：分兩趟的話中間失敗就會留下一列點開不會動的
+ *    GIF，而且要另外做一支「補動畫」的路由。
  */
 export async function uploadPhoto(
   albumId: string,
@@ -1573,15 +1595,22 @@ export async function uploadPhoto(
   allowDuplicate = false,
   /** 有值就代表這一格是影片，`file` 是它的封面圖 */
   video?: { fileName: string; durationMs: number },
+  /** 有值就代表這一格是 GIF，`file` 是它的第一格靜態圖、這裡的才是動畫本體 */
+  gif?: { file: File },
 ): Promise<UploadResult> {
   const formData = new FormData();
   formData.append('album_id', albumId);
   // 檔名要另外送：R2 只收縮圖，而縮圖的 blob 沒有原始檔名
-  formData.append('filename', video ? video.fileName : file.name);
+  // （GIF 的 `file` 是 canvas 產的 .jpg，原始檔名只有動畫本體那份留著）
+  formData.append('filename', video ? video.fileName : gif ? gif.file.name : file.name);
   if (allowDuplicate) formData.append('allow_duplicate', '1');
   if (video) {
     formData.append('media_type', 'video');
     formData.append('duration_ms', String(Math.round(video.durationMs)));
+  }
+  if (gif) {
+    formData.append('media_type', 'gif');
+    formData.append('gif', gif.file, gif.file.name);
   }
 
   /*
@@ -1677,7 +1706,7 @@ export async function uploadPhoto(
           thumb_url: e?.thumb_url ?? null,
           thumb_lg: e?.thumb_lg ?? null,
           taken_at: e?.taken_at ?? null,
-          media_type: e?.media_type === 'video' ? 'video' : 'photo',
+          media_type: e?.media_type === 'video' || e?.media_type === 'gif' ? e.media_type : 'photo',
           same_file: e?.same_file === true,
           has_4k: e?.has_4k !== false,
           has_original: e?.has_original !== false,
@@ -1885,7 +1914,7 @@ export interface DrivePendingPhoto {
   file_name: string;
   /** 上傳當下的客戶端檔名。要重傳的人拿它去硬碟裡找那個檔 */
   title: string;
-  /** 'photo' | 'video'。影片沒有 4K 那一份 */
+  /** 'photo' | 'video' | 'gif'。影片與 GIF 都沒有 4K 那一份 */
   media_type?: string;
   /** 已經有 4K 了（0/1） */
   has_4k?: number;

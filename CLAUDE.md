@@ -263,7 +263,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0019）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0021）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
@@ -570,7 +570,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 2026-08-24 加的。**影片與照片在相簿裡是同一格**：同一張 `Photo` 表、同一個排序、
 同樣能設封面／加標籤／留言／刪除。差別只在內容放哪、怎麼播。
 
-- `Photo.media_type`（`'photo'`／`'video'`，DEFAULT `'photo'`）與 `duration_ms`（0019）。
+- `Photo.media_type`（`'photo'`／`'video'`／`'gif'`，DEFAULT `'photo'`）與 `duration_ms`（0019）、`gif_key`（0021）。
   預設值就是為了**不對 prod 幾千列做 backfill UPDATE**。
 - ⚠️ **影片的 Drive file id 記在 `drive_original_id`，`drive_file_id` 永遠是 NULL。**
   照片那兩欄的意思是「衍生的 4K」與「相機原始檔」，而影片沒有衍生版 —— 傳上去的
@@ -621,19 +621,57 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   （`ORDER BY p.taken_at DESC`，NULL 在 DESC 排最後）。
 - 轉檔／第二種畫質（P4）**使用者明確延後**，先看實際讀取速度再決定。
 
+## GIF
+
+2026-08-28 加的。**使用者拍板：不轉影片，動畫本體直接塞 R2**（`media_type='gif'`
+＋ `Photo.gif_key`，0021）。於是 GIF 是站上**唯一位元組真的躺在 R2 的媒體** ——
+照片只有兩顆縮圖、影片只有一張封面。
+
+- **為什麼不走影片那條**：`<video>` 播不了 `image/gif`，走那條就得轉檔；而轉檔在
+  瀏覽器（ffmpeg.wasm 要的 COOP/COEP 會同時弄壞 Google Picker、Drive 上傳與地圖圖磚）
+  與 Worker（10ms CPU）兩邊都做不到。**不要再重開這個討論。**
+- **上傳跟照片同一條路**（`ingestSources` 沒有另外的分支，只有三個差異）：
+  ① 縮圖照舊由 `resizeImageFile()` 產 —— canvas 只畫得出**第一格**，而第一格正好
+  就是我們要的靜態縮圖；② 動畫本體跟著**同一趟** `uploadPhoto` 送上去
+  （FormData 多一個 `gif` 欄位 ＋ `media_type=gif`），由後端整份 `BUCKET.put` 進 R2。
+  ⚠️ **不要拆成兩趟** —— 中間失敗就留下一列點開不會動的 GIF，還得另外做一支補動畫的路由；
+  ③ Drive 只放**原始檔那一份**（`pushPhotoToDrive(..., { fourK: false })`），
+  「4K WebP」對 GIF 是把第一格放大成一張靜態圖，存了沒有用途。
+- ⚠️ **GIF 的 Drive 失敗是可以吞的，跟影片相反。** 動畫本體已經在 R2，相簿裡那一格
+  是完整的 —— 所以照舊記進 `pendingDriveBatch`，**不做 `deletePhoto()` 回滾**。
+- ⚠️ `pushPhotoToDrive` 的回傳裡 **`fourK: 'skipped'` 不是失敗**。算「還缺哪一半」
+  一律寫 `res.fourK === 'failed'`，**不可以寫 `!== 'ok'`** —— 那會讓下一次補傳
+  拿 GIF 去跑 `encode4kWebp`。三處都要（`ingestSources`、`runDuplicateJob`、
+  橫幅那顆「補傳這批」）。
+- 大小上限 **25MB**（`GIF_MAX_BYTES`，後端 `index.ts` 與前端 `lib/imageUtils.ts`
+  **同一個數字，要改兩邊一起改**）。前端在選檔後就講得出原因（省一趟白傳），
+  後端那道才是真的關 —— 少了它，直接打 `/api/upload` 就能把任意位元組塞進 R2。
+  理由：R2 的儲存是免費額度裡真的會被吃掉的那一格，而後端收檔走 `request.formData()`、
+  整份會進 Worker 記憶體（上限 128MB）。再長的動畫本來就該錄成影片。
+- **播放就是 `<img>`**（燈箱走照片那條，`photoFullSrc()` → `/api/photos/:id/full`）。
+  那條路由查到 `gif_key` 就直接把 R2 物件串出去，一年 immutable。
+  ⚠️ **刻意不把 `view/<key>` 的網址發給前端當大圖來源** —— `/api/photos/view/*`
+  在進站閘門的白名單上、唯一的護欄是「網址猜不到」，而動畫本體跟大圖同一個等級，
+  該由 `/full` 那段「先查 D1 再決定給不給」（不開放的判斷）擋著。
+- ⚠️ **`drive_file_id` 對 GIF 永遠是 NULL**（同影片）。所以：燈箱那句
+  「Drive 沒接上，顯示 800px 縮圖」要**先用 `isGif()` 擋掉**（不擋的話每張 GIF
+  都會掛上一句假話，而使用者眼前那張正在動的就是完整原檔）；`drive-pending`
+  與對帳的 `slotsOf()` 都用 `IN ('video','gif')` 判斷「只有原始檔一份」。
+- ⚠️ **標成不開放時 `gif_key` 要跟著換鍵**（`rotateThumbKeys` 已含）——
+  `SELECT p.*` 會把這一欄帶進相簿 JSON，也就是標記**之前**那把鍵早就發出去了，
+  而 `/api/photos/view/<key>` 不看身分。跟兩顆縮圖完全同一個理由。
+  刪照片時 `r2KeysForPhoto()` 也要含它，漏掉留下的不是幾十 KB 的孤兒縮圖，
+  而是一整份最大 25MB 的動畫。
+- 格線上是**靜止的第一格** ＋ 一顆 `GIF` 角標（沿用影片那顆 `.videoBadge`）。
+  燈箱的 `pendingLabel` 寫「動畫載入中…」，不然使用者會以為這張 GIF 壞了不會動。
+- GIF 沒有 EXIF，拍攝時間一律 NULL —— 跟影片一樣要人自己「指定時間」
+  （見「資料模型」那三支），在那之前它會排在相簿最前面。
+
 ## 儲存模型
 
 - **R2 一張照片只有兩顆縮圖：800px ＋ 400px WebP。** 2000px 那顆已經拿掉。
-- **收得進來的格式：JPEG／PNG／WebP／HEIC／HEIF ＋ mp4／mov／webm。GIF 不收**
-  （2026-08-28 查證，現況如此，不是漏掉）。三道關卡：選檔視窗的 `accept`
-  （`album/page.tsx`）不列 GIF；`resizeImageFile()` 除了「本來就是 JPEG 且長邊
-  ≤2000」之外一律 `<img>` → canvas → `image/jpeg`，而 canvas 只畫得出**第一格**；
-  後端 `/api/upload` 的 `allowedTypes` 只有 `image/jpeg`／`image/webp`。
-  硬選進來不會報錯，會安靜地變成一張靜止的第一格 —— 只有 Drive 上那份原始檔
-  還是 GIF 本身（`pushPhotoToDrive` 傳的是 rawFile）。
-  ⚠️ 真要支援動畫**不是加一個 MIME 就好**：得先決定它走影片那條（擷封面＋原檔進
-  Drive，但 `<video>` 播不了 GIF，等於要轉檔）還是照片那條（整份 GIF 也得進 R2，
-  跟「R2 只放兩顆縮圖」的儲存模型衝突）。**先攤開取捨再動手。**
+- **收得進來的格式：JPEG／PNG／WebP／HEIC／HEIF ＋ GIF ＋ mp4／mov／webm。**
+- **GIF 是第三種存法（0021）：動畫本體整份進 R2，不轉影片。** 見「GIF」一節。
 - **大圖／原始檔在 Google Drive**，不管誰上傳都寫進**站長**同一個 Drive
   （`drive.file` 是 per-file 授權，寫入者只能有一個）。憑據就是站長那一列的
   **`User.google_refresh_token`**（0017）—— 跟「Google 相簿匯入」用的同一張，

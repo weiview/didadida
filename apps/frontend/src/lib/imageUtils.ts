@@ -3,6 +3,31 @@ import piexif from 'piexifjs';
 import { normalizeGeo } from './geo';
 
 /**
+ * GIF 的動畫本體上限。**後端 `index.ts` 的 `GIF_MAX_BYTES` 是同一個數字，
+ * 要改就兩邊一起改** —— 這裡是為了在選檔當下就講得出原因，後端那道才是真的關。
+ *
+ * 25MB 的由來：GIF 是站上**唯一位元組真的躺在 R2 的媒體**（照片只有兩顆縮圖、
+ * 影片只有一張封面），所以它直接吃免費額度的儲存空間；而後端收檔走的是
+ * `request.formData()`，整份會進 Worker 記憶體（上限 128MB）。
+ * 再大的動畫本來就該錄成影片走影片那條。
+ */
+export const GIF_MAX_BYTES = 25 * 1024 * 1024;
+
+/**
+ * 這個檔是不是 GIF。
+ *
+ * GIF **不轉影片、動畫本體整份進 R2**（見 migrations/0021）：`<video>` 播不了
+ * image/gif，走影片那條就得轉檔，而轉檔在瀏覽器（ffmpeg.wasm 要的 COOP/COEP
+ * 會弄壞 Google Picker、Drive 上傳與地圖圖磚）與 Worker（10ms CPU）兩邊都做不到。
+ *
+ * 有些來源的 `File.type` 是空的，退回看副檔名 —— 跟 `isVideoFile` 同一個規矩。
+ */
+export function isGifFile(file: File): boolean {
+  if (file.type) return file.type.toLowerCase() === 'image/gif';
+  return /\.gif$/i.test(file.name);
+}
+
+/**
  * 燈箱要用的 4K WebP。長邊 3840、q80。
  *
  * **一定要餵原始檔，不要餵 resizeImageFile 的產物** —— 那份已經被壓到 2000px，

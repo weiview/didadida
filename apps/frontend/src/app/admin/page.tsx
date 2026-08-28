@@ -1411,6 +1411,15 @@ export default function AdminPage() {
 
 const SLOT_LABEL: Record<string, string> = { "4k": "4K", original: "原始檔" };
 
+/**
+ * 影片（0019）與 GIF（0021）在 Drive 上都**只有原始檔一份** —— 沒有衍生的 4K，
+ * `drive_file_id` 對它們永遠是 NULL。逐張明細那兩處的「缺哪一份」都要照這個分岔，
+ * 不然一整類的檔案會永遠掛著一個補不完的「缺 4K」。
+ */
+const isOneSlotMedia = (t?: string) => t === "video" || t === "gif";
+/** 明細列在檔名後面補一句它是什麼；照片不加（大多數都是照片，加了只是噪音） */
+const mediaSuffix = (t?: string) => (t === "video" ? "（影片）" : t === "gif" ? "（GIF）" : "");
+
 /** 還沒解決的那幾種，會出現在「還缺哪些」那一段 */
 const NEEDS_ACTION = new Set(["missing", "cleared", "gone"]);
 
@@ -1473,7 +1482,7 @@ function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
           {todo.map((i) => (
             <div key={`${i.photo_id}-${i.slot}`} className={styles.detailRow}>
               <span className={styles.detailName}>
-                {i.title}{i.media_type === "video" ? "（影片）" : ""} — 缺 {SLOT_LABEL[i.slot] ?? i.slot}
+                {i.title}{mediaSuffix(i.media_type)} — 缺 {SLOT_LABEL[i.slot] ?? i.slot}
               </span>
               <span className={styles.detailNote}>{ITEM_STATE_LABEL[i.state] ?? i.state}</span>
             </div>
@@ -1556,10 +1565,10 @@ function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
                 {d.photos.map((p) => (
                   <div key={p.id} className={styles.detailRow}>
                     <span className={styles.detailName}>
-                      #{p.id} {p.title}{p.media_type === "video" ? "（影片）" : ""}
+                      #{p.id} {p.title}{mediaSuffix(p.media_type)}
                     </span>
                     <span className={styles.detailNote}>
-                      {p.media_type === "video"
+                      {isOneSlotMedia(p.media_type)
                         ? (p.has_original ? "Drive 有原始檔" : "Drive 沒有備份")
                         : `${p.has_4k ? "有 4K" : "缺 4K"}、${p.has_original ? "有原始檔" : "缺原始檔"}`}
                       {p.created_at ? `　${p.created_at.slice(0, 10)} 加入` : ""}

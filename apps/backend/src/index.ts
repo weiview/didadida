@@ -616,6 +616,21 @@ const canSeeRestricted = (actor: Actor | null): boolean => !!actor?.canManageOth
 const RESTRICTED_VISIBLE_COND = "p.restricted = 0";
 
 /**
+ * GIF 動畫本體的大小上限（見 migrations/0021）。
+ *
+ * GIF 是站上**唯一一種位元組本身住在 R2 的媒體** —— 照片在 R2 只有兩顆縮圖
+ * （加起來 52KB），影片只有一張封面。一個 GIF 佔的是它的全尺寸，所以這個上限
+ * 直接決定免費額度的 10GB 撐得住幾個檔。
+ *
+ * ⚠️ 還有一道硬牆：這條路由是 `await request.formData()`，整份會進 Worker 的
+ *    記憶體（128MB），而 Worker 的請求體上限是 100MB。要往上調之前先想清楚
+ *    這兩件事 —— 影片就是因此走瀏覽器直傳 Drive，不經過 Worker。
+ * ⚠️ 前端 `lib/imageUtils.ts` 有同一個數字（在選檔當下就擋掉，不必等傳完），
+ *    改一邊要同步另一邊。
+ */
+const GIF_MAX_BYTES = 25 * 1024 * 1024;
+
+/**
  * 沒權限時統一的回應。訊息給前端直接顯示。
  *
  * 一定要帶上呼叫端的 CORS 標頭 —— 少了它，瀏覽器會在 JS 讀到之前就擋掉這個回應，
@@ -1766,8 +1781,9 @@ async function auditDriveAlbum(
   };
 
   /** 這一列該有哪幾份備份。回的是 [欄位名, 目前的值] */
+  // 影片與 GIF 在 Drive 上只有原始檔一份（沒有衍生的 4K），照片才是兩份
   const slotsOf = (p: any): ["drive_file_id" | "drive_original_id", any][] =>
-    String(p?.media_type) === "video"
+    String(p?.media_type) === "video" || String(p?.media_type) === "gif"
       ? [["drive_original_id", p.drive_original_id]]
       : [["drive_file_id", p.drive_file_id], ["drive_original_id", p.drive_original_id]];
 
@@ -3139,7 +3155,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           }
           const photos = clauses.length > 0
             ? (await env.DB.prepare(`
-                SELECT id, album_id, url, file_name, thumb_url, thumb_sm_url,
+                SELECT id, album_id, url, file_name, thumb_url, thumb_sm_url, gif_key,
                        drive_file_id, drive_original_id
                   FROM Photo WHERE ${clauses.join(" OR ")}
               `).bind(...binds).all<any>()).results
@@ -3578,7 +3594,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const photo = await env.DB.prepare(
           // url 現在跟 thumb_url 是同一顆物件，但舊照片（Google 同步進來的那批）
           // 只有 url，所以還是照 COALESCE 的順序逐級退
-          "SELECT COALESCE(thumb_url, thumb_sm_url, url) AS fallback_url, drive_file_id, restricted FROM Photo WHERE id = ?"
+          "SELECT COALESCE(thumb_url, thumb_sm_url, url) AS fallback_url, drive_file_id, gif_key, restricted FROM Photo WHERE id = ?"
         ).bind(photoId).first<any>();
         if (!photo) {
           return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
@@ -3626,6 +3642,30 @@ if (method === "POST" && pathname === "/api/verify-password") {
             "Cache-Control": "public, max-age=300",
           },
         });
+
+        /*
+         * GIF：位元組就在 R2（0021），不必問 Drive。
+         *
+         * **刻意走這條路由，而不是把那顆物件的 view 網址直接發給前端** ——
+         * /api/photos/view/* 在進站閘門的白名單上，唯一的護欄是「網址猜不到」；
+         * 而動畫本體跟大圖是同一個等級的東西，該由這裡「先查 D1 再決定給不給」
+         * （上面那段不開放的判斷）。物件不在了就退回 800px，燈箱永遠打得開。
+         */
+        if (typeof photo.gif_key === "string" && photo.gif_key) {
+          const obj = await env.BUCKET.get(photo.gif_key);
+          if (!obj) return fallback();
+          const anim = new Response(obj.body, {
+            headers: {
+              "Content-Type": obj.httpMetadata?.contentType || "image/gif",
+              "Access-Control-Allow-Origin": "*",
+              // 那顆物件的內容不會就地改寫，要換只會換鍵（見 rotateThumbKeys），
+              // 所以跟 Drive 那份 4K 同樣是一年 immutable
+              "Cache-Control": "public, max-age=31536000, s-maxage=31536000, immutable",
+            },
+          });
+          ctx.waitUntil(cache.put(cacheKey, anim.clone()));
+          return anim;
+        }
 
         if (!photo.drive_file_id || !env.GOOGLE_DRIVE_SA_KEY) return fallback();
 
@@ -4048,6 +4088,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
          *
          *   照片：4K（drive_file_id）＋ 原始檔（drive_original_id）**兩份都要**。
          *   影片：只有原始檔一份，drive_file_id 對它永遠是 NULL（見 0019）。
+         *   GIF：同影片，只有原始檔一份（動畫本體在 R2，Drive 上放的是同一份 GIF，
+         *        沒有「衍生的 4K」這個東西，見 0021）。
          *
          * 以前這裡是 `drive_file_id IS NULL AND media_type = 'photo'`，兩邊都漏：
          *   ① 影片整類被排除掉 —— 上傳時 Drive 失敗的影片**永遠不會出現在補傳清單上**，
@@ -4061,8 +4103,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
          *    共用底下這個字串就是為了讓它們沒辦法不一致。
          */
         const drivePendingCond = `(
-             (media_type = 'video' AND drive_original_id IS NULL)
-          OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NULL))
+             (media_type IN ('video','gif') AND drive_original_id IS NULL)
+          OR (media_type NOT IN ('video','gif') AND (drive_file_id IS NULL OR drive_original_id IS NULL))
         )`;
 
         const { results: photos } = await env.DB.prepare(`
@@ -4407,7 +4449,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           const cache = caches.default;
           const toRotate = ids.slice(0, RESTRICT_ROTATE_MAX);
           const { results: rows } = await env.DB.prepare(
-            `SELECT id, file_name, url, thumb_url, thumb_sm_url FROM Photo WHERE id IN (${placeholdersFor(toRotate)})`
+            `SELECT id, file_name, url, thumb_url, thumb_sm_url, gif_key FROM Photo WHERE id IN (${placeholdersFor(toRotate)})`
           ).bind(...toRotate).all();
           const rewrites: D1PreparedStatement[] = [];
           const staleKeys: string[] = [];
@@ -4597,7 +4639,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         //    縮圖的網址也要撈：只刪 file_name 會把兩張縮圖永遠留在 R2 佔額度
         //    drive id 也要撈：Photo 列一刪就再也查不到該搬哪些 Drive 檔
         const { results: photos } = await env.DB.prepare(
-          "SELECT id, file_name, thumb_url, thumb_sm_url, drive_file_id, drive_original_id FROM Photo WHERE album_id = ?"
+          "SELECT id, file_name, thumb_url, thumb_sm_url, gif_key, drive_file_id, drive_original_id FROM Photo WHERE album_id = ?"
         ).bind(albumId).all();
 
         if (photos.length > 0) {
@@ -4683,12 +4725,20 @@ function r2KeyFromViewUrl(viewUrl: unknown): string | null {
   }
 }
 
-/** 一張照片在 R2 佔用的所有物件鍵（主檔 + 兩種縮圖），已去重且濾掉空值 */
+/**
+ * 一張照片在 R2 佔用的所有物件鍵（主檔 + 兩種縮圖 + GIF 的動畫本體），
+ * 已去重且濾掉空值。
+ *
+ * ⚠️ `gif_key` 漏掉的話留下的不是幾十 KB 的孤兒縮圖，而是一整份動畫
+ *    （最大 25MB，見 GIF_MAX_BYTES）—— 所以每一支刪除路由的 SELECT
+ *    都要記得把這一欄撈出來，不然這裡拿到的是 undefined。
+ */
 function r2KeysForPhoto(photo: any): string[] {
   const keys = [
     typeof photo?.file_name === "string" ? photo.file_name : null,
     r2KeyFromViewUrl(photo?.thumb_url),
     r2KeyFromViewUrl(photo?.thumb_sm_url),
+    typeof photo?.gif_key === "string" ? photo.gif_key : null,
   ].filter((k): k is string => !!k);
   return [...new Set(keys)];
 }
@@ -4720,9 +4770,19 @@ async function rotateThumbKeys(
   }
   // file_name 跟 url 指的是同一顆物件（見上傳那條路由），一起換掉才不會對不上
   const fileName = typeof photo?.file_name === "string" ? photo.file_name : null;
+  /*
+   * GIF 的動畫本體也要換。它不對外發網址（燈箱走 /full），但 `SELECT p.*` 會把
+   * gif_key 帶進相簿 JSON —— 也就是標成不開放**之前**，那把鍵早就發出去了。
+   * 跟兩顆縮圖完全同一個理由。
+   */
+  const gifKey = typeof photo?.gif_key === "string" ? photo.gif_key : null;
 
   const moved = new Map<string, string>();   // 舊鍵 -> 新鍵，同一顆只搬一次
-  for (const oldKey of new Set([...keyByCol.values(), ...(fileName ? [fileName] : [])])) {
+  for (const oldKey of new Set([
+    ...keyByCol.values(),
+    ...(fileName ? [fileName] : []),
+    ...(gifKey ? [gifKey] : []),
+  ])) {
     const obj = await env.BUCKET.get(oldKey);
     if (!obj) continue;                      // 早就不在了，沒什麼好搬的
     const dot = oldKey.lastIndexOf(".");
@@ -4730,7 +4790,7 @@ async function rotateThumbKeys(
     // 前綴只認我們自己產的那兩種，其餘（早年匯進來的）一律歸到 thumb，
     // 不能拿整個舊檔名當前綴 —— 那等於把要作廢的名字又抄一次進新鍵裡
     const head = oldKey.split("_")[0];
-    const prefix = head === "thumb" || head === "thumbsm" ? head : "thumb";
+    const prefix = head === "thumb" || head === "thumbsm" || head === "gif" ? head : "thumb";
     const newKey = `${prefix}_${Date.now()}_${crypto.randomUUID().replace(/-/g, "")}${ext}`;
     await env.BUCKET.put(newKey, obj.body, { httpMetadata: obj.httpMetadata });
     moved.set(oldKey, newKey);
@@ -4743,6 +4803,8 @@ async function rotateThumbKeys(
     if (nk) sets[col] = `${origin}/api/photos/view/${encodeURIComponent(nk)}`;
   }
   if (fileName && moved.has(fileName)) sets.file_name = moved.get(fileName)!;
+  // gif_key 存的是**物件鍵本身**，不是網址（見 0021）
+  if (gifKey && moved.has(gifKey)) sets.gif_key = moved.get(gifKey)!;
   return Object.keys(sets).length > 0 ? { sets, movedFrom: [...moved.keys()] } : null;
 }
 
@@ -4826,7 +4888,20 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
          * 白名單比對而不是照收：這個欄位會進 SQL，也會決定 /video 肯不肯代理，
          * 收一個沒見過的值只會讓後面每一處判斷都變成第三種狀態。
          */
-        const mediaType = formData.get('media_type') === 'video' ? 'video' : 'photo';
+        const mediaTypeRaw = String(formData.get('media_type') ?? '');
+        const mediaType = mediaTypeRaw === 'video' || mediaTypeRaw === 'gif' ? mediaTypeRaw : 'photo';
+
+        /*
+         * GIF 是第三種存法（0021）：**動畫本體整份進 R2**，縮圖照樣是前端 canvas
+         * 畫出來的第一格。從這支路由的角度看只多了一顆物件與一欄 gif_key，
+         * 重複偵測、FTS、uploaded_by、兩顆縮圖全部沿用，所以下面一樣不需要分岔。
+         *
+         * 不走影片那條的理由在 0021 裡：<video> 播不了 GIF，走那條就得轉檔，
+         * 而轉檔在瀏覽器與 Worker 兩邊都做不到。
+         */
+        const gifFile = mediaType === 'gif'
+          ? (formData.get('gif') as unknown as File | null)
+          : null;
         const durationRaw = Number(formData.get('duration_ms'));
         const durationMs = mediaType === 'video' && Number.isFinite(durationRaw) && durationRaw > 0
           ? Math.round(durationRaw)
@@ -4845,6 +4920,25 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         const thumbType = (thumb.type || 'image/jpeg').toLowerCase();
         if (!allowedTypes.includes(thumbType)) {
           return new Response(JSON.stringify({ error: "Invalid file type. Only images are allowed." }), { status: 400, headers });
+        }
+
+        /*
+         * GIF 的動畫本體。**前端已經擋過一次**（選檔當下就講得出原因），這裡是
+         * 後端自己的那一道 —— 少了它，一個直接打這支路由的請求就能把任意大小、
+         * 任意型別的位元組塞進 R2。
+         */
+        if (mediaType === 'gif') {
+          if (!gifFile) {
+            return new Response(JSON.stringify({ error: "gif is required for media_type=gif" }), { status: 400, headers });
+          }
+          if ((gifFile.type || '').toLowerCase() !== 'image/gif') {
+            return new Response(JSON.stringify({ error: "GIF 的動畫本體必須是 image/gif" }), { status: 400, headers });
+          }
+          if (gifFile.size > GIF_MAX_BYTES) {
+            return new Response(JSON.stringify({
+              error: `GIF 太大了（${Math.round(gifFile.size / 1024 / 1024)}MB），上限 ${Math.round(GIF_MAX_BYTES / 1024 / 1024)}MB`,
+            }), { status: 400, headers });
+          }
         }
 
         /*
@@ -4927,7 +5021,15 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
              * （見 frontend ingestSources 的自動補那段）。影片沒有 4K 這一份，
              * `has_4k` 一律回 true，不然它永遠看起來像缺一半。
              */
-            const isVideoRow = (d: any) => String(d.media_type) === 'video';
+            /*
+             * 這一列是哪一種。⚠️ **不要寫成「不是 video 就是 photo」** ——
+             * GIF 跟影片一樣沒有 4K 那一份（動畫本體在 R2、Drive 上只有原始檔），
+             * 判錯的話它永遠看起來像「缺一半」，前端就會拿它去重複跳視窗。
+             */
+            const kindOf = (d: any): 'photo' | 'video' | 'gif' => {
+              const t = String(d.media_type);
+              return t === 'video' || t === 'gif' ? t : 'photo';
+            };
             return new Response(JSON.stringify({
               duplicate: true,
               // 讓前端講得出「哪裡像」：hash 一樣是同一個檔，只有時間一樣就是疑似
@@ -4945,10 +5047,10 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
                  */
                 thumb_lg: d.thumb_url || d.url || d.thumb_sm_url,
                 taken_at: d.taken_at,
-                media_type: isVideoRow(d) ? 'video' : 'photo',
+                media_type: kindOf(d),
                 // 這一筆是不是**位元組層級**的同一個檔（hash 一樣）。只有它才敢自動補
                 same_file: d.file_hash === fileHash,
-                has_4k: isVideoRow(d) ? true : Boolean(d.drive_file_id),
+                has_4k: kindOf(d) === 'photo' ? Boolean(d.drive_file_id) : true,
                 has_original: Boolean(d.drive_original_id),
               })),
             }), { headers });
@@ -4985,6 +5087,22 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
             : Promise.resolve(null),
         ]);
 
+        /*
+         * GIF 的動畫本體。跟縮圖同一個命名規則（時間戳＋原始檔名），但**這一顆
+         * 不對外發網址** —— 燈箱走 /api/photos/:id/full，那條路由會先查 D1 再決定
+         * 給不給（見那裡的「不開放」判斷）。
+         *
+         * 排在縮圖之後：兩邊都失敗只會留下孤兒物件，而縮圖先成功至少代表
+         * 「這張的縮圖產得出來」。丟出來的錯讓它往外炸 —— D1 還沒寫，
+         * 使用者看到的是「這個檔沒傳成功」，不是相簿裡多一格點開沒有動畫的東西。
+         */
+        const gifKey = gifFile ? `gif_${baseName}.gif` : null;
+        if (gifFile && gifKey) {
+          await env.BUCKET.put(gifKey, gifFile.stream(), {
+            httpMetadata: { contentType: 'image/gif' },
+          });
+        }
+
         const fileName = md.key;
         const thumbUrl = md.url;
         const thumbSmUrl = sm?.url ?? null;
@@ -4997,13 +5115,13 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           `INSERT INTO Photo
              (title, file_name, album_id, url, thumb_url, thumb_sm_url, exif, taken_at, file_hash, phash,
               lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by,
-              media_type, duration_ms, shuffle_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+              media_type, duration_ms, gif_key, shuffle_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
           originalName, fileName, albumId, fileUrl, thumbUrl, thumbSmUrl, exifData,
           uploadTakenAt, fileHash, clientPhash,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
-          uploadTimeSource, me.uid, mediaType, durationMs,
+          uploadTimeSource, me.uid, mediaType, durationMs, gifKey,
         ).run();
 
         const newPhotoId = Number(inserted.meta?.last_row_id ?? 0);
@@ -5054,7 +5172,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         const photoId = pathname.split("/")[3];
         if (!(await canTouchPhoto(photoId))) return forbidden(headers);
         const photo = await env.DB.prepare(
-          "SELECT id, file_name, url, thumb_url, thumb_sm_url, drive_file_id, drive_original_id FROM Photo WHERE id = ?"
+          "SELECT id, file_name, url, thumb_url, thumb_sm_url, gif_key, drive_file_id, drive_original_id FROM Photo WHERE id = ?"
         ).bind(photoId).first();
         if (!photo) return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
 
