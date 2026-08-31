@@ -6,7 +6,7 @@ import {
   type GeoJSONSource, type MapLayerMouseEvent,
 } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import type { Album, FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
+import type { FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
 import { CONVOY_PCT_DEFAULT } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 import {
@@ -31,13 +31,6 @@ interface Props {
    * points 仍然照傳：關掉只是不畫，鏡頭框景與播放列的統計都還算它們。
    */
   showPhotos?: boolean;
-  /**
-   * 相簿清單。只為了一件事：整叢照片都屬於同一本相簿時，用那本的封面照當代表。
-   *
-   * 沒傳、或那本沒設封面，就退回「從這本相簿的照片裡隨機挑一張」——
-   * 所以這個 prop 是加分項，缺了地圖照樣完整。
-   */
-  albums?: Album[];
   /** GPS 軌跡點。有軌跡時，動畫就是沿著它跑 */
   tracks?: TrackPoint[];
   /**
@@ -1456,7 +1449,7 @@ function colorByUser(colors: Record<number, string> | undefined, fallback: strin
 }
 
 export default function FootprintMap({
-  points, showPhotos = true, albums, tracks, connectPhotos = false, height = 520, styleUrl, onSelectPhoto,
+  points, showPhotos = true, tracks, connectPhotos = false, height = 520, styleUrl, onSelectPhoto,
   editable = false, onEditPoints, onMovePhoto,
   rawTracks, showRawLine = false,
   matchedTracks, showMatchedLine = false,
@@ -1490,7 +1483,6 @@ export default function FootprintMap({
   /** 已經處理過的 seekTo.nonce。資料重載時 warp 會換一份，不記一筆就會重跳一次 */
   const seekDoneRef = useRef<number>(-1);
   const sortedRef = useRef<FootprintPoint[]>([]);
-  const albumsRef = useRef<Album[]>([]);
   // 已經加進地圖的縮圖，以及正在下載中的。避免同一張重複抓，也用來擋住上限
   const thumbLoaded = useRef<Set<string>>(new Set());
   const thumbPending = useRef<Set<string>>(new Set());
@@ -1953,7 +1945,6 @@ export default function FootprintMap({
     mapRef.current.easeTo({ center: [cx, cy], duration: 600 });
   }, [seekTo, warp, memberPaths]);
   useEffect(() => { sortedRef.current = sorted; }, [sorted]);
-  useEffect(() => { albumsRef.current = albums || []; }, [albums]);
   useEffect(() => { tracksRef.current = tracks || []; }, [tracks]);
   useEffect(() => { editingRef.current = editing; }, [editing]);
   useEffect(() => {
@@ -2181,10 +2172,6 @@ export default function FootprintMap({
         // 停在 z15 的話 z16~17 這一段既沒有叢集、又還沒近到分得開，會糊成一團
         clusterMaxZoom: 17,
         clusterProperties: {
-          // 整叢是不是同一本相簿：min === max 就是。
-          // 沒有「集合」型的累加器可用，只好靠兩端夾出來
-          aMin: ['min', ['get', 'album_id']],
-          aMax: ['max', ['get', 'album_id']],
           // 這一叢的代表照（見 REP_ID_MOD）
           rep: ['max', ['get', 'rep']],
         },
@@ -2272,8 +2259,14 @@ export default function FootprintMap({
         },
       });
 
-      // 整叢的代表照：全部同一本相簿就用那本的封面（album-<id>，載不到封面時
-      // 由 styleimagemissing 那邊退回隨機一張），否則用這一區隨機抽中的那張照片
+      /*
+       * 整叢的代表照：**一律是這一叢裡隨機抽中的那一張**（見 REP_ID_MOD）。
+       *
+       * ⚠️ 以前整叢同一本相簿時改用那本的封面（`album-<id>`），拿掉了 ——
+       * 一本相簿通常是一整趟旅行、橫跨好幾公里，封面那張多半是在別的地方拍的。
+       * 於是地圖上這個點畫的是一張跟這裡無關的照片，而泡泡的意思就是
+       * 「這裡拍到什麼」。代表照要從**這一叢**裡抽，不是從相簿裡抽。
+       */
       map.addLayer({
         id: 'photo-cluster-thumbs',
         type: 'symbol',
@@ -2281,12 +2274,7 @@ export default function FootprintMap({
         filter: ['has', 'point_count'],
         layout: {
           ...bubbleLayout,
-          'icon-image': [
-            'case',
-            ['==', ['get', 'aMin'], ['get', 'aMax']],
-            ['concat', 'album-', ['to-string', ['get', 'aMin']]],
-            ['concat', 'photo-', ['to-string', ['%', ['get', 'rep'], REP_ID_MOD]]],
-          ],
+          'icon-image': ['concat', 'photo-', ['to-string', ['%', ['get', 'rep'], REP_ID_MOD]]],
         },
       });
 
@@ -2483,30 +2471,19 @@ export default function FootprintMap({
       map.on('mouseleave', 'track-point-dots', () => { map.getCanvas().style.cursor = ''; });
 
       /**
-       * icon-image 的名字 → 要拿哪張圖來畫。
-       *
-       * photo-<id>：那張照片本身。
-       * album-<id>：那本相簿的封面；沒設封面就從這本相簿在地圖上的照片裡隨機挑一張。
-       *   挑完就進了 maplibre 的圖庫、整個 session 不會再抽，所以不會一直跳。
+       * icon-image 的名字 → 要拿哪張圖來畫。名字只有 `photo-<id>` 一種：
+       * 單張畫它自己，整叢畫抽中的那一張（見 photo-cluster-thumbs）。
        */
       const bubbleSourceFor = (imageId: string): string | null => {
-        if (imageId.startsWith('photo-')) {
-          const photoId = Number(imageId.slice('photo-'.length));
-          return sortedRef.current.find((p) => p.id === photoId)?.url ?? null;
-        }
-        const albumId = Number(imageId.slice('album-'.length));
-        const cover = albumsRef.current.find((a) => a.id === albumId)?.cover_photo_url;
-        if (cover) return cover;
-        const pool = sortedRef.current.filter((p) => p.album_id === albumId);
-        if (pool.length === 0) return null;
-        return pool[Math.floor(Math.random() * pool.length)].url;
+        const photoId = Number(imageId.slice('photo-'.length));
+        return sortedRef.current.find((p) => p.id === photoId)?.url ?? null;
       };
 
       // 縮圖採「用到才載」：maplibre 找不到 icon-image 就會發這個事件。
       // 一次把整個相簿的縮圖抓下來是白費頻寬 —— 聚合起來的照片只會畫出一張代表。
       map.on('styleimagemissing', (e: { id: string }) => {
         const id = e.id;
-        if (!id.startsWith('photo-') && !id.startsWith('album-')) return;
+        if (!id.startsWith('photo-')) return;
         if (thumbPending.current.has(id) || thumbLoaded.current.size >= MAX_THUMBS) return;
         const url = bubbleSourceFor(id);
         if (!url) return;
@@ -2660,7 +2637,6 @@ export default function FootprintMap({
             id: p.id,
             geo_source: p.geo_source,
             title: p.title,
-            album_id: p.album_id,
             // 每次資料換掉就重抽一次代表照（也順便換一輪叢集泡泡的傾角）。
             // id 超過 REP_ID_MOD 的話低位會溢位、代表照就抽錯 —— 現實中差了好幾個數量級
             rep: Math.floor(Math.random() * REP_RAND_MAX) * REP_ID_MOD + (p.id % REP_ID_MOD),

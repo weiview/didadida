@@ -1473,7 +1473,6 @@ export default function MapPage() {
       <FootprintMap
         points={points}
         showPhotos={showPhotos}
-        albums={albums}
         tracks={tracks}
         editable={isAdmin}
         onEditPoints={handleEditPoints}
