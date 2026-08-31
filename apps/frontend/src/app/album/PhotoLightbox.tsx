@@ -48,6 +48,29 @@ interface PhotoLightboxProps {
   hasNext?: boolean;
 }
 
+/**
+ * 現在是不是手機的版面（≤768px，跟 lightbox.module.css 的斷點同一個數字）。
+ *
+ * ⚠️ 初值就直接問 matchMedia，**不是先給 false 再用 effect 補**：燈箱只有在
+ *    使用者點下去之後才會被掛出來（靜態匯出的 HTML 裡根本沒有它），所以不會
+ *    有 hydration mismatch；反過來先給 false 的話，手機上第一幀會先把 Story
+ *    與留言整片畫出來再收掉（而且留言那支請求已經送出去了），閃一下不說，
+ *    「一進去只有照片」這件事就等於沒做到。
+ */
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(max-width: 768px)").matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 768px)");
+    const onChange = () => setIsMobile(mq.matches);
+    onChange();
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  return isMobile;
+}
+
 export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, onUpdate, onToggleRestricted, onPrev, onNext, hasPrev, hasNext }: PhotoLightboxProps) {
   /*
    * EXIF 面板的開合是**站台層級的偏好**，不是這一張照片的狀態（見 lib/exifPref）。
@@ -56,6 +79,34 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   const showExif = useExifExpanded();
   // 「拍攝時間」那顆按鈕開的視窗。用的是相簿頁那支 FixTimeModal，只是鎖在「指定時間」
   const [showFixTime, setShowFixTime] = useState(false);
+
+  /* ── 手機：一進來只有照片，點一下才叫出 Story 與留言 ────────────────────
+   *
+   * 使用者的原話：「點進去燈箱後 希望是不要有任何其他 小故事 留言那些文字，
+   * 單純只有照片就好，再點一下照片 才會浮現 story 跟留言，以及查看更多的
+   * 文字按鈕，點了之後才會在出現更多其他資訊」。三段：
+   *
+   *   0 只有照片（照片撐滿整個畫面）
+   *   1 ＋ Story ＋ 留言 ＋ 一顆「查看更多」
+   *   2 ＋ 標籤／地點／照片資訊(EXIF)
+   *
+   * ⚠️ **收起來的那幾段是真的不 render，不是用 CSS 藏起來**：`PhotoComments`
+   *    一掛上去就是一趟 `GET /api/photos/:id/comments`（D1 讀取）。藏起來的話
+   *    每開一張照片照樣花那一趟，而使用者根本還沒說他要看留言。
+   * ⚠️ 桌機完全不受影響 —— 那邊是左右兩欄，照片跟留言本來就並排，
+   *    收起來只會空一大塊。所以每一個判斷都先看 `isMobile`。
+   * ⚠️ 換上一張／下一張**刻意不歸零**：想一路看照片的人不該每換一張就再點一次，
+   *    想看留言的人也一樣。歸零的只有「關掉燈箱再開」（元件重新掛載）。
+   */
+  const isMobile = useIsMobile();
+  const [mobileStage, setMobileStage] = useState<0 | 1 | 2>(0);
+  /** 手機上現在收著（＝只有照片）。桌機永遠是 false */
+  const collapsed = isMobile && mobileStage === 0;
+  /** Story 與留言要不要端出來 */
+  const showBasics = !isMobile || mobileStage >= 1;
+  /** 標籤／地點／照片資訊要不要端出來 */
+  const showMore = !isMobile || mobileStage === 2;
+
   
   const [descValue, setDescValue] = useState(photo.description || "");
   const [isSavingDesc, setIsSavingDesc] = useState(false);
@@ -135,6 +186,31 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   // 換一張就回到原尺寸 —— 上一張放大到 5 倍的位置對這一張沒有任何意義
   useEffect(() => { resetZoom(); }, [photo.id, resetZoom]);
 
+  /*
+   * ⚠️ **影片不參與收合**，跟它不參與捏合放大是同一個理由：`<video>` 自己要吃
+   *    點擊（播放／暫停）與拖時間軸那些手勢，`VideoPlayer` 的外框也刻意把 touch
+   *    擋在燈箱之外。拿「點一下」當開關就等於搶走播放鍵，而影片一旦收起來就
+   *    再也叫不出留言 —— 那是一條沒有出口的路。所以影片一律從第 1 段開始
+   *    （Story ＋ 留言看得到，「查看更多」照樣按得到）。
+   */
+  useEffect(() => {
+    if (!isVideo(photo)) return;
+    setMobileStage((s) => (s === 0 ? 1 : s));
+  }, [photo.id, photo.media_type]);
+
+  /*
+   * 輕點一下要做的事。放在 ref 裡是為了讓底下那個掛原生監聽器的 effect
+   * **不必因為 stage 換了就重掛一次** —— 重掛的瞬間手指還按著，捏合會斷掉。
+   */
+  const singleTapRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    singleTapRef.current = () => {
+      if (!isMobile) return;
+      // 從第 2 段點下去也是直接收回只有照片：想再看資訊按一下就回來了
+      setMobileStage((s) => (s === 0 ? 1 : 0));
+    };
+  }, [isMobile]);
+
   useEffect(() => {
     const el = containerRef.current;
     if (!el || !zoomable) return;
@@ -151,6 +227,11 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
     let panFrom: { x: number; y: number } | null = null;
     let tapFrom: { x: number; y: number; t: number } | null = null;
     let lastTap = 0;
+    /** 等著看「這一下到底是輕點一下，還是輕點兩下的第一下」的計時器 */
+    let singleTap: ReturnType<typeof setTimeout> | null = null;
+    const cancelSingleTap = () => {
+      if (singleTap) { clearTimeout(singleTap); singleTap = null; }
+    };
 
     const rectOf = () => el.getBoundingClientRect();
     const gap = (t: TouchList) =>
@@ -189,6 +270,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
     };
 
     const onStart = (e: TouchEvent) => {
+      // 又有手指下來了：先前那一下不能算「輕點一下」（可能是雙擊，也可能是拖）
+      cancelSingleTap();
       if (e.touches.length === 2) {
         if (e.cancelable) e.preventDefault();
         const r = rectOf();
@@ -249,10 +332,32 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
       const now = Date.now();
       if (now - lastTap < TAP_MS) {
         lastTap = 0;
+        cancelSingleTap();
         const r = rectOf();
         toggleAt(t.clientX - r.left, t.clientY - r.top, r);
       } else {
         lastTap = now;
+        /*
+         * 輕點一下＝手機上把 Story／留言收起來或叫回來（見 mobileStage）。
+         *
+         * ⚠️ **一定要等過 TAP_MS 才動手**，不能當場做：輕點兩下是放大，
+         *    馬上做的話每一次放大都會先閃一下收合。第二下的 touchstart 會把
+         *    這個計時器取消掉。
+         * ⚠️ 放大中（scale > 1）不算 —— 那時候的一下是「我還在看細節」，
+         *    把畫面收掉只會打斷他。
+         */
+        /*
+         * ⚠️ 點在按鈕上的那一下不算。照片上面疊著換頁箭頭、左上角那顆鎖、
+         *    以及「點一下暫時顯示」的遮罩 —— 它們都是 button，而原生監聽器
+         *    掛在整個容器上，子節點的 touchend 照樣冒泡上來（React 那邊的
+         *    stopPropagation 攔不到原生事件）。不擋的話按一下遮罩會同時
+         *    掀開照片又把 Story 叫出來。
+         */
+        const onBtn = !!(t.target as HTMLElement | null)?.closest?.("button");
+        if (tf.current.scale === 1 && !onBtn) {
+          cancelSingleTap();
+          singleTap = setTimeout(() => { singleTap = null; singleTapRef.current(); }, TAP_MS);
+        }
       }
     };
 
@@ -262,6 +367,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
     el.addEventListener("touchend", onEnd, { passive: true });
     el.addEventListener("touchcancel", onEnd, { passive: true });
     return () => {
+      cancelSingleTap();
       el.removeEventListener("touchstart", onStart);
       el.removeEventListener("touchmove", onMove);
       el.removeEventListener("touchend", onEnd);
@@ -483,7 +589,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
            * 放大中才鎖 touch-action —— 一倍時要留給 .content 直向捲動
            * （手機上照片底下還有 Story、標籤、留言，那些得捲得動）。
            */
-          className={`${styles.imageContainer} ${blurred ? styles.blurred : ''} ${zoomed ? styles.zooming : ''}`}
+          className={`${styles.imageContainer} ${blurred ? styles.blurred : ''} ${zoomed ? styles.zooming : ''} ${collapsed ? styles.soloImage : ''}`}
           onTouchStart={onTouchStartEvent}
           onTouchMove={onTouchMoveEvent}
           onTouchEnd={onTouchEndEvent}
@@ -606,6 +712,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           )}
         </div>
         
+        {showBasics && (
         <div className={styles.detailsContainer}>
           <div className={styles.section}>
             <div className={styles.sectionHeader}>
@@ -638,6 +745,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             )}
           </div>
 
+          {/* 這一段（標籤／地點／照片資訊）在手機上要按過「查看更多」才出來 */}
+          {showMore && (<>
           <div className={styles.section}>
             <h3>標籤</h3>
             <div className={styles.tagsArea} onClick={() => { if(isAdmin && (photo.tags?.length || 0) < 10) document.getElementById('tag-input')?.focus() }}>
@@ -793,16 +902,39 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               </div>
             </div>
           )}
+          </>)}
+
+          {/*
+            * 「查看更多」。手機專屬 —— 桌機沒有分段，上面那些本來就全在。
+            * 刻意是一顆**文字**按鈕（使用者的原話：「查看更多的文字按鈕」），
+            * 不做成箭頭或把手：這一塊底下接的是留言，多一個圖示反而看不出
+            * 它管的是哪一段。展開之後換成「收起其他資訊」——
+            * 只能靠點照片收回去的話，等於要人記住一個沒寫出來的手勢。
+            */}
+          {isMobile && (
+            <button
+              type="button"
+              className={styles.moreBtn}
+              onClick={() => setMobileStage((s) => (s === 2 ? 1 : 2))}
+            >
+              {mobileStage === 2 ? '收起其他資訊' : '查看更多'}
+            </button>
+          )}
 
         </div>
+        )}
 
         </div>
 
         {/* 留言。看不看得到、留不留得了都在元件裡自己判斷（沒權限就整塊不出現，
             外面這層有 :empty 的規則跟著收掉），所以這裡不必再包一層條件 */}
+        {/* ⚠️ 手機第 0 段**整塊不掛**，不是用 CSS 藏起來 —— 掛上去就是一趟
+            GET /api/photos/:id/comments（見 mobileStage 那一段） */}
+        {showBasics && (
         <div className={styles.commentsPane}>
           <PhotoComments photoId={photo.id} />
         </div>
+        )}
 
         {/*
           * 指定／修改這一張的拍攝時間。用的就是相簿頁那支 FixTimeModal（鎖在

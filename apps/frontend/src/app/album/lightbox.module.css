@@ -902,6 +902,40 @@ input:checked + .slider:before {
   }
 }
 
+/* ── 手機：一進來只有照片 ──────────────────────────
+ *
+ * 分段本身寫在 PhotoLightbox（mobileStage）：收起來的那幾塊是**真的不 render**，
+ * 不是這裡藏起來的 —— 留言一掛上去就是一趟 D1 讀取。這裡只負責兩件事：
+ * 收著的時候讓照片撐滿整個畫面，以及「查看更多」那顆文字按鈕長什麼樣。
+ *
+ * ⚠️ `.soloImage` 必須排在前面那個 `max-width: 768px`（`.imageContainer` 改
+ *    60vh）**後面**，同樣是一個 class 的權重，靠順序決勝。
+ */
+@media (max-width: 768px) {
+  /* 底下沒有東西了，60vh 會在照片下面留一大塊黑的。
+     用 100% 而不是 100dvh：`.content` 已經是 100vh，跟它一樣高才不會多出捲軸 */
+  .soloImage {
+    height: 100%;
+  }
+}
+
+/*
+ * 「查看更多」／「收起其他資訊」。它在 detailsContainer（flex column）裡面，
+ * 靠左對齊、做得像一行連結而不是一顆實心按鈕 —— 這一塊底下接的是留言，
+ * 太搶眼會蓋過 Story 本身。
+ */
+.moreBtn {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 4px 0;
+  color: var(--accent-color);
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 /* ── 桌機：照片＋照片資訊在左，留言獨立成右欄 ──────────────────────────────
  *
  * 基礎樣式（檔案最上面）是**手機優先**的上下堆疊：`.content` 是 column，
