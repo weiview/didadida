@@ -508,6 +508,12 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - ⚠️ `.soloImage` 必須排在前面那個 `max-width: 768px`（`.imageContainer` 改 60vh）
   **後面**，同樣是一個 class 的權重，靠順序決勝；而檔案最後面那個
   `min-width: 769px` 的桌機區塊照舊**必須留在最後**。
+- ⚠️⚠️ `.soloImage` 的高度**一定要是 `100vh` 這種絕對長度，不可以寫 `height: 100%`**
+  （上線當天就踩到）。百分比是拿父層的高度算的，而 `.imageContainer` 的父層
+  `.mainPane` 在手機上沒有指定高度（那是桌機兩欄那段才給的）—— 100% 解不出來就
+  退回 auto，照片高度變成「內容有多高」，而它的內容 `.zoomLayer` 與 PhotoImage 的
+  外框**又都是 height: 100%**，整條鏈一路塌成 0。症狀是**點進燈箱一片全黑、
+  只剩關閉鈕**，而且只在手機上。
 
 ## 不開放的照片
 
