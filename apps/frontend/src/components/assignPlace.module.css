@@ -55,6 +55,70 @@
   height: clamp(260px, 42vh, 520px);
 }
 
+/* ── 地圖底下那一行：打卡地點名稱 ＋ 搜尋地點或貼上座標 ────────────────────
+ *
+ * 兩格都不需要整行那麼寬，並排才不會把地圖與「套用地點」一路往下推。
+ *
+ * ⚠️ 換行**靠 flex-wrap 自己折，不另外寫 media query**：基準寬 240px，
+ *    手機的內容寬（360px 的機器扣掉左右 14px 的內距再扣掉外框）放不下兩格，
+ *    自動就變成上下兩排。多寫一個斷點只會多一個要跟 CSS 對齊的數字。
+ */
+.fieldRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.field {
+  /* min-width: 0 是 flex 子項的老問題：不寫的話輸入框的預設寬度會把它撐開，
+     兩格擠成一行放不下卻又不折行 */
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.fieldLabel {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.fieldNote {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  color: #64748b;
+  line-height: 1.6;
+}
+
+.fieldInput {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  font-size: 14px;
+}
+
+/* 兩格各自的下拉（地點簿、地名搜尋結果）。絕對定位蓋在底下那幾行上，
+   所以它的外層一定要 position: relative（見 .fieldAnchor） */
+.fieldAnchor {
+  position: relative;
+}
+
+.menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  background: #fff;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, .14);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
 @media (max-width: 768px) {
   .overlay {
     padding: 0;
