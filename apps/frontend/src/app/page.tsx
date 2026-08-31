@@ -105,8 +105,12 @@ function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, dr
         onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
         onPointerUp={handlePointerUpOrLeave}
         onPointerLeave={handlePointerUpOrLeave}
+        // ⚠️ 捏合縮放時瀏覽器接管手勢，發的是這一顆不是 pointerup
+        onPointerCancel={handlePointerUpOrLeave}
         onClick={(e) => {
-          if (longPressIndex !== null || draggingIndex !== null) {
+          // ⚠️ 比的是 `=== index` 不是 `!== null` —— 萬一哪一張卡在「舉起來」的狀態，
+          //    只有它自己點不動，不會連累旁邊每一本相簿
+          if (longPressIndex === index || draggingIndex !== null) {
             e.preventDefault();
           }
         }}
@@ -205,6 +209,25 @@ export default function Home() {
   const [longPressIndex, setLongPressIndex] = useState<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
+  /**
+   * 取消還沒成立的長按，並把已經舉起來的那一張放回去。
+   *
+   * ⚠️⚠️ 這是「手指縮放之後相簿點不動」的解法。長按計時器是在 pointerdown 起跑的，
+   * 而**兩指捏合時瀏覽器會把手勢接管走、發的是 `pointercancel` 不是 `pointerup`**
+   * —— 原本只有 pointerup／pointerleave 在清計時器，於是計時器活了下來，一秒後
+   * `longPressIndex` 被設起來，而卡片的 onClick 看到它不是 null 就 `preventDefault()`，
+   * **從此每一本相簿都點不進去**（清掉它的 handleDragEnd 永遠不會跑，因為根本沒有
+   * 拖曳開始過）。所以捏合一開始就要在這裡收乾淨。
+   */
+  const cancelLongPress = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    // 真的在拖的時候不要動它 —— draggable 還靠它撐著（見卡片上的 draggable）
+    if (dragItem.current === null) setLongPressIndex(null);
+  }, []);
+
   // 雙指 Pinch 手勢即時連續縮放相簿網格大小 (手機觸控)
   useEffect(() => {
     const getDistance = (touches: TouchList) => {
@@ -213,9 +236,19 @@ export default function Home() {
       return Math.hypot(dx, dy);
     };
 
+    /**
+     * 燈箱開著的時候整組讓開 —— 那裡有它自己的雙指縮放（放大照片），
+     * 不讓開的話捏一下照片，被蓋住的相簿格線也跟著改欄數。
+     */
+    const inLightbox = (e: TouchEvent) =>
+      !!(e.target as HTMLElement | null)?.closest?.('[data-lightbox]');
+
     const handleTouchStart = (e: TouchEvent) => {
+      if (inLightbox(e)) return;
       if (e.touches.length === 2) {
         if (e.cancelable) e.preventDefault();
+        // 手指落在卡片上時長按已經在倒數了，捏合不是長按（見 cancelLongPress）
+        cancelLongPress();
         touchStartDistRef.current = getDistance(e.touches);
         const defaultCols = window.innerWidth <= 768 ? 2 : 3;
         initialColumnsRef.current = gridColumns > 0 ? gridColumns : defaultCols;
@@ -223,6 +256,7 @@ export default function Home() {
     };
 
     const handleTouchMove = (e: TouchEvent) => {
+      if (inLightbox(e)) return;
       if (e.touches.length >= 2) {
         if (e.cancelable) e.preventDefault();
       }
@@ -259,7 +293,7 @@ export default function Home() {
       document.removeEventListener("touchmove", handleTouchMove);
       document.removeEventListener("touchend", handleTouchEnd);
     };
-  }, [gridColumns]);
+  }, [gridColumns, cancelLongPress]);
 
   // 照片全站搜尋與大圖檢視 State
   const [displayPhotos, setDisplayPhotos] = useState<Photo[]>([]);
@@ -291,9 +325,14 @@ export default function Home() {
   // 寫進 state。
   const querySeq = useRef(0);
 
-  const runQuery = useCallback(async () => {
+  /**
+   * ⚠️ `silent` ＝ **不要把整片內容換成「載入中...」**。`loading` 一翻上去底下
+   *    整塊就 unmount，頁面高度當場塌成 0，瀏覽器把捲軸收回頂端 —— 資料回來
+   *    重畫完也回不去了。燈箱裡改完資料那條路一律走 silent（見下面的燈箱）。
+   */
+  const runQuery = useCallback(async (opts?: { silent?: boolean }) => {
     const seq = ++querySeq.current;
-    setLoading(true);
+    if (!opts?.silent) setLoading(true);
     const q = searchQuery.trim();
     const filtering = q !== "" || selectedTags.length > 0;
 
@@ -309,7 +348,7 @@ export default function Home() {
     setAlbums(albumPage.albums);
     setHasMoreAlbums(albumPage.hasMore);
     setDisplayPhotos(photoPage.photos);
-    setLoading(false);
+    if (!opts?.silent) setLoading(false);
   }, [searchQuery, selectedTags, sortBy]);
 
   // 對外仍叫 loadData：新增／刪除／排序失敗之後要用它把畫面拉回真實狀態
@@ -440,6 +479,49 @@ export default function Home() {
     }
   };
 
+  /**
+   * 燈箱正在看的那一張的 **id**，不是索引 —— 跟相簿頁同一套（見 album/page.tsx）。
+   * 改完資料會重抓，重抓回來的順序可能不一樣，索引原地不動就會指到別張照片；
+   * 關燈箱時也靠它捲回那張照片現在的位置。
+   */
+  const viewingIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (selectedPhotoIndex == null) return;
+    const p = displayPhotos[selectedPhotoIndex];
+    if (p) viewingIdRef.current = p.id;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPhotoIndex]);
+
+  useEffect(() => {
+    const want = viewingIdRef.current;
+    if (selectedPhotoIndex == null || want == null) return;
+    if (displayPhotos[selectedPhotoIndex]?.id === want) return;
+    const next = displayPhotos.findIndex((p) => p.id === want);
+    setSelectedPhotoIndex(next >= 0 ? next : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayPhotos]);
+
+  /**
+   * 關燈箱：順手回到那張照片在搜尋結果裡的位置。已經整張在畫面裡就不動，
+   * 不在畫面裡才捲到中間，而且是瞬間不是 smooth（理由同相簿頁那支）。
+   */
+  const closeLightbox = () => {
+    const want = viewingIdRef.current;
+    viewingIdRef.current = null;
+    setSelectedPhotoIndex(null);
+    if (want == null || typeof window === "undefined") return;
+    const index = displayPhotos.findIndex((p) => p.id === want);
+    if (index < 0) return;
+    setTimeout(() => {
+      const el = photoCardRefs.current.get(index);
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.top >= 0 && rect.bottom <= window.innerHeight) return;
+      el.scrollIntoView({ block: 'center' });
+    }, 50);
+  };
+
   /*
    * 篩選（相簿名／描述／底下照片命中）與排序都已經在後端做完，`albums` 拿到的
    * 就是要顯示的東西。這裡保留這個名字只是為了不用改動下面一整片 JSX。
@@ -528,11 +610,15 @@ export default function Home() {
     }, 1000);
   };
 
+  /**
+   * 手指／滑鼠離開就收 —— pointerup、pointerleave，以及**手勢被瀏覽器接管走的
+   * `pointercancel`**（捏合、系統的返回手勢都是走這一條，見 cancelLongPress）。
+   *
+   * 除了計時器，也把 `longPressIndex` 放回去：長按一秒卻沒有拖就放開的話，
+   * 以前那一張會一直停在「舉起來」的狀態，而卡片的 onClick 因此擋掉每一次點擊。
+   */
   const handlePointerUpOrLeave = () => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
+    cancelLongPress();
   };
 
   const handleDragStart = (index: number) => {
@@ -1088,8 +1174,9 @@ export default function Home() {
           // 搜尋結果混著各人的相簿，逐張問「這張是不是我的」
           isAdmin={canEdit(displayPhotos[selectedPhotoIndex])}
           availableTags={[]}
-          onClose={() => setSelectedPhotoIndex(null)}
-          onUpdate={loadData}
+          onClose={closeLightbox}
+          /* ⚠️ silent：不要把整塊換成「載入中...」再換回來，那一下捲軸就回頂端了 */
+          onUpdate={() => { void loadData({ silent: true }); }}
           onToggleRestricted={handleToggleRestricted}
           onPrev={selectedPhotoIndex > 0 ? () => setSelectedPhotoIndex(selectedPhotoIndex - 1) : undefined}
           onNext={selectedPhotoIndex < displayPhotos.length - 1 ? () => setSelectedPhotoIndex(selectedPhotoIndex + 1) : undefined}

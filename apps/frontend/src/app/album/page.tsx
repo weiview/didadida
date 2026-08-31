@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, Suspense, useMemo } from "react";
+import { useEffect, useState, useRef, Suspense, useMemo, useCallback } from "react";
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
@@ -284,6 +284,25 @@ function AlbumContent() {
   const [longPressIndex, setLongPressIndex] = useState<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
+  /**
+   * 取消還沒成立的長按，並把已經舉起來的那一張放回去。
+   *
+   * ⚠️⚠️ 這是「手指縮放之後照片點不動」的解法。長按計時器是在 pointerdown 起跑的，
+   * 而**兩指捏合時瀏覽器會把手勢接管走、發的是 `pointercancel` 不是 `pointerup`**
+   * —— 原本只有 pointerup／pointerleave 在清計時器，於是計時器活了下來，一秒後
+   * `longPressIndex` 被設起來，而卡片的 onClick 看到它不是 null 就整個 return，
+   * **從此每一張照片都點不開**（清掉它的 handleDragEnd 永遠不會跑，因為根本沒有
+   * 拖曳開始過）。所以捏合一開始就要在這裡收乾淨。
+   */
+  const cancelLongPress = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    // 真的在拖的時候不要動它 —— draggable 還靠它撐著（見卡片上的 draggable）
+    if (dragItem.current === null) setLongPressIndex(null);
+  }, []);
+
   // 雙指 Pinch 手勢即時連續縮放照片網格大小 (手機觸控)
   useEffect(() => {
     const getDistance = (touches: TouchList) => {
@@ -292,9 +311,19 @@ function AlbumContent() {
       return Math.hypot(dx, dy);
     };
 
+    /**
+     * 燈箱開著的時候整組讓開 —— 那裡有它自己的雙指縮放（放大照片），
+     * 不讓開的話捏一下照片，被蓋住的相簿格線也跟著改欄數。
+     */
+    const inLightbox = (e: TouchEvent) =>
+      !!(e.target as HTMLElement | null)?.closest?.('[data-lightbox]');
+
     const handleTouchStart = (e: TouchEvent) => {
+      if (inLightbox(e)) return;
       if (e.touches.length === 2) {
         if (e.cancelable) e.preventDefault();
+        // 手指落在照片上時長按已經在倒數了，捏合不是長按（見 cancelLongPress）
+        cancelLongPress();
         touchStartDistRef.current = getDistance(e.touches);
         // 開始時記錄目前畫面的基準欄數（手機預設 2 欄，平板/電腦預設 4 欄）
         const defaultCols = window.innerWidth <= 768 ? 2 : 4;
@@ -303,6 +332,7 @@ function AlbumContent() {
     };
 
     const handleTouchMove = (e: TouchEvent) => {
+      if (inLightbox(e)) return;
       if (e.touches.length >= 2) {
         if (e.cancelable) e.preventDefault();
       }
@@ -340,7 +370,7 @@ function AlbumContent() {
       document.removeEventListener("touchmove", handleTouchMove);
       document.removeEventListener("touchend", handleTouchEnd);
     };
-  }, [gridColumns]);
+  }, [gridColumns, cancelLongPress]);
 
   const [currentCoverPhotoUrl, setCurrentCoverPhotoUrl] = useState<string | null>(null);
 
@@ -374,10 +404,18 @@ function AlbumContent() {
     return true;
   };
 
-  /** 回傳重抓到的照片，讓呼叫端不必等 state 生效就能依最新資料做決定 */
-  const loadData = async (): Promise<Photo[]> => {
+  /**
+   * 回傳重抓到的照片，讓呼叫端不必等 state 生效就能依最新資料做決定。
+   *
+   * ⚠️ `silent` ＝ **不要把整片格線換成「載入照片中...」**。`loading` 一翻上去
+   *    格線就 unmount，頁面高度當場塌成 0，瀏覽器把捲軸收回頂端 —— 資料回來
+   *    重畫完也回不去了，使用者得從頭捲回剛剛那一格（同那顆「不開放」的快速鎖
+   *    為什麼不重抓）。**燈箱裡改完資料那條路一律走 silent**：手上已經有一份
+   *    畫得出來的清單，沒有任何理由先清空它。
+   */
+  const loadData = async (opts?: { silent?: boolean }): Promise<Photo[]> => {
     if (!id) return [];
-    setLoading(true);
+    if (!opts?.silent) setLoading(true);
 
     const [current, photoData, tags] = await Promise.all([
       fetchAlbum(id),
@@ -395,7 +433,7 @@ function AlbumContent() {
     setPhotos(fresh);
     setAvailableTags(tags);
 
-    setLoading(false);
+    if (!opts?.silent) setLoading(false);
     return fresh;
   };
 
@@ -471,6 +509,37 @@ function AlbumContent() {
    * 通知本來就可能比內容活得久。
    */
   /**
+   * 燈箱正在看的那一張的 **id**，不是索引。兩件事都要它：
+   *   ① 在燈箱裡改完資料會重抓，而重抓回來的順序可能整個不一樣（剛補完拍攝
+   *      時間的那張就從「沒時間」那一疊掉進中間）—— 索引原地不動就會指到別張。
+   *   ② 關燈箱時要捲回那張照片**現在**在格線上的位置。
+   */
+  const viewingIdRef = useRef<number | null>(null);
+
+  /**
+   * 關掉燈箱之後回到那張照片在格線上的位置。
+   *
+   * 已經整張在畫面裡就不動（在原地開燈箱、改完資料原地關掉是最常見的一次，
+   * 硬捲一下只是晃）；不在畫面裡才把它捲到中間，而且是**瞬間不是 smooth** ——
+   * 平滑捲過八百張照片要好幾秒，而使用者要的就只是「回到剛剛那裡」。
+   */
+  const scrollBackTo = (photoId: number | null) => {
+    if (photoId == null || typeof window === "undefined") return;
+    const index = displayPhotos.findIndex((p) => p.id === photoId);
+    if (index < 0) return;
+    // 改完時間之後它可能被挪到還沒 render 的區段（無限捲動一次只放 24 張）
+    if (index >= visibleCount) setVisibleCount(index + 24);
+    // 等它畫出來 —— 跟時間軸那顆節點同一個作法
+    setTimeout(() => {
+      const el = photoCardRefs.current.get(index);
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.top >= 0 && rect.bottom <= window.innerHeight) return;
+      el.scrollIntoView({ block: "center" });
+    }, 50);
+  };
+
+  /**
    * 關燈箱。**順手把網址上的 `?photo=` 拿掉** —— 那是通知點進來留下的深連結，
    * 留著的話重新整理又會被上面那段效果重新開一次燈箱（`deepLinkDone` 只擋得住
    * 同一次載入之內的重開，擋不住重整）。
@@ -479,13 +548,43 @@ function AlbumContent() {
    * 讓 Next 重跑一輪路由（會捲回頂端、也會讓整頁重畫）。
    */
   const closeLightbox = () => {
+    const backTo = viewingIdRef.current;
+    viewingIdRef.current = null;
     setSelectedPhotoIndex(null);
+    scrollBackTo(backTo);
     if (typeof window === "undefined") return;
     const url = new URL(window.location.href);
     if (!url.searchParams.has("photo")) return;
     url.searchParams.delete("photo");
     window.history.replaceState(null, "", url.pathname + url.search + url.hash);
   };
+
+  /*
+   * 開燈箱／換上下一張時把 id 記下來。
+   * ⚠️ 相依只有 selectedPhotoIndex —— 清單自己變動時**不能**跟著改，
+   *    那正是下面那段要靠這個 id 認人的時候。
+   */
+  useEffect(() => {
+    if (selectedPhotoIndex == null) return;
+    const p = displayPhotos[selectedPhotoIndex];
+    if (p) viewingIdRef.current = p.id;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPhotoIndex]);
+
+  /*
+   * 清單換了（重抓、改排序、改篩選）就照 id 把索引挪回同一張照片身上。
+   * 沒有這一段的話，在燈箱裡補完拍攝時間的那一瞬間，畫面上那張會換成
+   * 剛好排到同一個索引的另一張照片。整個找不到（被刪了、被篩掉了）就收起來。
+   */
+  useEffect(() => {
+    const want = viewingIdRef.current;
+    if (selectedPhotoIndex == null || want == null) return;
+    if (displayPhotos[selectedPhotoIndex]?.id === want) return;
+    const next = displayPhotos.findIndex((p) => p.id === want);
+    if (next >= 0) setSelectedPhotoIndex(next);
+    else closeLightbox();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayPhotos]);
 
   const deepLinkDone = useRef(false);
   useEffect(() => {
@@ -1626,11 +1725,15 @@ function AlbumContent() {
     }, 1000);
   };
 
+  /**
+   * 手指／滑鼠離開就收 —— pointerup、pointerleave，以及**手勢被瀏覽器接管走的
+   * `pointercancel`**（捏合、系統的返回手勢都是走這一條，見 cancelLongPress）。
+   *
+   * 除了計時器，也把 `longPressIndex` 放回去：長按一秒卻沒有拖就放開的話，
+   * 以前那一張會一直停在「舉起來」的狀態，而卡片的 onClick 因此吃掉每一次點擊。
+   */
   const handlePointerUpOrLeave = () => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
+    cancelLongPress();
   };
 
   const handleDragStart = (index: number) => {
@@ -2233,7 +2336,9 @@ function AlbumContent() {
               className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""} ${isBlurred(photo) ? styles.blurredPhoto : ""}`}
               draggable={canReorderPhotos && longPressIndex === index && sortBy === "custom"}
               onClick={async () => {
-                if (longPressIndex !== null || draggingIndex !== null) return;
+                // ⚠️ 比的是 `=== index` 不是 `!== null` —— 萬一哪一張卡在「舉起來」的
+                //    狀態，只有它自己點不動，不會連累格線上其他每一張
+                if (longPressIndex === index || draggingIndex !== null) return;
                 if (isEditingPhotos) {
                   /*
                    * 不開放的那一張不能當封面 —— 封面是存下來的網址，會出現在
@@ -2265,6 +2370,8 @@ function AlbumContent() {
               onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
               onPointerUp={handlePointerUpOrLeave}
               onPointerLeave={handlePointerUpOrLeave}
+              // ⚠️ 捏合縮放時瀏覽器接管手勢，發的是這一顆不是 pointerup
+              onPointerCancel={handlePointerUpOrLeave}
               onDragStart={(e) => {
                 if ((e.target as HTMLElement).tagName === 'INPUT') {
                   e.preventDefault();
@@ -2440,7 +2547,8 @@ function AlbumContent() {
           isAdmin={canEdit(displayPhotos[selectedPhotoIndex])}
           availableTags={availableTags}
           onClose={closeLightbox}
-          onUpdate={loadData}
+          /* ⚠️ silent：不要把格線換成「載入照片中...」再換回來，那一下捲軸就回頂端了 */
+          onUpdate={() => { void loadData({ silent: true }); }}
           onToggleRestricted={handleToggleRestricted}
           onPrev={() => {
             if (selectedPhotoIndex > 0) setSelectedPhotoIndex(selectedPhotoIndex - 1);

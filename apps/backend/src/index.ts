@@ -2617,13 +2617,19 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * 畫一顆灰燈」本來就需要全部的人。停權的不列（他登不進來，永遠是灰的）。
          */
         const { results: rows } = await env.DB.prepare(
-          "SELECT id, name, last_seen_at FROM User WHERE active = 1"
+          // ⚠️ 多帶 track_color／avatar_key **不多花任何讀取額度**（D1 算的是讀了
+          //    幾列不是幾欄），而「誰在線上」那條橫幅要拿它們畫頭像
+          "SELECT id, name, track_color, avatar_key, last_seen_at FROM User WHERE active = 1"
         ).all<any>();
 
         return new Response(JSON.stringify({
           users: rows.map((r: any) => ({
             id: Number(r.id),
             name: String(r.name ?? ""),
+            // 算好的顏色，理由同 Actor.trackColor：退讓規則只寫在後端一處
+            track_color: trackColorFor(Number(r.id), r.track_color),
+            // 沒設頭像就是 null，前端畫成「名字首字 + 他的顏色」
+            avatar: avatarUrl(url.origin, r.avatar_key),
             // ISO 化：D1 存的是 'YYYY-MM-DD HH:MM:SS'（UTC），前端直接 Date.parse
             // 會在 Safari 上得到 NaN，而且沒有時區等於當成本地時間
             last_seen_at: r.last_seen_at ? `${String(r.last_seen_at).replace(" ", "T")}Z` : null,

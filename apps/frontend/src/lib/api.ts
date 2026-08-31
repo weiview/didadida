@@ -508,6 +508,12 @@ export function clampConvoyPct(v: unknown): number {
 export interface PresenceRow {
   id: number;
   name: string;
+  /**
+   * 頭像與顏色。**舊後端不回這兩欄**（邊快取裡也可能還躺著舊回應），
+   * 所以是選填的 —— 拿不到就退回「名字首字 + 預設色」。
+   */
+  track_color?: string | null;
+  avatar?: string | null;
   /** ISO 字串（後端已經把 D1 的 'YYYY-MM-DD HH:MM:SS' 補成 UTC）。null ＝ 還沒回來過 */
   last_seen_at: string | null;
 }

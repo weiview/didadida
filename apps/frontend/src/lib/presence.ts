@@ -27,6 +27,7 @@
 
 import { useEffect, useSyncExternalStore } from 'react';
 import { fetchPresence } from './api';
+import { DEFAULT_TRACK_COLOR } from './trackColors';
 
 /** 幾秒問一次。要小於後端 PRESENCE_ONLINE_MS（150 秒），不然自己都會閃成離線 */
 const POLL_MS = 60 * 1000;
@@ -37,11 +38,22 @@ const POLL_MS = 60 * 1000;
  */
 const DEFAULT_ONLINE_MS = 150 * 1000;
 
+/** 一位家人。名字給提示用，頭像與顏色給「誰在線上」那條橫幅畫圓頭像 */
+export interface PresencePerson {
+  id: number;
+  name: string;
+  /** 後端算好的軌跡顏色。舊後端沒回這一欄就退到調色盤第一色 */
+  color: string;
+  avatar: string | null;
+  /** 最後一次心跳的毫秒數。null ＝ 還沒回來過 */
+  lastSeen: number | null;
+}
+
 export interface PresenceSnapshot {
   /** uid → 最後一次心跳的毫秒數。沒有那個 key ＝ 不知道（不是離線） */
   seen: Map<number, number>;
-  /** 名字，給「XXX 上線囉」用 */
-  names: Map<number, string>;
+  /** 全站成員（停權的後端就沒回）。「XXX 上線囉」與那條橫幅都讀這一份 */
+  people: Map<number, PresencePerson>;
   onlineMs: number;
   /** 我自己是誰。訪客是 null */
   self: number | null;
@@ -50,7 +62,7 @@ export interface PresenceSnapshot {
 }
 
 const EMPTY: PresenceSnapshot = {
-  seen: new Map(), names: new Map(), onlineMs: DEFAULT_ONLINE_MS, self: null, ready: false,
+  seen: new Map(), people: new Map(), onlineMs: DEFAULT_ONLINE_MS, self: null, ready: false,
 };
 
 let snapshot: PresenceSnapshot = EMPTY;
@@ -119,17 +131,26 @@ async function poll() {
     const users = data.users;
 
     const seen = new Map<number, number>();
-    const names = new Map<number, string>();
+    const people = new Map<number, PresencePerson>();
     for (const u of users) {
-      names.set(u.id, u.name);
       const t = u.last_seen_at ? Date.parse(u.last_seen_at) : NaN;
-      if (Number.isFinite(t)) seen.set(u.id, t);
+      const lastSeen = Number.isFinite(t) ? t : null;
+      if (lastSeen != null) seen.set(u.id, lastSeen);
+      people.set(u.id, {
+        id: u.id,
+        name: u.name,
+        // 舊後端（或邊快取裡的舊回應）沒有這兩欄 —— 退到預設色／沒有頭像，
+        // 而不是讓整條橫幅畫不出來
+        color: u.track_color || DEFAULT_TRACK_COLOR,
+        avatar: u.avatar ?? null,
+        lastSeen,
+      });
     }
     const onlineMs = data.online_ms ?? DEFAULT_ONLINE_MS;
     const { self } = data;
 
     const prev = snapshot;
-    const next: PresenceSnapshot = { seen, names, onlineMs, self, ready: true };
+    const next: PresenceSnapshot = { seen, people, onlineMs, self, ready: true };
 
     // 誰剛上線（規則見上面）
     if (prev.ready) {
@@ -141,7 +162,7 @@ async function poll() {
         const before = prev.seen.get(uid);
         if (before == null) return;                      // 上一份不知道他 —— 不算剛上線
         if (now - before < prev.onlineMs) return;        // 上一份就已經在線上了
-        const toast: PresenceToast = { key: ++toastSeq, name: names.get(uid) || '有人' };
+        const toast: PresenceToast = { key: ++toastSeq, name: people.get(uid)?.name || '有人' };
         toastListeners.forEach((fn) => fn(toast));
       });
     }

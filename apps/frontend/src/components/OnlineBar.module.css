@@ -1,0 +1,133 @@
+/*
+ * 「現在誰在線上」那條。
+ *
+ * 位置緊貼右上角帳號牌的左邊：那顆是 40px、停在 right: max(12px, safe-area)，
+ * 所以這裡讓開 48px 就有 8px 的縫。上方那條 12～52px 的帶子在每一頁都是空的
+ * （相簿頁的時間軸從 top: 88px 才開始長，FAB 那疊在右下角），見 AccountBadge。
+ *
+ * z-index 刻意**比帳號牌那層低**（它的點擊攔截層是 930）—— 帳號面板打開時
+ * 這條就不該還能按，點下去只會先把那張卡收起來。
+ */
+
+.wrap {
+  position: fixed;
+  top: max(12px, env(safe-area-inset-top));
+  right: calc(max(12px, env(safe-area-inset-right)) + 48px);
+  z-index: 925;
+}
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 12px 0 10px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+  font: inherit;
+  color: #171717;
+  line-height: 1;
+}
+
+.pill:hover { background: rgba(255, 255, 255, 0.9); }
+
+/* 頭像互相疊一點，人多的時候才不會把整條撐爆 */
+.heads { display: flex; align-items: center; }
+.heads > * + * { margin-left: -8px; }
+.head {
+  border-radius: 50%;
+  /* 疊在一起要有一圈底色隔開，不然兩顆深色頭像會糊成一團 */
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9);
+  display: inline-flex;
+}
+
+.count { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22c55e; /* 跟頭像右下角那顆同色 */
+  flex-shrink: 0;
+}
+.dotIdle { background: #9ca3af; }
+
+/* 展開的名單 ------------------------------------------------------------- */
+
+.catcher {
+  position: fixed;
+  inset: 0;
+  z-index: 924; /* 就在 .wrap 底下：點空白處收起來 */
+}
+
+.panel {
+  position: absolute;
+  top: 48px;
+  right: 0;
+  width: 232px;
+  max-height: min(60vh, 420px);
+  overflow-y: auto;
+  padding: 8px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  animation: pop 140ms ease-out;
+}
+
+.title {
+  padding: 4px 8px 8px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 10px;
+}
+.row + .row { margin-top: 2px; }
+.rowOffline .name { color: #6b7280; }
+
+.name {
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.me {
+  margin-left: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: #6b7280;
+}
+.when {
+  margin-left: auto;
+  font-size: 12px;
+  color: #9ca3af;
+  white-space: nowrap;
+}
+.online { color: #16a34a; }
+
+@keyframes pop {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel { animation: none; }
+}
+
+/* 手機上把整條縮一點 —— 那條帶子要跟帳號牌並排 */
+@media (max-width: 480px) {
+  .pill { height: 36px; padding: 0 10px 0 8px; gap: 6px; }
+  .panel { top: 44px; width: 200px; }
+}

@@ -5,6 +5,7 @@ import ScrollToTopButton from "@/components/ScrollToTopButton";
 import AccessGate from "@/components/AccessGate";
 import AccountBadge from "@/components/AccountBadge";
 import PresenceToasts from "@/components/PresenceToasts";
+import OnlineBar from "@/components/OnlineBar";
 import { AuthProvider } from "@/lib/useAdmin";
 
 export const metadata: Metadata = {
@@ -41,6 +42,9 @@ export default function RootLayout({
             {/* 「XXX 上線囉」。它同時是全站唯一開上線輪詢的地方（見 lib/presence.ts）
                 —— 掛在這裡才每一頁都在，頭像上那些燈只是看同一份快照 */}
             <PresenceToasts />
+            {/* 「現在誰在線上」。跟帳號牌並排在右上角那條帶子上，
+                **不自己開輪詢**，只是看 PresenceToasts 開的那一份快照 */}
+            <OnlineBar />
             <main>{children}</main>
             <ScrollToTopButton />
           </AccessGate>

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import styles from "./lightbox.module.css";
 import PhotoComments from "./PhotoComments";
 import PhotoImage from "@/components/PhotoImage";
@@ -25,12 +25,20 @@ interface PhotoLightboxProps {
   isAdmin: boolean;
   availableTags: Tag[];
   onClose: () => void;
+  /**
+   * 改完資料之後叫一次，由呼叫端把清單重抓回來。
+   *
+   * ⚠️ 呼叫端**一定要用 silent 的那種重抓**（見 album/page.tsx 的 `loadData`）：
+   *    翻起 `loading` 會讓整片格線 unmount、頁面高度塌成 0，捲軸當場回頂端，
+   *    使用者關掉燈箱就得從頭找剛剛那一張。順序重排（例如剛補完拍攝時間）
+   *    也由呼叫端照 id 把索引挪回同一張照片身上，這裡不必管。
+   */
   onUpdate: () => void;
   /**
    * 切換「不開放」時**改用這個**，不要走 onUpdate。
    *
-   * onUpdate 是整頁重抓（loadData）—— 捲軸跳回頂端，使用者要重新找剛剛那一張。
-   * 呼叫端拿到這一格的結果就地把手上那一列換掉（見 lib/api applyRestrictedPatch）。
+   * 那顆鎖是每幾百張才動一次的管理動作，連重抓都不必：呼叫端拿到這一格的結果
+   * 就地把手上那一列換掉就好（見 lib/api applyRestrictedPatch）。
    * 沒給就退回 onUpdate，行為跟以前一樣。
    */
   onToggleRestricted?: (photoId: number, next: boolean) => Promise<boolean>;
@@ -91,17 +99,197 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
     setIsEditingDesc(false);
   }, [photo.id, photo.description]);
 
+  /* ── 手機上把照片放大來看 ──────────────────────────────────────────────
+   *
+   * 兩指捏合放大（1～5 倍，以兩指中點為錨點）、放大之後單指拖著看、
+   * 輕點兩下在原尺寸與 2.5 倍之間切換。換一張照片就回到原尺寸。
+   *
+   * ⚠️⚠️ 監聽器一定要**自己用 addEventListener 掛、而且 `{ passive: false }`**。
+   *    React 的 onTouchMove 是掛在 root 上的**被動**監聽器，在裡面呼叫
+   *    `preventDefault()` 一點作用都沒有（瀏覽器照樣捲頁面／接管手勢），
+   *    捏合到一半畫面就跟著滑走了。相簿格線那個改欄數的捏合也是同一套寫法。
+   * ⚠️ 位移直接寫進 DOM 的 style，**不走 React state** —— 一次捏合是幾十次
+   *    touchmove，每一次都重畫整個燈箱（右邊還掛著留言、EXIF、標籤）會掉格。
+   *    只有「現在有沒有放大」是 state：它要換掉 touch-action，並讓左右滑動讓開。
+   * ⚠️ 影片不參與（`<video>` 自己要吃拖時間軸那些手勢）。
+   */
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const zoomRef = useRef<HTMLDivElement | null>(null);
+  const tf = useRef({ scale: 1, x: 0, y: 0 });
+  const [zoomed, setZoomed] = useState(false);
+  const zoomable = !isVideo(photo);
+
+  const applyTransform = useCallback(() => {
+    const el = zoomRef.current;
+    if (!el) return;
+    const { scale, x, y } = tf.current;
+    el.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  }, []);
+
+  const resetZoom = useCallback(() => {
+    tf.current = { scale: 1, x: 0, y: 0 };
+    applyTransform();
+    setZoomed(false);
+  }, [applyTransform]);
+
+  // 換一張就回到原尺寸 —— 上一張放大到 5 倍的位置對這一張沒有任何意義
+  useEffect(() => { resetZoom(); }, [photo.id, resetZoom]);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !zoomable) return;
+
+    const MIN = 1;
+    const MAX = 5;
+    /** 輕點兩下之間最多隔幾毫秒，以及「這一下算不算輕點」的容忍距離 */
+    const TAP_MS = 300;
+    const TAP_SLOP = 12;
+
+    let pinchDist = 0;                                   // 0 ＝ 現在不是捏合
+    let start = { scale: 1, x: 0, y: 0 };
+    let anchor = { x: 0, y: 0 };                         // 起手時中點落在圖層的哪裡
+    let panFrom: { x: number; y: number } | null = null;
+    let tapFrom: { x: number; y: number; t: number } | null = null;
+    let lastTap = 0;
+
+    const rectOf = () => el.getBoundingClientRect();
+    const gap = (t: TouchList) =>
+      Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const midOf = (t: TouchList, r: DOMRect) => ({
+      x: (t[0].clientX + t[1].clientX) / 2 - r.left,
+      y: (t[0].clientY + t[1].clientY) / 2 - r.top,
+    });
+
+    /*
+     * 夾住位移：放大時不讓照片被拖到整片離開畫面（拖出去就再也找不回來），
+     * 一倍時一律回到正中央。transform-origin 是 0 0，所以位移的合法範圍是
+     * 「放大後多出來的那一段」的負值。
+     */
+    const clamp = (v: number, s: number, size: number) => {
+      const span = size * s - size;
+      if (span <= 0) return 0;
+      return Math.min(0, Math.max(-span, v));
+    };
+    const commit = (scale: number, x: number, y: number, r: DOMRect) => {
+      tf.current = { scale, x: clamp(x, scale, r.width), y: clamp(y, scale, r.height) };
+      applyTransform();
+    };
+
+    /** 輕點兩下：原尺寸 ⇄ 2.5 倍，以點到的那個位置為錨點 */
+    const toggleAt = (px: number, py: number, r: DOMRect) => {
+      if (tf.current.scale > 1) {
+        tf.current = { scale: 1, x: 0, y: 0 };
+        applyTransform();
+        setZoomed(false);
+        return;
+      }
+      const s = 2.5;
+      commit(s, px * (1 - s), py * (1 - s), r);
+      setZoomed(true);
+    };
+
+    const onStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        if (e.cancelable) e.preventDefault();
+        const r = rectOf();
+        pinchDist = gap(e.touches);
+        start = { ...tf.current };
+        const m = midOf(e.touches, r);
+        // 中點在「還沒縮放的圖層」上的座標。整段捏合都以它為錨點
+        anchor = { x: (m.x - start.x) / start.scale, y: (m.y - start.y) / start.scale };
+        panFrom = null;
+        tapFrom = null;
+      } else if (e.touches.length === 1) {
+        const t = e.touches[0];
+        tapFrom = { x: t.clientX, y: t.clientY, t: Date.now() };
+        if (tf.current.scale > 1) panFrom = { x: t.clientX, y: t.clientY };
+      }
+    };
+
+    const onMove = (e: TouchEvent) => {
+      if (e.touches.length >= 2 && pinchDist > 0) {
+        if (e.cancelable) e.preventDefault();
+        const r = rectOf();
+        const scale = Math.min(MAX, Math.max(MIN, (start.scale * gap(e.touches)) / pinchDist));
+        const m = midOf(e.touches, r);
+        // 錨點跟著兩指中點走，所以捏合同時也能把照片挪過去
+        commit(scale, m.x - anchor.x * scale, m.y - anchor.y * scale, r);
+        return;
+      }
+      if (panFrom && e.touches.length === 1 && tf.current.scale > 1) {
+        if (e.cancelable) e.preventDefault();
+        const t = e.touches[0];
+        commit(
+          tf.current.scale,
+          tf.current.x + (t.clientX - panFrom.x),
+          tf.current.y + (t.clientY - panFrom.y),
+          rectOf(),
+        );
+        panFrom = { x: t.clientX, y: t.clientY };
+      }
+    };
+
+    const onEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2) pinchDist = 0;
+      if (e.touches.length > 0) return;
+
+      panFrom = null;
+      // 手指全部離開才換一次 state：捏合過程中重畫整個燈箱會掉格
+      setZoomed(tf.current.scale > 1);
+
+      const t = e.changedTouches[0];
+      const from = tapFrom;
+      tapFrom = null;
+      if (!t || !from) return;
+      const isTap =
+        Date.now() - from.t < 500 &&
+        Math.hypot(t.clientX - from.x, t.clientY - from.y) < TAP_SLOP;
+      if (!isTap) { lastTap = 0; return; }
+
+      const now = Date.now();
+      if (now - lastTap < TAP_MS) {
+        lastTap = 0;
+        const r = rectOf();
+        toggleAt(t.clientX - r.left, t.clientY - r.top, r);
+      } else {
+        lastTap = now;
+      }
+    };
+
+    // ⚠️ passive: false —— 見上面那段。touchend 不 preventDefault，可以是被動的
+    el.addEventListener("touchstart", onStart, { passive: false });
+    el.addEventListener("touchmove", onMove, { passive: false });
+    el.addEventListener("touchend", onEnd, { passive: true });
+    el.addEventListener("touchcancel", onEnd, { passive: true });
+    return () => {
+      el.removeEventListener("touchstart", onStart);
+      el.removeEventListener("touchmove", onMove);
+      el.removeEventListener("touchend", onEnd);
+      el.removeEventListener("touchcancel", onEnd);
+    };
+  }, [zoomable, applyTransform]);
+
   // Swipe State
   const [touchStart, setTouchStart] = useState<number | null>(null);
   const [touchEnd, setTouchEnd] = useState<number | null>(null);
   const minSwipeDistance = 50;
 
+  /*
+   * ⚠️ 放大中或兩指按著的時候**左右滑動要整組讓開** —— 不然拖著看放大後的
+   *    照片，手一往左走就換到下一張了。用 tf.current 判斷（不是 zoomed 那個
+   *    state）：捏合過程中刻意不重畫，state 還停在上一個值。
+   */
+  const swipeBlocked = (e: React.TouchEvent) =>
+    e.touches.length > 1 || tf.current.scale > 1;
+
   const onTouchStartEvent = (e: React.TouchEvent) => {
     setTouchEnd(null);
+    if (swipeBlocked(e)) { setTouchStart(null); return; }
     setTouchStart(e.targetTouches[0].clientX);
   };
 
   const onTouchMoveEvent = (e: React.TouchEvent) => {
+    if (swipeBlocked(e)) { setTouchEnd(null); return; }
     setTouchEnd(e.targetTouches[0].clientX);
   };
 
@@ -164,6 +352,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   const handleWheel = (e: React.WheelEvent) => {
     // 「指定時間」的視窗開著時不換照片（同鍵盤那邊的理由）
     if (showFixTime) return;
+    // 放大來看的時候也不換 —— 滾一下就跳掉的話根本看不完一張（輕點兩下收回原尺寸）
+    if (tf.current.scale > 1) return;
     // 若在編輯框或輸入框內滾動則不觸發切換
     if ((e.target as HTMLElement).tagName === 'TEXTAREA' || (e.target as HTMLElement).tagName === 'INPUT') {
       return;
@@ -266,7 +456,13 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   ].filter(item => item.value);
 
   return (
-    <div className={styles.overlay} onClick={onClose}>
+    /*
+     * ⚠️ `data-lightbox` 是給**相簿格線與首頁那兩支改欄數的捏合**認的記號
+     *    （app/page.tsx、app/album/page.tsx 的 document 層 touch 監聽器）：
+     *    燈箱開著的時候那兩支要整組讓開，不然在這裡捏一下放大照片，
+     *    被蓋在後面的格線也跟著改欄數。
+     */
+    <div className={styles.overlay} data-lightbox onClick={onClose}>
       <button className={styles.closeBtn} onClick={(e) => { e.stopPropagation(); onClose(); }} title="關閉">×</button>
       
       <div className={styles.content} onClick={e => e.stopPropagation()}>
@@ -282,7 +478,12 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
         <div className={styles.mainPane}>
 
         <div
-          className={`${styles.imageContainer} ${blurred ? styles.blurred : ''}`}
+          ref={containerRef}
+          /*
+           * 放大中才鎖 touch-action —— 一倍時要留給 .content 直向捲動
+           * （手機上照片底下還有 Story、標籤、留言，那些得捲得動）。
+           */
+          className={`${styles.imageContainer} ${blurred ? styles.blurred : ''} ${zoomed ? styles.zooming : ''}`}
           onTouchStart={onTouchStartEvent}
           onTouchMove={onTouchMoveEvent}
           onTouchEnd={onTouchEndEvent}
@@ -298,6 +499,12 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             <VideoPlayer photo={photo} />
           ) : (
             <>
+          {/*
+            * 放大用的圖層。**只包照片本身** —— 那顆鎖、換頁箭頭、
+            * 「顯示的是 800px 縮圖」那句話都留在外面，不然放大 5 倍時
+            * 它們會跟著變成五倍大並被推出畫面。
+            */}
+          <div ref={zoomRef} className={styles.zoomLayer}>
           {/* 走 Worker 代理拿 Drive 的 4K；沒有的話那條路由自己會退回 R2 的 800px */}
           {/*
             * 縮圖先頂著、Drive 的 4K 載好再淡入蓋掉。使用者是從格線點進來的，
@@ -318,6 +525,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
              */
             pendingLabel={photo.drive_file_id ? '高畫質載入中…' : isGif(photo) ? '動畫載入中…' : null}
           />
+          </div>
           {/*
             * R2 只存縮圖，大圖唯一的來源是 Drive。沒有 drive_file_id 就代表現在看到的
             * 是 800px 的相簿縮圖 —— 不講的話使用者只會覺得「這張怎麼有點糊」。

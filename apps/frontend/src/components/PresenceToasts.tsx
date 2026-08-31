@@ -15,8 +15,14 @@ import { useAdmin } from '@/lib/useAdmin';
 import { PresenceToast, subscribePresenceToasts, usePresencePoll } from '@/lib/presence';
 import styles from './PresenceToasts.module.css';
 
-/** 一則留幾秒。四秒是「瞄一眼夠、但不會賴在畫面上」 */
-const TOAST_MS = 4000;
+/**
+ * 一則留幾秒。
+ *
+ * 本來是 4 秒，使用者反映「來不及看」—— 提示跳在左下角，而人多半正在看照片或
+ * 捲相簿，視線移過去就已經過了一半。拉到 10 秒：還是會自己收掉（不需要有人按），
+ * 但足夠瞄一眼再回去做原本的事。整疊本來就不吃點擊，賴久一點也擋不到任何東西。
+ */
+const TOAST_MS = 10000;
 
 export default function PresenceToasts() {
   const { user } = useAdmin();

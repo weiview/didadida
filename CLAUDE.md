@@ -416,6 +416,57 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   自己不開任何計時器。**停權的人不畫燈** —— 他登不進來永遠是灰的，
   而那一列旁邊已經有「已停權」的標籤了。
 - ⚠️ 登出要 `resetPresence()`。不清的話下一個登入的人會先看到上一個人的名單。
+- **畫面上那條「誰在線上」是 `components/OnlineBar.tsx`**（掛在 `layout.tsx`，
+  帳號牌左邊那 48px 的縫）。收起來是最多 3 顆別人的頭像 ＋「n 人在線上」，
+  點開才是完整名單（在線上的在前、離線的寫最後出現是多久以前）。
+  ⚠️ **它不開輪詢**，只是 `usePresence()` 看 `<PresenceToasts />` 開的那一份 ——
+  多掛這一條在每一頁**不會多打任何一次 API**。
+  ⚠️ 收起來那排**刻意不畫自己**（自己就在旁邊那顆帳號牌上），沒有別人時畫一顆
+  灰點 ＋「只有你在線上」—— 空著一條會讓人以為壞了。訪客與 `!ready` 一律不畫。
+  ⚠️ `z-index: 925` **比帳號牌那層低**（它的點擊攔截層是 930）：那張卡打開時
+  這條就不該還能按。
+- `GET /api/presence` 除了 `last_seen_at` 也回 **`track_color` 與 `avatar`**
+  （那條橫幅要拿它們畫圓頭像，共用 `components/Avatar.tsx`）。
+  ⚠️ 多帶兩欄**不多花任何讀取額度**（D1 算的是讀了幾列不是幾欄）；前端那兩欄
+  是**選填的**，邊快取裡還躺著舊回應時退回「名字首字 ＋ 預設色」。
+- 「XXX 上線囉」一則留 **10 秒**（`TOAST_MS`）。本來 4 秒，使用者反映來不及看 ——
+  提示在左下角，而人多半正在看照片。整疊本來就不吃點擊，賴久一點擋不到東西。
+
+## 手勢：捏合改欄數、燈箱裡放大照片
+
+兩件事都在手機上、都靠雙指，**而且互相會打架**，所以寫在一起。
+
+- ⚠️⚠️ 觸控監聽器**一律自己 `addEventListener(..., { passive: false })`**。
+  React 的 `onTouchMove` 是掛在 root 上的**被動**監聽器，在裡面 `preventDefault()`
+  一點作用都沒有 —— 瀏覽器照樣捲頁面／接管手勢。
+- **相簿格線與首頁：捏合改欄數**（`app/page.tsx` 1–5 欄、`app/album/page.tsx` 1–6 欄，
+  document 層監聽）。
+  ⚠️⚠️ **捏合曾經害整頁點不動**（2026-08-31 修）：卡片的 `pointerdown` 會起跑一個
+  1 秒的長按計時器（長按＝舉起來可以拖曳排序），而**兩指捏合時瀏覽器把手勢接管走，
+  發的是 `pointercancel` 不是 `pointerup`** —— 原本只有 pointerup／pointerleave
+  在清計時器，於是一秒後 `longPressIndex` 被設起來，卡片的 onClick 看到它就
+  `preventDefault()`，**從此每一本相簿／每一張照片都點不進去**（清掉它的
+  `handleDragEnd` 永遠不會跑，因為根本沒有拖曳開始過）。三道一起補，缺一不可：
+  ① 卡片加 `onPointerCancel`；② `handlePointerUpOrLeave` 除了計時器也把
+  `longPressIndex` 放回去（**`dragItem.current === null` 時才放** —— 真的在拖的時候
+  `draggable` 還靠它撐著）；③ 捏合起手就在 `handleTouchStart` 裡 `cancelLongPress()`。
+  ⚠️ onClick 的守衛比的是 **`longPressIndex === index`** 不是 `!== null` ——
+  萬一哪一張又卡住，只有它自己點不動，不會連累整頁。
+- **燈箱：捏合放大照片**（`PhotoLightbox.tsx`，1～5 倍、以兩指中點為錨點、
+  放大後單指拖著看、輕點兩下切換原尺寸／2.5 倍、換一張就歸零）。
+  ⚠️ 位移**直接寫進 DOM 的 style，不走 React state** —— 一次捏合是幾十次
+  touchmove，每一次都重畫整個燈箱（右邊還掛著留言、EXIF、標籤）會掉格。
+  只有「現在有沒有放大」是 state：它要換掉 `touch-action` 並讓左右滑動讓開。
+  ⚠️ 放大圖層（`.zoomLayer`）**只包照片本身** —— 那顆不開放的鎖、換頁箭頭、
+  「顯示的是 800px 縮圖」那句話都留在外面，不然放大 5 倍時它們會跟著變五倍大。
+  ⚠️ `transform-origin` 一定要是 `0 0`：夾住位移的算法是照「左上角為原點」推的，
+  改成 center 會讓照片能被拖到整片離開畫面。
+  ⚠️ `touch-action: none` **只在放大中才給** —— 一倍時要留給 `.content` 直向捲動
+  （手機上照片底下還有 Story、標籤、留言）。
+  ⚠️ 影片不參與（`<video>` 自己要吃拖時間軸那些手勢）。
+- ⚠️⚠️ 兩者的交界：燈箱的 overlay 帶著 **`data-lightbox`**，格線那兩支 document 層
+  的捏合處理器一律先 `closest('[data-lightbox]')` 讓開 —— 不讓的話在燈箱裡捏一下
+  放大照片，**被蓋在後面的格線也跟著改欄數**。
 
 ## 不開放的照片
 
@@ -658,6 +709,18 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   - **自訂排序時整條軌收起來**（回空陣列）。`sort_order` 跟時間無關，硬畫出來
     一樣是跳的，而且點下去會把人送到一個跟標籤對不上的位置。
   - 沒有時間的那一疊給一個 `無日期` 節點（它們就在最上面），點一下正好過去補時間。
+- **在燈箱裡改完資料，關掉之後要停在那張照片上**（2026-08-31 修）。三件事一起：
+  - ⚠️⚠️ 重抓一律走 **`loadData({ silent: true })`**。`loading` 一翻上去
+    `{loading ? 載入中 : 格線}` 那一段就把整片格線 unmount，**頁面高度當場塌成 0，
+    瀏覽器把捲軸收回頂端** —— 資料回來重畫完也回不去了。手上已經有一份畫得出來的
+    清單，沒有任何理由先清空它。首頁那支 `runQuery` 同樣有 `silent`。
+  - ⚠️ 燈箱認的是 **`viewingIdRef`（照片 id），不是 `selectedPhotoIndex`**。
+    補完拍攝時間那一張會從「沒時間」那一疊掉進中間，順序一換、索引原地不動就
+    **指到另一張照片**。一支效果在換上下一張時記 id（相依只有 index，清單變動時
+    刻意不跟），另一支在 `displayPhotos` 換掉時照 id 把索引挪回去，找不到就收燈箱。
+  - 關燈箱時 `scrollBackTo()` 捲回那張照片**現在**的位置：不在畫面裡才捲、
+    捲到中間、**瞬間不是 smooth**（平滑捲過八百張要好幾秒）。index 超出
+    `visibleCount` 要先補（無限捲動一次只放 24 張），再 `setTimeout(50)` 等它畫出來。
 - **重複的那幾張：按完立刻跳下一張，事情排到背景做。**
   `resolveDuplicate()` 只負責把 `runDuplicateJob()` 接到 `dupJobsRef` 那條鏈上，
   然後 `advanceDuplicate()`。以前是 `await` 完才換下一張 —— 一張要等上傳 →
