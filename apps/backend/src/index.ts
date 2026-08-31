@@ -12,6 +12,7 @@ import {
   readVideoMeta, videoMetaToExif, HEAD_CHUNK as VIDEO_HEAD_CHUNK,
   type RangeReader,
 } from './videoMeta';
+import { readMotionOffset, MOTION_HEAD_CHUNK } from './motionPhoto';
 
 export interface Env {
   DB: D1Database;
@@ -348,10 +349,11 @@ function requestMediaScope(request: Request, url: URL, env: Env): Promise<MediaS
  * 再加路徑進來要一條一條寫，不要改成 startsWith("/api/photos/") 之類的寬鬆比對。
  *
  * `/video` 跟 `/full` 同一個理由在這裡：<video src> 一樣不會帶 Authorization，
- * 而它吃的也是同一組流水號。
+ * 而它吃的也是同一組流水號。`/motion`（動態照片尾巴上那段 mp4，見 0024）
+ * 也是 <video src>，同一個理由。
  */
 function isSignedMediaPath(pathname: string): boolean {
-  return /^\/api\/photos\/\d+\/(full|video)$/.test(pathname);
+  return /^\/api\/photos\/\d+\/(full|video|motion)$/.test(pathname);
 }
 
 /**
@@ -2190,6 +2192,13 @@ interface VideoMetaItem {
   lat: number | null;
   lng: number | null;
   error?: string;
+  /** 以下只有「重讀比對」模式會填：站上現在存的值，以及兩邊一不一樣 */
+  stored_taken_at_local?: string | null;
+  stored_tz_offset_minutes?: number | null;
+  stored_time_source?: string | null;
+  stored_lat?: number | null;
+  stored_lng?: number | null;
+  differs?: boolean;
 }
 
 /**
@@ -2239,19 +2248,32 @@ function driveRangeReader(saKey: string, fileId: string): {
  *     一律不碰。影片的 metadata 沒有相機 EXIF 可信，人講的話更算數。
  *   - 座標：`AND lat IS NULL` ＋ `geoOverwriteGuard('exif')` —— 手動標過的
  *     地點是最高權威，不能被檔案裡那顆可能飄掉的 GPS 蓋掉。
+ *
+ * ## `compare` ＝重讀比對，**一個位元組都不寫**
+ *
+ * 上面那兩個條件的代價是：**每一格都已經有值的站台，這支路由永遠回報 0**
+ * —— 老實但沒用，使用者只會覺得功能壞了（2026-08-31 就是這樣被回報的）。
+ * 那時真正想問的問題其實是另一個：**「我當初手動填的，跟影片檔自己寫的
+ * 一不一樣？」** 所以多一個模式：條件放寬成「所有影片」，照樣去 Drive 讀，
+ * 但只把兩邊的值並排回報，不下任何 UPDATE。
+ *
+ * ⚠️ 刻意**不做「比對完順手改掉」** —— 手動填的值是人講的話，比檔案裡那個
+ *    推出來的時間更算數（見上面兩個條件的理由）。要改的話使用者自己在燈箱裡
+ *    「指定時間」，那本來就是那顆按鈕存在的原因。
  */
 async function backfillVideoMeta(
-  env: Env, saKey: string, cursor: number, limit: number,
+  env: Env, saKey: string, cursor: number, limit: number, compare = false,
 ): Promise<{
   items: VideoMetaItem[]; scanned: number; next_cursor: number;
   done: boolean; updated: number;
 }> {
   const { results } = await env.DB.prepare(`
-    SELECT id, title, album_id, drive_original_id, taken_at, lat
+    SELECT id, title, album_id, drive_original_id, taken_at, lat, lng,
+           taken_at_local, tz_offset_minutes, time_source
       FROM Photo
      WHERE media_type = 'video'
        AND drive_original_id IS NOT NULL
-       AND (taken_at IS NULL OR lat IS NULL)
+       ${compare ? "" : "AND (taken_at IS NULL OR lat IS NULL)"}
        AND id > ?
      ORDER BY id
      LIMIT ?
@@ -2292,6 +2314,35 @@ async function backfillVideoMeta(
       item.how = shape.how;
       const geo = normalizeGeo(shape.exif, shape.fallbackIso);
 
+      if (compare) {
+        /*
+         * 只並排、不寫。兩邊的「不一樣」分開判斷：時間差一個時區跟座標飄掉
+         * 是兩件不同的事，混成一個布林值就查不下去了。
+         * 座標容差 1e-5（約 1 公尺）—— 存進 D1 是 REAL，字面比對必定處處不同。
+         */
+        item.stored_taken_at_local = row.taken_at_local ?? null;
+        item.stored_tz_offset_minutes = row.tz_offset_minutes ?? null;
+        item.stored_time_source = row.time_source ?? null;
+        item.stored_lat = row.lat ?? null;
+        item.stored_lng = row.lng ?? null;
+        item.taken_at_local = geo.takenAtLocal;
+        item.tz_offset_minutes = geo.tzOffsetMinutes;
+        item.time_source = geo.timeSource;
+        item.lat = geo.lat;
+        item.lng = geo.lng;
+
+        const timeDiffers = geo.takenAtLocal !== null
+          && geo.takenAtLocal !== (row.taken_at_local ?? null);
+        const near = (a: number | null, b: number | null) =>
+          a !== null && b !== null && Math.abs(a - b) < 1e-5;
+        const geoDiffers = geo.lat !== null && geo.lng !== null
+          && !(near(geo.lat, row.lat ?? null) && near(geo.lng, row.lng ?? null));
+        item.differs = timeDiffers || geoDiffers;
+        if (item.differs) updated++;
+        items.push(item);
+        continue;
+      }
+
       if (row.taken_at === null && geo.takenAtUtc) {
         const r = await env.DB.prepare(`
           UPDATE Photo
@@ -2330,7 +2381,8 @@ async function backfillVideoMeta(
    * 改了 taken_at 就等於改了相簿的排序，而訪客那份清單是共用的邊緣快取
    * —— 不推版本號的話要等它自己過期才看得到（見 bumpContentEpoch）。
    */
-  if (updated > 0) await bumpContentEpoch(env);
+  // ⚠️ 比對模式一個位元組都沒寫，`updated` 在那裡是「幾支不一樣」，不能拿來推版本號
+  if (!compare && updated > 0) await bumpContentEpoch(env);
 
   return {
     items,
@@ -2338,6 +2390,103 @@ async function backfillVideoMeta(
     next_cursor: next,
     done: results.length < limit,
     updated,
+  };
+}
+
+/* ── 存量照片的動態照片掃描（0024） ────────────────────────────────────────
+ *
+ * Android 的動態照片在站上就是一張普通的 .jpg，尾巴上黏著一段 mp4。上傳時
+ * 前端在瀏覽器裡就算得出那段的起點，但**2026-08-31 之前傳的沒有人算過** ——
+ * 只能回 Drive 讀那份原始檔的檔頭（XMP 在那裡）。
+ *
+ * ⚠️ 成本是「每張照片一次 Drive 讀取」，而站上照片是以千計的 —— 所以同
+ *    video-meta 那支：一趟只做幾張，由前端迴圈推 cursor。
+ * ⚠️ 一般照片**只讀一次**（檔頭裡沒有 XMP 就當場回 0，不會再去驗位置），
+ *    真的是動態照片才多讀 1–2 次（見 motionPhoto.ts 的 readMotionOffset）。
+ */
+
+/** 一趟最多掃幾張。一般照片 1 次讀取、動態照片 2–3 次，抓 subrequest 預算 */
+const MOTION_SCAN_MAX_LIMIT = 16;
+const MOTION_SCAN_DEFAULT_LIMIT = 10;
+
+interface MotionScanItem {
+  id: number;
+  title: string;
+  album_id: number;
+  /** 0 ＝掃過了、不是動態照片；>0 ＝那段 mp4 的起點 */
+  offset: number;
+  error?: string;
+}
+
+async function scanMotionPhotos(
+  env: Env, saKey: string, cursor: number, limit: number,
+): Promise<{
+  items: MotionScanItem[]; scanned: number; next_cursor: number;
+  done: boolean; found: number;
+}> {
+  /*
+   * `motion_offset IS NULL` ＝「還沒掃過」，這就是續掃的書籤（見 0024）。
+   * 掃過的下一輪自己會掉出這個集合，所以同一張照片不會被讀第二次。
+   */
+  const { results } = await env.DB.prepare(`
+    SELECT id, title, album_id, drive_original_id
+      FROM Photo
+     WHERE media_type = 'photo'
+       AND drive_original_id IS NOT NULL
+       AND motion_offset IS NULL
+       AND id > ?
+     ORDER BY id
+     LIMIT ?
+  `).bind(cursor, limit).all<any>();
+
+  const items: MotionScanItem[] = [];
+  let next = cursor;
+  let found = 0;
+
+  for (const row of results) {
+    const id = Number(row.id);
+    next = id;
+    const item: MotionScanItem = {
+      id, title: String(row.title ?? ""), album_id: Number(row.album_id), offset: 0,
+    };
+
+    try {
+      const { read, totalSize } = driveRangeReader(saKey, String(row.drive_original_id));
+      const head = await read(0, MOTION_HEAD_CHUNK);
+      const size = totalSize();
+      // 起點是「檔案大小減掉影片長度」算出來的，大小不確定就整個算不得
+      if (size === null) throw new Error("Drive 沒告訴我們這個檔多大");
+      item.offset = await readMotionOffset(read, size, head);
+
+      /*
+       * ⚠️ 這句 UPDATE **一定要帶 `AND motion_offset IS NULL`** ——
+       * 免得蓋掉這中間剛上傳、前端自己算好的值（同 backfillVideoMeta 的規矩）。
+       * 寫 0 進去跟寫起點一樣重要：那才是「掃過了」，下一輪才不會再讀一次。
+       */
+      await env.DB.prepare(
+        "UPDATE Photo SET motion_offset = ? WHERE id = ? AND motion_offset IS NULL",
+      ).bind(item.offset, id).run();
+      if (item.offset > 0) found++;
+    } catch (e) {
+      /*
+       * 一張讀不到不該讓整批停下來。**這一列留在 NULL** —— 下一輪整批重跑時
+       * 它會再被撿起來試一次（游標只在這一趟往前走）。
+       */
+      item.error = e instanceof Error ? e.message : String(e);
+    }
+
+    items.push(item);
+  }
+
+  /*
+   * `SELECT p.*` 會把 motion_offset 帶進相簿 JSON，而訪客那份是共用的邊緣快取
+   * —— 不推版本號的話新掃出來的動畫要等快取過期才播得出來。
+   */
+  if (found > 0) await bumpContentEpoch(env);
+
+  return {
+    items, scanned: results.length, next_cursor: next,
+    done: results.length < limit, found,
   };
 }
 
@@ -3179,26 +3328,97 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }
 
         const body = await request.json().catch(() => ({})) as {
-          cursor?: unknown; limit?: unknown;
+          cursor?: unknown; limit?: unknown; compare?: unknown;
         };
         const cursor = Math.max(Number(body.cursor ?? 0) || 0, 0);
+        const compare = body.compare === true;
         const limit = Math.min(
           Math.max(Number(body.limit ?? VIDEO_META_DEFAULT_LIMIT) || VIDEO_META_DEFAULT_LIMIT, 1),
           VIDEO_META_MAX_LIMIT,
         );
 
-        // 還剩幾支沒補（給進度條用）。跟上面那句 WHERE 是同一個條件，
-        // 不然「剩幾張」永遠歸不了零（同 drive-pending 的清單與 COUNT）
+        // 還剩幾支要處理（給進度條用）。跟引擎那句 WHERE 是同一個條件，
+        // 不然「剩幾支」永遠歸不了零（同 drive-pending 的清單與 COUNT）
         const rest = await env.DB.prepare(`
           SELECT COUNT(*) AS n FROM Photo
            WHERE media_type = 'video' AND drive_original_id IS NOT NULL
-             AND (taken_at IS NULL OR lat IS NULL) AND id > ?
+             ${compare ? "" : "AND (taken_at IS NULL OR lat IS NULL)"}
+             AND id > ?
         `).bind(cursor).first<any>();
 
-        const result = await backfillVideoMeta(env, env.GOOGLE_DRIVE_SA_KEY, cursor, limit);
+        /*
+         * ⚠️ 這一句是為了讓回報講得出**理由**。回寫只補空的那幾格，所以每一支
+         * 都已經填好的站台會永遠看到「補上 0 支」—— 老實但看起來像壞掉
+         * （2026-08-31 就是這樣被回報的）。有了總數就講得出
+         * 「站上 110 支影片，每一支的時間與座標都已經有值了」。
+         * 一句 COUNT 對免費額度是零負擔（D1 算的是讀了幾列）。
+         */
+        const totals = await env.DB.prepare(`
+          SELECT COUNT(*) AS n,
+                 SUM(CASE WHEN drive_original_id IS NULL THEN 1 ELSE 0 END) AS no_drive,
+                 SUM(CASE WHEN taken_at IS NOT NULL AND lat IS NOT NULL THEN 1 ELSE 0 END) AS complete
+            FROM Photo WHERE media_type = 'video'
+        `).first<any>();
+
+        const result = await backfillVideoMeta(
+          env, env.GOOGLE_DRIVE_SA_KEY, cursor, limit, compare,
+        );
+        return new Response(JSON.stringify({
+          success: true,
+          compare,
+          remaining_before: Number(rest?.n ?? 0),
+          total_videos: Number(totals?.n ?? 0),
+          videos_without_drive: Number(totals?.no_drive ?? 0),
+          videos_complete: Number(totals?.complete ?? 0),
+          ...result,
+        }), { headers });
+      }
+
+      /* ── 站長專用：掃出既有照片裡的動態照片（0024） ────────────────────
+       *
+       * Android 的動態照片在站上是一張普通的 .jpg，尾巴黏著一段 mp4。上傳時
+       * 前端會就地算出那段的起點，但存量的沒有人算過 —— 回 Drive 讀檔頭。
+       * 引擎在 scanMotionPhotos，這裡只負責閘與游標（同 video-meta 那支）。
+       */
+      if (pathname === "/api/admin/motion-scan" && method === "POST") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.canManageOthers) {
+          return forbidden(headers, "這會掃過全站的照片，只有可以管理別人內容的帳號能做");
+        }
+        if (!env.GOOGLE_DRIVE_SA_KEY) {
+          return new Response(JSON.stringify({
+            error: "沒有設定 GOOGLE_DRIVE_SA_KEY，讀不到 Drive 上的原始檔",
+          }), { status: 503, headers });
+        }
+
+        const body = await request.json().catch(() => ({})) as {
+          cursor?: unknown; limit?: unknown;
+        };
+        const cursor = Math.max(Number(body.cursor ?? 0) || 0, 0);
+        const limit = Math.min(
+          Math.max(Number(body.limit ?? MOTION_SCAN_DEFAULT_LIMIT) || MOTION_SCAN_DEFAULT_LIMIT, 1),
+          MOTION_SCAN_MAX_LIMIT,
+        );
+
+        // 進度條的分母。跟引擎那句 WHERE 是同一個條件，不然數字歸不了零
+        const rest = await env.DB.prepare(`
+          SELECT COUNT(*) AS n FROM Photo
+           WHERE media_type = 'photo' AND drive_original_id IS NOT NULL
+             AND motion_offset IS NULL AND id > ?
+        `).bind(cursor).first<any>();
+        // 已經掃出來幾張有動畫的（跑完之後那句話要講得出總數）
+        const hits = await env.DB.prepare(
+          "SELECT COUNT(*) AS n FROM Photo WHERE motion_offset > 0",
+        ).first<any>();
+
+        const result = await scanMotionPhotos(env, env.GOOGLE_DRIVE_SA_KEY, cursor, limit);
         return new Response(JSON.stringify({
           success: true,
           remaining_before: Number(rest?.n ?? 0),
+          found_total_before: Number(hits?.n ?? 0),
           ...result,
         }), { headers });
       }
@@ -4187,6 +4407,111 @@ if (method === "POST" && pathname === "/api/verify-password") {
         } catch (e) {
           console.error("Drive 影片取檔失敗", e);
           return new Response(JSON.stringify({ error: "影片取檔失敗" }), { status: 502, headers });
+        }
+      }
+
+      /*
+       * 路由：動態照片尾巴上那段 mp4（Android 的 Motion Photo，見 0024）。
+       *
+       * 那段位元組**已經在 Drive 上那份原始 .jpg 裡了**，我們只存了它的起點
+       * （`Photo.motion_offset`）。所以這條路由做的事是「把整個檔案座標系的一段
+       * 視窗，翻譯成影片自己座標系的一段回應」：
+       *
+       *     檔案  [ JPEG ................ | mp4 ........................ ]
+       *           0                    start                        total
+       *     影片                          [ 0 ..................... len ]
+       *
+       * 前端要 `bytes=a-b` → 我們跟 Drive 要 `bytes=(start+a)-(start+b)`，
+       * 回來的 `Content-Range` 再減回去。**一定要翻譯回來，不能照抄上游的** ——
+       * 抄了的話 <video> 會以為這支影片有幾 MB 的前導垃圾，時間軸整個對不上。
+       *
+       * ⚠️ `bytes=-N`（從檔尾往回數）原封轉發就是對的：影片結束的地方就是檔案
+       *    結束的地方。這是唯一不必加 start 的寫法。
+       *
+       * 其餘規矩跟 /video 一模一樣：Range 要轉發、**不進 caches.default**
+       * （一個網址只存得下一份回應，存某一段 206 會餵錯給下一個人）、
+       * 位元組串流出去不落 Worker 記憶體。
+       */
+      if (method === "GET" && pathname.startsWith("/api/photos/")
+          && pathname.endsWith("/motion") && pathname.split("/").length === 5) {
+        const photoId = pathname.split("/")[3];
+        const photo = await env.DB.prepare(
+          "SELECT drive_original_id, motion_offset, restricted FROM Photo WHERE id = ?"
+        ).bind(photoId).first<any>();
+
+        // 「這張沒有動畫」跟「查無此照片」對前端是同一件事：沒有東西可以播
+        const start = Number(photo?.motion_offset ?? 0);
+        if (!photo || !(start > 0)) {
+          return new Response(JSON.stringify({ error: "Motion photo not found" }), { status: 404, headers });
+        }
+        // 不開放的照片：同 /full／/video，一律 404 不是 403
+        if (Number(photo.restricted) === 1
+            && (await requestMediaScope(request, url, env)) !== 'admin'
+            && !canSeeRestricted(await currentActor(request, env))) {
+          return new Response(JSON.stringify({ error: "Motion photo not found" }), { status: 404, headers });
+        }
+        if (!photo.drive_original_id) {
+          return new Response(JSON.stringify({ error: "這張照片還沒上傳到 Drive" }), { status: 404, headers });
+        }
+        if (!env.GOOGLE_DRIVE_SA_KEY) {
+          return new Response(JSON.stringify({ error: "Drive 未設定" }), { status: 503, headers });
+        }
+
+        const clientRange = request.headers.get("Range");
+        let upstreamRange = `bytes=${start}-`;
+        let wantPartial = false;
+        if (clientRange) {
+          const m = /^bytes=(\d*)-(\d*)$/.exec(clientRange.trim());
+          if (!m || (!m[1] && !m[2])) {
+            return new Response(null, { status: 416, headers: { "Access-Control-Allow-Origin": "*" } });
+          }
+          wantPartial = true;
+          upstreamRange = m[1]
+            ? `bytes=${start + Number(m[1])}-${m[2] ? String(start + Number(m[2])) : ""}`
+            : `bytes=-${Number(m[2])}`;
+        }
+
+        try {
+          const upstream = await fetchDriveMediaRange(
+            env.GOOGLE_DRIVE_SA_KEY, photo.drive_original_id, upstreamRange,
+          );
+          if (upstream.status === 416) {
+            return new Response(null, { status: 416, headers: { "Access-Control-Allow-Origin": "*" } });
+          }
+          /*
+           * ⚠️ Drive 沒理 Range 而回了整個檔（200）時**不可以照樣串出去** ——
+           * 那份位元組的前面是 JPEG，前端會拿到一支播不了的影片。/video 那邊
+           * 抄上游沒關係（它要的本來就是整支），這裡不行。切不出來就明講。
+           */
+          const cr = upstream.headers.get("Content-Range");
+          const m2 = cr ? /bytes\s+(\d+)-(\d+)\/(\d+)/.exec(cr) : null;
+          if (upstream.status !== 206 || !m2) {
+            await upstream.body?.cancel();
+            return new Response(JSON.stringify({ error: "Drive 沒有回應 Range 請求" }), { status: 502, headers });
+          }
+
+          const total = Number(m2[3]);
+          const from = Number(m2[1]) - start;
+          const to = Number(m2[2]) - start;
+          const clipLen = total - start;
+          // 起點被記錯（檔案被換過？）時寧可報錯，也不要端出一支從半路開始的影片
+          if (from < 0 || clipLen <= 0) {
+            await upstream.body?.cancel();
+            return new Response(JSON.stringify({ error: "動畫的位置對不上這個檔案" }), { status: 502, headers });
+          }
+
+          const mh = new Headers();
+          mh.set("Content-Type", "video/mp4");
+          mh.set("Accept-Ranges", "bytes");
+          mh.set("Content-Length", String(to - from + 1));
+          if (wantPartial) mh.set("Content-Range", `bytes ${from}-${to}/${clipLen}`);
+          mh.set("Access-Control-Allow-Origin", "*");
+          // 同 /video：這是「某一段」，共用快取存下來一定會餵錯給別人
+          mh.set("Cache-Control", "private, max-age=31536000, immutable");
+          return new Response(upstream.body, { status: wantPartial ? 206 : 200, headers: mh });
+        } catch (e) {
+          console.error("Drive 動態照片取檔失敗", e);
+          return new Response(JSON.stringify({ error: "動畫取檔失敗" }), { status: 502, headers });
         }
       }
 
@@ -5353,6 +5678,21 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           ? Math.round(durationRaw)
           : null;
 
+        /*
+         * 動態照片（0024）：前端在瀏覽器裡讀原始 .jpg 的檔頭，算出尾巴那段 mp4
+         * 從第幾個位元組開始。這裡只是把那個整數存起來，位元組**完全不經過我們**
+         * —— 它跟著原始檔直傳 Drive，播的時候由 /api/photos/:id/motion 切出來。
+         *
+         * ⚠️ 三個值的意思不一樣：NULL＝還沒掃過（既有的列與非照片都是這樣）、
+         *    0＝掃過了不是動態照片、>0＝起點。**前端一定要送 0 而不是不送** ——
+         *    不送的話這一列會留在 NULL，之後 /api/admin/motion-scan 會再花一次
+         *    Drive 讀取去掃一張我們剛剛才掃過的照片。
+         */
+        const motionRaw = formData.get('motion_offset');
+        const motionOffset = mediaType === 'photo' && motionRaw !== null
+          ? Math.max(0, Math.round(Number(motionRaw) || 0))
+          : null;
+
         if (!thumb || !albumId) {
           // 縮圖產不出來就整張不收：沒有它 R2 這邊一個位元組都沒有，
           // 存進 D1 只會得到一列點不開的照片
@@ -5561,13 +5901,13 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           `INSERT INTO Photo
              (title, file_name, album_id, url, thumb_url, thumb_sm_url, exif, taken_at, file_hash, phash,
               lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by,
-              media_type, duration_ms, gif_key, shuffle_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+              media_type, duration_ms, gif_key, motion_offset, shuffle_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
           originalName, fileName, albumId, fileUrl, thumbUrl, thumbSmUrl, exifData,
           uploadTakenAt, fileHash, clientPhash,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
-          uploadTimeSource, me.uid, mediaType, durationMs, gifKey,
+          uploadTimeSource, me.uid, mediaType, durationMs, gifKey, motionOffset,
         ).run();
 
         const newPhotoId = Number(inserted.meta?.last_row_id ?? 0);

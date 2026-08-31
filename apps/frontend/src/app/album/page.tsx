@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, Suspense, useMemo, useCallback } from "rea
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, setPhotosRestricted, applyRestrictedPatch, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, setPhotosRestricted, applyRestrictedPatch, hasMotion, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
 import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive, pushVideoToDrive } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
@@ -18,6 +18,7 @@ import PlaceCheckinModal from "@/components/PlaceCheckinModal";
 import { GIF_MAX_BYTES, isGifFile, resizeImageFile } from "@/lib/imageUtils";
 import { ACCEPTED_VIDEO_TYPES, captureVideoPoster, formatDuration, isVideoFile } from "@/lib/videoUtils";
 import { readVideoExifFromFile } from "@/lib/videoMeta";
+import { readMotionOffsetFromFile } from "@/lib/motionPhoto";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
@@ -55,6 +56,14 @@ type PendingDuplicate = {
    * 「照樣上傳」時要把它一起送給 uploadPhoto，不然 R2 上只會有一張不會動的圖。
    */
   gif?: { file: File };
+  /**
+   * Android 動態照片尾巴上那段 mp4 的起點（不是動態照片就是 0）。
+   *
+   * ⚠️ **一定要跟著存在這裡**：算它要讀原始檔的檔頭，而使用者按「照樣上傳」
+   *    可能是幾分鐘以後的事。不帶的話從重複視窗進來的動態照片會少掉動畫，
+   *    而且要等 /admin 那支掃描回 Drive 讀一次才補得回來（同 exifData／takenAt）。
+   */
+  motionOffset?: number;
 };
 
 /**
@@ -1063,6 +1072,7 @@ function AlbumContent() {
     try {
       const result = await uploadPhoto(
         id as string, item.resized, item.exifData, item.takenAt, true, item.video, item.gif,
+        item.motionOffset,
       );
       if (result.status !== 'ok') {
         dupFailuresRef.current.push(`${name}：${result.status === 'error' ? result.reason : '上傳失敗'}`);
@@ -1347,9 +1357,20 @@ function AlbumContent() {
 
         // 縮圖處理 (長邊不超過 2000px)
         const { file, exifData, takenAt } = await resizeImageFile(rawFile, 2000);
+        /*
+         * Android 的動態照片：原始 .jpg 的尾巴上黏著一段 mp4（見 migrations/0024）。
+         * **在這裡算是最便宜的一次** —— 位元組已經在使用者手上（`File.slice()`
+         * 是惰性讀，只碰檔頭那 128KB），而它一送上 Drive 之後就只剩「Worker 回頭
+         * 讀一次 Drive」那條貴的路（/admin 的掃描）。
+         *
+         * ⚠️ GIF 不算（`gifSource` 那條），後端也只在 media_type='photo' 時收。
+         * ⚠️ **不是動態照片也要送 0** —— 不送的話那一列留在 NULL，之後 /admin
+         *    的掃描還會回 Drive 讀一次我們剛剛在這裡讀過的檔頭。
+         */
+        const motionOffset = gifSource ? undefined : await readMotionOffsetFromFile(rawFile);
         const result = await uploadPhoto(
           id as string, file, exifData, takenAt || undefined, false, undefined,
-          gifSource ? { file: rawFile } : undefined,
+          gifSource ? { file: rawFile } : undefined, motionOffset,
         );
         if (result.status === 'ok') {
           uploaded.push(result.photo);
@@ -1428,6 +1449,7 @@ function AlbumContent() {
             exifData, takenAt: takenAt || undefined,
             reason: result.reason, existing: result.existing,
             ...(gifSource ? { gif: { file: rawFile } } : {}),
+            motionOffset,
           });
         } else {
           failures.push(`${source.name}：${result.reason}`);
@@ -2561,6 +2583,18 @@ function AlbumContent() {
                 */}
               {photo.media_type === 'gif' && (
                 <span className={styles.videoBadge}>GIF</span>
+              )}
+              {/*
+                * Android 的動態照片：格線上就是那張靜態的照片本身，動畫藏在原始檔
+                * 尾巴上（見 migrations/0024）。⚠️ 角標**只是告訴使用者「這格點進去
+                * 有動畫」**，格線上刻意不播 —— 一頁二十四格就是二十四次 Drive 取檔。
+                * media_type 仍然是 'photo'，所以跟上面那兩個不是同一組判斷。
+                */}
+              {photo.media_type === 'photo' && hasMotion(photo) && (
+                <span className={styles.videoBadge}>
+                  <span className={styles.videoBadgeIcon} aria-hidden="true">▶</span>
+                  動態
+                </span>
               )}
               {/*
                 * 不開放的那幾格只有可管理全站內容的人拿得到（後端就濾掉了，

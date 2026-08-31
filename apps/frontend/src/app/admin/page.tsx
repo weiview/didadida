@@ -15,6 +15,7 @@ import { isOnline, usePresence } from "@/lib/presence";
 import AdminSection from "./AdminSection";
 import DriveCompareCard from "./DriveCompareCard";
 import VideoMetaCard from "./VideoMetaCard";
+import MotionScanCard from "./MotionScanCard";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import Avatar from "@/components/Avatar";
 import AvatarPicker from "@/components/AvatarPicker";
@@ -883,6 +884,8 @@ export default function AdminPage() {
         這一格只為存量而存在。
       */}
       <VideoMetaCard />
+
+      <MotionScanCard />
 
       {/*
         GPS 軌跡資料夾。為什麼要一個人一個資料夾：GPSLogger 只拿得到

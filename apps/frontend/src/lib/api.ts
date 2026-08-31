@@ -163,9 +163,33 @@ export function photoVideoSrc(photo: { id: number }): string {
   return mt ? `${base}?mt=${encodeURIComponent(mt)}` : base;
 }
 
+/**
+ * 動態照片（Android Motion Photo）那段動畫的播放網址，見 migrations/0024。
+ *
+ * 那段 mp4 黏在 Drive 上那份原始 .jpg 的尾巴，`motion_offset` 記的是起點；
+ * 這條路由負責把 Range 翻譯進影片自己的座標系再串出來。**跟 photoVideoSrc
+ * 一樣不要加 `crossOrigin`。**
+ */
+export function photoMotionSrc(photo: { id: number }): string {
+  const base = `${API_BASE_URL}/photos/${photo.id}/motion`;
+  const mt = typeof window !== 'undefined' ? localStorage.getItem(MEDIA_TOKEN_KEY) : null;
+  return mt ? `${base}?mt=${encodeURIComponent(mt)}` : base;
+}
+
 /** 這一格是影片還是照片。舊資料沒有 media_type，一律當照片 */
 export function isVideo(photo: { media_type?: string | null }): boolean {
   return photo.media_type === 'video';
+}
+
+/**
+ * 這是不是一張「有動畫可以播」的動態照片。
+ *
+ * ⚠️ 判斷式是 **`> 0`**，不是「有沒有值」：`motion_offset` 有三個狀態
+ * （null＝還沒掃過、0＝掃過了不是動態照片、>0＝起點），而 `0` 跟 `null`
+ * 對前端是同一件事 —— 沒有動畫可以播。
+ */
+export function hasMotion(photo: { motion_offset?: number | null }): boolean {
+  return typeof photo.motion_offset === 'number' && photo.motion_offset > 0;
 }
 
 /**
@@ -217,6 +241,14 @@ export interface Photo {
   media_type?: 'photo' | 'video' | 'gif';
   /** 影片長度（毫秒），格線右下角那個「0:42」。null ＝ 抓不到，就不畫 */
   duration_ms?: number | null;
+  /**
+   * Android 動態照片尾巴上那段 mp4 從第幾個位元組開始（見 migrations/0024）。
+   *
+   * **三個狀態**：`null`／undefined ＝還沒掃過、`0` ＝掃過了不是動態照片、
+   * `> 0` ＝起點。要判斷「播不播得出動畫」一律用 `hasMotion()`，
+   * 不要寫 `photo.motion_offset != null`（那會把 0 也算進去）。
+   */
+  motion_offset?: number | null;
   sort_order: number;
   taken_at?: string;
   /** 牆上時間 'YYYY-MM-DD HH:MM:SS'，顯示與行程段比對都用這個 */
@@ -957,6 +989,13 @@ export interface VideoMetaItem {
   lat: number | null;
   lng: number | null;
   error?: string;
+  /** 以下只有「重讀比對」模式會有：站上現在存的值，以及兩邊一不一樣 */
+  stored_taken_at_local?: string | null;
+  stored_tz_offset_minutes?: number | null;
+  stored_time_source?: string | null;
+  stored_lat?: number | null;
+  stored_lng?: number | null;
+  differs?: boolean;
 }
 
 export interface VideoMetaResult {
@@ -965,28 +1004,85 @@ export interface VideoMetaResult {
   scanned: number;
   next_cursor: number;
   done: boolean;
-  /** 這一趟真的寫進去幾支 */
+  /** 補空格模式：這一趟真的寫進去幾支。**比對模式：幾支跟站上存的不一樣** */
   updated: number;
-  /** 這個游標之後還有幾支沒補（給進度條用） */
+  /** 這個游標之後還有幾支要處理（給進度條用） */
   remaining_before: number;
+  /** 這一趟是不是比對模式（後端回聲，前端拿它決定怎麼講結果） */
+  compare?: boolean;
+  /** 站上總共幾支影片 */
+  total_videos?: number;
+  /** 其中幾支根本沒有 Drive 備份（讀不到檔，補不了也比不了） */
+  videos_without_drive?: number;
+  /** 其中幾支的時間與座標都已經有值了（＝補空格那條永遠不會碰的） */
+  videos_complete?: number;
 }
 
 /**
- * 回 Drive 讀影片檔自己的拍攝時間與座標，寫回站上那一列。站長限定。
+ * 回 Drive 讀影片檔自己的拍攝時間與座標。站長限定。
+ *
+ * 兩種模式：
+ * - 預設（`compare = false`）＝**補空格**：只寫目前是 NULL 的那幾格，
+ *   手動填過的一律不碰。
+ * - `compare = true` ＝**重讀比對**：條件放寬成「所有影片」，照樣去 Drive 讀，
+ *   但**一個位元組都不寫**，只把兩邊的值並排回來讓人自己看。
+ *   已經手動填好的站台問的其實是這個問題（見後端 backfillVideoMeta 的註解）。
  *
  * ⚠️ **一趟只做幾支**（一支要 1–3 次 Drive Range 請求，而 Workers 免費版
  *    單次呼叫上限 50 個 subrequest）—— 呼叫端要自己拿 `next_cursor` 迴圈跑到
  *    `done`，跟「比對全部相簿」那顆同一個做法。
  */
 export async function backfillVideoMeta(
-  cursor = 0, limit = 6,
+  cursor = 0, limit = 6, compare = false,
 ): Promise<VideoMetaResult> {
   const res = await fetch(`${API_BASE_URL}/admin/video-meta`, {
     method: 'POST',
     headers: getAuthHeaders(),
-    body: JSON.stringify({ cursor, limit }),
+    body: JSON.stringify({ cursor, limit, compare }),
   });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '回讀影片資訊失敗');
+  return await res.json();
+}
+
+/** 一張照片的動態照片掃描結果。`offset` 0 ＝掃過了、不是動態照片 */
+export interface MotionScanItem {
+  id: number;
+  title: string;
+  album_id: number;
+  offset: number;
+  error?: string;
+}
+
+export interface MotionScanResult {
+  items: MotionScanItem[];
+  /** 這一趟看了幾張 */
+  scanned: number;
+  next_cursor: number;
+  done: boolean;
+  /** 這一趟掃出幾張真的有動畫 */
+  found: number;
+  /** 這個游標之後還有幾張沒掃（給進度條用） */
+  remaining_before: number;
+  /** 開跑之前，全站已經掃出幾張有動畫的 */
+  found_total_before: number;
+}
+
+/**
+ * 回 Drive 讀原始 .jpg 的檔頭，掃出 Android 動態照片尾巴上那段 mp4 的起點。
+ * 站長限定，見 migrations/0024。
+ *
+ * ⚠️ 同 backfillVideoMeta：**一趟只做幾張**，呼叫端自己拿 `next_cursor`
+ *    迴圈跑到 `done`。一般照片一次讀取就結束，動態照片才多讀 1–2 次。
+ */
+export async function scanMotionPhotos(
+  cursor = 0, limit = 10,
+): Promise<MotionScanResult> {
+  const res = await fetch(`${API_BASE_URL}/admin/motion-scan`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ cursor, limit }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '掃描動態照片失敗');
   return await res.json();
 }
 
@@ -1794,6 +1890,13 @@ export async function uploadPhoto(
   video?: { fileName: string; durationMs: number },
   /** 有值就代表這一格是 GIF，`file` 是它的第一格靜態圖、這裡的才是動畫本體 */
   gif?: { file: File },
+  /**
+   * Android 動態照片尾巴上那段 mp4 的起點（0 ＝掃過了、不是動態照片）。
+   *
+   * ⚠️ **照片一定要送**，連 0 也要送 —— 不送的話 D1 那一欄留在 NULL，
+   *    之後 /admin 的掃描還會再花一次 Drive 讀取去掃我們剛剛才掃過的照片。
+   */
+  motionOffset?: number,
 ): Promise<UploadResult> {
   const formData = new FormData();
   formData.append('album_id', albumId);
@@ -1808,6 +1911,10 @@ export async function uploadPhoto(
   if (gif) {
     formData.append('media_type', 'gif');
     formData.append('gif', gif.file, gif.file.name);
+  }
+  // 影片與 GIF 沒有這件事（後端也只在 media_type='photo' 時收）
+  if (!video && !gif && typeof motionOffset === 'number') {
+    formData.append('motion_offset', String(Math.max(0, Math.round(motionOffset))));
   }
 
   /*

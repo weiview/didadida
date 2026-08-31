@@ -4,7 +4,7 @@ import PhotoComments from "./PhotoComments";
 import PhotoImage from "@/components/PhotoImage";
 import VideoPlayer from "@/components/VideoPlayer";
 import FixTimeModal from "@/components/FixTimeModal";
-import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, isVideo, isGif, setPhotosRestricted } from "@/lib/api";
+import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, photoMotionSrc, hasMotion, isVideo, isGif, setPhotosRestricted } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import { setExifExpanded, useExifExpanded } from "@/lib/exifPref";
@@ -185,6 +185,20 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
 
   // 換一張就回到原尺寸 —— 上一張放大到 5 倍的位置對這一張沒有任何意義
   useEffect(() => { resetZoom(); }, [photo.id, resetZoom]);
+
+  /*
+   * Android 的動態照片：一張 .jpg 的尾巴上黏著一段 mp4（見 migrations/0024）。
+   * 位元組在 Drive 上那份原始檔裡，`/api/photos/:id/motion` 從那裡切出來。
+   *
+   * ⚠️ **點了才載**，不是一進燈箱就播 —— 那段影片是 1～4MB，每播一次就是一趟
+   *    Drive 取檔，而使用者多半只是在一張一張翻。`preload` 也因此不給。
+   * ⚠️ 換一張要收回去（連同載失敗的紀錄），不然上一張的動畫會蓋在這一張上面。
+   * ⚠️ 影片與 GIF 沒有這件事：它們本身就會動，`motion_offset` 對它們永遠是 0。
+   */
+  const hasMotionClip = !isVideo(photo) && !isGif(photo) && hasMotion(photo);
+  const [playMotion, setPlayMotion] = useState(false);
+  const [motionFailed, setMotionFailed] = useState(false);
+  useEffect(() => { setPlayMotion(false); setMotionFailed(false); }, [photo.id]);
 
   /*
    * ⚠️ **影片不參與收合**，跟它不參與捏合放大是同一個理由：`<video>` 自己要吃
@@ -655,6 +669,53 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             <span className={styles.qualityNote}>
               Drive 沒接上或缺這張備份，顯示的是 800px 縮圖
             </span>
+          )}
+          {/*
+            * 動態照片的那段 mp4。蓋在靜態照片上面、但在遮罩底下（見 CSS）。
+            *
+            * ⚠️ **不要加 crossOrigin**：不加是 no-cors，跟 <img> 一樣免預檢；
+            *    加了 Range 會多一次預檢，而我們也沒有要讀回應的內容（同影片那條）。
+            * ⚠️ muted 是必要的，不是偏好 —— 沒有它瀏覽器不准自動播放，
+            *    使用者按下去會什麼都不發生。動態照片本來也沒有聲音。
+            * ⚠️ 播完自己收回去（onEnded）：那是一兩秒的東西，留在最後一格
+            *    不動的畫面上，看起來像卡住了。
+            */}
+          {hasMotionClip && playMotion && (
+            <video
+              className={styles.motionVideo}
+              src={photoMotionSrc(photo)}
+              poster={photoThumbSrc(photo, 'md')}
+              autoPlay
+              muted
+              playsInline
+              onEnded={() => setPlayMotion(false)}
+              onError={() => { setPlayMotion(false); setMotionFailed(true); }}
+            />
+          )}
+          {/*
+            * 這顆是 <button> 不只是為了語意：手機上「輕點照片一下」是那三段
+            * 收合／展開的開關，而那個原生監聽器認的就是「點到的是不是按鈕」。
+            * 讀不到的時候把原因寫在按鈕上 —— 按了沒反應是這個站最不該有的東西。
+            */}
+          {hasMotionClip && (
+            <button
+              type="button"
+              className={styles.motionBtn}
+              disabled={motionFailed}
+              title={motionFailed
+                ? '這張的動畫讀不到（原始檔可能還沒備份到 Drive）'
+                : '播放這張照片的動態片段'}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (motionFailed) return;
+                // 放大中直接播會讓影片跟底下那張照片對不齊，先歸零
+                resetZoom();
+                setPlayMotion((v) => !v);
+              }}
+            >
+              <span aria-hidden>{motionFailed ? '⚠' : playMotion ? '■' : '▶'}</span>
+              <span>{motionFailed ? '動畫讀不到' : playMotion ? '停止' : '動態'}</span>
+            </button>
           )}
             </>
           )}

@@ -1000,6 +1000,72 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - GIF 沒有 EXIF，拍攝時間一律 NULL —— 跟影片一樣要人自己「指定時間」
   （見「資料模型」那三支），在那之前它會排在相簿最前面。
 
+## Android 的動態照片：存位置，不存位元組
+
+2026-08-31 加的。一張 `.jpg` 的**尾巴上黏著一段 mp4**（一兩秒）。站上把它當
+一張普通照片收（`media_type` 仍然是 `'photo'`），只多記一個整數
+`Photo.motion_offset`（0024）＝那段 mp4 從第幾個位元組開始。
+
+- ⚠️⚠️ **不要把那段影片抽出來另外存一份。** 原始檔整份早就在 Drive 上了
+  （直傳的），動態那一段跟著在裡面 —— 抽出來進 R2 等於同樣的位元組收兩次錢，
+  而 R2 儲存是免費額度裡真的會被吃掉的那一格（見「GIF」）。一支動態照片的
+  影片是 1～4MB，兩千張就好幾 GB。**播放是現切**：`GET /api/photos/:id/motion`
+  對 Drive 發一個 Range 請求，把 `[start, EOF]` 那一段串出去。
+- **`motion_offset` 有三個值，NULL 不是 0**：`NULL` ＝還沒掃過（既有的每一列）、
+  `0` ＝掃過了不是動態照片、`>0` ＝起點。⚠️ 這個分野**就是 `/api/admin/motion-scan`
+  的續掃書籤**，所以 0024 刻意沒有 `DEFAULT 0` —— 有的話整批既有照片會變成
+  「掃過了、沒有動畫」，那是一句假話而且再也掃不回來。
+- **解析在 `lib/motionPhoto.ts`**（同 `geo.ts`／`videoMeta.ts` 的**兩份副本**規矩：
+  前端 LF 權威 → 後端 CRLF 複本）。兩種格式都是「長度從檔尾往回算」：
+  ① **MicroVideo**（舊的 `MVIMG_*.jpg`）`GCamera:MicroVideoOffset="N"`，
+  ⚠️ 名字叫 Offset 值卻是**影片長度**；② **Motion Photo v1**（Pixel 的 `*.MP.jpg`、
+  近年三星）XMP 的 `Container:Directory` 裡 `Semantic="MotionPhoto"` 那一項的
+  `Length` ＋ `Padding`。兩種都是 `起點 = 檔案大小 − 長度 − padding`。
+  ⚠️ 三星更早期那種（尾巴接 `MotionPhoto_Data` 標記）**刻意不支援** ——
+  它的 XMP 裡沒有長度，只能從檔尾整片掃字串，在 Worker 就是一次幾 MB 的 Drive 讀取。
+  ⚠️ **不解 JPEG 的段結構**：要的只是幾個 ASCII 字串，而 `Semantic="MotionPhoto"`
+  不會憑空出現在 APP1 以外的地方，直接把檔頭當文字搜還不會被 Extended XMP 卡住。
+  ⚠️⚠️ 那幾個樣式**一律寫成 regex 字面值，不要塞進字串再 `new RegExp`** ——
+  字串裡的 `\d`／`\s`／`\w` 經過任何一層處理跳脫字元的東西就會安靜地掉成
+  `d`／`s`／`w`，樣式照樣編譯得過、只是永遠比不中（同「資料模型」那顆指定時間的按鈕）。
+- ⚠️ 算出來的位置要**驗一次**（那裡是不是 `....ftyp`），差幾個位元組就在附近 4KB
+  掃一次 `ftyp`，找不到當成不是動態照片 —— 硬給一個位置只會讓燈箱端出一支播不了的影片。
+  **一般照片只花一次讀取**（檔頭裡沒有那段 XMP 就直接回 0），驗證那一次只有真的
+  疑似動態照片才會發生，所以整批掃描的成本是「每張一次」不是兩三次。
+- **上傳時就在瀏覽器算好**（`ingestSources()` 的照片那一岔，`readMotionOffsetFromFile`）
+  —— 位元組本來就在使用者手上（`File.slice()` 惰性讀檔頭那 128KB），
+  一送上 Drive 之後就只剩「Worker 回頭讀一次 Drive」那條貴的路。
+  ⚠️ **不是動態照片也要送 0**，不送的話那一列留在 NULL，之後掃描還會回 Drive
+  讀一次我們剛剛才讀過的檔頭。⚠️ `PendingDuplicate` **要跟著存**
+  （同 `exifData`／`takenAt` 那個坑）—— 不帶的話從重複視窗「照樣上傳」進來的
+  動態照片會少掉動畫。⚠️ `readMotionOffsetFromFile` **絕不往外丟例外**。
+- **`GET /api/photos/:id/motion`**：在進站閘門的簽章網址表上（`isSignedMediaPath`，
+  跟 `/full`／`/video` 同一個理由，`<video src>` 不會帶 Authorization）。
+  ⚠️ **Range 要換算座標系**：前端送的 `bytes=a-b` 是**影片內**的位置，
+  對 Drive 要問 `bytes=(start+a)-(start+b)`，回來的 `Content-Range` 再減掉 `start`、
+  分母換成 `total − start`。`bytes=-N`（從尾巴數）原樣轉發 —— 影片的結尾就是檔案的結尾。
+  ⚠️⚠️ **Drive 不理 Range 而回 200 時要當場 502，不可以照樣串出去** ——
+  那份位元組的前面是整張 JPEG，前端會拿到一支播不了的影片。
+  ⚠️ 同 `/video`：**不進 `caches.default`**（一個網址只存一份完整回應，
+  把某人的 206 存成「這個網址的答案」會餵給下一個人錯的位元組），回 `Cache-Control: private`。
+  不開放的照片一律回 **404 不是 403**。
+- **燈箱裡是一顆播放鈕 ＋ 一層蓋在照片上的 `<video>`**（`.motionVideo`／`.motionBtn`）：
+  ⚠️ **點了才載**，不是一進燈箱就播 —— 每播一次就是一趟 Drive 取檔，而使用者
+  多半只是在翻照片；⚠️ 那一層**排在 `.zoomLayer` 外面**（放進去的話捏合放大 5 倍
+  會跟著變五倍大），`z-index` **低於 `.revealVeil`（3150）** 好讓不開放又糊著的
+  照樣糊著；⚠️ `muted` 是必要的不是偏好（沒有它瀏覽器不准自動播放，按下去會沒反應），
+  **不要加 `crossOrigin`**（同影片）；播完 `onEnded` 自己收回去。
+  那顆按鈕是 `<button>`，手機那套「輕點照片一下」的收合才會讓開它。
+- 格線上是**靜止的照片** ＋ 一顆「▶ 動態」角標（沿用 `.videoBadge`）——
+  ⚠️ 格線刻意**不播**，一頁二十四格就是二十四次 Drive 取檔。
+- **存量補掃：`/admin`「Android 動態照片」那一格**（`POST /api/admin/motion-scan`，
+  認 `canManageOthers`）。⚠️ 同「影片的拍攝時間與座標」：**一趟只做十張，
+  由前端推 `cursor` 迴圈**（subrequest 預算），另掛 `MAX_ROUNDS` 保險絲。
+  ⚠️ 讀不到的那幾張**刻意不寫 D1**（留在 NULL），下次按會重試 —— Drive 抖一下
+  就把一張動態照片永久記成「沒有動畫」太可惜了；畫面上要講出「再按一次會重試」。
+  ⚠️ 掃出東西就 `bumpContentEpoch()`：`SELECT p.*` 會把這一欄帶進相簿 JSON，
+  訪客那份共用邊緣快取不換 key 的話角標不會出現。
+
 ## 旋轉：只轉 R2 的兩顆縮圖
 
 2026-08-31 加的。入口在**編輯模式底部那排動作鈕**（`🔄 旋轉`，跟 📍 指定地點／🕒 修正時間
