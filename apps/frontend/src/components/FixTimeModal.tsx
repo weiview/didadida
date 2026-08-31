@@ -3,6 +3,9 @@
 import { useEffect, useState } from 'react';
 import { shiftPhotoTime, setPhotoTimezone, setPhotoTime } from '@/lib/api';
 import { TZ_OPTIONS, tzOptionLabel, tzOptionsIncluding } from '@/lib/tz';
+// 檔名猜時間這件事上傳路徑也要用（影片沒有 mvhd 時就靠它），
+// 所以實作搬去 lib/videoMeta.ts，兩邊共用同一份 —— 不要再各留一份副本
+import { guessWallClockFromName } from '@/lib/videoMeta';
 
 interface Props {
   isOpen: boolean;
@@ -39,29 +42,6 @@ interface Props {
 //   改時區　：瞬間是對的，只是拿錯時區在顯示 —— 只重算牆上時間，瞬間不動
 //   指定時間：本來就沒有時間 —— 牆上時間與時區都由使用者說了算
 type Mode = 'shift' | 'timezone' | 'set';
-
-/**
- * 從檔名猜拍攝時間，**只當預填值**，使用者按套用才會真的寫進去。
- *
- * 認得 `VID_20260824_143000.mp4`／`IMG_20260824_143000.jpg`／`20260824_143000`
- * 這一類 Android 常見的檔名。
- *
- * ⚠️ **`PXL_` 開頭的刻意不猜**（Pixel 的相機）—— 那串數字是 **UTC**，
- *    直接當牆上時間預填會整整差一個時區（台灣是 8 小時），而且錯得很安靜。
- *    回 'utc' 讓畫面說明白為什麼沒有預填，使用者自己填才不會被誤導。
- */
-function guessWallClockFromName(name: string | undefined): string | 'utc' | null {
-  if (!name) return null;
-  if (/^PXL_/i.test(name)) return 'utc';
-  const m = name.match(/(?:^|[^0-9])(\d{4})(\d{2})(\d{2})[_-]?(\d{2})(\d{2})(\d{2})(?![0-9])/);
-  if (!m) return null;
-  const [, y, mo, d, h, mi, s] = m;
-  const yy = Number(y);
-  if (yy < 1990 || yy > 2100) return null;
-  if (Number(mo) < 1 || Number(mo) > 12 || Number(d) < 1 || Number(d) > 31) return null;
-  if (Number(h) > 23 || Number(mi) > 59 || Number(s) > 59) return null;
-  return `${y}-${mo}-${d}T${h}:${mi}:${s}`;
-}
 
 /** 拍攝時間的六個欄位。年月日時分秒都是數字，時區另外一個 select */
 interface WallParts { y: number; mo: number; d: number; h: number; mi: number; s: number }

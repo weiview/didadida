@@ -8,6 +8,10 @@ import {
   listFolderFiles, probeDriveFile,
 } from './drive';
 import { syncFtsForPhotos, deleteFtsForPhotos, ftsMatchExpr } from './fts';
+import {
+  readVideoMeta, videoMetaToExif, HEAD_CHUNK as VIDEO_HEAD_CHUNK,
+  type RangeReader,
+} from './videoMeta';
 
 export interface Env {
   DB: D1Database;
@@ -2147,6 +2151,196 @@ async function runDriveAudit(env: Env, albums: number, force: boolean): Promise<
   return state;
 }
 
+/* ── 影片的拍攝時間與座標：從 Drive 上的原始檔回讀 ────────────────────────
+ *
+ * 影片的封面圖是瀏覽器用 canvas 畫的，**不帶任何 metadata** —— 所以 2026-08-31
+ * 之前上傳的影片一律 `taken_at IS NULL`，在相簿裡永遠排在最前面那一疊，
+ * 要人一支一支手動「指定時間」。可是**影片檔自己有**：mp4／mov 把建立時間與
+ * 座標放在 `moov` box 裡（見 src/videoMeta.ts）。原始檔整份在 Drive 上，
+ * 所以補救的辦法就是回去讀它。
+ *
+ * ⚠️ **不解析整支影片**：先讀 128KB 檔頭，faststart 的檔（多數手機相機）moov
+ *    整個就在裡面；moov 排在檔尾的靠 mdat 的 size 直接跳過去。一支影片
+ *    1–3 次 Drive Range 請求，**而 Workers 免費版單次呼叫上限 50 個 subrequest**
+ *    —— 所以一趟只做幾支，由前端迴圈推游標（同 /admin 那顆「比對全部相簿」）。
+ *
+ * ⚠️ 換算一律走 `normalizeGeo()`。這裡不自己拼 taken_at ——
+ *    `taken_at = taken_at_local − tz` 的不變式全站只能有一份實作。
+ */
+
+/** 一趟最多處理幾支影片。上限是 subrequest 預算（一支 1–3 次） */
+const VIDEO_META_MAX_LIMIT = 10;
+const VIDEO_META_DEFAULT_LIMIT = 6;
+/** 單支影片最多讀幾段：檔頭、moov 的檔頭、moov 內容，再留一格餘裕 */
+const VIDEO_META_MAX_READS = 4;
+/** Drive 忽略 Range 直接回整個檔時的保險絲（Worker 只有 128MB 記憶體） */
+const VIDEO_META_MAX_WHOLE_FILE = 4 * 1024 * 1024;
+
+interface VideoMetaItem {
+  id: number;
+  title: string;
+  album_id: number;
+  /** 時間是靠哪一層得來的（見 videoMeta.ts 檔頭的四層） */
+  how: string;
+  wrote_time: boolean;
+  wrote_geo: boolean;
+  taken_at_local: string | null;
+  tz_offset_minutes: number | null;
+  time_source: string | null;
+  lat: number | null;
+  lng: number | null;
+  error?: string;
+}
+
+/**
+ * 用 Drive 的 Range 請求當 `RangeReader`。
+ *
+ * 回傳 `[reader, sizeOf]`：檔案大小是**第一次請求的 `Content-Range` 告訴我們的**，
+ * 刻意不另外打一趟 `files.get?fields=size` —— 那是多一個 subrequest 換一個
+ * 順手就拿得到的數字。
+ */
+function driveRangeReader(saKey: string, fileId: string): {
+  read: RangeReader; totalSize: () => number | null;
+} {
+  let reads = 0;
+  let total: number | null = null;
+
+  const read: RangeReader = async (start, end) => {
+    if (reads >= VIDEO_META_MAX_READS) throw new Error("這支影片要讀太多段，先跳過");
+    reads++;
+    const res = await fetchDriveMediaRange(saKey, fileId, `bytes=${start}-${end - 1}`);
+    if (res.status === 416) return new Uint8Array(0);
+
+    const m = res.headers.get("Content-Range")?.match(/\/(\d+)\s*$/);
+    if (m) total = Number(m[1]);
+
+    if (res.status === 200) {
+      // Range 被忽略了 —— 回的是整個檔。幾 GB 的影片直接讀進來會炸掉 Worker
+      const len = Number(res.headers.get("Content-Length") ?? 0);
+      if (len > VIDEO_META_MAX_WHOLE_FILE) {
+        await res.body?.cancel();
+        throw new Error("Drive 沒有回應 Range 請求，這支影片太大不能整份讀");
+      }
+      const whole = new Uint8Array(await res.arrayBuffer());
+      total = whole.length;
+      return whole.subarray(Math.min(start, whole.length), Math.min(end, whole.length));
+    }
+    return new Uint8Array(await res.arrayBuffer());
+  };
+
+  return { read, totalSize: () => total };
+}
+
+/**
+ * 回寫一批影片的拍攝時間與座標。
+ *
+ * ⚠️ 兩個 UPDATE 都帶著「原本是空的」那個條件：
+ *   - 時間：`AND taken_at IS NULL` —— 已經有時間的（包含使用者手動指定過的）
+ *     一律不碰。影片的 metadata 沒有相機 EXIF 可信，人講的話更算數。
+ *   - 座標：`AND lat IS NULL` ＋ `geoOverwriteGuard('exif')` —— 手動標過的
+ *     地點是最高權威，不能被檔案裡那顆可能飄掉的 GPS 蓋掉。
+ */
+async function backfillVideoMeta(
+  env: Env, saKey: string, cursor: number, limit: number,
+): Promise<{
+  items: VideoMetaItem[]; scanned: number; next_cursor: number;
+  done: boolean; updated: number;
+}> {
+  const { results } = await env.DB.prepare(`
+    SELECT id, title, album_id, drive_original_id, taken_at, lat
+      FROM Photo
+     WHERE media_type = 'video'
+       AND drive_original_id IS NOT NULL
+       AND (taken_at IS NULL OR lat IS NULL)
+       AND id > ?
+     ORDER BY id
+     LIMIT ?
+  `).bind(cursor, limit).all<any>();
+
+  const items: VideoMetaItem[] = [];
+  let next = cursor;
+  let updated = 0;
+
+  for (const row of results) {
+    const id = Number(row.id);
+    next = id;
+    const item: VideoMetaItem = {
+      id,
+      title: String(row.title ?? ""),
+      album_id: Number(row.album_id),
+      how: "none",
+      wrote_time: false,
+      wrote_geo: false,
+      taken_at_local: null,
+      tz_offset_minutes: null,
+      time_source: null,
+      lat: null,
+      lng: null,
+    };
+
+    try {
+      const { read, totalSize } = driveRangeReader(
+        saKey, String(row.drive_original_id),
+      );
+      const head = await read(0, VIDEO_HEAD_CHUNK);
+      const size = totalSize() ?? head.length;
+      const meta = await readVideoMeta(read, size, head);
+
+      // 檔名（`Photo.title` 存的就是上傳當下的原始檔名）是第二條線索：
+      // 沒有 mvhd 時它就是唯一的時間，有 mvhd 時兩者相減就是時區
+      const shape = videoMetaToExif(meta, item.title);
+      item.how = shape.how;
+      const geo = normalizeGeo(shape.exif, shape.fallbackIso);
+
+      if (row.taken_at === null && geo.takenAtUtc) {
+        const r = await env.DB.prepare(`
+          UPDATE Photo
+             SET taken_at = ?, taken_at_local = ?, tz_offset_minutes = ?, time_source = ?
+           WHERE id = ? AND taken_at IS NULL
+        `).bind(
+          geo.takenAtUtc, geo.takenAtLocal, geo.tzOffsetMinutes, geo.timeSource, id,
+        ).run();
+        item.wrote_time = Number((r as any)?.meta?.changes ?? 0) > 0;
+        item.taken_at_local = geo.takenAtLocal;
+        item.tz_offset_minutes = geo.tzOffsetMinutes;
+        item.time_source = geo.timeSource;
+      }
+
+      if (row.lat === null && geo.lat !== null && geo.lng !== null) {
+        const r = await env.DB.prepare(`
+          UPDATE Photo
+             SET lat = ?, lng = ?, geo_source = 'exif'
+           WHERE id = ? AND lat IS NULL${geoOverwriteGuard("exif")}
+        `).bind(geo.lat, geo.lng, id).run();
+        item.wrote_geo = Number((r as any)?.meta?.changes ?? 0) > 0;
+        item.lat = geo.lat;
+        item.lng = geo.lng;
+      }
+
+      if (item.wrote_time || item.wrote_geo) updated++;
+    } catch (e) {
+      // 一支讀不到不該讓整批停下來，游標照樣往前走
+      item.error = e instanceof Error ? e.message : String(e);
+    }
+
+    items.push(item);
+  }
+
+  /*
+   * 改了 taken_at 就等於改了相簿的排序，而訪客那份清單是共用的邊緣快取
+   * —— 不推版本號的話要等它自己過期才看得到（見 bumpContentEpoch）。
+   */
+  if (updated > 0) await bumpContentEpoch(env);
+
+  return {
+    items,
+    scanned: results.length,
+    next_cursor: next,
+    done: results.length < limit,
+    updated,
+  };
+}
+
 /**
  * 這個 Google access token 的主人可不可以當管理員。
  *
@@ -2958,6 +3152,55 @@ if (method === "POST" && pathname === "/api/verify-password") {
           const state = await runDriveAudit(env, want, true);
           return new Response(JSON.stringify(state), { headers });
         }
+      }
+
+      /* ── 站長專用：回讀影片的拍攝時間與座標 ────────────────────────────
+       *
+       * 2026-08-31 之前上傳的影片一律沒有拍攝時間（封面圖是 canvas 畫的，
+       * 不帶 metadata），但**影片檔自己有** —— 回 Drive 讀它的 moov box。
+       * 引擎在 backfillVideoMeta，這裡只負責閘與游標。
+       *
+       * ⚠️ 一趟只做幾支（subrequest 預算），由前端迴圈推 `cursor`，
+       *    跟「比對全部相簿」那顆同一個做法。收工看 `done`。
+       * 歸 canManageOthers：它會改到全站每一個人的影片。
+       */
+      if (pathname === "/api/admin/video-meta" && method === "POST") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.canManageOthers) {
+          return forbidden(headers, "這會改到全站的影片，只有可以管理別人內容的帳號能做");
+        }
+        if (!env.GOOGLE_DRIVE_SA_KEY) {
+          return new Response(JSON.stringify({
+            error: "沒有設定 GOOGLE_DRIVE_SA_KEY，讀不到 Drive 上的影片",
+          }), { status: 503, headers });
+        }
+
+        const body = await request.json().catch(() => ({})) as {
+          cursor?: unknown; limit?: unknown;
+        };
+        const cursor = Math.max(Number(body.cursor ?? 0) || 0, 0);
+        const limit = Math.min(
+          Math.max(Number(body.limit ?? VIDEO_META_DEFAULT_LIMIT) || VIDEO_META_DEFAULT_LIMIT, 1),
+          VIDEO_META_MAX_LIMIT,
+        );
+
+        // 還剩幾支沒補（給進度條用）。跟上面那句 WHERE 是同一個條件，
+        // 不然「剩幾張」永遠歸不了零（同 drive-pending 的清單與 COUNT）
+        const rest = await env.DB.prepare(`
+          SELECT COUNT(*) AS n FROM Photo
+           WHERE media_type = 'video' AND drive_original_id IS NOT NULL
+             AND (taken_at IS NULL OR lat IS NULL) AND id > ?
+        `).bind(cursor).first<any>();
+
+        const result = await backfillVideoMeta(env, env.GOOGLE_DRIVE_SA_KEY, cursor, limit);
+        return new Response(JSON.stringify({
+          success: true,
+          remaining_before: Number(rest?.n ?? 0),
+          ...result,
+        }), { headers });
       }
 
       /* ── 後台：白名單管理 ──────────────────────────────────────────────────

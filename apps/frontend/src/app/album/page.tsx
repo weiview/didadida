@@ -17,6 +17,7 @@ import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import PlaceCheckinModal from "@/components/PlaceCheckinModal";
 import { GIF_MAX_BYTES, isGifFile, resizeImageFile } from "@/lib/imageUtils";
 import { ACCEPTED_VIDEO_TYPES, captureVideoPoster, formatDuration, isVideoFile } from "@/lib/videoUtils";
+import { readVideoExifFromFile } from "@/lib/videoMeta";
 import { useSearchParams } from "next/navigation";
 import PhotoLightbox from "./PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
@@ -1263,7 +1264,17 @@ function AlbumContent() {
         if (isVideoFile(rawFile)) {
           const { poster, durationMs } = await captureVideoPoster(rawFile);
           const meta = { fileName: rawFile.name, durationMs };
-          const result = await uploadPhoto(id as string, poster, undefined, undefined, false, meta);
+          /*
+           * 拍攝時間與座標從**影片檔自己的 moov box** 讀（見 lib/videoMeta.ts）。
+           * 封面圖是 canvas 畫的、不帶任何 metadata，所以這一步不做的話那一列
+           * 就是 taken_at 全空 —— 相簿裡永遠排在最前面，要人一支一支手動指定。
+           * ⚠️ 讀不到不算失敗，`readVideoExifFromFile` 不會往外丟。
+           */
+          const vmeta = await readVideoExifFromFile(rawFile);
+          const result = await uploadPhoto(
+            id as string, poster, vmeta.exif ?? undefined,
+            vmeta.fallbackIso ?? undefined, false, meta,
+          );
           if (result.status === 'duplicate') {
             /*
              * 這支影片站上已經有了，只是 Drive 上沒有原始檔（上傳當下 Drive 斷線，
@@ -1288,7 +1299,7 @@ function AlbumContent() {
             dupes.push({
               key: `${Date.now()}-${i}-${source.name}`,
               file: rawFile, resized: poster, previewUrl: URL.createObjectURL(poster),
-              exifData: undefined, takenAt: undefined,
+              exifData: vmeta.exif ?? undefined, takenAt: vmeta.fallbackIso ?? undefined,
               reason: result.reason, existing: result.existing,
               video: meta,
             });

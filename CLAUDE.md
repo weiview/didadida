@@ -30,6 +30,7 @@ apps/backend/
                      if (method === … && pathname === …) 依序比對。沒有 router 套件。
   src/drive.ts       Google Drive（service account 讀 + 站長 refresh token 寫）
   src/geo.ts         EXIF 座標／時區正規化 —— 與 apps/frontend/src/lib/geo.ts 是兩份副本
+  src/videoMeta.ts   mp4/mov 的 moov box —— 與 apps/frontend/src/lib/videoMeta.ts 是兩份副本
   src/fts.ts         FTS5 全文檢索
   migrations/        ✅ schema 變更的權威位置（0003 起）
   wrangler.toml      prod ＋ [env.dev] 兩組 D1/R2/vars/triggers
@@ -38,6 +39,7 @@ apps/frontend/
   src/components/    FootprintMap.tsx 是最大的一支（maplibre-gl，dynamic import 禁 SSR）
                      VideoPlayer.tsx 是燈箱裡的影片播放器（見「影片」）
   src/lib/videoUtils.ts      封面圖擷取、長度格式化、可收的影片型別
+  src/lib/videoMeta.ts       影片的拍攝時間／座標（解 moov box），後端有一份副本
   src/lib/api.ts     唯一的 API 客戶端
   functions/_middleware.ts   Pages Function：非台灣來源直接 403
 database/
@@ -870,10 +872,18 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   所以那幾格改成一句「影片沒有相機參數」，**但面板本身要在** ——
   裡面的「拍攝時間」與「時間來源」對影片才是最要緊的兩格。開關的字跟著換成
   「顯示影片資訊」。
-- **影片的拍攝時間是 NULL，要由使用者自己指定**（封面圖是 canvas 畫的，沒有 EXIF）：
+- **拍攝時間與座標從影片檔自己的 `moov` box 讀**（2026-08-31 加，`lib/videoMeta.ts`）。
+  在那之前站上的每一支影片都是 `taken_at` NULL —— 不是「影片沒有 EXIF」，是**我們一直
+  沒讀**：封面圖是 canvas 畫的不帶任何 metadata，而我們只從 `<video>` 元素問長度與寬高。
+  mp4／mov 把這些放在 `moov` 裡（`mvhd` 的建立時間、`udta/©xyz` 的 ISO 6709 座標、
+  Apple 的 `meta/keys/ilst`）。詳見「影片的 metadata」一節。
+- **影片的拍攝時間讀不到時仍是 NULL，要由使用者自己指定**：
   燈箱資訊面板裡「時間來源」那一格右邊那顆小按鈕（沒有時間時寫「指定時間」，
   有的話寫「修改」），或相簿裡選起來 →「拍攝時間」→「指定時間」分頁，
   都走 `POST /api/photos/geo/set-time`（見「資料模型」那三支）。
+  ⚠️ **影片與 GIF 的時間永遠改得動**（`canEditTime` 的例外，2026-08-31）——
+  照片是「本來就有時間就鎖住」，但影片那個時間是我們從 moov ／檔名**推**出來的，
+  跟相機 EXIF 不是同一個等級的事實，鎖起來等於推錯了就永遠錯著。
   ⚠️ 燈箱那個入口開著的時候**左右鍵、Esc、滾輪要整組讓開** —— 視窗裡全是
   `<select>`，而 select 不是 INPUT／TEXTAREA，燈箱既有那道「在輸入框裡不換照片」
   的防護攔不住它：在年份選單上按左右鍵會一邊改年份一邊把燈箱換到下一張。
@@ -881,6 +891,68 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   沒給時間的影片在相簿格線不受影響（那支照 `sort_order`），但**會沉到搜尋結果最底**
   （`ORDER BY p.taken_at DESC`，NULL 在 DESC 排最後）。
 - 轉檔／第二種畫質（P4）**使用者明確延後**，先看實際讀取速度再決定。
+
+## 影片的 metadata：解 moov box
+
+2026-08-31 加的。`lib/videoMeta.ts`，**同 `geo.ts` 的兩份副本規矩**
+（`apps/frontend/src/lib/` 是權威 LF ／ `apps/backend/src/` 是 CRLF 複本，改一邊要同步）。
+兩份都要是因為**位元組在兩個不同的地方**：上傳時原始影片直傳 Drive、從不經過 Worker，
+所以在瀏覽器解（`File.slice()` 惰性讀）；回寫既有影片時位元組只有 Drive 那邊有，
+所以在 Worker 解（Drive 的 Range 請求）。
+
+- **這一檔本身不做任何時間換算**，只把檔案裡有什麼挖出來湊成一份 **EXIF 形狀**的物件
+  交給 `normalizeGeo()`。全站的不變式（`taken_at = taken_at_local − tz`）只能有一份實作。
+  於是 `mvhd` 的 UTC 瞬間扮演 `GPSTimeStamp`、牆上時間扮演 `DateTimeOriginal`，
+  `deriveTzOffset()` 那招原封不動沿用。
+- ⚠️⚠️ **`mvhd.creation_time` 沒有時區。** 規格說是 UTC，實際上一大票 Android 機身寫的是
+  **當地時間** —— 猜錯就是整整 8 小時，而且錯得很安靜（同 `PXL_` 檔名刻意不猜那個坑）。
+  所以時間分**四層，優先序不能對調**：
+  ① 檔案自己寫明時區（Apple 的 `com.apple.quicktime.creationdate` `…+0800`）→ `offset_tag`；
+  ② 有 mvhd 瞬間 ＋ 另一個牆上時間來源（沒帶時區的 `©day`，或 `VID_20260824_143000.mp4`
+  這類檔名）→ **兩者相減就是時區** → `gps_utc`；
+  ③ 只有 mvhd → 照規格當 UTC 瞬間 → `file_time`；
+  ④ 只有牆上時間 → 配站台預設 +8 → `assumed`。什麼都沒有就維持 NULL。
+  ⚠️ ②相減出來**剛好是 0** 代表 mvhd 寫的其實是當地時間，這時候退回④，
+  **不要真的存一個 UTC+0 進去**。⚠️ `PXL_` 開頭的檔名是 **UTC**，不參與②的相減
+  （它落在③剛好是對的）。⚠️ 容許 10 分鐘殘差（`DERIVE_RESIDUAL_MAX_MIN`）——
+  mvhd 記的常是**錄影結束**、檔名記的是**開始**，一支 3 分鐘的影片兩者就差 3 分鐘。
+- ⚠️ `meta` 這個 box **在 ISO BMFF 是 FullBox、在 QuickTime 不是**（差 4 個位元組）。
+  硬套其中一種會有一半的檔解不開，所以用 `looksLikeBox()` 探下一個位置像不像 box 頭。
+- ⚠️ 走 box 時 **`size === 1` 是 64 位元長度（檔頭 16 位元組）、`size === 0` 是「一路到檔尾」**，
+  兩個都要接。截斷是常態不是錯誤（moov 太大時只讀開頭），最後一個 box 超出手上這塊時
+  照樣回報 —— 否則 mvhd 明明在最前面卻解不到。
+- **讀取次數是刻意壓的**：先讀 128KB 檔頭（`HEAD_CHUNK`，faststart 的手機影片 moov 整個
+  就在裡面 ＝ **1 次**），moov 在檔尾的靠 `mdat` 自己的 size **直接跳過去**，不逐段試。
+  在 Worker 裡每一次 `read` 就是一個 Drive subrequest（免費版單次上限 50）。
+- `readVideoExifFromFile()`（上傳路徑）**絕不往外丟例外** —— 讀不到 metadata 只是
+  「這支影片沒有時間」，跟上傳成不成功無關，丟出去會讓整批停在這裡。
+- **上傳路徑**在 `ingestSources()` 的 `isVideoFile()` 那一岔，接在 `captureVideoPoster`
+  後面把 `exifData`／`taken_at` 一起交給 `uploadPhoto`。⚠️ 重複視窗那條也要帶
+  （`PendingDuplicate` 多存 `exifData`／`takenAt`），不然「選取代」進來的影片沒有時間。
+  Google 相簿匯入**不必另外做** —— 它跟本機選檔在 `source.load()` 之後就合流了。
+- `guessWallClockFromName()` 也住在這一檔，`FixTimeModal` 是它的另一個呼叫端
+  （**不要再各留一份副本**）。⚠️⚠️ 裡面那兩個正規表示式的 `\d` 曾經整批掉成 `d`，
+  改完要 grep 一次 `[^\\]d{`（見「資料模型」）。
+
+### 回寫既有影片：`POST /api/admin/video-meta`
+
+存量影片（2026-08-31 之前傳的）一律沒有時間，入口在 **`/admin`「影片的拍攝時間與座標」**
+那一格（`app/admin/VideoMetaCard.tsx`）。
+
+- 認 `canManageOthers`（它會改到全站每一個人的影片）。沒有 `GOOGLE_DRIVE_SA_KEY` 回 503。
+- ⚠️ **一趟只做幾支（`VIDEO_META_DEFAULT_LIMIT` 6，上限 10），由前端推 `cursor` 迴圈**
+  —— 跟「比對全部相簿」那顆完全同一個做法（subrequest 預算）。收工看 `done`，
+  另外掛 `MAX_ROUNDS` 當保險絲。
+- ⚠️ **只補目前是空的那幾格**：兩句 UPDATE 各自帶著 `WHERE … taken_at IS NULL` 與
+  `lat IS NULL${geoOverwriteGuard('exif')}`，手動改過的座標（`geo_source = 'manual'`）碰不到。
+- ⚠️ **一支影片壞掉不能停掉整批** —— 逐支 try／catch 收進 `item.error`，最後在畫面上列出來。
+- ⚠️ 檔案大小是從第一次回應的 **`Content-Range` 表頭**解出來的，刻意不多打一次
+  `files.get?fields=size`（那是一個白花的 subrequest）。
+- ⚠️ **Drive 不理 Range 而回 200 時要當場 `cancel()` body**（`Content-Length` 超過 4MB）——
+  不然幾 GB 的影片會整份灌進 128MB 的 Worker。
+- ⚠️ 有寫進東西就 `bumpContentEpoch()`：`taken_at` 一改，相簿的排序就變了。
+- `remaining_before`（進度條的分母）那句 COUNT **跟分頁那句 WHERE 是同一個條件**，
+  不然數字永遠歸不了零（同 drive-pending 的清單與 COUNT）。
 
 ## GIF
 
@@ -1267,8 +1339,8 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
 
 ## 一進來就該知道的坑
 
-1. **`geo.ts` 有兩份副本**（`apps/backend/src/` 與 `apps/frontend/src/lib/`），改一邊一定要同步另一邊。
-   前端 LF 是權威 → 產生後端 CRLF 版。
+1. **`geo.ts` 與 `videoMeta.ts` 各有兩份副本**（`apps/backend/src/` 與 `apps/frontend/src/lib/`），
+   改一邊一定要同步另一邊。前端 LF 是權威 → 產生後端 CRLF 版。
 2. **D1 綁定參數上限 100** —— 批次 `IN (?,?,…)` 一定要先切塊，否則一百多筆就 500。
 3. **站門閘必須排在 `withEdgeCache` 之前**，否則訪客回應會進共用邊緣快取、匿名請求直接命中。
    座標與軌跡的隱私**必須在 SQL 裡過濾**，不能只靠回應後處理。

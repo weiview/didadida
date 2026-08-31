@@ -943,6 +943,53 @@ export async function auditOneAlbum(albumId: number): Promise<DriveAuditAlbumRep
   return data.report as DriveAuditAlbumReport;
 }
 
+/** 一支影片回讀的結果。`how` 是時間靠哪一層得來的（見 lib/videoMeta.ts） */
+export interface VideoMetaItem {
+  id: number;
+  title: string;
+  album_id: number;
+  how: 'tagged' | 'derived' | 'instant' | 'wall' | 'none' | string;
+  wrote_time: boolean;
+  wrote_geo: boolean;
+  taken_at_local: string | null;
+  tz_offset_minutes: number | null;
+  time_source: string | null;
+  lat: number | null;
+  lng: number | null;
+  error?: string;
+}
+
+export interface VideoMetaResult {
+  items: VideoMetaItem[];
+  /** 這一趟看了幾支 */
+  scanned: number;
+  next_cursor: number;
+  done: boolean;
+  /** 這一趟真的寫進去幾支 */
+  updated: number;
+  /** 這個游標之後還有幾支沒補（給進度條用） */
+  remaining_before: number;
+}
+
+/**
+ * 回 Drive 讀影片檔自己的拍攝時間與座標，寫回站上那一列。站長限定。
+ *
+ * ⚠️ **一趟只做幾支**（一支要 1–3 次 Drive Range 請求，而 Workers 免費版
+ *    單次呼叫上限 50 個 subrequest）—— 呼叫端要自己拿 `next_cursor` 迴圈跑到
+ *    `done`，跟「比對全部相簿」那顆同一個做法。
+ */
+export async function backfillVideoMeta(
+  cursor = 0, limit = 6,
+): Promise<VideoMetaResult> {
+  const res = await fetch(`${API_BASE_URL}/admin/video-meta`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ cursor, limit }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '回讀影片資訊失敗');
+  return await res.json();
+}
+
 /** 掃一遍分享給服務帳號的 Drive 資料夾，照信箱自動綁到人身上。站長限定 */
 export async function syncTrackFolders(): Promise<TrackFolderSync> {
   const res = await fetch(`${API_BASE_URL}/tracks/drive/sync-folders`, {

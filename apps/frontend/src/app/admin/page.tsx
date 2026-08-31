@@ -14,6 +14,7 @@ import { useAdmin } from "@/lib/useAdmin";
 import { isOnline, usePresence } from "@/lib/presence";
 import AdminSection from "./AdminSection";
 import DriveCompareCard from "./DriveCompareCard";
+import VideoMetaCard from "./VideoMetaCard";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import Avatar from "@/components/Avatar";
 import AvatarPicker from "@/components/AvatarPicker";
@@ -874,6 +875,14 @@ export default function AdminPage() {
         （原本拆成「Drive 備份對帳」與「缺 Drive 備份的檔案」兩格，2026-08-28 合併）
       */}
       <DriveCompareCard />
+
+      {/*
+        影片的拍攝時間與座標。封面圖是 canvas 畫的、不帶 metadata，所以 2026-08-31
+        之前傳的影片一律沒有時間（在相簿裡永遠排最前面）。這一格把原始檔從 Drive
+        用 Range 讀回 moov box 解出來補上。之後上傳的影片在瀏覽器就解掉了，
+        這一格只為存量而存在。
+      */}
+      <VideoMetaCard />
 
       {/*
         GPS 軌跡資料夾。為什麼要一個人一個資料夾：GPSLogger 只拿得到

@@ -514,8 +514,15 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
    *
    * ⚠️ 判斷用 displayDate 不是 photo.taken_at：EXIF 裡有時間但 D1 沒存到的
    *    舊資料，畫面上是看得到時間的，那也算「本來就有」。
+   *
+   * ⚠️⚠️ **影片與 GIF 是例外，永遠改得動**（2026-08-31）。它們的時間是從
+   *    mp4 的 moov box（或檔名）推出來的，而那裡面**沒有時區** —— 我們靠
+   *    「UTC 瞬間 ⊖ 檔名牆上時間」猜，猜不到時直接當 +8（`assumed`）。
+   *    跟相機的 EXIF 不是同一個等級的事實，鎖起來等於猜錯了就永遠錯著，
+   *    而這是唯一改得回來的地方。GIF 根本沒有時間可言，同理。
    */
-  const canEditTime = isAdmin && (!displayDate || photo.time_source === 'manual');
+  const canEditTime = isAdmin
+    && (!displayDate || photo.time_source === 'manual' || isVideo(photo) || isGif(photo));
 
   const handleSaveDesc = async () => {
     setIsSavingDesc(true);
