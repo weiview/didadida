@@ -12,6 +12,7 @@ import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
 import AssignPlaceModal from "@/components/AssignPlaceModal";
 import FixTimeModal from "@/components/FixTimeModal";
+import RotatePhotosModal from "@/components/RotatePhotosModal";
 import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import PlaceCheckinModal from "@/components/PlaceCheckinModal";
 import { GIF_MAX_BYTES, isGifFile, resizeImageFile } from "@/lib/imageUtils";
@@ -217,6 +218,7 @@ function AlbumContent() {
   const [selectedPhotos, setSelectedPhotos] = useState<number[]>([]);
   const [showAssignPlace, setShowAssignPlace] = useState(false);
   const [showFixTime, setShowFixTime] = useState(false);
+  const [showRotate, setShowRotate] = useState(false);
   // 相簿層級的打卡補件畫面（整本攤開、照日期分組）
   const [showPlaceCheckin, setShowPlaceCheckin] = useState(false);
   // 從打卡畫面轉去指定地點時，套用完要回到打卡畫面繼續處理下一批
@@ -2491,6 +2493,15 @@ function AlbumContent() {
           </button>
 
           <button
+            className={pageStyles.actionButton}
+            onClick={() => setShowRotate(true)}
+            disabled={selectedPhotos.length === 0}
+            style={{ opacity: selectedPhotos.length === 0 ? 0.5 : 1 }}
+          >
+            🔄 旋轉
+          </button>
+
+          <button
             className={`${pageStyles.actionButton} ${selectedPhotos.length > 0 ? pageStyles.danger : ''}`}
             onClick={() => setShowDeleteConfirm(true)}
             disabled={selectedPhotos.length === 0 || isBatchDeleting}
@@ -2619,6 +2630,44 @@ function AlbumContent() {
           } else {
             alert(`已為 ${updated} 張照片指定地點${skipped}。這本相簿都有位置與地名了 🎉`);
           }
+        }}
+      />
+
+      {/*
+        * 旋轉只動 R2 那兩顆縮圖（Drive 的原始檔與 4K 不碰，那兩份本來就是正的）。
+        * ⚠️ **成功之後不重抓（不呼叫 loadData）** —— 同那顆「不開放」的快速鎖：
+        *    重抓一次捲軸就回頂端，一本幾千張的相簿要重新捲回剛剛那一格。
+        *    後端換掉了 R2 的物件鍵、舊物件當場刪除，所以新網址要就地併回手上那一列，
+        *    不套用那幾格就是破圖。
+        */}
+      <RotatePhotosModal
+        isOpen={showRotate}
+        photos={selectedPhotos.map((pid) => photos.find((p) => p.id === pid)).filter(Boolean) as Photo[]}
+        onClose={() => setShowRotate(false)}
+        onDone={({ rotated, failures, skipped }) => {
+          const patch = new Map(rotated.map((r) => [r.id, r]));
+          setPhotos((prev) => prev.map((p) => {
+            const r = patch.get(p.id);
+            // ⚠️ thumb_sm_url 的 null 是有主張的（後端已經把欄位清成 NULL），
+            //    留著舊值會指向一顆剛被刪掉的物件
+            return r ? { ...p, url: r.url, thumb_url: r.thumb_url, thumb_sm_url: r.thumb_sm_url ?? undefined } : p;
+          }));
+          // 封面存的是網址不是 id，換了鍵就要跟著換，不然首頁那張變破圖
+          const cover = rotated.find((r) => currentCoverPhotoUrl && photos.find((p) => p.id === r.id)?.url === currentCoverPhotoUrl);
+          if (cover) setCurrentCoverPhotoUrl(cover.url);
+          setSelectedPhotos([]);
+          lastSelectedIndexRef.current = null;
+          // 失敗一律逐張講原因，收工一次講完 —— 批次跑到一半 alert 會蓋住還在跑的那幾張
+          const parts = [`已旋轉 ${rotated.length} 張`];
+          if (skipped > 0) parts.push(`${skipped} 個影片／GIF 未處理`);
+          let msg = parts.join('，');
+          if (failures.length > 0) {
+            // 每一張各自一行，`，` 串起來會擠成一團看不出有幾張
+            msg += `，${failures.length} 張失敗：
+${failures.join(`
+`)}`;
+          }
+          alert(msg);
         }}
       />
 

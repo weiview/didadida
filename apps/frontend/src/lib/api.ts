@@ -1526,7 +1526,7 @@ function canEncodeWebp(): boolean {
   return webpEncodable;
 }
 
-function loadImage(file: File): Promise<HTMLImageElement> {
+function loadImage(file: Blob): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     // 用 objectURL 而不是 FileReader 的 data URL：後者要先把整份檔案 base64 化，
     // 多花 33% 記憶體與一趟編碼，批次上傳幾百張時很有感
@@ -1538,21 +1538,35 @@ function loadImage(file: File): Promise<HTMLImageElement> {
   });
 }
 
-function encodeThumb(img: HTMLImageElement, maxEdge: number): Promise<Blob | null> {
+/**
+ * @param rotateDeg 順時針轉幾度，只收 0／90／180／270（見 rotatePhotoThumbs）。
+ *   90 與 270 會把畫布的長寬對調，不然轉完會被切掉兩邊。
+ */
+function encodeThumb(
+  img: HTMLImageElement, maxEdge: number, rotateDeg: 0 | 90 | 180 | 270 = 0,
+): Promise<Blob | null> {
   // 只縮不放：原圖比目標還小的時候放大只會多佔位元組，畫質一點都不會變好
   const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
   const width = Math.max(1, Math.round(img.width * scale));
   const height = Math.max(1, Math.round(img.height * scale));
+  const swap = rotateDeg === 90 || rotateDeg === 270;
 
   const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
+  canvas.width = swap ? height : width;
+  canvas.height = swap ? width : height;
   const ctx = canvas.getContext('2d');
   if (!ctx) return Promise.resolve(null);
 
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(img, 0, 0, width, height);
+  if (rotateDeg === 0) {
+    ctx.drawImage(img, 0, 0, width, height);
+  } else {
+    // 以畫布中心為原點轉，再把圖片畫在自己的中心上 —— 長寬對調時這樣才對得準
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate((rotateDeg * Math.PI) / 180);
+    ctx.drawImage(img, -width / 2, -height / 2, width, height);
+  }
 
   const type = canEncodeWebp() ? 'image/webp' : 'image/jpeg';
   return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), type, THUMB_QUALITY));
@@ -1576,6 +1590,86 @@ async function generateThumbnails(file: File): Promise<ThumbnailSet> {
     encodeThumb(img, THUMB_MAX_EDGE_MD),
   ]);
   return { sm, md };
+}
+
+/**
+ * 旋轉只收 90 的倍數。任意角度會在四個角露出空白，還得決定要不要裁掉、
+ * 裁掉又等於偷偷改變構圖 —— 而這個功能要解的是「相機把方向記錯了」，
+ * 那本來就只會差 90 的倍數。
+ */
+export type RotateDegrees = 90 | 180 | 270;
+
+/** 轉完之後那一列的新網址。⚠️ `thumb_sm_url` 可能是 null（400px 那顆沒編出來） */
+export interface RotatedThumbs {
+  id: number;
+  url: string;
+  thumb_url: string;
+  thumb_sm_url: string | null;
+}
+
+/**
+ * 把一張照片在 R2 的兩顆縮圖轉個方向。
+ *
+ * **轉的只有 R2 那兩顆**（相簿格線、首頁輪播、地圖標記看到的那張）。Drive 上
+ * 那份 4K 不動 —— 它走 `encode4kWebp(rawFile)`，吃的是原始檔、EXIF 只被套用
+ * 一次，本來就是正的；歪掉的一直只有縮圖（見 imageUtils 的 `Orientation` 那段）。
+ * 沒有 Drive 備份的照片燈箱本來就退回 800px，所以那些也一起修好了。
+ *
+ * 位元組全部在瀏覽器裡處理：抓下現有的 800px → canvas 轉向 → 重編 800／400 →
+ * 交給 `POST /api/photos/:id/thumbs` 換上去。Worker 沒有影像解碼器，這件事
+ * 在後端做不到。
+ *
+ * ⚠️ 一定要 `fetch` 位元組再走 objectURL，不能直接把網址塞給 `<img>` ——
+ *    那是跨來源的圖，canvas 會被汙染，`toBlob` 當場丟例外。縮圖那條路
+ *    （`/api/photos/view/*`）回的是 `Access-Control-Allow-Origin: *`，抓得到。
+ *
+ * 失敗一律**丟例外並講出原因**（同 IngestResult.failures 的規矩）：批次轉的時候
+ * 呼叫端要把每一張的理由收集起來，收工一次講完。
+ */
+export async function rotatePhotoThumbs(
+  photo: { id: number; url?: string; thumb_url?: string; thumb_sm_url?: string },
+  degrees: RotateDegrees,
+): Promise<RotatedThumbs> {
+  // 拿 800px 那顆當來源：轉 90 度不必重取樣，而它縮到 400 也還夠清楚
+  const src = photo.thumb_url || photo.url || photo.thumb_sm_url;
+  if (!src) throw new Error('這張在 R2 上沒有縮圖可以轉');
+
+  const got = await fetch(src);
+  if (!got.ok) throw new Error(`抓不到現有的縮圖（伺服器回 ${got.status}）`);
+  const img = await loadImage(await got.blob());
+
+  const [sm, md] = await Promise.all([
+    encodeThumb(img, THUMB_MAX_EDGE_SM, degrees),
+    encodeThumb(img, THUMB_MAX_EDGE_MD, degrees),
+  ]);
+  if (!md) throw new Error('這個瀏覽器編不出旋轉後的縮圖');
+
+  const form = new FormData();
+  form.append('thumb', md, 'thumb');
+  if (sm) form.append('thumb_sm', sm, 'thumb_sm');
+
+  const token = localStorage.getItem(SITE_TOKEN_KEY) || '';
+  const res = await fetch(`${API_BASE_URL}/photos/${photo.id}/thumbs`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}` },
+    body: form,
+  });
+  if (!res.ok) {
+    // 狀態碼要講出來：401 是進站 token 過期、403 是沒權限、400 是影片／GIF
+    const detail = await res.text().catch(() => '');
+    throw new Error(`伺服器回 ${res.status}${detail ? `：${detail.slice(0, 140)}` : ''}`);
+  }
+  const data = await res.json();
+  const p = data?.photo ?? {};
+  if (!p.url || !p.thumb_url) throw new Error('伺服器沒有回新的縮圖網址');
+  return {
+    id: photo.id,
+    url: String(p.url),
+    thumb_url: String(p.thumb_url),
+    // ⚠️ 這裡的 null 是**有主張的**（後端沒收到 400px 那顆，已經把欄位清成 NULL）。
+    //    呼叫端要照著清掉，留著舊值會指向一顆剛被刪掉的物件 ＝ 破圖
+    thumb_sm_url: p.thumb_sm_url ? String(p.thumb_sm_url) : null,
+  };
 }
 
 /** 上傳成功後回傳的那一筆，null 代表失敗 */

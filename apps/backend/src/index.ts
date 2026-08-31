@@ -5344,24 +5344,180 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         const photoId = pathname.split("/")[3];
         if (!(await canTouchPhoto(photoId))) return forbidden(headers);
         const body: any = await request.json();
-        // body.taken_at 是 UTC 瞬間。改了它就必須同步重算 taken_at_local，
-        // 否則兩欄會各說各話（顯示與行程段比對用 local、排序與軌跡比對用 taken_at）。
-        // 這裡把瞬間視為權威、時區不變，用 tz 把 local 推回來。
+
+        /*
+         * ⚠️⚠️ **只更新請求裡真的有帶的欄位，沒帶的一個都不能碰。**
+         *
+         * 這一支曾經是無條件覆寫三欄（description + taken_at + taken_at_local
+         * + time_source）。而前端存 Story 只送 `{ description }` —— 於是
+         * `body.taken_at || null` 一律是 null，**存一次 Story 就把拍攝時間、
+         * 牆上時間與時間來源三欄一起清空**：燈箱的「時間來源」變成一個「—」，
+         * 相簿格線因為沒有時間而把那張排到最前面（見「相簿格線」那一節），
+         * 而且錯得很安靜 —— 使用者以為自己只是打了幾個字。
+         *
+         * 用 `in` 判斷而不是 `!= null`：Story 清空送的是 `""`，那是**有主張**的
+         * （要清掉），跟「這一趟根本沒提到 description」是兩件事。
+         */
+        const sets: string[] = [];
+        const binds: any[] = [];
+        if ('description' in body) {
+          sets.push('description = ?');
+          binds.push(body.description || null);
+        }
+        if ('taken_at' in body) {
+          // body.taken_at 是 UTC 瞬間。改了它就必須同步重算 taken_at_local，
+          // 否則兩欄會各說各話（顯示與行程段比對用 local、排序與軌跡比對用 taken_at）。
+          // 這裡把瞬間視為權威、時區不變，用 tz 把 local 推回來。
+          const takenAtValue = body.taken_at || null;
+          sets.push(
+            'taken_at = ?',
+            `taken_at_local = strftime('%Y-%m-%d %H:%M:%S', ?,
+               COALESCE(tz_offset_minutes, ${DEFAULT_TZ_OFFSET_MINUTES}) || ' minutes')`,
+            "time_source = CASE WHEN ? IS NULL THEN NULL ELSE 'manual' END",
+          );
+          binds.push(takenAtValue, takenAtValue, takenAtValue);
+        }
+        if (sets.length === 0) {
+          return new Response(JSON.stringify({ error: "沒有要更新的欄位" }), { status: 400, headers });
+        }
         await env.DB.prepare(
-          `UPDATE Photo SET
-             description = ?,
-             taken_at = ?,
-             taken_at_local = strftime('%Y-%m-%d %H:%M:%S', ?,
-               COALESCE(tz_offset_minutes, ${DEFAULT_TZ_OFFSET_MINUTES}) || ' minutes'),
-             time_source = CASE WHEN ? IS NULL THEN NULL ELSE 'manual' END
-           WHERE id = ?`
-        ).bind(
-          body.description || null,
-          body.taken_at || null, body.taken_at || null, body.taken_at || null,
-          photoId,
-        ).run();
+          `UPDATE Photo SET ${sets.join(', ')} WHERE id = ?`
+        ).bind(...binds, photoId).run();
         await syncFtsForPhotos(env.DB, [Number(photoId)]);
         return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      /*
+       * 路由：換掉一張照片在 R2 的那兩顆縮圖。**目前唯一的用途是旋轉。**
+       *
+       * 轉這件事只能在瀏覽器做 —— Worker 沒有影像解碼器，也沒有 10ms CPU 以外的
+       * 預算去編一張 WebP。所以前端把 800px 那顆抓下來、在 canvas 上轉好、
+       * 重編成兩個尺寸，這一支只負責把新的位元組換上去。
+       *
+       * ⚠️⚠️ **一定要換一組新的物件鍵，不可以就地覆寫舊鍵。**
+       *    `/api/photos/view/*` 回的是 `immutable` 的一年快取（那條路由的護欄
+       *    就是「內容不會被就地改寫」），覆寫舊鍵的話瀏覽器與邊緣快取會**一直**
+       *    拿舊的那張躺著的圖，使用者按了旋轉卻什麼都沒變。
+       *
+       * ⚠️ `file_hash` 刻意不重算 —— 它記的是「上傳當下那份 800px 的位元組」，
+       *    重複偵測與「重傳自動補 Drive」都靠它。轉過之後改掉的話，同一個原始檔
+       *    再拖進來會算出上傳當下那個舊 hash，反而對不上（見「重複偵測」一節）。
+       *
+       * ⚠️ 只收照片。影片的縮圖是封面（轉了它畫面照樣是躺著的，而我們沒有轉檔
+       *    能力）；GIF 的動畫本體整份在 R2、燈箱走 /full，只轉縮圖會讓格線跟
+       *    燈箱對不起來。兩種都回 400 把理由講出來。
+       */
+      if (method === "POST" && pathname.startsWith("/api/photos/")
+          && pathname.endsWith("/thumbs") && pathname.split("/").length === 5) {
+        const photoId = pathname.split("/")[3];
+        if (!(await canTouchPhoto(photoId))) return forbidden(headers);
+
+        const row = await env.DB.prepare(
+          "SELECT id, media_type, file_name, url, thumb_url, thumb_sm_url FROM Photo WHERE id = ?"
+        ).bind(photoId).first<any>();
+        if (!row) {
+          return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+        }
+        const kind = String(row.media_type ?? 'photo');
+        if (kind !== 'photo') {
+          return new Response(JSON.stringify({
+            error: kind === 'video'
+              ? "影片沒辦法旋轉：R2 上那張只是封面，轉了它播放起來照樣是躺著的"
+              : "GIF 沒辦法旋轉：動畫本體整份在 R2，只轉縮圖會讓格線跟燈箱對不起來",
+          }), { status: 400, headers });
+        }
+
+        const form = await request.formData();
+        const thumb = form.get('thumb') as unknown as File | null;   // 800px，兼任主檔
+        const thumbSm = form.get('thumb_sm') as unknown as File | null; // 400px
+        if (!thumb) {
+          return new Response(JSON.stringify({ error: "thumb is required" }), { status: 400, headers });
+        }
+        const thumbType = (thumb.type || 'image/jpeg').toLowerCase();
+        if (!thumbType.startsWith('image/')) {
+          return new Response(JSON.stringify({ error: "thumb 必須是圖片" }), { status: 400, headers });
+        }
+
+        const host = new URL(request.url).origin;
+        /*
+         * 命名跟上傳那條同一個規則（前綴 + 時間戳），只是後半段改用亂數而不是
+         * 原始檔名 —— 這裡手上只有一顆 blob，而舊鍵裡那個檔名正是要作廢的東西，
+         * 抄過來等於把舊名字又寫一次進新鍵（同 rotateThumbKeys 的理由）。
+         */
+        const baseName = `${Date.now()}_${crypto.randomUUID().replace(/-/g, '')}`;
+        const putThumb = async (
+          body: ReadableStream, contentType: string, prefix: string,
+        ): Promise<{ key: string; url: string }> => {
+          const key = `${prefix}_${baseName}.${thumbExtFor(contentType)}`;
+          await env.BUCKET.put(key, body, { httpMetadata: { contentType } });
+          return { key, url: `${host}/api/photos/view/${encodeURIComponent(key)}` };
+        };
+        const [md, sm] = await Promise.all([
+          putThumb(thumb.stream(), thumbType, 'thumb'),
+          thumbSm
+            ? putThumb(thumbSm.stream(), (thumbSm.type || 'image/jpeg').toLowerCase(), 'thumbsm')
+            : Promise.resolve(null),
+        ]);
+
+        /*
+         * ⚠️ 沒收到 400px 那顆時把 `thumb_sm_url` 清成 NULL，**不能留著舊的** ——
+         *    讀取端的 COALESCE 會優先拿它，於是首頁輪播與地圖標記還是那張躺著的圖。
+         *    清成 NULL 之後它們自己會退回 800px（見 photoThumbSrc 的逐級退回）。
+         */
+        await env.DB.prepare(
+          "UPDATE Photo SET url = ?, file_name = ?, thumb_url = ?, thumb_sm_url = ? WHERE id = ?"
+        ).bind(md.url, md.key, md.url, sm?.url ?? null, photoId).run();
+
+        /*
+         * 相簿封面存的是**網址**不是 id（見刪除那條路由），換了鍵就要跟著改，
+         * 不然首頁那本相簿的封面會指著一顆等一下就要被刪掉的物件 ＝ 破圖。
+         * 這裡是改成新網址而不是清成 NULL —— 使用者只是把照片轉正，沒有要換封面。
+         */
+        if (typeof row.url === 'string' && row.url) {
+          await env.DB.prepare(
+            "UPDATE Album SET cover_photo_url = ? WHERE cover_photo_url = ?"
+          ).bind(md.url, row.url).run();
+        }
+
+        /*
+         * ⚠️ **順序：先把新網址寫進 D1，再刪舊物件。** 反過來的話 D1 寫失敗就等於
+         *    照片指著一顆已經刪掉的物件，相簿裡直接破圖而且救不回來。
+         *    照這個順序最壞只是留下幾顆孤兒縮圖（幾十 KB，而且有 log）。
+         */
+        const staleKeys = new Set<string>();
+        for (const u of [row.url, row.thumb_url, row.thumb_sm_url]) {
+          const k = r2KeyFromViewUrl(u);
+          if (k) staleKeys.add(k);
+        }
+        if (typeof row.file_name === 'string' && row.file_name) staleKeys.add(row.file_name);
+        staleKeys.delete(md.key);
+        if (sm) staleKeys.delete(sm.key);
+        try {
+          for (const k of staleKeys) await env.BUCKET.delete(k);
+        } catch (e) {
+          console.error(`照片 ${photoId} 的舊縮圖沒刪掉（新的已經上去了）`, e);
+        }
+        // 舊網址在這個機房的邊緣快取殘影，順手清一次（只清得到當下這一個機房）
+        for (const u of new Set([row.url, row.thumb_url, row.thumb_sm_url])) {
+          // 舊網址可能是早年匯進來的怪值（甚至字串 "null"），new Request 會直接丟例外
+          if (typeof u === 'string' && (u.startsWith('http://') || u.startsWith('https://'))) {
+            ctx.waitUntil(caches.default.delete(new Request(u, { method: "GET" })));
+          }
+        }
+
+        /*
+         * 訪客那份共用邊緣快取裡的相簿 JSON 還帶著剛剛作廢的網址，而 Cache API
+         * 清不掉（`cache.delete` 只作用在當下這一個機房）—— 換一把 key 讓舊的
+         * 再也沒有人問得到（見「不開放的照片」那一節的 content_epoch）。
+         */
+        await bumpContentEpoch(env);
+
+        // 回新網址讓前端就地併回手上那一列：整頁重抓的話捲軸會跳回頂端，
+        // 一本幾千張的相簿要重新捲回剛剛那一格（同「不開放」那顆快速鎖）
+        return new Response(JSON.stringify({
+          success: true,
+          photo: { id: Number(row.id), url: md.url, thumb_url: md.url, thumb_sm_url: sm?.url ?? null },
+        }), { headers });
       }
 
       // 路由：刪除照片

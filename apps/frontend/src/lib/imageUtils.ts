@@ -127,6 +127,26 @@ export async function resizeImageFile(file: File, maxEdge: number = 2000): Promi
           reader.readAsDataURL(file);
         });
         const exifObj = piexif.load(dataURL);
+        /*
+         * ⚠️⚠️ **Orientation 一定要改寫成 1（正向）才寫回去。**
+         *
+         * 下面那段是「把原圖畫進 canvas 再存成新的 JPEG」，而瀏覽器載入 `<img>`
+         * 時**已經照 EXIF 把畫面轉正了**（`image-orientation: from-image` 是預設值）
+         * —— 也就是說 canvas 吐出來的位元組本來就是正的。這時候再把原始的
+         * `Orientation: 6` 原封不動寫回去，等於留下一句「請再轉 90 度」的指示。
+         *
+         * 於是 `generateThumbnails()`（api.ts）用 `<img>` 載這份 2000px JPEG 產
+         * R2 縮圖時**又轉了一次** —— 相簿格線、首頁輪播、地圖標記全部歪掉，而
+         * 燈箱的大圖走 `encode4kWebp(rawFile)` 吃的是原始檔、只轉一次，是正的。
+         * 「只有網站縮圖轉向不對」就是這麼來的。
+         *
+         * 其餘的 EXIF（時間、GPS、相機參數）照舊完整寫回，只有這一個欄位失去意義。
+         */
+        for (const ifd of ['0th', '1st'] as const) {
+          if (exifObj[ifd] && exifObj[ifd][piexif.ImageIFD.Orientation] !== undefined) {
+            exifObj[ifd][piexif.ImageIFD.Orientation] = 1;
+          }
+        }
         exifDump = piexif.dump(exifObj);
       } catch (e) {
         console.warn("piexifjs could not dump exif:", e);
