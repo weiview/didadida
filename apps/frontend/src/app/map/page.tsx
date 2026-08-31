@@ -194,7 +194,29 @@ export default function MapPage() {
   const [to, setTo] = useState('');
   // 日期選擇器目前翻到哪個月。跟 from/to 分開 —— 還沒選日期時也要能翻月份找足跡
   const [pickerMonth, setPickerMonth] = useState(() => monthOf(todayLocal()));
+  /**
+   * 「跳到幾點」那個框的值（'HH:MM'，當地時間）。只有選了**單獨一天**才有意義 ——
+   * 跨好幾天的時候「14:30」指的是哪一天沒有答案。
+   */
+  const [jumpTime, setJumpTime] = useState('');
+  /**
+   * 送給地圖的跳轉要求。`nonce` 是為了讓「同一個時間再送一次」也算數
+   * （鏡頭被拖走之後想跳回角色身上），見 FootprintMap 的 `seekTo`。
+   */
+  const [seekTo, setSeekTo] = useState<{ t: number; nonce: number } | null>(null);
+  const seekNonce = useRef(0);
   const [albumId, setAlbumId] = useState<number | ''>('');
+  /**
+   * 把 'HH:MM' 換成那一天的 UTC 毫秒，送給地圖。
+   * `new Date('YYYY-MM-DDTHH:MM')` 解出來的是**當地**時間，跟畫面上顯示的時間同一套。
+   */
+  const jumpToTime = useCallback((hhmm: string) => {
+    if (!from || from !== to || !/^\d{2}:\d{2}$/.test(hhmm)) return;
+    const t = new Date(`${from}T${hhmm}:00`).getTime();
+    if (!Number.isFinite(t)) return;
+    seekNonce.current += 1;
+    setSeekTo({ t, nonce: seekNonce.current });
+  }, [from, to]);
   // 目前這本相簿的照片橫跨哪段日期（本地日，YYYY-MM-DD）。
   // 選了相簿之後日期輸入框就鎖在這個範圍內
   const [albumSpan, setAlbumSpan] = useState<{ first: string; last: string } | null>(null);
@@ -1168,6 +1190,12 @@ export default function MapPage() {
     [matchedTracks, timelineTracks, meHidden],
   );
 
+  /*
+   * 換一天就把「跳到幾點」清掉。時間本身不帶日期，留著那個值會讓下一天的畫面
+   * 停在一個使用者沒有要求過的時刻 —— 而且他很可能根本沒發現那個框還填著東西。
+   */
+  useEffect(() => { setJumpTime(''); setSeekTo(null); }, [from, to]);
+
   const focusPoint = useMemo<[number, number] | null>(() => {
     if (!from || from !== to) return null;
     // 還在抓的時候手上這批資料是「上一次查詢」的，拿它定位會飛到跟這一天無關的
@@ -1242,6 +1270,43 @@ export default function MapPage() {
           min={albumSpan?.first}
           max={albumSpan?.last}
         />
+        {/*
+          跳到當天的某個時刻：角色（車與車上的人）直接搬到那一刻的位置，鏡頭跟過去。
+          ⚠️ 只有**選了單獨一天**才給填 —— 跨好幾天時「14:30」指的是哪一天沒有答案。
+          ⚠️ 旁邊那顆「跳」不是多餘的：<input type="time"> 值沒變就不會發 change，
+             而使用者把鏡頭拖走之後想回到同一個時刻是常有的事（見 seekTo 的 nonce）。
+          ⚠️ 超出當天軌跡範圍的時間會被夾到頭尾，這裡刻意不擋也不報錯 ——
+             播放列上那行時間會照實寫出實際停在哪一刻。
+        */}
+        <label style={{ fontSize: 13 }}>
+          <div style={{ marginBottom: 4, color: '#475569' }}>跳到幾點</div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <input
+              type="time"
+              value={jumpTime}
+              disabled={!from || from !== to}
+              onChange={(e) => { setJumpTime(e.target.value); jumpToTime(e.target.value); }}
+              title={!from || from !== to ? '先選一個單獨的日子' : '角色會跳到這一刻的位置'}
+              style={{
+                padding: '6px 10px', borderRadius: 7, border: '1px solid #cbd5e1',
+                fontSize: 13, background: !from || from !== to ? '#f1f5f9' : '#fff',
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => jumpToTime(jumpTime)}
+              disabled={!jumpTime || !from || from !== to}
+              title="回到這個時刻（鏡頭拖走之後可以按它跳回角色身上）"
+              style={{
+                padding: '6px 12px', borderRadius: 7, border: '1px solid #cbd5e1',
+                background: '#fff', cursor: jumpTime && from && from === to ? 'pointer' : 'default',
+                fontSize: 13,
+              }}
+            >
+              跳
+            </button>
+          </div>
+        </label>
         <label style={{ fontSize: 13 }}>
           <div style={{ marginBottom: 4, color: '#475569' }}>相簿</div>
           <select
@@ -1393,6 +1458,7 @@ export default function MapPage() {
         // 我自己被篩掉時，我的 Google 紀念層也跟著收 —— 那一層畫的就是我
         timelineLines={showTimeline && !meHidden ? timelineLines : undefined}
         focusPoint={focusPoint}
+        seekTo={seekTo}
         // 點縮圖就跳去那本相簿。地圖上看到一張照片時，下一個想做的事
         // 幾乎都是「看那天其他張」—— 編輯模式下點擊是選取，FootprintMap 自己擋掉了
         onSelectPhoto={(p) => router.push(`/album?id=${p.album_id}`)}

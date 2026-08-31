@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  MapLibreMap, NavigationControl, LngLatBounds,
+  MapLibreMap, NavigationControl, LngLatBounds, Popup,
   type GeoJSONSource, type MapLayerMouseEvent,
 } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
@@ -135,6 +135,14 @@ interface Props {
    * 給 null 就恢復成「全部框進來」。
    */
   focusPoint?: [number, number] | null;
+  /**
+   * 把播放頭直接搬到某個 UTC 時刻，並讓鏡頭停在角色身上。
+   * `/map` 那個「跳到幾點」的輸入框用的。
+   *
+   * ⚠️ 帶著 `nonce` 而不是只給一個時間：使用者可能把鏡頭拖走之後**再送一次同一個時間**
+   *    要它跳回來。只看 `t` 的話值沒變，效果不會重跑，看起來就是「按了沒反應」。
+   */
+  seekTo?: { t: number; nonce: number } | null;
 }
 
 /** 動畫路徑上的一個節點 */
@@ -1460,6 +1468,7 @@ export default function FootprintMap({
   trackAvatars,
   timelineColor = DEFAULT_TRACK_COLOR,
   focusPoint,
+  seekTo,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -1469,6 +1478,17 @@ export default function FootprintMap({
   const convoysRef = useRef<ConvoyFrame[]>([]);
   /** 把播放頭移到某個 UTC 時刻。點照片時用（見底下那個同步 warp 的效果） */
   const seekRef = useRef<(t: number) => void>(() => {});
+  /**
+   * 點角色跳出來的那顆氣泡（時間＋座標＋去 Google 地圖的連結）。
+   *
+   * 同時只留一顆 —— 車跟頭是兩層、常常疊在一起，不收掉上一顆的話點兩下會留下兩張卡。
+   * ⚠️ 存 ref 不存 state：它的內容是 maplibre 自己畫的 DOM，進 state 只會多一次重畫。
+   */
+  const popupRef = useRef<Popup | null>(null);
+  /** 現在播到哪個 UTC 時刻。地圖事件只註冊一次，讀不到當下的 state */
+  const cursorTRef = useRef<number>(NaN);
+  /** 已經處理過的 seekTo.nonce。資料重載時 warp 會換一份，不記一筆就會重跳一次 */
+  const seekDoneRef = useRef<number>(-1);
   const sortedRef = useRef<FootprintPoint[]>([]);
   const albumsRef = useRef<Album[]>([]);
   // 已經加進地圖的縮圖，以及正在下載中的。避免同一張重複抓，也用來擋住上限
@@ -1898,6 +1918,40 @@ export default function FootprintMap({
   useEffect(() => {
     seekRef.current = (t: number) => setProgress(progressAtTime(warp, t));
   }, [warp]);
+  useEffect(() => { cursorTRef.current = cursorT; }, [cursorT]);
+
+  /*
+   * 「跳到幾點」：把播放頭搬過去，順手把鏡頭挪到角色身上。
+   *
+   * ⚠️ 一定要 `setPlaying(false)` —— 跳過去是為了看那一刻，還在跑的話跳完就跑掉了。
+   * ⚠️ 鏡頭得自己挪：跟拍那段只在 `playing` 時 `setCenter`，停著的時候沒有人會把
+   *    角色帶進畫面 —— 使用者輸入時間之後畫面完全不動，看起來就是壞的。
+   *    幾個人分頭時對準形心，跟跟拍那段同一個規矩。
+   * ⚠️ 認的是 `nonce` 不是 `t`：warp／memberPaths 換一份時這支效果會重跑
+   *    （資料還沒到就先送時間進來的情況要靠它補跳），但同一次要求只能生效一次，
+   *    不然使用者自己把鏡頭拖走之後，下一次重算會把他拉回去。
+   * ⚠️ `progressAtTime` 會把超出範圍的時間夾到頭尾 —— 輸入 03:00 但那天的軌跡
+   *    從 08:12 才開始時，角色停在 08:12。播放列上那行時間會照實寫出來，
+   *    所以這裡不另外報錯（畫面已經在回答「實際停在哪一刻」）。
+   */
+  useEffect(() => {
+    if (!seekTo || !Number.isFinite(seekTo.t)) return;
+    if (seekTo.nonce === seekDoneRef.current) return;
+    const k = warp.times.length;
+    if (k === 0) return;   // 資料還沒到，等 warp 換一份時這支會再跑一次
+    seekDoneRef.current = seekTo.nonce;
+    setPlaying(false);
+    setProgress(progressAtTime(warp, seekTo.t));
+    popupRef.current?.remove();
+    const t = Math.min(Math.max(seekTo.t, warp.times[0]), warp.times[k - 1]);
+    const spots = memberPaths
+      .map((m) => posAt(m.nodes, t))
+      .filter((x): x is [number, number] => x != null);
+    if (spots.length === 0 || !mapRef.current) return;
+    const cx = spots.reduce((a, p) => a + p[0], 0) / spots.length;
+    const cy = spots.reduce((a, p) => a + p[1], 0) / spots.length;
+    mapRef.current.easeTo({ center: [cx, cy], duration: 600 });
+  }, [seekTo, warp, memberPaths]);
   useEffect(() => { sortedRef.current = sorted; }, [sorted]);
   useEffect(() => { albumsRef.current = albums || []; }, [albums]);
   useEffect(() => { tracksRef.current = tracks || []; }, [tracks]);
@@ -1906,6 +1960,8 @@ export default function FootprintMap({
     playingRef.current = playing;
     // 停的時候 render() 就不再要求下一幀，所以要重新起跑得自己踢一下
     if (playing) mapRef.current?.triggerRepaint();
+    // 一跑起來角色就離開那顆氣泡了，留著等於指著一個沒有人的位置
+    if (playing) popupRef.current?.remove();
   }, [playing]);
 
   // --- 建立地圖 ---
@@ -2472,6 +2528,9 @@ export default function FootprintMap({
 
       // 點叢集就展開。泡泡那一層畫得比底下的圓點大，只掛圓點的話點到泡泡不會有反應
       const onClusterClick = (e: MapLayerMouseEvent) => {
+        // 車與人畫在照片那幾層上面，同一下點擊兩邊的 handler 都會收到。
+        // 角色優先，否則點角色會連帶把底下的叢集展開、鏡頭跳走
+        if (map.queryRenderedFeatures(e.point, { layers: ['vehicle-marker', 'rider-heads'] }).length > 0) return;
         const f = map.queryRenderedFeatures(e.point, {
           layers: ['photo-clusters', 'photo-cluster-thumbs'],
         })[0];
@@ -2486,6 +2545,8 @@ export default function FootprintMap({
       map.on('click', 'photo-cluster-thumbs', onClusterClick);
 
       const onPhotoClick = (e: MapLayerMouseEvent) => {
+        // 同上：角色壓在照片上面，不讓的話點角色會順便開燈箱
+        if (map.queryRenderedFeatures(e.point, { layers: ['vehicle-marker', 'rider-heads'] }).length > 0) return;
         const f = e.features?.[0];
         if (!f) return;
         const id = Number(f.properties?.id);
@@ -2523,10 +2584,55 @@ export default function FootprintMap({
         map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
       }
 
+      /*
+       * 點角色（車或車上的人）→ 一顆小氣泡：現在幾點、在哪、以及去 Google 地圖。
+       *
+       * ⚠️ 刻意**先跳氣泡才是連結**，不是點下去就直接 window.open ——
+       *    角色在畫面正中央、又跟著播放一直在動，誤觸就被丟到新分頁太粗暴；
+       *    而且點之前沒有任何地方看得到那個座標是什麼。
+       * ⚠️ 座標一律讀 `properties.lng/lat`，**不可以用 feature 的幾何** ——
+       *    頭那一層的幾何是座位的螢幕位移換回來的，不是這個人真正的位置。
+       * ⚠️ 車與頭是兩層、常常疊在一起，同一下點擊會進來兩次（兩層各一次）。
+       *    用 originalEvent 認出是同一下，只開第一顆（queryRenderedFeatures 由上而下，
+       *    所以疊在一起時拿到的是頭）。
+       */
+      let lastActorEvent: unknown = null;
+      const onActorClick = (e: MapLayerMouseEvent) => {
+        if (e.originalEvent === lastActorEvent) return;
+        lastActorEvent = e.originalEvent;
+        const f = map.queryRenderedFeatures(e.point, { layers: ['rider-heads', 'vehicle-marker'] })[0];
+        const lng = Number(f?.properties?.lng);
+        const lat = Number(f?.properties?.lat);
+        if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+        const when = cursorLabel(cursorTRef.current);
+        const q = `${lat},${lng}`;
+        popupRef.current?.remove();
+        popupRef.current = new Popup({ offset: 14, closeButton: true, maxWidth: '260px' })
+          .setLngLat([lng, lat])
+          .setHTML(
+            `<div style="font-size:12px;line-height:1.7">`
+            + (when ? `<div style="font-weight:600;color:#0f172a">${when}</div>` : '')
+            + `<div style="color:#475569">${lat.toFixed(5)}, ${lng.toFixed(5)}</div>`
+            + `<a href="https://www.google.com/maps/search/?api=1&amp;query=${q}"`
+            + ` target="_blank" rel="noopener noreferrer"`
+            + ` style="display:inline-block;margin-top:4px;color:#2563eb;text-decoration:none">`
+            + `在 Google 地圖開啟 ↗</a></div>`
+          )
+          .addTo(map);
+      };
+      for (const layer of ['vehicle-marker', 'rider-heads']) {
+        map.on('click', layer, onActorClick);
+        map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
+        map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
+      }
+
       setReady(true);
     });
 
     return () => {
+      // 氣泡是掛在 map 底下的 DOM，先收掉再 remove 才不會留下孤兒節點
+      popupRef.current?.remove();
+      popupRef.current = null;
       map.remove();
       mapRef.current = null;
       setReady(false);
@@ -2929,7 +3035,9 @@ export default function FootprintMap({
 
       carFeatures.push({
         type: 'Feature',
-        properties: { img: ensureCar(map, carColor, flip), scale: carScale },
+        // lng/lat 是給點下去那顆氣泡用的（Google 地圖連結要真的座標）。
+        // 車的幾何本來就是形心，這裡是抄一份，properties 拿得到而已
+        properties: { img: ensureCar(map, carColor, flip), scale: carScale, lng: center[0], lat: center[1] },
         geometry: { type: 'Point', coordinates: center },
       });
 
@@ -2937,6 +3045,12 @@ export default function FootprintMap({
       const seatY = cpx.y + CAR_SEAT_Y * carScale;
       idx.forEach((i, k) => {
         const color = colorFor(memberPaths[i].userId);
+        /*
+         * ⚠️ 頭的**幾何不是這個人真正的位置** —— 它是把車投影成像素、在座位上排好
+         *    再投影回來的（見上面那段註解）。所以點下去要開 Google 地圖時，
+         *    絕對不能拿 geometry 當座標，得另外把真的那一份帶在 properties 上。
+         */
+        const truth = pos[i] ?? center;
         const ll = map.unproject([
           cpx.x + (k - (n - 1) / 2) * step,
           // 奇數位的人坐低一點（後座），加上各自錯開相位的上下晃動
@@ -2945,7 +3059,10 @@ export default function FootprintMap({
         headFeatures.push({
           type: 'Feature',
           // 後排的先畫，前排的才蓋得住他 —— 這一層的疊放順序就是 feature 的順序
-          properties: { img: ensureHead(map, memberPaths[i].userId, color), scale: headScale },
+          properties: {
+            img: ensureHead(map, memberPaths[i].userId, color), scale: headScale,
+            lng: truth[0], lat: truth[1],
+          },
           geometry: { type: 'Point', coordinates: [ll.lng, ll.lat] },
         });
       });

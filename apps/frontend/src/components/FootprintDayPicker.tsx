@@ -11,6 +11,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
  *
  * 資料從哪來由外面決定（daysWithData）。這裡刻意不自己去抓：
  * Google 足跡是一個月一個檔，抓哪個月、快取放哪都是頁面那邊的事。
+ *
+ * **兩處共用**：/map 的日期篩選、/album 的日期篩選。相簿那邊要的是同一件事
+ * （「哪幾天有東西」＋單日或範圍），差別只有面板上那幾句說明文字要叫「照片」
+ * 而不是「足跡」—— 所以是一個 `noun` 選填 prop，不是第二支日曆元件。
  */
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
@@ -77,10 +81,25 @@ interface Props {
   /** 可選範圍的上下界（選了相簿時鎖到該相簿的照片範圍） */
   min?: string;
   max?: string;
+  /**
+   * 「有東西的日子」在這一頁叫什麼。地圖是足跡、相簿是照片。
+   *
+   * 這支元件兩邊共用（同一件事不要做第二套日曆），差別只有面板上那幾句說明文字 ——
+   * 相簿裡寫「這個月沒有任何足跡」會讓人以為自己按錯頁面了。
+   */
+  noun?: string;
+  /**
+   * 按鈕上面那行欄位標題。`null` ＝不畫。
+   *
+   * 地圖那排控制項每一格都有標題（日期／相簿／…），對齊得靠它；相簿頁的篩選列
+   * 只有一個沒有標題的搜尋框，多一行字反而讓兩格的高度對不起來。
+   */
+  fieldLabel?: string | null;
 }
 
 export default function FootprintDayPicker({
   from, to, onChange, month, onMonthChange, daysWithData, years, loading = false, min, max,
+  noun = '足跡', fieldLabel = '日期',
 }: Props) {
   const [open, setOpen] = useState(false);
   /**
@@ -162,7 +181,9 @@ export default function FootprintDayPicker({
 
   return (
     <div ref={boxRef} style={{ position: 'relative', fontSize: 13 }}>
-      <div style={{ marginBottom: 4, color: '#475569' }}>日期</div>
+      {fieldLabel !== null && (
+        <div style={{ marginBottom: 4, color: '#475569' }}>{fieldLabel}</div>
+      )}
       <button
         type="button"
         onClick={() => setOpen(o => !o)}
@@ -170,7 +191,7 @@ export default function FootprintDayPicker({
           padding: '7px 12px', borderRadius: 7, border: '1px solid #cbd5e1',
           background: '#fff', cursor: 'pointer', fontSize: 13, minWidth: 168, textAlign: 'left',
         }}
-        title="只有留下足跡的日子選得到。點一天＝就看那天，再點第二天＝框出一段範圍"
+        title={`只有留下${noun}的日子選得到。點一天＝就看那天，再點第二天＝框出一段範圍`}
       >
         {label} ▾
       </button>
@@ -187,7 +208,7 @@ export default function FootprintDayPicker({
               value={yearStr}
               onChange={(e) => onMonthChange(`${e.target.value}-${monthStr}`)}
               style={{ ...jumpSelect, flex: 1 }}
-              title="有足跡的年份"
+              title={`有${noun}的年份`}
             >
               {yearOptions.map(y => <option key={y} value={y}>{y} 年</option>)}
             </select>
@@ -220,7 +241,7 @@ export default function FootprintDayPicker({
                   type="button"
                   disabled={!ok}
                   onClick={() => pick(day)}
-                  title={ok ? day : `${day} 沒有任何足跡`}
+                  title={ok ? day : `${day} 沒有任何${noun}`}
                   style={{
                     position: 'relative', padding: '6px 0', borderRadius: 6, fontSize: 12.5,
                     border: '1px solid transparent',
@@ -250,10 +271,10 @@ export default function FootprintDayPicker({
               {/* 等第二下的時候，這行字要蓋過月份統計 —— 那是此刻唯一需要知道的事，
                   而且它同時解釋了「為什麼面板還開著」 */}
               {anchor ? '再點一天框出範圍，或按「完成」就看這一天'
-                : loading ? '讀取這個月的足跡…'
-                : daysWithData === null ? '（尚未載入足跡索引）'
-                : daysWithData.size === 0 ? '這個月沒有任何足跡'
-                : `這個月有 ${daysWithData.size} 天有足跡`}
+                : loading ? `讀取這個月的${noun}…`
+                : daysWithData === null ? `（尚未載入${noun}索引）`
+                : daysWithData.size === 0 ? `這個月沒有任何${noun}`
+                : `這個月有 ${daysWithData.size} 天有${noun}`}
             </span>
             {(from || to) && (
               <button
