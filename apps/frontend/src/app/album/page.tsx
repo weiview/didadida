@@ -1970,26 +1970,6 @@ function AlbumContent() {
         </div>
         <div className={styles.controls}>
           <div className={styles.filters}>
-            {/*
-              日期篩選（拍攝日期）。用的是 /map 那支日曆本身 —— 同一件事不要做第二套 UI，
-              而且「哪幾天有東西才點得下去」正是這一頁需要的行為。
-              ⚠️ 它刻意**排在篩選列的第一個**：面板是絕對定位、靠左展開的 280px，
-                 擺在最右邊的話窄螢幕上會撐出畫面。
-              ⚠️ 也刻意**不收進手機那張篩選表**（FilterBottomSheet 是 overflow: hidden，
-                 會把面板整個切掉）。
-            */}
-            <FootprintDayPicker
-              from={dateFrom}
-              to={dateTo}
-              onChange={(f, t) => { setDateFrom(f); setDateTo(t); }}
-              month={pickerMonth}
-              onMonthChange={setPickerMonth}
-              daysWithData={loading ? null : pickerDays}
-              years={photoYears}
-              loading={loading}
-              noun="照片"
-              fieldLabel={null}
-            />
             <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
               <input 
                 type="text" 
@@ -2036,7 +2016,32 @@ function AlbumContent() {
                   { value: "taken_date", label: "依拍攝日期 (新到舊)" }
                 ]}
               />
-
+            </div>
+            {/*
+              日期篩選（拍攝日期）。用的是 /map 那支日曆本身 —— 同一件事不要做第二套 UI，
+              而且「哪幾天有東西才點得下去」正是這一頁需要的行為。
+              ⚠️ 它**擺在「依日期排序」右邊**（使用者要求），所以夾在兩塊 desktopOnly 中間：
+                 那個 class 在手機上是 display:none，把日期塞進去等於手機看不到日期篩選。
+              ⚠️ 也刻意**不收進手機那張篩選表**（FilterBottomSheet 是 overflow: hidden，
+                 會把絕對定位的面板整個切掉）。
+              ⚠️ 外面那層 .datePicker 不是裝飾用的：面板是靠左展開的 280px，
+                 而它現在排在中間，手機上得靠 CSS 把面板改成靠右對齊（見 album.module.css）。
+            */}
+            <div className={styles.datePicker}>
+              <FootprintDayPicker
+                from={dateFrom}
+                to={dateTo}
+                onChange={(f, t) => { setDateFrom(f); setDateTo(t); }}
+                month={pickerMonth}
+                onMonthChange={setPickerMonth}
+                daysWithData={loading ? null : pickerDays}
+                years={photoYears}
+                loading={loading}
+                noun="照片"
+                fieldLabel={null}
+              />
+            </div>
+            <div className={pageStyles.desktopOnly}>
               <CustomSelect
                 value={gridColumns || 0}
                 onChange={(val) => setGridColumns(Number(val))}

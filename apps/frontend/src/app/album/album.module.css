@@ -24,10 +24,35 @@
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+  align-items: center;
+}
+
+/*
+ * 篩選列上每一格的高度一律對齊日期選擇器那顆按鈕（使用者要求）——
+ * 原本搜尋框與三顆 CustomSelect 是 ~42px、日期是 ~31px，一排高高低低。
+ *
+ * ⚠️ CustomSelect 的樣式全寫死在行內（那個 className prop 宣告了卻從來沒接上去），
+ *    只能從外面壓，所以這裡挑的是**深度**：
+ *      .filters > button            手機那顆「篩選與排序」
+ *      .filters > div > button      搜尋框裡那顆清除 ×
+ *      .filters > div > div > button  日期那顆觸發鈕、三顆 CustomSelect 的觸發鈕
+ *    日曆面板裡那幾十顆日期／導覽按鈕都在 `> div > div > div > button` 以下，
+ *    比這裡列的深一層，掃不到 —— 加深度前先數一次，不然日曆會整片變形。
+ */
+.filters > button,
+.filters > div > button,
+.filters > div > div > button {
+  height: 34px;
+  padding-top: 0;
+  padding-bottom: 0;
+  box-sizing: border-box;
 }
 
 .searchInput {
-  padding: 10px 15px;
+  /* 高度跟旁邊那幾格一起對齊日期選擇器（見上面 .filters 那段） */
+  height: 34px;
+  box-sizing: border-box;
+  padding: 0 15px;
   border-radius: 8px;
   border: 1px solid rgba(0, 0, 0, 0.1);
   background: var(--card-bg);
@@ -36,6 +61,11 @@
   font-family: inherit;
   font-size: 0.95rem;
   line-height: 1.4;
+}
+
+/* 日期選擇器的外框。存在的理由見手機那段 media query 與 page.tsx 裡的註解 */
+.datePicker {
+  display: inline-flex;
 }
 
 .select {
@@ -96,6 +126,17 @@
     min-width: 0;
     width: 100%;
     flex: 1;
+  }
+  /*
+   * 日期面板是絕對定位、靠左展開的 280px，而日期現在排在「依日期排序」右邊
+   * ——手機上那一格落在中間偏右，靠左展開會整片撐出畫面。這裡改成靠右對齊。
+   * ⚠️ 元件裡那個 left/top 是**行內樣式**，只有 !important 蓋得過去。
+   * ⚠️ `.datePicker > div > div` 剛好只命中面板：那顆觸發鈕是 button，
+   *    而 fieldLabel 傳 null 所以沒有標題那層 div。
+   */
+  .datePicker > div > div {
+    left: auto !important;
+    right: 0 !important;
   }
 }
 

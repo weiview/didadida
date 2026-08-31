@@ -195,7 +195,8 @@ export default function MapPage() {
   // 日期選擇器目前翻到哪個月。跟 from/to 分開 —— 還沒選日期時也要能翻月份找足跡
   const [pickerMonth, setPickerMonth] = useState(() => monthOf(todayLocal()));
   /**
-   * 「跳到幾點」那個框的值（'HH:MM'，當地時間）。只有選了**單獨一天**才有意義 ——
+   * 「時間點」那個下拉目前選的值 —— 那一分鐘起點的 **UTC 毫秒**，型別是字串
+   * （<option> 的 value 只有字串）。只有選了**單獨一天**才有意義 ——
    * 跨好幾天的時候「14:30」指的是哪一天沒有答案。
    */
   const [jumpTime, setJumpTime] = useState('');
@@ -206,17 +207,12 @@ export default function MapPage() {
   const [seekTo, setSeekTo] = useState<{ t: number; nonce: number } | null>(null);
   const seekNonce = useRef(0);
   const [albumId, setAlbumId] = useState<number | ''>('');
-  /**
-   * 把 'HH:MM' 換成那一天的 UTC 毫秒，送給地圖。
-   * `new Date('YYYY-MM-DDTHH:MM')` 解出來的是**當地**時間，跟畫面上顯示的時間同一套。
-   */
-  const jumpToTime = useCallback((hhmm: string) => {
-    if (!from || from !== to || !/^\d{2}:\d{2}$/.test(hhmm)) return;
-    const t = new Date(`${from}T${hhmm}:00`).getTime();
-    if (!Number.isFinite(t)) return;
+  /** 選了一個時間點就直接送給地圖（沒有另外一顆「跳」了）。 */
+  const seekToMs = useCallback((ms: number) => {
+    if (!Number.isFinite(ms)) return;
     seekNonce.current += 1;
-    setSeekTo({ t, nonce: seekNonce.current });
-  }, [from, to]);
+    setSeekTo({ t: ms, nonce: seekNonce.current });
+  }, []);
   // 目前這本相簿的照片橫跨哪段日期（本地日，YYYY-MM-DD）。
   // 選了相簿之後日期輸入框就鎖在這個範圍內
   const [albumSpan, setAlbumSpan] = useState<{ first: string; last: string } | null>(null);
@@ -1191,10 +1187,42 @@ export default function MapPage() {
   );
 
   /*
-   * 換一天就把「跳到幾點」清掉。時間本身不帶日期，留著那個值會讓下一天的畫面
+   * 換一天就把「時間點」清掉。時間本身不帶日期，留著那個值會讓下一天的畫面
    * 停在一個使用者沒有要求過的時刻 —— 而且他很可能根本沒發現那個框還填著東西。
    */
   useEffect(() => { setJumpTime(''); setSeekTo(null); }, [from, to]);
+
+  /*
+   * 「時間點」下拉的選項：**當天真的有 GPS 紀錄的每一分鐘**（使用者要求），
+   * 不是一個什麼都填得進去的時間框 —— 沒有紀錄的時刻跳過去只會被夾到頭尾，
+   * 看起來像壞掉。
+   *
+   * 來源取動畫真的在走的那一份（`routeTracks` ＝ 貼路 ＋ Google 時間軸），
+   * 還沒貼路時退回原始軌跡 `tracks`；兩邊的時間戳本來就是同一批。
+   * ⚠️ `TrackPoint.t_utc` 是**字串**，要 Date.parse 才拿得到毫秒。
+   * 一天最多 1440 個選項，全在瀏覽器算，不多打任何一次 API。
+   */
+  const jumpTimes = useMemo(() => {
+    const out: { t: number; label: string }[] = [];
+    if (!from || from !== to) return out;
+    const src = routeTracks.length > 0 ? routeTracks : tracks;
+    const seen = new Set<number>();
+    for (const p of src) {
+      const ms = Date.parse(p.t_utc);
+      if (!Number.isFinite(ms)) continue;
+      const minute = Math.floor(ms / 60000) * 60000;
+      if (seen.has(minute)) continue;
+      seen.add(minute);
+      out.push({
+        t: minute,
+        label: new Date(minute).toLocaleTimeString('zh-TW', {
+          hour: '2-digit', minute: '2-digit', hour12: false,
+        }),
+      });
+    }
+    out.sort((a, b) => a.t - b.t);
+    return out;
+  }, [from, to, routeTracks, tracks]);
 
   const focusPoint = useMemo<[number, number] | null>(() => {
     if (!from || from !== to) return null;
@@ -1272,40 +1300,44 @@ export default function MapPage() {
         />
         {/*
           跳到當天的某個時刻：角色（車與車上的人）直接搬到那一刻的位置，鏡頭跟過去。
-          ⚠️ 只有**選了單獨一天**才給填 —— 跨好幾天時「14:30」指的是哪一天沒有答案。
-          ⚠️ 旁邊那顆「跳」不是多餘的：<input type="time"> 值沒變就不會發 change，
-             而使用者把鏡頭拖走之後想回到同一個時刻是常有的事（見 seekTo 的 nonce）。
-          ⚠️ 超出當天軌跡範圍的時間會被夾到頭尾，這裡刻意不擋也不報錯 ——
-             播放列上那行時間會照實寫出實際停在哪一刻。
+          ⚠️ 只有**選了單獨一天**才給選 —— 跨好幾天時「14:30」指的是哪一天沒有答案。
+          ⚠️ 選項只列**當天真的有 GPS 紀錄的分鐘**（見 jumpTimes），而且選下去就直接跳，
+             沒有另外一顆「跳」（使用者拍板）。代價是：<select> 的值沒變不會發 change，
+             所以「鏡頭拖走之後想回到同一個時刻」要改選旁邊那一分鐘。
         */}
         <label style={{ fontSize: 13 }}>
-          <div style={{ marginBottom: 4, color: '#475569' }}>跳到幾點</div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <input
-              type="time"
-              value={jumpTime}
-              disabled={!from || from !== to}
-              onChange={(e) => { setJumpTime(e.target.value); jumpToTime(e.target.value); }}
-              title={!from || from !== to ? '先選一個單獨的日子' : '角色會跳到這一刻的位置'}
-              style={{
-                padding: '6px 10px', borderRadius: 7, border: '1px solid #cbd5e1',
-                fontSize: 13, background: !from || from !== to ? '#f1f5f9' : '#fff',
-              }}
-            />
-            <button
-              type="button"
-              onClick={() => jumpToTime(jumpTime)}
-              disabled={!jumpTime || !from || from !== to}
-              title="回到這個時刻（鏡頭拖走之後可以按它跳回角色身上）"
-              style={{
-                padding: '6px 12px', borderRadius: 7, border: '1px solid #cbd5e1',
-                background: '#fff', cursor: jumpTime && from && from === to ? 'pointer' : 'default',
-                fontSize: 13,
-              }}
-            >
-              跳
-            </button>
-          </div>
+          <div style={{ marginBottom: 4, color: '#475569' }}>時間點</div>
+          <select
+            value={jumpTime}
+            disabled={jumpTimes.length === 0}
+            onChange={(e) => {
+              setJumpTime(e.target.value);
+              if (e.target.value) seekToMs(Number(e.target.value));
+            }}
+            title={
+              !from || from !== to
+                ? '先選一個單獨的日子'
+                : jumpTimes.length === 0
+                  ? '這一天沒有 GPS 紀錄'
+                  : '角色會跳到這一刻的位置'
+            }
+            style={{
+              padding: '6px 10px', borderRadius: 7, border: '1px solid #cbd5e1',
+              fontSize: 13, minWidth: 120,
+              background: jumpTimes.length === 0 ? '#f1f5f9' : '#fff',
+            }}
+          >
+            <option value="">
+              {!from || from !== to
+                ? '先選一個單獨的日子'
+                : jumpTimes.length === 0
+                  ? '這天沒有 GPS 紀錄'
+                  : '選一個時刻'}
+            </option>
+            {jumpTimes.map((o) => (
+              <option key={o.t} value={o.t}>{o.label}</option>
+            ))}
+          </select>
         </label>
         <label style={{ fontSize: 13 }}>
           <div style={{ marginBottom: 4, color: '#475569' }}>相簿</div>
