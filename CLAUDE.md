@@ -41,7 +41,7 @@ apps/frontend/
   src/lib/videoUtils.ts      封面圖擷取、長度格式化、可收的影片型別
   src/lib/videoMeta.ts       影片的拍攝時間／座標（解 moov box），後端有一份副本
   src/lib/api.ts     唯一的 API 客戶端
-  functions/_middleware.ts   Pages Function：非台灣來源直接 403
+  functions/_middleware.ts   Pages Function：允許清單以外的國家直接 403（TW/AU/NZ）
 database/
   schema.sql         歷史起點的基礎 schema ＋ 一堆 migrate_*.sql（**舊路徑，別再往這加**）
 ```
@@ -1463,9 +1463,14 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
 5. 路由靠 `pathname.split("/").length` 分辨，**新增巢狀路徑前先算長度**（`/api/photos/1/geo` 是 5，不撞 4）。
 6. `core.autocrlf=true` 且無 `.gitattributes` → 行尾混用（`index.ts`/`api.ts`/`FootprintMap.tsx` 是 CRLF，
    `gpx.ts`/`map/page.tsx`/`schema.sql` 是 LF）。**純外觀，不要順手統一**，會炸出整檔 diff。
-7. **非台灣來源會被擋成 403，而且有兩道**：前端 `functions/_middleware.ts`、後端 `index.ts`
-   （看 `cf.country`，放行 `TW`/`XX`/`T1`）。從國外或雲端 runner 測會以為整站壞了。
-   關掉一道沒用，兩道都要處理。
+7. **允許清單以外的國家會被擋成 403，而且有兩道**：前端 `functions/_middleware.ts`
+   （看 `cf-ipcountry` 表頭）、後端 `index.ts`（看 `request.cf.country`）。
+   兩邊各有一份 **`ALLOWED_COUNTRIES`**，內容必須一模一樣 —— **只改一邊等於沒改**。
+   目前是 `TW`／`AU`／`NZ` ＋ `XX`（Cloudflare 判不出來，含本機開發）／`T1`（Tor）。
+   ⚠️ 2026-09-01 從「只有台灣」放寬到含澳洲：家人住在澳洲，在那之前整個站對他是一片 403。
+   這一層本來就只是縱深防禦，真正的護欄是進站閘門（沒有 token 一律 401）——
+   所以要再開新的國家，照著加就好，不必為此另外做什麼。
+   從別的國家或雲端 runner 測會以為整站壞了。
 8. `lib/gpx.ts` 管線順序不可顛倒：`collapseStays`（60m／300s）→ `simplifyTrack`（Douglas-Peucker 5m，上限 8000 點）。
 9. FootprintMap 的 emoji 一律 canvas → `addImage`，**不可進 `text-field`**（底圖 SDF 字型沒有 emoji 字符）。
 10. `apps/backend/` 根目錄躺著幾十個 `check_*.sql` / `print_*.js` 之類的一次性查詢腳本，

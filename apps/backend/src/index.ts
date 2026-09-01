@@ -2653,6 +2653,19 @@ const ALLOWED_ORIGINS = [
   "http://127.0.0.1:3000",
 ];
 
+/*
+ * 進得了站的國家（ISO 3166-1 alpha-2）。**前端 `apps/frontend/functions/_middleware.ts`
+ * 有一模一樣的一份**，兩道各自獨立 —— 只改一邊等於沒改。
+ *
+ * 2026-09-01：從「只有台灣」放寬成「台灣＋澳洲／紐西蘭」。家人住在澳洲，
+ * 在那之前整個站對他就是一片 403。這一層本來只是縱深防禦，真正的護欄是底下的
+ * 進站閘門（沒有 token 一律 401）。
+ *
+ * `XX`（Cloudflare 判不出來，含本機開發）與 `T1`（Tor）不是國家，一律放行 ——
+ * 判不出來寧可漏，也不要把自己人擋在門外。
+ */
+const ALLOWED_COUNTRIES = new Set(['TW', 'AU', 'NZ', 'XX', 'T1']);
+
 /* ─────────────────────────── 免費額度用量 ────────────────────────────────
  *
  * 「還剩多少免費額度」在 Cloudflare 後台是散在四個地方的數字（R2、D1、
@@ -3098,11 +3111,10 @@ const origin = request.headers.get("Origin") || "";
       return new Response(null, { headers: { ...headers, "Access-Control-Max-Age": "86400" } });
     }
 
-    // Block non-TW IPs
+    // 地理閘門。允許清單見 ALLOWED_COUNTRIES（前端 functions/_middleware.ts 有另一道，要一起改）
     const country = (request as any).cf?.country;
-    // Allow if country is TW, or if running locally (country is undefined, 'XX', 'T1' etc.)
-    if (country && typeof country === 'string' && !['TW', 'XX', 'T1'].includes(country.toUpperCase())) {
-      return new Response(JSON.stringify({ error: "Access Denied. Only accessible from Taiwan." }), {
+    if (country && typeof country === 'string' && !ALLOWED_COUNTRIES.has(country.toUpperCase())) {
+      return new Response(JSON.stringify({ error: "Access Denied." }), {
         status: 403,
         headers
       });
