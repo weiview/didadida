@@ -13,12 +13,21 @@
   justify-content: center;
 }
 
+/*
+ * ⚠️⚠️ **撐滿整格 ＋ object-fit: contain，不要用 width/height: auto。**
+ *
+ * auto 的意思是「照固有尺寸長」：metadata 還沒回來時 <video> 的固有尺寸來自
+ * poster（R2 那張 800px 縮圖），所以一開始只有 800px 寬 —— 比容器小一圈。
+ * 按下播放、真正的影片尺寸（多半 1920 以上）解出來之後才被 max-width 夾成
+ * 滿版，於是畫面當場跳大一階，看起來像換了一個播放器。
+ *
+ * 撐滿容器之後尺寸從頭到尾是同一個，跟照片那條 (.image 的 contain) 一致；
+ * 影片本身照樣完整看得到，四周留黑邊 —— 那本來就是燈箱的底色。
+ */
 .video {
-  max-width: 100%;
-  max-height: 100%;
-  /* 沒有這一行，Safari 會讓 <video> 撐出自己的固有尺寸而溢出容器 */
-  width: auto;
-  height: auto;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
   display: block;
   background: #000;
 }

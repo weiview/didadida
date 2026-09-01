@@ -12,6 +12,12 @@ import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallCloc
 import { formatTzOffset } from "@/lib/tz";
 import { formatDuration } from "@/lib/videoUtils";
 
+/*
+ * 動態照片重播之間停多久。0.5 秒是使用者指定的：接成無縫的迴圈看起來像一團
+ * 抽損的畫面，中間停一下才看得出來「這是一段影片在重播」。
+ */
+const MOTION_REPLAY_GAP_MS = 500;
+
 // 只有顯示用的中文說明，值域本身定義在 geo.ts
 const TIME_SOURCE_LABEL: Record<string, string> = {
   manual: '手動修正',
@@ -191,15 +197,36 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
    * Android 的動態照片：一張 .jpg 的尾巴上黏著一段 mp4（見 migrations/0024）。
    * 位元組在 Drive 上那份原始檔裡，`/api/photos/:id/motion` 從那裡切出來。
    *
-   * ⚠️ **點了才載**，不是一進燈箱就播 —— 那段影片是 1～4MB，每播一次就是一趟
-   *    Drive 取檔，而使用者多半只是在一張一張翻。`preload` 也因此不給。
-   * ⚠️ 換一張要收回去（連同載失敗的紀錄），不然上一張的動畫會蓋在這一張上面。
+   * ⚠️⚠️ **進燈箱就自己播，而且一直重播**（2026-09-01 使用者拍板改的；
+   *    在那之前是「點了才載」）。代價是真的：那段影片 1～4MB，**每開一張
+   *    動態照片就是一趟 Drive 取檔**，不是使用者真的想看才花。交換到的是
+   *    「動態照片一點進來就在動」—— 那本來就是這種照片存在的理由。
+   *    只有動態照片走這條（`hasMotionClip`），普通照片一毛錢也不多花。
+   * ⚠️ 重播中間隔 `MOTION_REPLAY_GAP_MS`（0.5 秒），不是 `loop` 屬性 ——
+   *    一兩秒的東西接成無縫的循環看起來像一團抽損的畫面，
+   *    中間停一下才看得出來「這是一段影片在重播」。
+   *    它是一支 `setTimeout`，**換照片與按停止都要收**，不然上一張的計時器
+   *    會在這一張身上叫 `play()`。
    * ⚠️ 影片與 GIF 沒有這件事：它們本身就會動，`motion_offset` 對它們永遠是 0。
    */
   const hasMotionClip = !isVideo(photo) && !isGif(photo) && hasMotion(photo);
-  const [playMotion, setPlayMotion] = useState(false);
+  const [playMotion, setPlayMotion] = useState(hasMotionClip);
   const [motionFailed, setMotionFailed] = useState(false);
-  useEffect(() => { setPlayMotion(false); setMotionFailed(false); }, [photo.id]);
+  const motionRef = useRef<HTMLVideoElement | null>(null);
+  const motionTimerRef = useRef<number | null>(null);
+  const clearMotionTimer = useCallback(() => {
+    if (motionTimerRef.current !== null) {
+      window.clearTimeout(motionTimerRef.current);
+      motionTimerRef.current = null;
+    }
+  }, []);
+  useEffect(() => {
+    clearMotionTimer();
+    setPlayMotion(hasMotionClip);
+    setMotionFailed(false);
+  }, [photo.id, hasMotionClip, clearMotionTimer]);
+  // 離開燈箱時也要收 —— 計時器活得比元件久就是一支指向已卸載 DOM 的手
+  useEffect(() => clearMotionTimer, [clearMotionTimer]);
 
   /*
    * ⚠️ **影片不參與收合**，跟它不參與捏合放大是同一個理由：`<video>` 自己要吃
@@ -717,14 +744,32 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             */}
           {hasMotionClip && playMotion && (
             <video
+              /* 換一張要重建，不然 src 換了但還停在上一支的最後一格 */
+              key={photo.id}
+              ref={motionRef}
               className={styles.motionVideo}
               src={photoMotionSrc(photo)}
               poster={photoThumbSrc(photo, 'md')}
               autoPlay
               muted
               playsInline
-              onEnded={() => setPlayMotion(false)}
-              onError={() => { setPlayMotion(false); setMotionFailed(true); }}
+              onEnded={() => {
+                // 停半秒再從頭來（見上面：無縫循環看不出來它在重播）
+                clearMotionTimer();
+                motionTimerRef.current = window.setTimeout(() => {
+                  motionTimerRef.current = null;
+                  const v = motionRef.current;
+                  if (!v) return;
+                  v.currentTime = 0;
+                  // 分頁被蓋住、電池模式…… play() 被擋下來是常態，不是錯誤
+                  void v.play().catch(() => {});
+                }, MOTION_REPLAY_GAP_MS);
+              }}
+              onError={() => {
+                clearMotionTimer();
+                setPlayMotion(false);
+                setMotionFailed(true);
+              }}
             />
           )}
           {/*
@@ -739,12 +784,16 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               disabled={motionFailed}
               title={motionFailed
                 ? '這張的動畫讀不到（原始檔可能還沒備份到 Drive）'
-                : '播放這張照片的動態片段'}
+                : playMotion
+                  ? '停下這張照片的動態片段'
+                  : '播放這張照片的動態片段'}
               onClick={(e) => {
                 e.stopPropagation();
                 if (motionFailed) return;
                 // 放大中直接播會讓影片跟底下那張照片對不齊，先歸零
                 resetZoom();
+                // 按停止時連重播的計時器一起收，不然半秒後它又自己跳回來
+                clearMotionTimer();
                 setPlayMotion((v) => !v);
               }}
             >
