@@ -1091,6 +1091,70 @@ export async function scanMotionPhotos(
   return await res.json();
 }
 
+/* ── 免費額度用量 ────────────────────────────────────────────────────────── */
+
+/** 一條用量條。`used` 是 null ＝這一格沒有數字（沒掃過、或沒設 CF_API_TOKEN） */
+export interface UsageMetric {
+  key: string;
+  used: number | null;
+  limit: number;
+  unit: 'bytes' | 'count';
+  /** now＝當下的量、day＝今天（UTC 換日）、month＝本月（UTC） */
+  period: 'now' | 'day' | 'month';
+  /** 這個數字哪來的。畫面上要講出來，不然使用者分不出「零」與「量不到」 */
+  source: 'scan' | 'analytics' | 'd1_meta' | null;
+  error?: string;
+}
+
+/** 掃 R2 的進度。整包存在後端的 `AppSetting.usage_r2` 那一列 JSON 裡 */
+export interface R2ScanState {
+  bytes: number;
+  objects: number;
+  /** 照物件鍵的前綴分類：縮圖 800px／縮圖 400px／GIF 動畫／頭像／GPS 軌跡／… */
+  kinds: Record<string, { objects: number; bytes: number }>;
+  cursor: string | null;
+  done: boolean;
+  started_at: string;
+  scanned_at: string | null;
+}
+
+export interface UsageReport {
+  generated_at: string;
+  metrics: UsageMetric[];
+  breakdown: {
+    r2_ops: { name: string; requests: number; cls: string }[];
+    workers: { name: string; requests: number }[];
+    d1: { name: string; rows_read: number; rows_written: number; queries: number }[];
+    r2_buckets: { name: string; bytes: number; objects: number }[];
+  };
+  analytics: { configured: boolean; account_id: string | null; errors: string[] };
+  r2_scan: R2ScanState | null;
+}
+
+/** 目前的用量。站長限定 —— 回應裡是整個 Cloudflare 帳號的量 */
+export async function getUsage(): Promise<UsageReport> {
+  const res = await fetch(`${API_BASE_URL}/admin/usage`, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取用量失敗');
+  return await res.json();
+}
+
+/**
+ * 掃一段 R2 把物件大小加總。
+ *
+ * ⚠️ 同 scanMotionPhotos：**一趟只掃幾頁**（一頁 1000 顆＝一個 subrequest，
+ *    而免費版單次呼叫上限 50 個），呼叫端自己迴圈跑到 `done`。
+ *    後端記著上次的游標，所以第二趟不必傳任何東西。
+ */
+export async function scanR2Usage(reset = false): Promise<R2ScanState> {
+  const res = await fetch(`${API_BASE_URL}/admin/usage/r2-scan`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ reset }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '掃描 R2 失敗');
+  return await res.json();
+}
+
 /** 掃一遍分享給服務帳號的 Drive 資料夾，照信箱自動綁到人身上。站長限定 */
 export async function syncTrackFolders(): Promise<TrackFolderSync> {
   const res = await fetch(`${API_BASE_URL}/tracks/drive/sync-folders`, {

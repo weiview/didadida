@@ -17,3 +17,12 @@ GOOGLE_DRIVE_SA_KEY=
 
 # 站長（uid 1）的 GPSLogger 資料夾 id；其他成員各自綁在 User.track_drive_folder_id
 GOOGLE_DRIVE_FOLDER_ID=
+
+# Cloudflare 的 GraphQL Analytics（/admin「免費額度用量」那格的四條 analytics 用量條）。
+# 沒設的話那幾條顯示「未設定」，R2 儲存量與 D1 大小照常 —— 本機開發通常不必填。
+# token：帳號層級 Custom token，權限只要 Account -> Account Analytics -> Read。
+# ⚠️ 兩個是一組的，遠端要兩個都 `wrangler secret put`：列帳號要的是
+#    Account Settings: Read，只給 Analytics 的 token 問不出自己屬於哪個帳號。
+#    帳號 id 的值在 `npx wrangler whoami` 那張表的 Account ID。
+CF_API_TOKEN=
+CF_ACCOUNT_ID=

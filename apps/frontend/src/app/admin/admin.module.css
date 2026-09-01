@@ -483,3 +483,71 @@
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+/* ── 免費額度用量條（見 UsageCard.tsx） ──────────────────────────────────
+   跟上面 .progressTrack 那條刻意分開：那個是「跑到哪了」的進度，這個是
+   「還剩多少能用」的水位 —— 條要粗一點看得出滿了沒，而且顏色會變。 */
+.usageRow {
+  padding: 0.7rem 0;
+  border-top: 1px solid var(--border-color);
+}
+
+.usageRow:first-of-type {
+  border-top: none;
+}
+
+.usageHead {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 0.85rem;
+}
+
+.usageLabel {
+  min-width: 0;
+}
+
+/* 數字不換行，而且用 tabular-nums —— 一排條上下對齊才讀得出誰比較多 */
+.usageNum {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-light);
+  white-space: nowrap;
+}
+
+.usageTrack {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--border-color);
+  overflow: hidden;
+  margin: 0.45rem 0 0.3rem;
+}
+
+.usageFill {
+  height: 100%;
+  border-radius: 999px;
+  background: #22c55e;
+  transition: width 200ms ease;
+}
+
+/* 七成之後開始變色，九成就是紅的 —— 滿條＝免費額度用完 */
+.usageWarn { background: #f59e0b; }
+.usageHot { background: #ef4444; }
+
+/* 量不到的那幾格。條是空的，但要看得出「這裡本來有東西」而不是零 */
+.usageUnknown {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(120, 100, 84, 0.12) 0 6px,
+    transparent 6px 12px
+  );
+  height: 100%;
+  width: 100%;
+}
+
+.usageNote {
+  font-size: 0.75rem;
+  color: var(--text-light);
+  line-height: 1.6;
+}

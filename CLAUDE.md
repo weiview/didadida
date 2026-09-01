@@ -256,6 +256,7 @@ npx wrangler pages deploy out --project-name didadida-frontend --branch main --c
 | `GUEST_PASSWORD` | `/api/verify-guest` 回 503，除了 Google 登入沒人進得了站 |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google 登入整條掛掉 |
 | `GOOGLE_DRIVE_SA_KEY` | 燈箱取大圖、搬 trash、讀 GPSLogger 全掛 |
+| `CF_API_TOKEN` ＋ `CF_ACCOUNT_ID` | **只影響 `/admin` 用量條的四條 analytics**（今日 Workers 請求、R2 操作次數、D1 讀寫列數）顯示「未設定」，其餘照常。兩個是一組的，見「免費額度用量條」 |
 
 ⚠️ **`$v | wrangler secret put` 會多存一個換行**（管線加的，wrangler 不 trim），
 曾經害 Google 回 `invalid_grant`。灌任何一個 secret 都一樣，值裡不要有尾巴。
@@ -1501,6 +1502,54 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
     「部分或全部照片上傳失敗，請稍後再試」對 HEIC 是句假話，再試一百次都一樣。
     `uploadPhoto` 的 `{status:'error'}` 因此帶著 `reason`。
     Drive 失敗**不算這張失敗**（照片已經在 R2 了），要記進 `pendingDriveBatch` 讓補傳看得到它。
+
+## 免費額度用量條
+
+`/admin`「免費額度用量」那一格（`app/admin/UsageCard.tsx`，`AdminSection` id 是 `usage`）。
+**滿條＝免費額度用完**（使用者的原話）。七成變黃、九成變紅。
+後端是 `GET /api/admin/usage` 與 `POST /api/admin/usage/r2-scan`，兩支都認 `canManageOthers`
+（回應裡是整個 Cloudflare 帳號的用量）。
+
+- **額度數字只有一份權威**：後端的 `USAGE_LIMITS`。前端只負責畫條，Cloudflare 調額度就改那一處。
+  目前七格：R2 儲存 10GB／class A 每月 1M／class B 每月 10M／D1 儲存 5GB／
+  D1 每日讀 5M 列・寫 100k 列／Workers 每日 100k 次。儲存類用十進位（1e9），帳單就是這樣算的。
+- **數字有兩個來源，刻意都留著**：
+  - **自己算得出來的**（零設定）：R2 儲存量掃一遍 bucket 加總；
+    **D1 的資料庫大小就掛在任何一句查詢的 `meta.size_after` 上** ——
+    所以 `readR2Scan()` 刻意用 `.all()` 不是 `.first()`（`.first()` 不回 meta），
+    一句查詢同時把掃描狀態跟資料庫大小都拿回來，不為了大小多打一次。
+  - **Cloudflare GraphQL Analytics**（要 `CF_API_TOKEN`）：今日 Workers 請求數、
+    R2 class A／B 次數、D1 讀寫列數。這幾格**沒有第二條路**，Worker 量不出自己
+    今天被打了幾次。⚠️ 沒設 token 時那幾條顯示「未設定」＋**畫面上要寫出怎麼補**
+    （帳號層級、Account Analytics: Read，`wrangler secret put CF_API_TOKEN [--env dev]`）——
+    只寫「未設定」是一條查不下去的死巷。
+    ⚠️⚠️ **`CF_ACCOUNT_ID` 跟 token 是一組的，兩個都要灌**（值在 `npx wrangler whoami`）。
+    本來以為 `cfAccountId()` 問得出來，但**列帳號要的是 `Account Settings: Read`**，
+    而用量條只需要 Analytics —— 只給 Analytics 的 token 打 `viewer { accounts }`
+    會回 **not authorized for that account**（2026-09-01 實測；`accounts` 那個欄位
+    也**不吃 `limit` 參數**，寫了是語法錯誤）。所以那段自動探測只是退路，
+    它的錯誤訊息一定要直接寫出「請灌 CF_ACCOUNT_ID」。
+- ⚠️⚠️ **Analytics 那四段各自一次請求、各自 try**，刻意不合成同一份 GraphQL 文件 ——
+  合起來的話任何一個欄位名對不上就整份查詢失敗，四條條一起變空白而且看不出是哪一段害的。
+  錯誤逐條回到前端（`metrics[].error` ＋ `analytics.errors`）。
+- ⚠️ **時間窗一律用 UTC 算**：Workers 與 D1 的每日額度照 UTC 換日、R2 操作次數以自然月計。
+  用本地時間切窗會在台灣時間早上八點前後整個對不上。
+- ⚠️ **R2 的操作分級要自己對**（GraphQL 只給 `actionType` 字串）：`R2_CLASS_A`／`R2_CLASS_B`
+  ／`R2_FREE_OPS`（刪除是免費的）。對不上的**不要默默丟掉**，收進 `other` 並在畫面上講出來。
+- ⚠️ **掃 R2 是前端的迴圈，不是一次請求**（同「比對全部相簿」、影片回讀、動態照片補掃）：
+  一頁 1000 顆就是一個 subrequest，而免費版單次呼叫上限 50 個。後端一趟掃 8 頁
+  （`R2_SCAN_PAGES_PER_CALL`）並把游標與累計值整包存進 **`AppSetting.usage_r2`**
+  （k/v，**不需要 migration**），前端推到 `done`，另掛 `MAX_ROUNDS`（200）當保險絲。
+  「重新掃描 R2」第一趟送 `reset: true` —— 那顆按鈕的意思是「從頭再算一次」，
+  接著上次的游標會漏掉新物件。
+- ⚠️ **掃描那份只有這個環境的一顆 bucket，帳單看的是整個帳號**（prod ＋ dev 加起來）。
+  所以 analytics 有值時 `r2_storage` 以它為準，掃描那份退成 `<details>` 裡的參考
+  （順便照物件鍵前綴分類：縮圖 800／400、GIF 動畫、頭像、GPS 軌跡、Google 時間軸）。
+- ⚠️ **量不到跟「用了零」要分開講** —— 兩種條都是空的。量不到的畫成斜線底
+  （`.usageUnknown`）並在底下寫出原因，不然使用者會以為這一格真的沒用到額度。
+- ⚠️ 兩支路由**不可以包 `withEdgeCache`**（值一直在變，而且是整個帳號的用量），
+  回 `Cache-Control: no-store`；那一格也**不在進頁時自動抓**（要按按鈕），
+  同 Drive 比對那格的規矩。
 
 ## 工作習慣
 

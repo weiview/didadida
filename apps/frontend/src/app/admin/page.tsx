@@ -16,6 +16,7 @@ import AdminSection from "./AdminSection";
 import DriveCompareCard from "./DriveCompareCard";
 import VideoMetaCard from "./VideoMetaCard";
 import MotionScanCard from "./MotionScanCard";
+import UsageCard from "./UsageCard";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import Avatar from "@/components/Avatar";
 import AvatarPicker from "@/components/AvatarPicker";
@@ -886,6 +887,13 @@ export default function AdminPage() {
       <VideoMetaCard />
 
       <MotionScanCard />
+
+      {/*
+        免費額度用量。這個站整個蓋在 Cloudflare 的免費額度上，而「還剩多少」
+        平常是散在 R2／D1／Workers 三個後台頁面的數字 —— 這一格把會咬人的
+        那幾條收成一排水位條，滿條＝額度用完。
+      */}
+      <UsageCard />
 
       {/*
         GPS 軌跡資料夾。為什麼要一個人一個資料夾：GPSLogger 只拿得到

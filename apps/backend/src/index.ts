@@ -73,6 +73,23 @@ export interface Env {
    * 這樣要換實例或臨時關掉都不必改程式。沒設就等於這個功能關閉。
    */
   VALHALLA_URL?: string;
+  /**
+   * Cloudflare 的 GraphQL Analytics API token（帳號層級、Account Analytics 唯讀）。
+   * **只有 /admin 那格用量條的「今日 Workers 請求數／R2 操作次數／D1 讀寫列數」
+   * 需要它** —— 那幾個數字 Worker 自己量不出來（它不知道自己今天被打了幾次）。
+   *
+   * 沒設的話那幾條顯示「未設定」，其餘（R2 儲存量、D1 大小）照常。
+   * ⚠️ 灌的時候不要用管線（`$v | wrangler secret put`）—— 會多存一個換行。
+   */
+  CF_API_TOKEN?: string;
+  /**
+   * 帳號 id（`npx wrangler whoami` 那張表的 Account ID）。
+   * ⚠️ **跟 CF_API_TOKEN 是一組的，兩個都要設。** 本來以為 token 自己問得出來，
+   *    但列帳號要的是 `Account Settings: Read`，而用量條只需要
+   *    `Account Analytics: Read` —— 只給 Analytics 的 token 打
+   *    `viewer { accounts }` 會回 not authorized（2026-09-01 實測）。
+   */
+  CF_ACCOUNT_ID?: string;
 }
 
 /** AppSetting 的 key。放這麼前面是因為路由與底下的 helper 都會用到 */
@@ -2636,6 +2653,425 @@ const ALLOWED_ORIGINS = [
   "http://127.0.0.1:3000",
 ];
 
+/* ─────────────────────────── 免費額度用量 ────────────────────────────────
+ *
+ * 「還剩多少免費額度」在 Cloudflare 後台是散在四個地方的數字（R2、D1、
+ * Workers、Pages），而不要產生費用是這個站的最高宗旨 —— 所以把會咬人的那幾格
+ * 收成一排用量條放進 /admin。
+ *
+ * 數字有兩個來源，**刻意兩個都留著**：
+ *   ① 自己算得出來的：R2 的儲存量（掃一遍 bucket 把每顆物件的 size 加總）、
+ *      D1 的資料庫大小（**任何一句查詢的 `meta.size_after` 就是**，零成本）。
+ *      不必任何設定，開箱就有。
+ *   ② Cloudflare GraphQL Analytics API：每日 Workers 請求數、R2 的 class A／B
+ *      次數、D1 的讀寫列數。這幾格**沒有第二條路** —— Worker 量不到自己被打了
+ *      幾次，D1 的 meta 也只講得出「這一句讀了幾列」不是「今天總共」。
+ *      要一把帳號層級、Account Analytics 唯讀的 API token（`CF_API_TOKEN`），
+ *      沒設的話那幾條顯示「未設定」，其餘照常。
+ *
+ * ⚠️ 這兩支路由**一律不包 withEdgeCache**：值本來就是一直在變的，而且回應裡是
+ *    整個帳號的用量。GET 只多讀一列 AppSetting，成本可以忽略。
+ */
+
+/** 掃描結果放這個 AppSetting（k/v，**不需要 migration**） */
+const SETTING_USAGE_R2 = "usage_r2";
+
+/**
+ * 免費額度。**這是這幾個數字唯一的來源**，前端只負責畫條 ——
+ * Cloudflare 哪天調額度就只改這裡一處。
+ * 儲存類用十進位 GB（1e9），Cloudflare 帳單就是這樣算的。
+ */
+const USAGE_LIMITS = {
+  r2_storage: 10_000_000_000,   // R2 儲存 10 GB
+  r2_class_a: 1_000_000,        // R2 寫入類操作，每月 1M
+  r2_class_b: 10_000_000,       // R2 讀取類操作，每月 10M
+  d1_storage: 5_000_000_000,    // D1 儲存 5 GB
+  d1_rows_read: 5_000_000,      // D1 每日讀取列數
+  d1_rows_written: 100_000,     // D1 每日寫入列數
+  workers_requests: 100_000,    // Workers 每日請求數
+} as const;
+
+/**
+ * R2 的操作分兩級收費，而 GraphQL 只給 `actionType` 這個字串，分級要自己對。
+ * ⚠️ 對不到的**不要默默丟掉**，收進 `other` 讓畫面講出來 —— Cloudflare 加了新的
+ * actionType 時，安靜地少算比端出一個沒看過的名字危險。
+ */
+const R2_CLASS_A = new Set([
+  "PutObject", "CopyObject", "ListObjects", "ListBuckets", "PutBucket", "CreateBucket",
+  "CreateMultipartUpload", "CompleteMultipartUpload", "UploadPart", "UploadPartCopy",
+  "ListMultipartUploads", "ListParts", "PutBucketEncryption", "PutBucketCors",
+  "PutBucketLifecycleConfiguration", "PutBucketStorageClass", "LifecycleStorageTierTransition",
+]);
+const R2_CLASS_B = new Set([
+  "GetObject", "HeadObject", "HeadBucket", "UsageSummary",
+  "GetBucketEncryption", "GetBucketCors", "GetBucketLifecycleConfiguration",
+]);
+/** 刪除是免費的，別算進任何一級 */
+const R2_FREE_OPS = new Set([
+  "DeleteObject", "DeleteObjects", "DeleteBucket", "AbortMultipartUpload",
+]);
+
+/** 一趟掃幾頁。一頁 1000 顆＝1 個 subrequest，而免費版單次呼叫上限 50 個 */
+const R2_SCAN_PAGES_PER_CALL = 8;
+
+type R2ScanKinds = Record<string, { objects: number; bytes: number }>;
+type R2ScanState = {
+  bytes: number;
+  objects: number;
+  kinds: R2ScanKinds;
+  cursor: string | null;
+  done: boolean;
+  started_at: string;
+  scanned_at: string | null;
+};
+
+/** 物件鍵長什麼樣 → 這顆是誰的。前綴規則見 `/api/upload`、avatarR2Key、matchedKey */
+function r2KeyKind(key: string): string {
+  if (key.startsWith("thumbsm_")) return "縮圖 400px";
+  if (key.startsWith("thumb_")) return "縮圖 800px";
+  if (key.startsWith("gif_")) return "GIF 動畫";
+  if (key.startsWith("avatars/")) return "頭像";
+  if (key.startsWith("tracks/")) return "GPS 軌跡";
+  if (key.startsWith("timeline/")) return "Google 時間軸";
+  return "其他";
+}
+
+async function readR2Scan(env: Env): Promise<{ state: R2ScanState | null; d1Bytes: number | null }> {
+  /*
+   * ⚠️ 用 `.all()` 不是 `.first()`：**D1 的資料庫大小就掛在 `meta.size_after` 上**，
+   * 而 `.first()` 不回 meta。於是這一句同時做完兩件事，不必為了大小多打一次查詢。
+   */
+  const res = await env.DB.prepare(
+    "SELECT value FROM AppSetting WHERE key = ?",
+  ).bind(SETTING_USAGE_R2).all<any>();
+  const size = Number((res as any)?.meta?.size_after);
+  let state: R2ScanState | null = null;
+  try {
+    const raw = res.results?.[0]?.value;
+    if (raw) state = JSON.parse(raw as string) as R2ScanState;
+  } catch { state = null; }
+  return { state, d1Bytes: Number.isFinite(size) && size > 0 ? size : null };
+}
+
+/** 打 Cloudflare 的 GraphQL Analytics API。回 `data`，讓呼叫端自己往下挖 */
+async function cfGraphQL(
+  token: string, query: string, variables: Record<string, unknown>,
+): Promise<any> {
+  const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json: any = await res.json().catch(() => null);
+  const gqlErr = Array.isArray(json?.errors) && json.errors.length
+    ? json.errors.map((e: any) => e?.message).filter(Boolean).join("；")
+    : null;
+  if (!res.ok) throw new Error(`Cloudflare 回 ${res.status}${gqlErr ? `：${gqlErr}` : ""}`);
+  if (gqlErr) throw new Error(gqlErr);
+  if (!json?.data) throw new Error("Cloudflare 回了預期外的內容");
+  return json.data;
+}
+
+/**
+ * 帳號 id。以 `CF_ACCOUNT_ID` 為準。
+ *
+ * ⚠️⚠️ 底下那條「自己問」是**退路，而且多半問不出來** —— 列帳號要的是
+ *    `Account Settings: Read`，而用量條只需要 `Account Analytics: Read`。
+ *    只給 Analytics 的 token 打 `viewer { accounts }` 會回
+ *    **not authorized for that account**（2026-09-01 實測）。
+ *    所以正常的設定是**兩個都灌**：`CF_API_TOKEN` ＋ `CF_ACCOUNT_ID`
+ *    （值就是 `npx wrangler whoami` 那張表的 Account ID）。
+ *    ⚠️ `accounts` 這個欄位**不吃 `limit` 參數**，寫了會當場是語法錯誤。
+ */
+async function cfAccountId(env: Env, token: string): Promise<string> {
+  const fixed = (env.CF_ACCOUNT_ID || "").trim();
+  if (fixed) return fixed;
+  const data = await cfGraphQL(token, "{ viewer { accounts { accountTag } } }", {});
+  const tag = data?.viewer?.accounts?.[0]?.accountTag;
+  if (!tag) throw new Error("這把 token 列不出帳號，請另外設定 CF_ACCOUNT_ID");
+  return String(tag);
+}
+
+type UsageMetric = {
+  key: string;
+  used: number | null;
+  limit: number;
+  unit: "bytes" | "count";
+  /** now＝當下的量、day＝今天（UTC 換日）、month＝本月（UTC） */
+  period: "now" | "day" | "month";
+  /** 這個數字哪來的，畫面上要講出來 */
+  source: "scan" | "analytics" | "d1_meta" | null;
+  error?: string;
+};
+
+/**
+ * 把用量湊齊。**Analytics 那四段各自一次請求、各自 try** ——
+ * 合成同一份 GraphQL 文件的話，任何一個欄位名對不上就整份查詢失敗，
+ * 於是四條用量條會一起變空白，而且看不出是哪一段害的。
+ */
+async function collectUsage(env: Env): Promise<any> {
+  const { state, d1Bytes } = await readR2Scan(env);
+  const scanDone = state?.done ? state : null;
+
+  const metrics: Record<string, UsageMetric> = {
+    r2_storage: {
+      key: "r2_storage", used: scanDone ? scanDone.bytes : null, limit: USAGE_LIMITS.r2_storage,
+      unit: "bytes", period: "now", source: scanDone ? "scan" : null,
+    },
+    r2_class_a: {
+      key: "r2_class_a", used: null, limit: USAGE_LIMITS.r2_class_a,
+      unit: "count", period: "month", source: null,
+    },
+    r2_class_b: {
+      key: "r2_class_b", used: null, limit: USAGE_LIMITS.r2_class_b,
+      unit: "count", period: "month", source: null,
+    },
+    d1_storage: {
+      key: "d1_storage", used: d1Bytes, limit: USAGE_LIMITS.d1_storage,
+      unit: "bytes", period: "now", source: d1Bytes == null ? null : "d1_meta",
+    },
+    d1_rows_read: {
+      key: "d1_rows_read", used: null, limit: USAGE_LIMITS.d1_rows_read,
+      unit: "count", period: "day", source: null,
+    },
+    d1_rows_written: {
+      key: "d1_rows_written", used: null, limit: USAGE_LIMITS.d1_rows_written,
+      unit: "count", period: "day", source: null,
+    },
+    workers_requests: {
+      key: "workers_requests", used: null, limit: USAGE_LIMITS.workers_requests,
+      unit: "count", period: "day", source: null,
+    },
+  };
+
+  const breakdown: Record<string, any[]> = { r2_ops: [], workers: [], d1: [], r2_buckets: [] };
+  const token = (env.CF_API_TOKEN || "").trim();
+  const analytics: any = {
+    configured: !!token, account_id: null as string | null, errors: [] as string[],
+  };
+
+  if (token) {
+    /*
+     * 時間窗。Workers 與 D1 的每日額度是**照 UTC 換日**的，R2 的操作次數則以
+     * 自然月計 —— 用本地時間切窗會在台灣時間早上八點前後整個對不上。
+     */
+    const now = new Date();
+    const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const dayAgo = new Date(now.getTime() - 24 * 3600 * 1000);
+    const iso = (d: Date) => d.toISOString();
+    const ymd = (d: Date) => d.toISOString().slice(0, 10);
+
+    let acct: string | null = null;
+    try {
+      acct = await cfAccountId(env, token);
+      analytics.account_id = acct;
+    } catch (e: any) {
+      /*
+       * ⚠️ 這一句要直接寫出解法。只給 Account Analytics: Read 的 token 列不出
+       *    帳號（Cloudflare 回 not authorized for that account），照抄那句話
+       *    等於留給使用者一條查不下去的死巷 —— 他要做的其實只是灌 CF_ACCOUNT_ID。
+       */
+      analytics.errors.push(
+        `找不到帳號 id：${e?.message || e}。`
+        + "請灌 CF_ACCOUNT_ID（值在 npx wrangler whoami 的 Account ID 那一欄）",
+      );
+    }
+
+    if (acct) {
+      const A = acct;
+
+      // ① Workers 今日請求數
+      try {
+        const data = await cfGraphQL(token, `
+          query($a: String!, $s: Time!, $e: Time!) {
+            viewer { accounts(filter: { accountTag: $a }) {
+              workersInvocationsAdaptive(limit: 100, filter: { datetime_geq: $s, datetime_leq: $e }) {
+                sum { requests }
+                dimensions { scriptName }
+              }
+            } }
+          }`, { a: A, s: iso(dayStart), e: iso(now) });
+        const rows: any[] = data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive ?? [];
+        let total = 0;
+        for (const r of rows) {
+          const n = Number(r?.sum?.requests ?? 0) || 0;
+          total += n;
+          breakdown.workers.push({ name: r?.dimensions?.scriptName ?? "?", requests: n });
+        }
+        breakdown.workers.sort((x, y) => y.requests - x.requests);
+        metrics.workers_requests.used = total;
+        metrics.workers_requests.source = "analytics";
+      } catch (e: any) {
+        metrics.workers_requests.error = String(e?.message || e);
+        analytics.errors.push(`Workers 請求數：${e?.message || e}`);
+      }
+
+      // ② R2 儲存量（過去 24 小時的高點 —— Cloudflare 這份是按小時取樣的）
+      try {
+        const data = await cfGraphQL(token, `
+          query($a: String!, $s: Time!, $e: Time!) {
+            viewer { accounts(filter: { accountTag: $a }) {
+              r2StorageAdaptiveGroups(limit: 50, filter: { datetime_geq: $s, datetime_leq: $e }) {
+                max { objectCount payloadSize metadataSize }
+                dimensions { bucketName }
+              }
+            } }
+          }`, { a: A, s: iso(dayAgo), e: iso(now) });
+        const rows: any[] = data?.viewer?.accounts?.[0]?.r2StorageAdaptiveGroups ?? [];
+        let total = 0;
+        for (const r of rows) {
+          const bytes = (Number(r?.max?.payloadSize ?? 0) || 0)
+            + (Number(r?.max?.metadataSize ?? 0) || 0);
+          total += bytes;
+          breakdown.r2_buckets.push({
+            name: r?.dimensions?.bucketName ?? "?",
+            bytes, objects: Number(r?.max?.objectCount ?? 0) || 0,
+          });
+        }
+        breakdown.r2_buckets.sort((x, y) => y.bytes - x.bytes);
+        /*
+         * ⚠️ 帳單看的是**整個帳號**（prod ＋ dev ＋ preview 三顆 bucket 加起來），
+         * 而自己掃的那份只有這個環境的一顆。所以 analytics 有值就以它為準，
+         * 掃描那份退成旁邊的參考數字。
+         */
+        if (rows.length) {
+          metrics.r2_storage.used = total;
+          metrics.r2_storage.source = "analytics";
+        }
+      } catch (e: any) {
+        metrics.r2_storage.error = String(e?.message || e);
+        analytics.errors.push(`R2 儲存量：${e?.message || e}`);
+      }
+
+      // ③ R2 本月的操作次數，分 class A／B
+      try {
+        const data = await cfGraphQL(token, `
+          query($a: String!, $s: Time!, $e: Time!) {
+            viewer { accounts(filter: { accountTag: $a }) {
+              r2OperationsAdaptiveGroups(limit: 200, filter: { datetime_geq: $s, datetime_leq: $e }) {
+                sum { requests }
+                dimensions { actionType }
+              }
+            } }
+          }`, { a: A, s: iso(monthStart), e: iso(now) });
+        const rows: any[] = data?.viewer?.accounts?.[0]?.r2OperationsAdaptiveGroups ?? [];
+        let a = 0, b = 0, other = 0;
+        for (const r of rows) {
+          const action = String(r?.dimensions?.actionType ?? "?");
+          const n = Number(r?.sum?.requests ?? 0) || 0;
+          const cls = R2_CLASS_A.has(action) ? "A"
+            : R2_CLASS_B.has(action) ? "B"
+            : R2_FREE_OPS.has(action) ? "free" : "?";
+          if (cls === "A") a += n;
+          else if (cls === "B") b += n;
+          else if (cls === "?") other += n;
+          breakdown.r2_ops.push({ name: action, requests: n, cls });
+        }
+        breakdown.r2_ops.sort((x, y) => y.requests - x.requests);
+        metrics.r2_class_a.used = a;
+        metrics.r2_class_a.source = "analytics";
+        metrics.r2_class_b.used = b;
+        metrics.r2_class_b.source = "analytics";
+        if (other > 0) {
+          analytics.errors.push(`有 ${other} 次操作的分級對不上（見明細裡 cls = ? 的那幾列）`);
+        }
+      } catch (e: any) {
+        metrics.r2_class_a.error = String(e?.message || e);
+        metrics.r2_class_b.error = metrics.r2_class_a.error;
+        analytics.errors.push(`R2 操作次數：${e?.message || e}`);
+      }
+
+      // ④ D1 今日讀寫列數
+      try {
+        const data = await cfGraphQL(token, `
+          query($a: String!, $s: Date!, $e: Date!) {
+            viewer { accounts(filter: { accountTag: $a }) {
+              d1AnalyticsAdaptiveGroups(limit: 100, filter: { date_geq: $s, date_leq: $e }) {
+                sum { readQueries writeQueries rowsRead rowsWritten }
+                dimensions { databaseId }
+              }
+            } }
+          }`, { a: A, s: ymd(dayStart), e: ymd(now) });
+        const rows: any[] = data?.viewer?.accounts?.[0]?.d1AnalyticsAdaptiveGroups ?? [];
+        let read = 0, written = 0;
+        for (const r of rows) {
+          const rr = Number(r?.sum?.rowsRead ?? 0) || 0;
+          const rw = Number(r?.sum?.rowsWritten ?? 0) || 0;
+          read += rr;
+          written += rw;
+          breakdown.d1.push({
+            name: String(r?.dimensions?.databaseId ?? "?").slice(0, 8),
+            rows_read: rr, rows_written: rw,
+            queries: (Number(r?.sum?.readQueries ?? 0) || 0)
+              + (Number(r?.sum?.writeQueries ?? 0) || 0),
+          });
+        }
+        breakdown.d1.sort((x, y) => y.rows_read - x.rows_read);
+        metrics.d1_rows_read.used = read;
+        metrics.d1_rows_read.source = "analytics";
+        metrics.d1_rows_written.used = written;
+        metrics.d1_rows_written.source = "analytics";
+      } catch (e: any) {
+        metrics.d1_rows_read.error = String(e?.message || e);
+        metrics.d1_rows_written.error = metrics.d1_rows_read.error;
+        analytics.errors.push(`D1 讀寫列數：${e?.message || e}`);
+      }
+    }
+  }
+
+  return {
+    success: true,
+    generated_at: new Date().toISOString(),
+    metrics: Object.values(metrics),
+    breakdown,
+    analytics,
+    r2_scan: state,
+  };
+}
+
+/**
+ * 掃一段 bucket 把物件大小加總。狀態整包塞在 `AppSetting.usage_r2` 那一列 JSON 裡
+ * （k/v，**不需要 migration**），由前端推 `cursor` 迴圈直到 `done` ——
+ * 跟「比對全部相簿」與影片回讀完全同一個做法（subrequest 預算）。
+ */
+async function scanR2Usage(env: Env, reset: boolean): Promise<R2ScanState> {
+  const { state: prev } = await readR2Scan(env);
+  // 上一輪已經跑完（或根本沒跑過）就從頭開始，不然接著上次的游標往下走
+  const fresh = reset || !prev || prev.done;
+  const state: R2ScanState = fresh
+    ? {
+        bytes: 0, objects: 0, kinds: {}, cursor: null, done: false,
+        started_at: new Date().toISOString(), scanned_at: null,
+      }
+    : prev!;
+
+  let cursor = state.cursor ?? undefined;
+  for (let i = 0; i < R2_SCAN_PAGES_PER_CALL; i++) {
+    const page = await env.BUCKET.list({ limit: 1000, cursor });
+    for (const obj of page.objects) {
+      state.objects++;
+      state.bytes += obj.size;
+      const kind = r2KeyKind(obj.key);
+      const slot = state.kinds[kind] || (state.kinds[kind] = { objects: 0, bytes: 0 });
+      slot.objects++;
+      slot.bytes += obj.size;
+    }
+    if (!page.truncated) {
+      state.cursor = null;
+      state.done = true;
+      state.scanned_at = new Date().toISOString();
+      break;
+    }
+    cursor = (page as any).cursor;
+    state.cursor = cursor ?? null;
+  }
+
+  await setSetting(env, SETTING_USAGE_R2, JSON.stringify(state));
+  return state;
+}
+
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -3461,6 +3897,45 @@ if (method === "POST" && pathname === "/api/verify-password") {
           found_total_before: Number(hits?.n ?? 0),
           ...result,
         }), { headers });
+      }
+
+      /* ── 後台：免費額度用量 ────────────────────────────────────────────────
+       *
+       * ⚠️ 兩支都**不包 withEdgeCache**：值一直在變，而且回應裡是整個帳號的用量。
+       * ⚠️ 前端那一格**不在進頁時自動抓**（要按按鈕），同 Drive 比對那格的規矩。
+       */
+      if (pathname === "/api/admin/usage" && method === "GET") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.canManageOthers) {
+          return forbidden(headers, "這是整個帳號的用量，只有可以管理全站內容的帳號看得到");
+        }
+        const usage = await collectUsage(env);
+        return new Response(JSON.stringify(usage), {
+          headers: { ...headers, "Cache-Control": "no-store" },
+        });
+      }
+
+      /*
+       * 掃一段 R2 把物件大小加總。⚠️ **一趟只掃幾頁，由前端推 cursor 迴圈** ——
+       * 一頁 1000 顆就是一個 subrequest，而免費版單次呼叫上限 50 個
+       * （同「比對全部相簿」、影片回讀、動態照片補掃的做法）。
+       */
+      if (pathname === "/api/admin/usage/r2-scan" && method === "POST") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.canManageOthers) {
+          return forbidden(headers, "這會掃過整個 bucket，只有可以管理全站內容的帳號能做");
+        }
+        const body = await request.json().catch(() => ({})) as { reset?: unknown };
+        const state = await scanR2Usage(env, body.reset === true);
+        return new Response(JSON.stringify({ success: true, ...state }), {
+          headers: { ...headers, "Cache-Control": "no-store" },
+        });
       }
 
       /* ── 後台：白名單管理 ──────────────────────────────────────────────────
