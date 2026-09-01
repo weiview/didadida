@@ -2216,7 +2216,7 @@ export async function saveAlbumDriveFolder(
 
 export interface DrivePendingPhoto {
   id: number;
-  /** 它在哪一本相簿。清單上那顆「看照片」用它組 /album/<album_id>?photo=<id> */
+  /** 它在哪一本相簿。清單上那顆「看照片」用它組 /album?id=<album_id>&photo=<id> */
   album_id?: number;
   /** 那本相簿的名字。要重傳的人得知道該打開哪一本 */
   album_name?: string | null;

@@ -143,9 +143,14 @@ export default function MotionScanCard() {
           </div>
           {items.map((it) => (
             <div key={it.id} className={styles.detailRow}>
+              {/*
+                * ⚠️⚠️ 相簿頁是 `/album?id=<相簿>`，**不是** `/album/<相簿>`。
+                *    前端是 `output: "export"` 的純靜態站，`src/app/album/` 底下
+                *    沒有 `[id]` 這一層，多打一段路徑就是實實在在的 404。
+                */}
               <a
                 className={styles.detailName}
-                href={`/album/${it.album_id}?photo=${it.id}`}
+                href={`/album?id=${it.album_id}&photo=${it.id}`}
                 target="_blank"
                 rel="noreferrer"
                 title="在新分頁看這張照片"

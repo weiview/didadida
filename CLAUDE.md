@@ -1368,7 +1368,7 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
 剪貼簿被擋掉（權限、非安全來源）要 `window.prompt` 把字攤開來讓人自己選，
 只 console.error 又是一次「按了沒反應」。
 
-一列右邊另外一顆**「看照片 ↗」**在新分頁開 `/album/<album_id>?photo=<id>` ——
+一列右邊另外一顆**「看照片 ↗」**在新分頁開 `/album?id=<album_id>&photo=<id>` ——
 回答的是另一個問題：「這個檔名到底是**哪一張**」。要人自己複製檔名去首頁搜尋
 是繞遠路，這裡明明就握著 id。**另開分頁**是因為看完還要回來看清單的下一列。
 
@@ -1378,6 +1378,10 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
   不要組出 `/album/undefined`。
 - ⚠️ 那一列因此是 `div` 包一顆 `button`（檔名／複製）＋一個 `a`（看照片），
   **不是整列一顆 button** —— button 裡面不能再放 button／a。
+- ⚠️⚠️ **相簿頁是 `/album?id=<相簿>`，不是 `/album/<相簿>`。** 前端是 `output: "export"` 的
+  純靜態站，`src/app/album/` 底下沒有 `[id]` 這一層 —— 多打一段路徑就是實實在在的 404。
+  三張後台卡片（補傳清單、影片的 Metadata、Android 動態照片）都各自踩過一次，
+  **新增任何連到某一張照片的連結前先看一眼這一條**。
 - 清單刻意**不列縮圖**：一次幾百張就是幾百次 Workers 請求。要看是哪一張是
   使用者一次點一張的動作，不是一開頁就全部載進來。
 - ⚠️ 那一格**不在進頁時自動抓**（要按「看清單」），跟 Drive 對帳那一格同一個規矩 ——
