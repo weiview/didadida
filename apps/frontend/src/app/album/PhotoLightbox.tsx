@@ -10,6 +10,7 @@ import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from 
 import { setExifExpanded, useExifExpanded } from "@/lib/exifPref";
 import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
+import { formatDuration } from "@/lib/videoUtils";
 
 // 只有顯示用的中文說明，值域本身定義在 geo.ts
 const TIME_SOURCE_LABEL: Record<string, string> = {
@@ -582,6 +583,40 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
     { label: '焦距', value: parsedExif?.FocalLength ? `${parsedExif.FocalLength}mm` : null },
   ].filter(item => item.value);
 
+  /*
+   * 影片的 Metadata（`exif._video`，見 lib/videoMeta.ts）。
+   *
+   * ⚠️ 「影片沒有 metadata」是誤解 —— mp4／mov 把機身、型號、解析度、編碼、
+   *    影格率、建立時間、座標全記在 moov box 裡，只是我們以前沒讀。上傳時在
+   *    瀏覽器解、存量的由 /admin「影片的 Metadata」回讀，兩條路都寫進
+   *    `Photo.exif` 的 `_video` 底下。所以影片這一塊**不是空的**，
+   *    面板的名字也跟著從「照片資訊 (EXIF)」換成「影片的 Metadata」。
+   * ⚠️ 沒對照到常用鍵的原始標籤（`Tags`）照樣一條一條列出來 —— 使用者要的是
+   *    「檔案裡所有的 metadata」，挑幾格端出來等於又替他決定哪些不重要。
+   */
+  const videoMeta = (parsedExif?._video ?? null) as Record<string, any> | null;
+  const videoTags: Record<string, string> = videoMeta?.Tags ?? {};
+  const videoMetaItems = [
+    { label: '相機', value: videoMeta?.Make },
+    { label: '型號', value: videoMeta?.Model },
+    { label: '軟體', value: videoMeta?.Software },
+    {
+      label: '解析度',
+      value: videoMeta?.Width && videoMeta?.Height
+        ? `${videoMeta.Width} × ${videoMeta.Height}`
+        : null,
+    },
+    { label: '旋轉', value: videoMeta?.Rotation ? `${videoMeta.Rotation}°` : null },
+    { label: '長度', value: formatDuration(videoMeta?.DurationMs ?? photo.duration_ms) },
+    { label: '影格率', value: videoMeta?.FrameRate ? `${videoMeta.FrameRate} fps` : null },
+    { label: '視訊編碼', value: videoMeta?.VideoCodec },
+    { label: '音訊編碼', value: videoMeta?.AudioCodec },
+    ...Object.keys(videoTags).map((k) => ({ label: k, value: videoTags[k] })),
+  ].filter(item => item.value);
+
+  /** 兩邊畫的是同一個 grid（欄位長得一樣），差別只在資料從哪一塊來 */
+  const infoItems = isVideo(photo) ? videoMetaItems : exifItems;
+
   return (
     /*
      * ⚠️ `data-lightbox` 是給**相簿格線與首頁那兩支改欄數的捏合**認的記號
@@ -898,14 +933,14 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           {/* 「不開放」的開關在照片左上角（見 imageContainer 裡那顆），不在這一欄 */}
 
           {/*
-            * 照片資訊。**影片也端這一塊**（以前整塊擋掉）—— 裡面的相機參數對它
-            * 確實是空的，但「拍攝時間」與「時間來源」那兩格對影片才是最要緊的：
-            * 影片的封面圖是瀏覽器 canvas 畫出來的，沒有 EXIF，時間得人自己指定，
-            * 不然它在相簿裡永遠浮在最前面排不進去。
+            * 照片資訊。**影片也端這一塊**，而且端的東西跟照片一樣多 ——
+            * 照片有 EXIF、影片有 moov 裡的 metadata（機身、型號、解析度、編碼…），
+            * 所以標題跟著換成「影片的 Metadata」。「拍攝時間」與「時間來源」
+            * 那兩格對影片尤其要緊：讀不到時間的影片在相簿裡會一直浮在最前面。
             */}
           <div className={styles.exifToggleRow}>
             <div className={styles.switchWrapper}>
-              <span>{isVideo(photo) ? '顯示影片資訊' : '顯示照片資訊 (EXIF)'}</span>
+              <span>{isVideo(photo) ? '顯示影片的 Metadata' : '顯示照片資訊 (EXIF)'}</span>
               <label className={styles.switch}>
                 <input type="checkbox" checked={showExif} onChange={(e) => setExifExpanded(e.target.checked)} />
                 <span className={styles.slider}></span>
@@ -926,7 +961,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                   <span className={styles.exifLabel}>拍攝時間</span>
                   <span className={styles.exifValue}>
                     {displayDate
-                      || (isVideo(photo) ? '未指定（影片沒有 EXIF）'
+                      || (isVideo(photo) ? '未指定（檔案裡沒有寫時間）'
                         : isGif(photo) ? '未指定（GIF 沒有 EXIF）' : '未知')}
                   </span>
                 </div>
@@ -949,8 +984,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                   </span>
                 </div>
 
-                {exifItems.length > 0 ? (
-                  exifItems.map(item => (
+                {infoItems.length > 0 ? (
+                  infoItems.map(item => (
                     <div className={styles.exifItem} key={item.label}>
                       <span className={styles.exifLabel}>{item.label}</span>
                       <span className={styles.exifValue}>{item.value}</span>
@@ -960,7 +995,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                   <div className={styles.exifItem}>
                     <span className={styles.exifValue} style={{ color: '#888' }}>
                       {isVideo(photo)
-                        ? '影片沒有相機參數（封面圖是瀏覽器畫的）'
+                        ? '還沒讀過這支影片的 metadata（站長可以到後台「影片的 Metadata」回讀一次）'
                         : isGif(photo)
                           ? 'GIF 沒有相機參數'
                           : '此照片無其他 EXIF 參數'}

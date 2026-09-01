@@ -2186,6 +2186,10 @@ interface VideoMetaItem {
   how: string;
   wrote_time: boolean;
   wrote_geo: boolean;
+  /** 讀到的 metadata 整批寫進 `Photo.exif` 了沒（燈箱那塊面板吃它） */
+  wrote_exif: boolean;
+  /** 座標沒動：那是使用者親手標的打卡地點（`geo_source = 'manual'`） */
+  kept_manual_geo?: boolean;
   taken_at_local: string | null;
   tz_offset_minutes: number | null;
   time_source: string | null;
@@ -2243,23 +2247,32 @@ function driveRangeReader(saKey: string, fileId: string): {
 /**
  * 回寫一批影片的拍攝時間與座標。
  *
- * ⚠️ 兩個 UPDATE 都帶著「原本是空的」那個條件：
- *   - 時間：`AND taken_at IS NULL` —— 已經有時間的（包含使用者手動指定過的）
- *     一律不碰。影片的 metadata 沒有相機 EXIF 可信，人講的話更算數。
- *   - 座標：`AND lat IS NULL` ＋ `geoOverwriteGuard('exif')` —— 手動標過的
- *     地點是最高權威，不能被檔案裡那顆可能飄掉的 GPS 蓋掉。
+ * ## 回寫是**覆蓋**，不是只補空格（2026-09-01 使用者拍板）
+ *
+ * 影片檔裡那些值是**檔案自己記著的事實**（mvhd 的建立時間、`©xyz` 的座標、
+ * 機身、型號、軟體、解析度、編碼…），只有「時區」那一層是推出來的
+ * —— mvhd 沒有時區，見 videoMeta.ts 檔頭的四層。存量影片當初沒有人讀得到，
+ * 所以站上那些時間全是人一支一支手動填的；使用者要的就是拿檔案裡的蓋掉它們。
+ *
+ * ⚠️⚠️ **只覆蓋「檔案裡真的有值」的那幾格。** 讀不到時間就維持原樣，
+ *    **絕不把手動填過的時間清成 NULL** —— 那是把資料弄丟，不是回寫。
+ * ⚠️ 座標唯一的例外是 `geo_source = 'manual'`（`geoOverwriteGuard('exif')`）：
+ *    那是使用者親手在地圖上標的打卡地點，旁邊還掛著一個 `place_name`。
+ *    用檔案裡那顆可能飄掉的 GPS 蓋過去，地名會留在原地變成一句假話。
+ *    時間沒有這個問題（時間沒有名字），所以時間照覆蓋。
+ * ⚠️ **值一樣就不下 UPDATE** —— 跑第二次不該產生任何 D1 寫入，
+ *    `updated` 也才講得出「這一趟真的改了幾支」。
+ *
+ * ## 讀到的東西整批存進 `Photo.exif`
+ *
+ * `videoMetaToExif()` 把所有 metadata 掛在 `exif._video` 底下（**不需要
+ * migration**，那一欄本來就是 TEXT、影片一直是空的）。燈箱那塊面板拿它畫出
+ * 「照片有 EXIF、影片有 Metadata」，欄位一一對應。
  *
  * ## `compare` ＝重讀比對，**一個位元組都不寫**
  *
- * 上面那兩個條件的代價是：**每一格都已經有值的站台，這支路由永遠回報 0**
- * —— 老實但沒用，使用者只會覺得功能壞了（2026-08-31 就是這樣被回報的）。
- * 那時真正想問的問題其實是另一個：**「我當初手動填的，跟影片檔自己寫的
- * 一不一樣？」** 所以多一個模式：條件放寬成「所有影片」，照樣去 Drive 讀，
- * 但只把兩邊的值並排回報，不下任何 UPDATE。
- *
- * ⚠️ 刻意**不做「比對完順手改掉」** —— 手動填的值是人講的話，比檔案裡那個
- *    推出來的時間更算數（見上面兩個條件的理由）。要改的話使用者自己在燈箱裡
- *    「指定時間」，那本來就是那顆按鈕存在的原因。
+ * 覆蓋是不可逆的（原本手動填的值沒有備份），所以動手之前要看得到差在哪。
+ * 這個模式照樣去 Drive 讀，但只把「站上存的」跟「檔案裡寫的」並排回報。
  */
 async function backfillVideoMeta(
   env: Env, saKey: string, cursor: number, limit: number, compare = false,
@@ -2269,11 +2282,10 @@ async function backfillVideoMeta(
 }> {
   const { results } = await env.DB.prepare(`
     SELECT id, title, album_id, drive_original_id, taken_at, lat, lng,
-           taken_at_local, tz_offset_minutes, time_source
+           taken_at_local, tz_offset_minutes, time_source, geo_source, exif
       FROM Photo
      WHERE media_type = 'video'
        AND drive_original_id IS NOT NULL
-       ${compare ? "" : "AND (taken_at IS NULL OR lat IS NULL)"}
        AND id > ?
      ORDER BY id
      LIMIT ?
@@ -2293,6 +2305,7 @@ async function backfillVideoMeta(
       how: "none",
       wrote_time: false,
       wrote_geo: false,
+      wrote_exif: false,
       taken_at_local: null,
       tz_offset_minutes: null,
       time_source: null,
@@ -2313,12 +2326,14 @@ async function backfillVideoMeta(
       const shape = videoMetaToExif(meta, item.title);
       item.how = shape.how;
       const geo = normalizeGeo(shape.exif, shape.fallbackIso);
+      // 座標存進 D1 是 REAL，字面比對必定處處不同 —— 1e-5 約等於 1 公尺
+      const near = (a: number | null, b: number | null) =>
+        a !== null && b !== null && Math.abs(a - b) < 1e-5;
 
       if (compare) {
         /*
          * 只並排、不寫。兩邊的「不一樣」分開判斷：時間差一個時區跟座標飄掉
          * 是兩件不同的事，混成一個布林值就查不下去了。
-         * 座標容差 1e-5（約 1 公尺）—— 存進 D1 是 REAL，字面比對必定處處不同。
          */
         item.stored_taken_at_local = row.taken_at_local ?? null;
         item.stored_tz_offset_minutes = row.tz_offset_minutes ?? null;
@@ -2333,8 +2348,6 @@ async function backfillVideoMeta(
 
         const timeDiffers = geo.takenAtLocal !== null
           && geo.takenAtLocal !== (row.taken_at_local ?? null);
-        const near = (a: number | null, b: number | null) =>
-          a !== null && b !== null && Math.abs(a - b) < 1e-5;
         const geoDiffers = geo.lat !== null && geo.lng !== null
           && !(near(geo.lat, row.lat ?? null) && near(geo.lng, row.lng ?? null));
         item.differs = timeDiffers || geoDiffers;
@@ -2343,32 +2356,62 @@ async function backfillVideoMeta(
         continue;
       }
 
-      if (row.taken_at === null && geo.takenAtUtc) {
+      // 讀到什麼就報什麼（寫不寫得進去是另一回事，看 wrote_* 那三格）
+      item.taken_at_local = geo.takenAtLocal;
+      item.tz_offset_minutes = geo.tzOffsetMinutes;
+      item.time_source = geo.timeSource;
+      item.lat = geo.lat;
+      item.lng = geo.lng;
+
+      /*
+       * 時間：檔案裡有就蓋過去（連手動填的一起）。
+       * ⚠️ `takenAtUtc` 是 null 時**什麼都不做** —— 讀不到不代表原本那個值是錯的，
+       *    清成 NULL 是把資料弄丟，不是回寫。
+       */
+      if (geo.takenAtUtc && (
+        geo.takenAtUtc !== (row.taken_at ?? null)
+        || geo.takenAtLocal !== (row.taken_at_local ?? null)
+        || geo.tzOffsetMinutes !== (row.tz_offset_minutes ?? null)
+        || geo.timeSource !== (row.time_source ?? null)
+      )) {
         const r = await env.DB.prepare(`
           UPDATE Photo
              SET taken_at = ?, taken_at_local = ?, tz_offset_minutes = ?, time_source = ?
-           WHERE id = ? AND taken_at IS NULL
+           WHERE id = ?
         `).bind(
           geo.takenAtUtc, geo.takenAtLocal, geo.tzOffsetMinutes, geo.timeSource, id,
         ).run();
         item.wrote_time = Number((r as any)?.meta?.changes ?? 0) > 0;
-        item.taken_at_local = geo.takenAtLocal;
-        item.tz_offset_minutes = geo.tzOffsetMinutes;
-        item.time_source = geo.timeSource;
       }
 
-      if (row.lat === null && geo.lat !== null && geo.lng !== null) {
+      /*
+       * 座標：同樣覆蓋，但**手動標的打卡地點碰不得**（那道閘在 SQL 裡）——
+       * 座標被蓋掉而 `place_name` 留在原地，地名就變成一句假話。
+       */
+      if (geo.lat !== null && geo.lng !== null
+        && !(near(geo.lat, row.lat ?? null) && near(geo.lng, row.lng ?? null))) {
         const r = await env.DB.prepare(`
           UPDATE Photo
              SET lat = ?, lng = ?, geo_source = 'exif'
-           WHERE id = ? AND lat IS NULL${geoOverwriteGuard("exif")}
+           WHERE id = ?${geoOverwriteGuard("exif")}
         `).bind(geo.lat, geo.lng, id).run();
         item.wrote_geo = Number((r as any)?.meta?.changes ?? 0) > 0;
-        item.lat = geo.lat;
-        item.lng = geo.lng;
+        // 那一列一定在（id 是主鍵），所以沒改到就只有那道 manual 閘一個可能
+        if (!item.wrote_geo) item.kept_manual_geo = true;
       }
 
-      if (item.wrote_time || item.wrote_geo) updated++;
+      /*
+       * 讀到的 metadata 整批存起來（`exif._video`），燈箱那塊面板要拿它畫。
+       * 一樣就不寫 —— 這一支跑第二次不該產生任何 D1 寫入。
+       */
+      const exifJson = shape.exif ? JSON.stringify(shape.exif) : null;
+      if (exifJson && exifJson !== (row.exif ?? null)) {
+        await env.DB.prepare("UPDATE Photo SET exif = ? WHERE id = ?")
+          .bind(exifJson, id).run();
+        item.wrote_exif = true;
+      }
+
+      if (item.wrote_time || item.wrote_geo || item.wrote_exif) updated++;
     } catch (e) {
       // 一支讀不到不該讓整批停下來，游標照樣往前走
       item.error = e instanceof Error ? e.message : String(e);
@@ -3305,9 +3348,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
 
       /* ── 站長專用：回讀影片的拍攝時間與座標 ────────────────────────────
        *
-       * 2026-08-31 之前上傳的影片一律沒有拍攝時間（封面圖是 canvas 畫的，
-       * 不帶 metadata），但**影片檔自己有** —— 回 Drive 讀它的 moov box。
-       * 引擎在 backfillVideoMeta，這裡只負責閘與游標。
+       * 影片檔自己記著拍攝時間、座標、機身型號、解析度、編碼 —— 全在 moov box 裡
+       * （封面圖是 canvas 畫的才不帶 metadata，那是兩件事）。這一支回 Drive 讀它，
+       * **把讀到的蓋回站上**（含手動填過的時間）。引擎在 backfillVideoMeta。
        *
        * ⚠️ 一趟只做幾支（subrequest 預算），由前端迴圈推 `cursor`，
        *    跟「比對全部相簿」那顆同一個做法。收工看 `done`。
@@ -3342,15 +3385,12 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const rest = await env.DB.prepare(`
           SELECT COUNT(*) AS n FROM Photo
            WHERE media_type = 'video' AND drive_original_id IS NOT NULL
-             ${compare ? "" : "AND (taken_at IS NULL OR lat IS NULL)"}
              AND id > ?
         `).bind(cursor).first<any>();
 
         /*
-         * ⚠️ 這一句是為了讓回報講得出**理由**。回寫只補空的那幾格，所以每一支
-         * 都已經填好的站台會永遠看到「補上 0 支」—— 老實但看起來像壞掉
-         * （2026-08-31 就是這樣被回報的）。有了總數就講得出
-         * 「站上 110 支影片，每一支的時間與座標都已經有值了」。
+         * ⚠️ 這一句是為了讓回報講得出**分母**：站上總共幾支影片、其中幾支沒有
+         * Drive 備份（讀不到檔，這支路由永遠碰不到它們）。
          * 一句 COUNT 對免費額度是零負擔（D1 算的是讀了幾列）。
          */
         const totals = await env.DB.prepare(`

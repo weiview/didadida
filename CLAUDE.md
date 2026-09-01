@@ -900,6 +900,18 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 所以在瀏覽器解（`File.slice()` 惰性讀）；回寫既有影片時位元組只有 Drive 那邊有，
 所以在 Worker 解（Drive 的 Range 請求）。
 
+- ⚠️ **「影片沒有 metadata」是誤解，「時間是推出來的」也只對了一半。** mp4／mov 的 moov
+  裡真的記著：建立時間（`mvhd`）、座標（`udta/©xyz` 的 ISO 6709）、機身與型號
+  （`©mak`／`©mod`、Apple 的 `com.apple.quicktime.make`／`.model`）、軟體、解析度與旋轉
+  （`trak/tkhd` 的 16.16 定點長寬 ＋ 變換矩陣）、長度、影格率（`stts`）、視訊／音訊編碼
+  （`stsd` 的 fourcc）。**唯一真的用推的是「時區」**（見下一條）—— 其餘都是檔案自己寫的。
+- **讀到的東西整批存進 `Photo.exif` 的 `_video` 底下**（`videoMetaToExif()`／`videoMetaBlock()`，
+  **不需要 migration**，那一欄本來就是 TEXT 而影片一直是空的）。`normalizeGeo()` 只認白名單
+  裡那幾個鍵，所以 `_video` 對它是惰性的。燈箱那塊面板因此對影片端出
+  **「影片的 Metadata」**（欄位跟照片的 EXIF 一一對應，沒對照到的原始標籤照樣一條條列）。
+  ⚠️ `uploadPhoto()` 的 exif 白名單**必須含 `'_video'`** —— 那個白名單是**丟掉沒列到的鍵**，
+  漏了它新上傳的影片就跟存量的一樣是空的，而且錯得很安靜（時間與座標照樣進得去，
+  因為那幾個鍵在白名單上）。
 - **這一檔本身不做任何時間換算**，只把檔案裡有什麼挖出來湊成一份 **EXIF 形狀**的物件
   交給 `normalizeGeo()`。全站的不變式（`taken_at = taken_at_local − tz`）只能有一份實作。
   於是 `mvhd` 的 UTC 瞬間扮演 `GPSTimeStamp`、牆上時間扮演 `DateTimeOriginal`，
@@ -936,21 +948,39 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ### 回寫既有影片：`POST /api/admin/video-meta`
 
-存量影片（2026-08-31 之前傳的）一律沒有時間，入口在 **`/admin`「影片的拍攝時間與座標」**
-那一格（`app/admin/VideoMetaCard.tsx`）。
+存量影片（2026-08-31 之前傳的）一律沒有時間、也沒有 `_video`，入口在
+**`/admin`「影片的 Metadata」**那一格（`app/admin/VideoMetaCard.tsx`，`AdminSection` 的
+id 仍是 `video-meta`，換掉會弄丟 localStorage 那個開合狀態）。
 
 - 認 `canManageOthers`（它會改到全站每一個人的影片）。沒有 `GOOGLE_DRIVE_SA_KEY` 回 503。
 - ⚠️ **一趟只做幾支（`VIDEO_META_DEFAULT_LIMIT` 6，上限 10），由前端推 `cursor` 迴圈**
   —— 跟「比對全部相簿」那顆完全同一個做法（subrequest 預算）。收工看 `done`，
   另外掛 `MAX_ROUNDS` 當保險絲。
-- ⚠️ **只補目前是空的那幾格**：兩句 UPDATE 各自帶著 `WHERE … taken_at IS NULL` 與
-  `lat IS NULL${geoOverwriteGuard('exif')}`，手動改過的座標（`geo_source = 'manual'`）碰不到。
+- ⚠️⚠️ **這是覆蓋，不是補空格**（2026-09-01 使用者拍板改的；在那之前兩句 UPDATE 各帶著
+  `taken_at IS NULL`／`lat IS NULL`，於是**每一格都已經有值的站台永遠回報 0**，
+  上線當天就被回報成「功能壞了」）。檔案自己記著的才是事實，**手動填的時間一律讓位**。
+  三道閂缺一不可：
+  ① **只蓋「檔案裡真的有值」的那幾格** —— `takenAtUtc` 是 null 就什麼都不做，
+  **絕不把手動填過的時間清成 NULL**（那是把資料弄丟，不是回寫）；
+  ② **座標唯一的例外是 `geo_source = 'manual'`**（`geoOverwriteGuard('exif')` 照舊）——
+  那是使用者親手標的打卡地點，旁邊掛著一個 `place_name`，蓋掉座標地名就變成假話。
+  時間沒有這個問題（時間沒有名字），所以時間照覆蓋。跳過的那幾支要回報
+  `kept_manual_geo`，不然看起來像漏掉了；
+  ③ **值一樣就不下 UPDATE** —— 跑第二次不該產生任何 D1 寫入，`updated` 也才講得出
+  「這一趟真的改了幾支」。座標比對要用容差（`near()`，1e-5 約一公尺），存進 D1 是 REAL，
+  字面比對必定處處不同。
+- ⚠️ **`compare = true`（「重讀比對」）一個位元組都不寫。** 覆蓋不可逆（原本手動填的沒有
+  備份），所以動手之前要看得到差在哪。⚠️ 刻意**不做「比對完順手改掉」**：那兩顆按鈕
+  要做的事完全不同，合成一顆就沒有預覽了。
 - ⚠️ **一支影片壞掉不能停掉整批** —— 逐支 try／catch 收進 `item.error`，最後在畫面上列出來。
 - ⚠️ 檔案大小是從第一次回應的 **`Content-Range` 表頭**解出來的，刻意不多打一次
   `files.get?fields=size`（那是一個白花的 subrequest）。
 - ⚠️ **Drive 不理 Range 而回 200 時要當場 `cancel()` body**（`Content-Length` 超過 4MB）——
   不然幾 GB 的影片會整份灌進 128MB 的 Worker。
 - ⚠️ 有寫進東西就 `bumpContentEpoch()`：`taken_at` 一改，相簿的排序就變了。
+- ⚠️ **`mvhd` 是唯一時間來源（`how === 'instant'`）的影片有風險**：Android 機身常把
+  當地時間寫進 mvhd，照規格當 UTC 解就整整差 8 小時 —— 而覆蓋會拿它蓋掉正確的手動值。
+  這正是「重讀比對」存在的理由，回寫之前先按那顆。
 - `remaining_before`（進度條的分母）那句 COUNT **跟分頁那句 WHERE 是同一個條件**，
   不然數字永遠歸不了零（同 drive-pending 的清單與 COUNT）。
 

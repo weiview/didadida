@@ -49,12 +49,45 @@ export interface VideoMeta {
   wallClockOnly: string | null;
   lat: number | null;
   lng: number | null;
+
+  /*
+   * 以下是「照片有 EXIF、影片有 metadata」那一半 —— 時間與座標之外，
+   * 檔案裡還寫著機身、軟體、解析度、編碼…… 燈箱要照著 EXIF 那一格畫出來。
+   * 全部都在**已經讀進記憶體的那份 moov 裡**，不多花任何一次 Drive 讀取。
+   */
+
+  /**
+   * 檔案裡**所有**讀得出來的標籤：udta 底下每一個 `©xxx`，加上 Apple 的
+   * keys／ilst 每一筆。鍵名原樣保留、不做對照 —— 哪幾個要翻成中文是燈箱的事，
+   * 這一檔只負責「一個都不漏」。
+   */
+  tags: Record<string, string>;
+  /** 影像尺寸。已經套過 tkhd 的旋轉矩陣，直的影片回的就是直的 */
+  width: number | null;
+  height: number | null;
+  /** tkhd 矩陣算出來的旋轉角（0／90／180／270） */
+  rotation: number | null;
+  /** mvhd 的 duration ÷ timescale */
+  durationMs: number | null;
+  /** stsd 第一個 entry 的四字元型別：avc1／hvc1／mp4a… */
+  videoCodec: string | null;
+  audioCodec: string | null;
+  /** 影格率＝視訊軌的樣本數 ÷ 時長 */
+  frameRate: number | null;
 }
 
-const EMPTY: VideoMeta = {
-  instantMs: null, wallClock: null, offsetMinutes: null,
-  wallClockOnly: null, lat: null, lng: null,
-};
+/**
+ * ⚠️ 這是**函式不是常數**：`tags` 是物件，共用一份常數再淺複製出來的每一支影片
+ *    會指到同一張表，第二支就會看到第一支的標籤。
+ */
+function emptyMeta(): VideoMeta {
+  return {
+    instantMs: null, wallClock: null, offsetMinutes: null,
+    wallClockOnly: null, lat: null, lng: null,
+    tags: {}, width: null, height: null, rotation: null,
+    durationMs: null, videoCodec: null, audioCodec: null, frameRate: null,
+  };
+}
 
 /**
  * 檔頭一次讀多少。faststart 的 mp4（多數手機相機）moov 整個就在這裡面，
@@ -135,23 +168,143 @@ function looksLikeBox(b: Uint8Array, i: number, to: number): boolean {
 
 /* ---------- 各個 box 的內容 ---------- */
 
-/** mvhd：影片的建立時間（1904 紀元的秒數）。版本 1 是 64 位元 */
-function parseMvhd(b: Uint8Array, s: number, e: number): number | null {
-  if (s + 5 > e) return null;
-  const version = b[s];
-  let secs: number;
-  if (version === 1) {
-    if (s + 12 > e) return null;
-    secs = u64(b, s + 4);
-  } else {
-    if (s + 8 > e) return null;
-    secs = u32(b, s + 4);
+/**
+ * mvhd：影片的建立時間（1904 紀元的秒數）＋ 長度。版本 1 的時間與長度都是 64 位元。
+ *
+ * ⚠️ 兩件事**各自檢查邊界**：截斷的 moov 常常只夠讀到時間，那時候長度讀不到，
+ *    但時間仍然是好的 —— 綁在一起檢查等於為了長度把時間也丟掉。
+ */
+function parseMvhd(b: Uint8Array, s: number, e: number): { instantMs: number | null; durationMs: number | null } {
+  const out: { instantMs: number | null; durationMs: number | null } = { instantMs: null, durationMs: null };
+  if (s + 5 > e) return out;
+  const v1 = b[s] === 1;
+
+  // 建立時間
+  let secs = 0;
+  if (v1) { if (s + 12 <= e) secs = u64(b, s + 4); }
+  else if (s + 8 <= e) secs = u32(b, s + 4);
+  if (secs) {
+    const ms = (secs - MAC_EPOCH_OFFSET) * 1000;
+    // 1990 年以前與未來的時間都是壞值（有些機身寫的是「開機到現在」的秒數）
+    if (ms >= Date.UTC(1990, 0, 1) && ms <= Date.now() + 86400000) out.instantMs = ms;
   }
-  if (!secs) return null;   // 沒設定時常見 0
-  const ms = (secs - MAC_EPOCH_OFFSET) * 1000;
-  // 1990 年以前與未來的時間都是壞值（有些機身寫的是「開機到現在」的秒數）
-  if (ms < Date.UTC(1990, 0, 1) || ms > Date.now() + 86400000) return null;
-  return ms;
+
+  // 長度：timescale ＋ duration 接在兩個時間戳後面
+  const tsAt = s + (v1 ? 20 : 12);
+  const durAt = s + (v1 ? 24 : 16);
+  const durEnd = durAt + (v1 ? 8 : 4);
+  if (durEnd <= e) {
+    const timescale = u32(b, tsAt);
+    const duration = v1 ? u64(b, durAt) : u32(b, durAt);
+    // 0xFFFFFFFF ＝「不知道」，不是一段 49 天的影片
+    if (timescale > 0 && duration > 0 && duration !== 0xffffffff) {
+      out.durationMs = Math.round((duration / timescale) * 1000);
+    }
+  }
+  return out;
+}
+
+/** 一條軌（trak）解出來的東西。視訊軌與音訊軌各取各的 */
+interface TrackInfo {
+  kind: string | null;      // hdlr 的 handler type：'vide'／'soun'／…
+  codec: string | null;
+  width: number | null;
+  height: number | null;
+  rotation: number | null;
+  frameRate: number | null;
+}
+
+/** 16.16 定點數（tkhd 的矩陣與寬高都是這個格式） */
+function fixed1616(b: Uint8Array, i: number): number {
+  const raw = u32(b, i);
+  return (raw >= 0x80000000 ? raw - 0x100000000 : raw) / 65536;
+}
+
+/**
+ * tkhd：旋轉矩陣 ＋ 影像寬高。
+ *
+ * ⚠️ 手機的直式影片**位元組上仍然是橫的**，靠矩陣轉 90 度 —— 所以寬高一定要
+ *    套過旋轉再交出去，不然直的影片會寫成 1920 × 1080。
+ */
+function parseTkhd(b: Uint8Array, s: number, e: number, t: TrackInfo): void {
+  // version(1)+flags(3) 之後：v0 是 4+4+4+4+4（建立/修改/id/保留/時長）＝ 20，
+  // v1 的兩個時間戳與時長是 64 位元 ＝ 32；再加 8 保留 + 2 layer + 2 group
+  // + 2 volume + 2 保留，矩陣才開始。
+  const matrixAt = s + (b[s] === 1 ? 52 : 40);
+  if (matrixAt + 44 > e) return;
+
+  // 矩陣前兩個值是 a、b，旋轉角就是 atan2(b, a)
+  const a = fixed1616(b, matrixAt);
+  const bb = fixed1616(b, matrixAt + 4);
+  let deg = Math.round((Math.atan2(bb, a) * 180) / Math.PI);
+  if (deg < 0) deg += 360;
+  deg = (Math.round(deg / 90) * 90) % 360;
+  t.rotation = deg;
+
+  // 寬高接在 36 個位元組的矩陣後面
+  let w = fixed1616(b, matrixAt + 36);
+  let h = fixed1616(b, matrixAt + 40);
+  if (deg === 90 || deg === 270) { const tmp = w; w = h; h = tmp; }
+  if (w >= 1 && h >= 1) { t.width = Math.round(w); t.height = Math.round(h); }
+}
+
+/**
+ * 一條軌：tkhd（尺寸／旋轉）→ mdia → mdhd（時基）／hdlr（是影像還是聲音）／
+ * minf → stbl → stsd（編碼）與 stts（樣本數，除以時長就是影格率）。
+ *
+ * ⚠️ 這些全都在**已經讀進來的那份 moov 裡**，一次 Drive 讀取都不會多花。
+ *    唯一的代價是 stbl 很大時可能被 MOOV_MAX 截斷，那時候 walkBoxes 自己會停。
+ */
+function parseTrak(b: Uint8Array, s: number, e: number): TrackInfo {
+  const t: TrackInfo = { kind: null, codec: null, width: null, height: null, rotation: null, frameRate: null };
+  let timescale = 0;
+  let duration = 0;
+  let samples = 0;
+
+  walkBoxes(b, s, e, (type, cs, ce) => {
+    if (type === 'tkhd') {
+      parseTkhd(b, cs, ce, t);
+      return;
+    }
+    if (type !== 'mdia') return;
+    walkBoxes(b, cs, ce, (mt, ms, me) => {
+      if (mt === 'mdhd') {
+        const v1 = b[ms] === 1;
+        const tsAt = ms + (v1 ? 20 : 12);
+        const durAt = ms + (v1 ? 24 : 16);
+        if (durAt + (v1 ? 8 : 4) <= me) {
+          timescale = u32(b, tsAt);
+          duration = v1 ? u64(b, durAt) : u32(b, durAt);
+        }
+      } else if (mt === 'hdlr') {
+        // FullBox(4) + pre_defined(4)，接著才是 handler type
+        if (ms + 12 <= me) t.kind = boxType(b, ms + 8);
+      } else if (mt === 'minf') {
+        walkBoxes(b, ms, me, (nt, ns, ne) => {
+          if (nt !== 'stbl') return;
+          walkBoxes(b, ns, ne, (st, ss, se) => {
+            if (st === 'stsd') {
+              // FullBox(4) + entry_count(4)，接著就是第一個 entry 的 box 檔頭
+              if (ss + 16 <= se && !t.codec) t.codec = boxType(b, ss + 12).trim();
+            } else if (st === 'stts') {
+              // FullBox(4) + entry_count(4)，每一筆 [sample_count][sample_delta]
+              if (ss + 8 > se) return;
+              const n = u32(b, ss + 4);
+              let p = ss + 8;
+              for (let i = 0; i < n && p + 8 <= se; i++, p += 8) samples += u32(b, p);
+            }
+          });
+        });
+      }
+    });
+  });
+
+  if (timescale > 0 && duration > 0 && samples > 0) {
+    const fps = samples / (duration / timescale);
+    // 1000 以上一定是解錯了（音訊軌的樣本數除以時長就是取樣率）
+    if (fps > 0 && fps < 1000) t.frameRate = Math.round(fps * 100) / 100;
+  }
+  return t;
 }
 
 /**
@@ -169,6 +322,14 @@ function parseIso6709(raw: string): { lat: number; lng: number } | null {
 }
 
 const decoder = new TextDecoder();
+
+/**
+ * udta 底下**不是** `©xxx` 開頭、但一樣是文字的那幾個。
+ * 0xA9 開頭的整批都收（見 udtaChild），這裡只補這些例外。
+ */
+const UDTA_TEXT_TYPES: Record<string, true> = {
+  name: true, auth: true, titl: true, desc: true, albm: true, gnre: true, yrrc: true,
+};
 
 /** udta 底下那些 `©xxx` 的內容：[長度 uint16][語系 uint16][字串] */
 function parseUdtaText(b: Uint8Array, s: number, e: number): string {
@@ -268,10 +429,10 @@ function parseAppleMeta(b: Uint8Array, s: number, e: number, out: Record<string,
 export async function readVideoMeta(
   read: RangeReader, size: number, headBuf?: Uint8Array,
 ): Promise<VideoMeta> {
-  if (!size || size < 16) return { ...EMPTY };
+  if (!size || size < 16) return emptyMeta();
 
   const head = headBuf ?? await read(0, Math.min(size, HEAD_CHUNK));
-  if (head.length < 8) return { ...EMPTY };
+  if (head.length < 8) return emptyMeta();
 
   // 走頂層 box 找 moov。mdat（那個幾 GB 的位元組海）只看它的 size 就跳過去了
   let moovStart = -1;
@@ -298,7 +459,7 @@ export async function readVideoMeta(
     }
     p += boxSize;
   }
-  if (moovStart < 0 || moovEnd <= moovStart) return { ...EMPTY };
+  if (moovStart < 0 || moovEnd <= moovStart) return emptyMeta();
 
   // moov 的位元組。已經在檔頭那塊裡就不要再讀一次
   let moov: Uint8Array;
@@ -314,10 +475,21 @@ export async function readVideoMeta(
   const moovStop = off + (moovEnd - moovStart) > moov.length
     ? moov.length : off + (moovEnd - moovStart);
 
-  const out: VideoMeta = { ...EMPTY };
+  const out: VideoMeta = emptyMeta();
   const apple: Record<string, string> = {};
+  const tracks: TrackInfo[] = [];
 
   const udtaChild: BoxVisitor = (type, s, e) => {
+    /*
+     * 先原樣收下來 —— 認得的（©xyz／©day）下面再各自解析，不認得的
+     * （©mak 機身廠牌、©mod 型號、©swr 軟體，以及各家自己塞的）**一個都不丟**。
+     * 使用者要的是「檔案裡所有的 metadata」，我們沒有資格先挑掉幾個。
+     */
+    if (type.charCodeAt(0) === 0xa9 || UDTA_TEXT_TYPES[type]) {
+      const text = parseUdtaText(moov, s, e);
+      if (text) out.tags[type] = text;
+    }
+
     if (type === '©xyz') {
       const c = parseIso6709(parseUdtaText(moov, s, e));
       if (c) { out.lat = c.lat; out.lng = c.lng; }
@@ -337,7 +509,11 @@ export async function readVideoMeta(
 
   walkBoxes(moov, off, moovStop, (type, s, e) => {
     if (type === 'mvhd') {
-      out.instantMs = parseMvhd(moov, s, e);
+      const mv = parseMvhd(moov, s, e);
+      out.instantMs = mv.instantMs;
+      out.durationMs = mv.durationMs;
+    } else if (type === 'trak') {
+      tracks.push(parseTrak(moov, s, e));
     } else if (type === 'udta') {
       walkBoxes(moov, s, e, udtaChild);
     } else if (type === 'meta') {
@@ -362,6 +538,31 @@ export async function readVideoMeta(
     const c = parseIso6709(appleLoc);
     if (c) { out.lat = c.lat; out.lng = c.lng; }
   }
+
+  // Apple 那一整批也全部留著（機身、型號、iOS 版本、拍攝模式…）
+  const appleKeys = Object.keys(apple);
+  for (let i = 0; i < appleKeys.length; i++) out.tags[appleKeys[i]] = apple[appleKeys[i]];
+
+  /*
+   * 軌：影像那條給尺寸／旋轉／影格率，聲音那條只取編碼。
+   * ⚠️ hdlr 讀不到時（截斷的 moov）退而求其次：有寬高的就是影像那條。
+   */
+  let vid: TrackInfo | null = null;
+  let aud: TrackInfo | null = null;
+  for (let i = 0; i < tracks.length; i++) {
+    const t = tracks[i];
+    if (t.kind === 'soun') { if (!aud) aud = t; continue; }
+    if (t.kind === 'vide') { if (!vid || vid.kind !== 'vide') vid = t; continue; }
+    if (!vid && t.width !== null) vid = t;
+  }
+  if (vid) {
+    out.width = vid.width;
+    out.height = vid.height;
+    out.rotation = vid.rotation;
+    out.videoCodec = vid.codec;
+    out.frameRate = vid.frameRate;
+  }
+  if (aud) out.audioCodec = aud.codec;
 
   return out;
 }
@@ -397,6 +598,101 @@ export function guessWallClockFromName(name: string | undefined): string | 'utc'
 }
 
 /* ---------- 對外：湊成 EXIF 形狀交給 normalizeGeo ---------- */
+
+/**
+ * 存進 `Photo.exif` 的那一塊「影片 metadata」。
+ *
+ * ⚠️ **刻意掛在既有的 `exif` 欄位底下**（鍵名 `_video`），不另外開一欄 ——
+ *    那一欄本來就是 TEXT、影片一直是空的，多一欄 migration 換來的是同一件事。
+ *    `normalizeGeo()` 只讀白名單裡那幾個鍵，多這一塊對它完全沒有影響。
+ * ⚠️ 鍵名跟 EXIF 平行（Make／Model／Software），燈箱那一格才畫得出「照片有什麼、
+ *    影片就有什麼」。認不出來的原始標籤整批留在 `Tags` 裡，一個都不丟。
+ */
+export interface VideoExifBlock {
+  Make?: string;
+  Model?: string;
+  Software?: string;
+  Width?: number;
+  Height?: number;
+  Rotation?: number;
+  DurationMs?: number;
+  FrameRate?: number;
+  VideoCodec?: string;
+  AudioCodec?: string;
+  /** 沒對照到那幾個常用鍵的原始標籤，鍵名照檔案裡寫的 */
+  Tags?: Record<string, string>;
+}
+
+/** 同一件事在不同機身寫在不同鍵上，由前往後取第一個有值的 */
+const MAKE_KEYS = ['com.apple.quicktime.make', '©mak', 'com.android.manufacturer'];
+const MODEL_KEYS = ['com.apple.quicktime.model', '©mod', 'com.android.model'];
+const SOFTWARE_KEYS = ['com.apple.quicktime.software', '©swr', 'com.android.version'];
+
+/** 這幾個已經在別的地方畫出來了（時間、座標），不必在原始標籤裡再列一次 */
+const SHOWN_ELSEWHERE = [
+  '©day', '©xyz',
+  'com.apple.quicktime.creationdate',
+  'com.apple.quicktime.location.ISO6709',
+];
+
+/**
+ * 標籤值可能是二進位（有些 box 的內容根本不是文字）。控制字元與解碼失敗的
+ * 替代字元一律拿掉，並且夾在 200 字 —— 這一份是要塞進 D1 那一列 JSON 的。
+ */
+function cleanTagValue(raw: string): string {
+  let s = '';
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw.charCodeAt(i);
+    // 控制字元與「解碼失敗」那個替代字元（U+FFFD）都不要
+    if (c < 0x20 || c === 0x7f || c === 0xfffd) continue;
+    s += raw[i];
+  }
+  s = s.trim();
+  return s.length > 200 ? `${s.slice(0, 200)}…` : s;
+}
+
+function pickTag(tags: Record<string, string>, keys: string[]): string | undefined {
+  for (let i = 0; i < keys.length; i++) {
+    const v = tags[keys[i]];
+    if (v) {
+      const c = cleanTagValue(v);
+      if (c) return c;
+    }
+  }
+  return undefined;
+}
+
+/** 讀到的 metadata → 要存起來的那一塊。什麼都沒有時回空物件 */
+export function videoMetaBlock(meta: VideoMeta): VideoExifBlock {
+  const out: VideoExifBlock = {};
+  const make = pickTag(meta.tags, MAKE_KEYS);
+  const model = pickTag(meta.tags, MODEL_KEYS);
+  const software = pickTag(meta.tags, SOFTWARE_KEYS);
+  if (make) out.Make = make;
+  if (model) out.Model = model;
+  if (software) out.Software = software;
+  if (meta.width !== null && meta.height !== null) {
+    out.Width = meta.width;
+    out.Height = meta.height;
+  }
+  if (meta.rotation) out.Rotation = meta.rotation;
+  if (meta.durationMs !== null) out.DurationMs = meta.durationMs;
+  if (meta.frameRate !== null) out.FrameRate = meta.frameRate;
+  if (meta.videoCodec) out.VideoCodec = meta.videoCodec;
+  if (meta.audioCodec) out.AudioCodec = meta.audioCodec;
+
+  const used = MAKE_KEYS.concat(MODEL_KEYS, SOFTWARE_KEYS, SHOWN_ELSEWHERE);
+  const rest: Record<string, string> = {};
+  const names = Object.keys(meta.tags);
+  for (let i = 0; i < names.length; i++) {
+    const k = names[i];
+    if (used.indexOf(k) >= 0) continue;
+    const v = cleanTagValue(meta.tags[k]);
+    if (v) rest[k] = v;
+  }
+  if (Object.keys(rest).length > 0) out.Tags = rest;
+  return out;
+}
 
 export interface VideoExifShape {
   /** 白名單過的 EXIF 形狀物件，直接餵 normalizeGeo（或 uploadPhoto 的 exifData） */
@@ -444,11 +740,26 @@ const DERIVE_RESIDUAL_MAX_MIN = 10;
  */
 export function videoMetaToExif(meta: VideoMeta, fileName?: string): VideoExifShape {
   const exif: Record<string, unknown> = {};
-  if (meta.lat !== null && meta.lng !== null) {
+
+  /*
+   * 檔案裡讀到的**全部** metadata 掛在 `_video` 底下，跟著 exif 一起存進 D1 ——
+   * 燈箱那塊面板要拿它畫「影片的 Metadata」（照片有什麼、影片就有什麼）。
+   * `normalizeGeo()` 只讀白名單裡那幾個鍵，多這一塊對它完全沒有影響。
+   */
+  const block = videoMetaBlock(meta);
+  const hasBlock = Object.keys(block).length > 0;
+  if (hasBlock) exif._video = block;
+
+  const geo = meta.lat !== null && meta.lng !== null;
+  if (geo) {
     exif.latitude = meta.lat;
     exif.longitude = meta.lng;
   }
-  const hasGeo = () => Object.keys(exif).length > 0;
+  /*
+   * ⚠️ 「有沒有東西值得存」不可以再寫成 `Object.keys(exif).length > 0` ——
+   *    `_video` 幾乎一定在裡面，那句話會永遠是 true。
+   */
+  const hasAny = () => geo || hasBlock;
 
   // ① 檔案自己寫明時區 —— 牆上時間與偏移都有，normalizeGeo 會標成 offset_tag
   if (meta.wallClock && meta.offsetMinutes !== null) {
@@ -493,7 +804,7 @@ export function videoMetaToExif(meta: VideoMeta, fileName?: string): VideoExifSh
   // ③ 只有 mvhd → 照規格當 UTC 瞬間。`PXL_` 的檔名本來就是 UTC，落在這裡剛好對
   if (meta.instantMs !== null) {
     return {
-      exif: hasGeo() ? exif : null,
+      exif: hasAny() ? exif : null,
       fallbackIso: new Date(meta.instantMs).toISOString(),
       how: 'instant',
     };
@@ -508,7 +819,7 @@ export function videoMetaToExif(meta: VideoMeta, fileName?: string): VideoExifSh
     }
   }
 
-  return { exif: hasGeo() ? exif : null, fallbackIso: null, how: 'none' };
+  return { exif: hasAny() ? exif : null, fallbackIso: null, how: 'none' };
 }
 
 /** 瀏覽器端的 RangeReader：File.slice 是惰性的，不會把幾 GB 讀進記憶體 */
@@ -529,6 +840,6 @@ export async function readVideoExifFromFile(file: File): Promise<VideoExifShape>
     return videoMetaToExif(meta, file.name);
   } catch (err) {
     console.warn('讀不到影片的拍攝資訊，當成沒有', file.name, err);
-    return videoMetaToExif({ ...EMPTY }, file.name);
+    return videoMetaToExif(emptyMeta(), file.name);
   }
 }

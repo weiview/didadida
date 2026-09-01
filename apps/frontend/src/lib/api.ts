@@ -983,6 +983,10 @@ export interface VideoMetaItem {
   how: 'tagged' | 'derived' | 'instant' | 'wall' | 'none' | string;
   wrote_time: boolean;
   wrote_geo: boolean;
+  /** 讀到的 metadata 整批寫進 `Photo.exif` 了沒（燈箱那塊「Metadata」面板吃它） */
+  wrote_exif?: boolean;
+  /** 座標沒動：那是使用者親手標的打卡地點（`geo_source = 'manual'`），不覆蓋 */
+  kept_manual_geo?: boolean;
   taken_at_local: string | null;
   tz_offset_minutes: number | null;
   time_source: string | null;
@@ -1004,7 +1008,7 @@ export interface VideoMetaResult {
   scanned: number;
   next_cursor: number;
   done: boolean;
-  /** 補空格模式：這一趟真的寫進去幾支。**比對模式：幾支跟站上存的不一樣** */
+  /** 回寫模式：這一趟真的改了幾支。**比對模式：幾支跟站上存的不一樣** */
   updated: number;
   /** 這個游標之後還有幾支要處理（給進度條用） */
   remaining_before: number;
@@ -1014,7 +1018,7 @@ export interface VideoMetaResult {
   total_videos?: number;
   /** 其中幾支根本沒有 Drive 備份（讀不到檔，補不了也比不了） */
   videos_without_drive?: number;
-  /** 其中幾支的時間與座標都已經有值了（＝補空格那條永遠不會碰的） */
+  /** 其中幾支的時間與座標都已經有值了（純粹給回報講分母用） */
   videos_complete?: number;
 }
 
@@ -1022,11 +1026,12 @@ export interface VideoMetaResult {
  * 回 Drive 讀影片檔自己的拍攝時間與座標。站長限定。
  *
  * 兩種模式：
- * - 預設（`compare = false`）＝**補空格**：只寫目前是 NULL 的那幾格，
- *   手動填過的一律不碰。
- * - `compare = true` ＝**重讀比對**：條件放寬成「所有影片」，照樣去 Drive 讀，
- *   但**一個位元組都不寫**，只把兩邊的值並排回來讓人自己看。
- *   已經手動填好的站台問的其實是這個問題（見後端 backfillVideoMeta 的註解）。
+ * - 預設（`compare = false`）＝**回寫**：檔案裡讀得到什麼就蓋掉站上那一格，
+ *   **包含手動填過的時間**（2026-09-01 使用者拍板：檔案自己記著的才是事實）。
+ *   ⚠️ 只蓋「檔案裡真的有值」的那幾格，讀不到就維持原樣；手動標的打卡地點
+ *   （`geo_source = 'manual'`）的座標一律不碰。
+ * - `compare = true` ＝**重讀比對**：照樣去 Drive 讀，但**一個位元組都不寫**，
+ *   只把兩邊的值並排回來讓人自己看。覆蓋是不可逆的，動手前先看這個。
  *
  * ⚠️ **一趟只做幾支**（一支要 1–3 次 Drive Range 請求，而 Workers 免費版
  *    單次呼叫上限 50 個 subrequest）—— 呼叫端要自己拿 `next_cursor` 迴圈跑到
@@ -1963,6 +1968,13 @@ export async function uploadPhoto(
         // 時區還原：OffsetTimeOriginal 是拍攝當下的 UTC 偏移；
         // GPSDateStamp/GPSTimeStamp 為 UTC，可與 DateTimeOriginal 相減反推偏移
         'OffsetTimeOriginal', 'GPSDateStamp', 'GPSTimeStamp',
+        /*
+         * 影片的 metadata 整塊（`videoMetaBlock()` 產的，見 lib/videoMeta.ts）。
+         * ⚠️ 這個白名單是**丟掉沒列到的鍵**，漏了它新上傳的影片就會跟存量的
+         *    一樣是空的 —— 燈箱那塊「影片的 Metadata」什麼都畫不出來，
+         *    而且錯得很安靜（時間與座標照樣會進去，因為那幾個鍵在上面）。
+         */
+        '_video',
       ];
       const filteredExif: any = {};
       for (const key of allowedKeys) {

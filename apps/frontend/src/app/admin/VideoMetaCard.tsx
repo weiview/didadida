@@ -6,11 +6,17 @@ import AdminSection from "./AdminSection";
 import styles from "./admin.module.css";
 
 /*
- * 影片的拍攝時間／座標回讀。
+ * 影片的 metadata 回讀。
  *
- * 影片的封面圖是瀏覽器 canvas 畫的、不帶任何 metadata，所以 2026-08-31 之前傳上來的
- * 影片全都是 taken_at NULL（在相簿裡永遠排最前面）。這一格把那些影片的原始檔從 Drive
- * 上用 Range 讀回 moov box，解出時間與座標寫回 D1。
+ * mp4／mov 把拍攝時間、座標、機身、型號、解析度、編碼全記在 moov box 裡
+ * —— 是我們以前沒讀，不是影片沒有（封面圖是 canvas 畫的才不帶 metadata，
+ * 那是另一件事）。所以 2026-08-31 之前傳上來的影片全是 taken_at NULL，
+ * 在相簿裡永遠排最前面，而且那些時間後來是人一支一支手動補的。
+ *
+ * ⚠️ 這一格是**覆蓋**不是補空格（2026-09-01 使用者拍板）：檔案自己記著的才是
+ *    事實，手動填的一律讓位。但**只蓋「檔案裡真的有值」的那幾格** ——
+ *    讀不到時間就維持原樣，不會把人填好的清掉；手動標的打卡地點座標也不碰
+ *    （那旁邊掛著一個 place_name，蓋掉座標地名就變成假話）。
  *
  * ⚠️⚠️ 這是**前端的迴圈，不是一次請求** —— 同「比對全部相簿」那顆（見 DriveCompareCard）。
  * 一支影片要 1～3 次 Drive Range 請求，而 Workers 免費版單次呼叫上限 50 個 subrequest，
@@ -108,16 +114,16 @@ export default function VideoMetaCard() {
       }
 
       const failed = collected.filter((it) => it.error).length;
+      const keptGeo = collected.filter((it) => it.kept_manual_geo).length;
       /*
-       * ⚠️⚠️ 「看了 0 支，補上 0 支。沒有需要回讀的影片。」是這一格上線當天就被
-       *    回報的問題：站上明明有一百多支影片。**那句話沒有說謊，只是沒說完** ——
-       *    補空格那條的條件是「時間或座標是空的」，而那些影片早就被人手動填過了
-       *    （time_source = 'manual'），所以一支都沒命中。
-       *    把分母講出來才答得完整：總共幾支、其中幾支已經有值、幾支沒有 Drive 備份。
+       * ⚠️ 「看了 0 支」要講得出**為什麼** —— 這一格上線當天就被回報過
+       *    「補上 0 支，沒有需要回讀的影片」而站上明明有一百多支（那時候的條件是
+       *    「只補空的」，而那些影片早就被人手動填過了）。現在條件是所有影片，
+       *    但沒有 Drive 備份的那些照樣碰不到，分母還是要講出來。
        */
       const tail = totals && totals.all > 0
-        ? `站上共 ${totals.all} 支影片，其中 ${totals.complete} 支的時間與座標都已經有值`
-          + (totals.noDrive ? `、${totals.noDrive} 支沒有 Drive 備份（讀不到檔）` : "")
+        ? `站上共 ${totals.all} 支影片`
+          + (totals.noDrive ? `，其中 ${totals.noDrive} 支沒有 Drive 備份（讀不到檔）` : "")
           + "。"
         : "站上目前沒有影片。";
 
@@ -130,10 +136,11 @@ export default function VideoMetaCard() {
               ok: failed === 0,
             }
           : {
-              text: `看了 ${scanned} 支影片，補上 ${updated} 支`
+              text: `讀了 ${scanned} 支影片，改寫 ${updated} 支`
                 + (failed ? `，${failed} 支讀不到（見下面）` : "")
+                + (keptGeo ? `。${keptGeo} 支的座標維持原樣（那是手動標的打卡地點）` : "")
                 + "。"
-                + (scanned === 0 ? `沒有需要回讀的影片：${tail}` : ""),
+                + (scanned === 0 ? `沒有可以回讀的影片：${tail}` : ""),
               ok: failed === 0,
             },
       );
@@ -149,22 +156,24 @@ export default function VideoMetaCard() {
     : items;
 
   return (
-    <AdminSection id="video-meta" title="影片的拍攝時間與座標">
+    <AdminSection id="video-meta" title="影片的 Metadata">
       <p className={styles.hint}>
-        影片的封面圖是瀏覽器畫出來的，不帶任何拍攝資訊 —— 所以早期傳上來的影片沒有時間，
-        在相簿裡會一直排在最前面。這顆按鈕會把那些影片的原始檔從 Google Drive 讀回來，
-        解出檔案自己記著的拍攝時間與座標寫回站上。
+        影片檔自己記著拍攝時間、座標、機身型號、解析度、編碼 —— 這些全在檔案的
+        moov 裡（就是影片版的 EXIF），只是早期上傳時站上沒有讀。這顆按鈕把影片的
+        原始檔從 Google Drive 讀回來，把裡面的資訊寫回站上，燈箱那塊
+        <strong>影片的 Metadata</strong> 就看得到了。
       </p>
       <p className={styles.hint}>
-        只補<strong>目前是空的</strong>那幾格：已經有時間的不動，手動改過座標的也不動。
+        <strong>會覆蓋手動填過的拍攝時間</strong> —— 檔案自己寫的才是事實。
+        但只蓋<strong>檔案裡真的有值</strong>的那幾格：讀不到時間的維持原樣，
+        不會把你補好的清掉；手動在地圖上標過的打卡地點座標也不碰。
         一次看幾支就回報一次，可以按著不管，跑完會講結果。
       </p>
 
       <p className={styles.hint}>
-        已經填好的那些想再確認一次，按<strong>重讀比對</strong> —— 它照樣去 Drive 讀，
-        但<strong>一個字都不寫</strong>，只把「站上存的」跟「檔案裡寫的」並排列出來。
-        要改哪一支自己到那張照片的燈箱按「指定時間」：手動填的是你自己的判斷，
-        比檔案裡推出來的時間更算數。
+        覆蓋沒有還原鍵，動手之前想先看差在哪就按<strong>重讀比對</strong> ——
+        它照樣去 Drive 讀，但<strong>一個字都不寫</strong>，
+        只把「站上存的」跟「檔案裡寫的」並排列出來。
       </p>
 
       <div className={styles.formRow}>
@@ -173,7 +182,7 @@ export default function VideoMetaCard() {
           onClick={() => run(false)}
           disabled={busy}
         >
-          {busy ? "處理中..." : "回讀影片資訊"}
+          {busy ? "處理中..." : "回讀並覆蓋"}
         </button>
         <button
           className={styles.button}
@@ -238,8 +247,11 @@ export default function VideoMetaCard() {
                       it.wrote_geo && it.lat != null && it.lng != null
                         ? `座標 ${it.lat.toFixed(5)}, ${it.lng.toFixed(5)}`
                         : null,
-                      !it.wrote_time && !it.wrote_geo
-                        ? (HOW_LABEL[it.how] ?? it.how)
+                      // 座標沒動的理由要講出來，不然看起來像漏掉了
+                      it.kept_manual_geo ? "座標維持手動標的地點" : null,
+                      it.wrote_exif ? "metadata 已更新" : null,
+                      !it.wrote_time && !it.wrote_geo && !it.wrote_exif
+                        ? `沒有變動（${HOW_LABEL[it.how] ?? it.how}）`
                         : null,
                     ]
                       .filter(Boolean)
