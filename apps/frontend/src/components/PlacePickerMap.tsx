@@ -3,6 +3,7 @@
 import { useEffect, useRef } from 'react';
 import { MapLibreMap, Marker, NavigationControl } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
+import { collapseAttribution } from '@/lib/mapAttribution';
 
 // 跟足跡地圖同一套圖磚（見 FootprintMap 的 DEFAULT_STYLE）：
 // 免費、免 API key，而且兩張地圖長得一樣，點下去的位置才對得起來
@@ -56,6 +57,8 @@ export default function PlacePickerMap({ center, value, onPick, height = 240, cl
     if (center) centeredRef.current = true;
 
     map.addControl(new NavigationControl({ showCompass: false }), 'top-right');
+    // 右下角那塊出處預設收成一顆圓點（compact: true 自己做不到，理由見那一檔）
+    collapseAttribution(map);
     map.on('click', (e) => onPickRef.current(e.lngLat.lat, e.lngLat.lng));
     mapRef.current = map;
 

@@ -6,6 +6,7 @@ import {
   type GeoJSONSource, type MapLayerMouseEvent,
 } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
+import { collapseAttribution } from '@/lib/mapAttribution';
 import type { FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
 import { CONVOY_PCT_DEFAULT } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
@@ -1966,6 +1967,8 @@ export default function FootprintMap({
       attributionControl: { compact: true },
     });
     map.addControl(new NavigationControl({ showCompass: false }), 'top-right');
+    // 右下角那塊出處預設收成一顆圓點（compact: true 自己做不到，理由見那一檔）
+    collapseAttribution(map);
     mapRef.current = map;
     // 底圖或圖磚載入失敗時要留下線索 —— 沒有這個 handler 時地圖只會靜靜地一片空白
     map.on('error', (e: any) => console.error('[FootprintMap] 地圖錯誤:', e?.error?.message || e));

@@ -1588,6 +1588,11 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
     「部分或全部照片上傳失敗，請稍後再試」對 HEIC 是句假話，再試一百次都一樣。
     `uploadPhoto` 的 `{status:'error'}` 因此帶著 `reason`。
     Drive 失敗**不算這張失敗**（照片已經在 R2 了），要記進 `pendingDriveBatch` 讓補傳看得到它。
+14. **maplibre 的 `attributionControl: { compact: true }` 不等於「一開始是收著的」** ——
+    它第一次拿到出處文字時會同時掛上 `maplibregl-compact` 與 `maplibregl-compact-show`，
+    也就是**攤開**，要等使用者拖一下地圖才收。所以兩張地圖（`FootprintMap`／`PlacePickerMap`）
+    建好之後都要叫一次 `lib/mapAttribution.ts` 的 `collapseAttribution(map)`：出處文字是圖磚
+    來源載進來才填的，**`load` 與第一次 `idle` 各補收一次**，只在建立當下收一次擋不住。
 
 ## 免費額度用量條
 
