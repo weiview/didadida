@@ -12,7 +12,7 @@ import { CONVOY_PCT_DEFAULT } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 import {
   buildAvatarHead, createAlienHead, createCarImage, seatOffset,
-  CAR_H, CAR_PIXEL_RATIO, HEAD_SIZE, HEAD_PIXEL_RATIO,
+  CAR_H, CAR_W, CAR_PIXEL_RATIO, HEAD_SIZE, HEAD_PIXEL_RATIO,
   type CarSprite, type Seat,
 } from '@/lib/car';
 import { DEFAULT_TRACK_COLOR } from '@/lib/trackColors';
@@ -117,6 +117,15 @@ interface Props {
    */
   trackAvatars?: Record<number, string | null>;
   /**
+   * 每個家人的頭像**朝哪一邊**（`{ [user_id]: 'left' | 'right' }`，來自
+   * `/api/track-members` 的 `avatar_facing`）。
+   *
+   * 車頭會跟著行進方向左右鏡射，頭像不會 —— 於是一張朝左的頭像在往右開的那半段
+   * 看起來是「臉朝車尾」。這裡存的是**圖本身朝哪邊**，要不要鏡射是當場算的：
+   * `鏡射 = (圖朝的那一邊 !== 車頭朝的那一邊)`。沒設就當 'left'。
+   */
+  trackAvatarFacings?: Record<number, 'left' | 'right'>;
+  /**
    * 誰坐哪個位子（`{ [user_id]: 'driver' | 'passenger' }`，同樣來自 `/api/track-members`）。
    *
    * 合體時車上的座位是**固定語意**的：站長開車、指定的那位坐副駕、後座是寶寶。
@@ -130,6 +139,8 @@ interface Props {
    * 還沒設就坐外星人，跟沒設頭像的家人一樣（座椅空著看起來像壞掉）。
    */
   babyAvatar?: string | null;
+  /** 後座那個寶寶的頭像朝哪邊（站長在 `/admin` 設，跟著 `/api/auth/me` 回來） */
+  babyAvatarFacing?: 'left' | 'right';
   /**
    * Google 紀念層要用的顏色。那一層的線是頁面切好的座標陣列，帶不了 user_id，
    * 而它的內容永遠是**當下這個人自己的**時間軸（R2 key 依 uid 分開），
@@ -328,8 +339,12 @@ const HEAD_HIDE_GAP_MS = 30 * 60 * 1000;
  */
 /** 車在畫面上有多高（CSS px）。貼圖是 2 倍解析度，見 car.ts 的 CAR_PIXEL_RATIO */
 const CAR_CSS_H = CAR_H / CAR_PIXEL_RATIO;
+/** 車在畫面上有多寬（CSS px）。合體時那一排頭要夾在這個寬度裡面 */
+const CAR_CSS_W = CAR_W / CAR_PIXEL_RATIO;
 /** 一整張頭貼圖在畫面上有多高（CSS px，還沒乘 icon-size）。含四周的透明邊 */
 const HEAD_CSS_H = HEAD_SIZE / HEAD_PIXEL_RATIO;
+/** 一整張頭貼圖在畫面上有多寬。貼圖是正方形，所以跟高一樣 */
+const HEAD_CSS_W = HEAD_CSS_H;
 
 /*
  * 座位上那幾顆頭的大小。**刻意誇張** —— 使用者要的就是「大頭狗開車」那種比例。
@@ -346,13 +361,6 @@ const SEAT_HEAD_SCALE = 0.62;
 /** 後座那個寶寶再小一點（他本來就比較小顆），也順便讓前面兩顆蓋得住他的下巴 */
 const BABY_HEAD_SCALE = 0.85;
 /**
- * 寶寶再往上抬一點，讓頭頂從駕駛後面探出來 —— 不抬的話整顆被擋掉。
- * ⚠️ 錨點改成下巴之後這個值要比以前大：他的頭比較小，下巴對齊脖子時頭頂
- * 反而比駕駛低。車一縮小，座位間距跟著縮，這個值就得再往上調。
- */
-const BABY_LIFT = 18;
-
-/**
  * 頭像底下那圈透明邊，佔整張頭貼圖高度的比例（car.ts 的 `HEAD_PAD` ＋
  * avatar.ts contain-fit 留的白）。**下巴不在貼圖的最底下**，所以錨在底部之後
  * 還要往下推這麼多，下巴才真的碰得到脖子。
@@ -361,10 +369,23 @@ const HEAD_BOTTOM_PAD = 0.11;
 /** 推完再多壓進脖子幾 CSS px。使用者要的是「稍微蓋到 1～2 px」，接縫才不突兀 */
 const NECK_OVERLAP = 2;
 
-/** 座位不夠時多出來的人排在車頂上方。兩顆頭的水平間距（CSS px） */
-const HEAD_STEP = 26;
+/**
+ * 合體時**兩顆頭之間至少要留多寬**，以兩顆頭平均寬度的比例表示。
+ *
+ * ⚠️⚠️ 插畫上那三個脖子只橫跨 ~64 CSS px，而一顆座位頭就有 ~72 px ——
+ * 頭照著自己的脖子擺，數學上一定互相蓋住（縮到 0.5 倍還是蓋掉六成）。
+ * 使用者要的是「不要互相遮擋、後座寶寶要露出來」，所以合體時**水平位置改成
+ * 排開的**（垂直仍然釘在各自的脖子高度上）。代價講在下面 spreadX 那裡。
+ */
+const HEAD_GAP_RATIO = 0.72;
+
 /** 排在車頂上那幾顆縮小一點，免得比整台車還寬 */
 const HEAD_CROWD_SCALE = 0.6;
+/**
+ * 座位不夠時多出來的人排在車頂上方。兩顆頭的水平間距（CSS px）。
+ * 跟座位那排同一個規矩（頭寬 × HEAD_GAP_RATIO），不然那一排也會互相蓋住。
+ */
+const HEAD_STEP = HEAD_CSS_W * HEAD_CROWD_SCALE * HEAD_GAP_RATIO;
 /** 那一排離車頂多高（CSS px，指頭的中心） */
 const HEAD_ROW_LIFT = 30;
 
@@ -1506,8 +1527,10 @@ export default function FootprintMap({
   timelineLines,
   trackColors,
   trackAvatars,
+  trackAvatarFacings,
   trackSeats,
   babyAvatar,
+  babyAvatarFacing,
   timelineColor = DEFAULT_TRACK_COLOR,
   focusPoint,
   seekTo,
@@ -1597,6 +1620,16 @@ export default function FootprintMap({
     [trackAvatars],
   );
 
+  /**
+   * 這個人的頭像**本來朝哪一邊**。沒設就是 'left'（多數去背頭像是側臉朝左）。
+   * 要不要鏡射由 placeCar 當場跟車頭方向比對出來。
+   */
+  const facingFor = useCallback(
+    (userId: number | null): 'left' | 'right' =>
+      (userId != null && trackAvatarFacings?.[userId] === 'right') ? 'right' : 'left',
+    [trackAvatarFacings],
+  );
+
   /** 這個人固定坐哪。沒指定就回 null，由 placeCar 照順序遞補 */
   const seatFor = useCallback(
     (userId: number | null) => (userId != null && trackSeats?.[userId]) || null,
@@ -1610,6 +1643,17 @@ export default function FootprintMap({
    * 不然暫停中做好的頭要等下次播放才換得上去，畫面會卡在外星人。
    */
   const [headTick, setHeadTick] = useState(0);
+  /**
+   * 鏡頭動過就 +1，逼那個排頭的效果重跑一次。
+   *
+   * ⚠️⚠️ 頭的位置是**螢幕像素算完再 unproject 回經緯度**的，也就是「這個縮放
+   * 比例下的那個位置」—— 縮放或平移之後那份經緯度就不再對準車了，頭會整片
+   * 飄離車身。播放中每一幀都重算所以會自己修正，**暫停時沒有任何東西會重跑**，
+   * 於是「中途暫停再放大」就看到頭跟車分家。
+   * ⚠️ 只在**暫停時**才記數：播放中跟拍每一幀都 `setCenter`，等於每一幀多一次
+   * setState ＋ 重新渲染，白花效能（而且那時候本來就每幀重算了）。
+   */
+  const [viewTick, setViewTick] = useState(0);
   /** 每台車現在車頭朝哪。key 是「車上有誰」，見 FACING_HYSTERESIS_PX */
   const facingRef = useRef<Map<string, 1 | -1>>(new Map());
 
@@ -1633,7 +1677,7 @@ export default function FootprintMap({
    *
    * 收的是網址不是 user_id：後座那個寶寶不是 `User`（他的頭像存在 AppSetting 裡）。
    */
-  const ensureHead = useCallback((map: MapLibreMap, url: string | null) => {
+  const ensureHead = useCallback((map: MapLibreMap, url: string | null, mirror = false) => {
     const alien = 'head:alien';
     if (!map.hasImage(alien)) {
       map.addImage(
@@ -1645,14 +1689,16 @@ export default function FootprintMap({
     if (!url) return alien;
 
     // ⚠️ id 裡**不再有顏色**（外框拿掉了，見 car.ts 的 HALO）——
-    // 帶著顏色只會讓同一張頭像照人數做出好幾張一模一樣的貼圖
-    const id = `head:${url}`;
+    // 帶著顏色只會讓同一張頭像照人數做出好幾張一模一樣的貼圖。
+    // ⚠️ 但**鏡射版一定要是另一張圖**：maplibre 沒有「把 icon 翻過來」這種屬性
+    // （icon-size 不吃負數），所以左右各烤一張，靠 id 的 `:m` 尾巴分開。
+    const id = `head:${url}${mirror ? ':m' : ''}`;
     if (map.hasImage(id)) return id;
     if (!headPending.current.has(id)) {
       headPending.current.add(id);
       // 給 hooks 才會解 GIF —— 動圖是一張會自己換格的 StyleImage，
       // 它跟車一樣要能叫地圖重畫下一幀
-      buildAvatarHead(url, {
+      buildAvatarHead(url, mirror, {
         triggerRepaint: () => map.triggerRepaint(),
         isAnimating: () => playingRef.current,
       })
@@ -1973,6 +2019,21 @@ export default function FootprintMap({
     seekRef.current = (t: number) => setProgress(progressAtTime(warp, t));
   }, [warp]);
   useEffect(() => { cursorTRef.current = cursorT; }, [cursorT]);
+
+  /*
+   * 暫停時鏡頭一動就重排一次車上的頭（見 viewTick）。
+   *
+   * 聽的是 `move` 不是 `zoom`：平移也會讓 project／unproject 的結果偏掉
+   * （麥卡托投影下同一段像素在不同緯度不是同一段經緯度）。`move` 在拖曳與縮放
+   * 中都會連續發，正好每一格都跟著修正。
+   */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const bump = () => { if (!playingRef.current) setViewTick((v) => v + 1); };
+    map.on('move', bump);
+    return () => { map.off('move', bump); };
+  }, [ready]);
 
   /*
    * 「跳到幾點」：把播放頭搬過去，順手把鏡頭挪到角色身上。
@@ -3097,13 +3158,15 @@ export default function FootprintMap({
        *    得另外把真的那一份帶在 properties 上（`truth`）。
        */
       const putHead = (
-        url: string | null, scale: number,
+        url: string | null, facing: 'left' | 'right', scale: number,
         px: number, py: number, truth: [number, number],
       ) => {
         const ll = map.unproject([px, py]);
+        // 車頭會鏡射，頭像不會 —— 兩邊朝的方向不一樣時就換那張鏡射過的貼圖
+        const mirror = (facing === 'left') !== flip;
         headFeatures.push({
           type: 'Feature',
-          properties: { img: ensureHead(map, url), scale, lng: truth[0], lat: truth[1] },
+          properties: { img: ensureHead(map, url, mirror), scale, lng: truth[0], lat: truth[1] },
           geometry: { type: 'Point', coordinates: [ll.lng, ll.lat] },
         });
       };
@@ -3112,19 +3175,23 @@ export default function FootprintMap({
        * 坐進插畫上某一個座位。`seatOffset` 給的是**脖子上緣**，而頭那一層錨在
        * 貼圖底部 —— 底部到下巴之間還有一圈透明邊，所以要再往下推 `sink`，
        * 下巴才會落在脖子上（並依使用者要求多蓋 1～2 px）。
+       *
+       * `dx` 給了就用給的（合體時整排頭是排開的，見 spreadX），
+       * 垂直高度**永遠**照座位本身算 —— 那才是「坐在這個位子上」的意思。
        */
       const putSeat = (
-        seat: Seat, url: string | null, scale: number,
-        truth: [number, number], lift = 0,
+        seat: Seat, url: string | null, facing: 'left' | 'right', scale: number,
+        truth: [number, number], dx?: number,
       ) => {
         const off = seatOffset(seat, flip, now);
         const sink = HEAD_CSS_H * scale * HEAD_BOTTOM_PAD + NECK_OVERLAP;
-        putHead(url, scale, cpx.x + off.dx, cpx.y + off.dy + sink - lift, truth);
+        putHead(url, facing, scale, cpx.x + (dx ?? off.dx), cpx.y + off.dy + sink, truth);
       };
 
       if (n === 1) {
         const i = idx[0];
-        putSeat('driver', avatarFor(memberPaths[i].userId), 1, pos[i] ?? center);
+        const uid = memberPaths[i].userId;
+        putSeat('driver', avatarFor(uid), facingFor(uid), 1, pos[i] ?? center);
         return;
       }
 
@@ -3138,18 +3205,51 @@ export default function FootprintMap({
       };
       const ordered = [...idx].sort((a, b) => rank(a) - rank(b) || idx.indexOf(a) - idx.indexOf(b));
 
-      /*
-       * 畫的順序＝疊放順序（見圖層那個 symbol-z-order: 'source'）：
-       * 後座 → 駕駛 → 副駕。頭大到會互相蓋住，由後往前畫才像一列坐著的人。
-       */
-      // 只要是合體軌跡，後座就一定有寶寶（使用者拍板）。還沒設頭像就先坐外星人
-      putSeat('rear', babyAvatar ?? null, SEAT_HEAD_SCALE * BABY_HEAD_SCALE, center, BABY_LIFT);
-
-      // 這個順序就是「駕駛先畫、副駕後畫」，副駕因此蓋在最上面
       const seated: Seat[] = ['driver', 'passenger'];
-      ordered.slice(0, seated.length).forEach((i, k) => {
-        putSeat(seated[k], avatarFor(memberPaths[i].userId), SEAT_HEAD_SCALE, pos[i] ?? center);
+      const row = ordered.slice(0, seated.length).map((i, k) => ({
+        seat: seated[k],
+        url: avatarFor(memberPaths[i].userId),
+        facing: facingFor(memberPaths[i].userId),
+        scale: SEAT_HEAD_SCALE,
+        truth: pos[i] ?? center,
+      }));
+      // 只要是合體軌跡，後座就一定有寶寶（使用者拍板）。還沒設頭像就先坐外星人。
+      // ⚠️ 排在最後 ＝ 疊在最上面（symbol-z-order: 'source'），使用者要的就是
+      //    「盡量讓後座寶寶顯示出來不要擋到」
+      row.push({
+        seat: 'rear',
+        url: babyAvatar ?? null,
+        facing: babyAvatarFacing === 'right' ? 'right' : 'left',
+        scale: SEAT_HEAD_SCALE * BABY_HEAD_SCALE,
+        truth: center,
       });
+
+      /*
+       * 這一排頭的水平位置：先照各自的脖子擺，再把太近的推開。
+       *
+       * ⚠️⚠️ **合體時頭不再正對自己的脖子**（垂直高度還是照座位算的）。
+       *    插畫上三個脖子只橫跨 ~64 CSS px，而一顆座位頭就有 ~72 px ——
+       *    「下巴貼著脖子」跟「不要互相遮擋」在這個尺寸下不可能同時成立
+       *    （縮到看得清楚的極限也還是疊掉六成）。使用者要的是後者。
+       * ⚠️ 排不下就把間隙等比壓縮，最後整排夾在車身寬度裡 —— 頭飄到車外面
+       *    比互相蓋住更難看。
+       */
+      const gaps: number[] = [];
+      const order = row.map((_, i) => i)
+        .sort((a, b) => seatOffset(row[a].seat, flip, now).dx - seatOffset(row[b].seat, flip, now).dx);
+      for (let k = 1; k < order.length; k++) {
+        gaps.push(HEAD_GAP_RATIO * HEAD_CSS_W * (row[order[k - 1]].scale + row[order[k]].scale) / 2);
+      }
+      const span = gaps.reduce((a, b) => a + b, 0);
+      const squeeze = span > CAR_CSS_W ? CAR_CSS_W / span : 1;
+      const xs: number[] = new Array(row.length).fill(0);
+      let cur = -(span * squeeze) / 2;
+      order.forEach((i, k) => {
+        if (k > 0) cur += gaps[k - 1] * squeeze;
+        xs[i] = cur;
+      });
+
+      row.forEach((r, k) => putSeat(r.seat, r.url, r.facing, r.scale, r.truth, xs[k]));
 
       /*
        * 位子不夠的（四個人以上）排在車頂上方那一列。
@@ -3159,7 +3259,7 @@ export default function FootprintMap({
       const extra = ordered.slice(seated.length);
       extra.forEach((i, k) => {
         putHead(
-          avatarFor(memberPaths[i].userId), HEAD_CROWD_SCALE,
+          avatarFor(memberPaths[i].userId), facingFor(memberPaths[i].userId), HEAD_CROWD_SCALE,
           cpx.x + (k - (extra.length - 1) / 2) * HEAD_STEP,
           // ⚠️ 頭錨在底部，而 HEAD_ROW_LIFT 說的是「頭的中心」離車頂多高 ——
           //    所以要再補半顆頭，不然這一排會整個往上飄半顆
@@ -3222,8 +3322,9 @@ export default function FootprintMap({
       map.setCenter([cx / carFeatures.length, cy / carFeatures.length]);
     }
   }, [
-    cursorT, memberPaths, convoys, colorFor, avatarFor, seatFor, babyAvatar,
-    ensureCar, ensureHead, headTick, ready, playing,
+    cursorT, memberPaths, convoys, colorFor, avatarFor, seatFor, facingFor,
+    babyAvatar, babyAvatarFacing,
+    ensureCar, ensureHead, headTick, viewTick, ready, playing,
   ]);
 
   // --- 播放迴圈 ---

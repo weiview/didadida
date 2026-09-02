@@ -758,16 +758,26 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   所以沒有「爹地＋媽咪」那張）。四個人以上位子不夠，多出來的頭排在車頂上方一列
   （`HEAD_CROWD_SCALE`／`HEAD_STEP`）—— 至少「今天幾個人在一起」還看得出來。
 - **頭是刻意畫得很大的**（使用者的原話是「大頭狗開車」）。頭大到會互相蓋住，
-  所以**畫的順序就是疊放順序**（`rider-heads` 那層設 `'symbol-z-order': 'source'`）：
-  後座 → 駕駛 → 副駕。
+  所以**畫的順序就是疊放順序**（`rider-heads` 那層設 `'symbol-z-order': 'source'`）。
+  ⚠️⚠️ **合體時那幾顆頭橫向會被推開，不再各自坐在自己的脖子正上方**
+  （2026-09-02 使用者：「合體的時候 大頭不要互相遮擋, 盡量讓後座寶寶頭像顯示出來不要擋到」）。
+  三個脖子橫向只隔 ~63 CSS px，而一顆座位頭就 ~72 px —— **「黏在脖子上」與
+  「不互相遮擋」在這張插畫上不可能同時成立**，使用者要的是後者。所以
+  `putSeat` 多一個選填的 `dx` 覆寫**橫向**位置（縱向永遠照座位算，下巴還是落在脖子上）：
+  照 `seatOffset().dx` 排序 → 相鄰兩顆至少隔 `HEAD_GAP_RATIO × 兩顆頭寬的平均`
+  → 整排超過 `CAR_CSS_W` 就等比壓回去 → 置中。
+  ⚠️ **寶寶最後才 push**（`symbol-z-order: 'source'` ＝後畫的在上面），
+  所以他永遠不會被別人的頭蓋掉 —— 那正是使用者點名的那一顆。
   ⚠️⚠️ **要更誇張一律去縮 `CAR_W`（car.ts），不要再放大 `HEAD_SIZE`。**
   頭的來源只有 256px，`HEAD_BOX` 超過它就是把小圖放大、邊緣糊掉；而且三顆頭是靠
   插畫上那三個綠點定位的，座位間距跟著 `CAR_W` 等比縮，頭一放大就整團疊死。
   現在是車 150 CSS px 寬、一顆頭 116 —— 2026-09-02 兩輪調過來的
   （260／88 →「車子太大了」→ 180／116 →「車子再小一點 但頭像大小先不動」→ 150／116）。
-  ⚠️ 縮車連帶要調 `BABY_LIFT`（後座到駕駛只剩 ~20px，而且他的頭比較小、
-  下巴對齊時頭頂反而比駕駛低，不抬高整顆會被擋掉）與車頂那一列的
-  `HEAD_STEP`／`HEAD_CROWD_SCALE`。
+  ⚠️ 縮車連帶要調車頂那一列的 `HEAD_STEP`／`HEAD_CROWD_SCALE`。
+  ⚠️ **`BABY_LIFT` 已經移除**（2026-09-02 使用者：「寶寶頭像位置太高 沒有貼到後座
+  身體的脖子上」）。它本來是為了「不被駕駛的頭擋掉」把寶寶整顆往上抬 18px，
+  代價就是他浮在脖子上面。遮擋改由上面那條橫向推開＋畫的順序解決，
+  **不要再用抬高來閃避遮擋** —— 那是拿「貼不到脖子」換的。
 - ⚠️⚠️ **停著的時候也要補一次 `triggerRepaint()`**（`car.ts` 的 `makeSettler`）。
   `StyleImageInterface.render()` 寫進 `this.data` 的內容要等**下一次**重繪才真的
   畫得出來 —— 動畫在跑時每一格都有下一次，停著就沒有了，於是外星人那顆頭
@@ -776,6 +786,12 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - ⚠️ **頭的 geometry 不是那個人真正的位置** —— 它是把車投影成像素（`map.project`）、
   在座位上排好再投影回來（`map.unproject`）。所以點下去要開 Google 地圖時
   **絕對不能拿 geometry 當座標**，真的那一份另外掛在 properties 的 `lng`／`lat` 上。
+  ⚠️⚠️ 也因為是**螢幕座標推回經緯度**，那份 geometry 只在算它的那個縮放級別上對齊。
+  播放中每一格都重算所以會自己修正，**暫停的時候不會** —— 於是縮放或拖動地圖，
+  頭就跟車分家了（2026-09-02 使用者：「中途暫停 放大的時候 頭像會跟車子分離」）。
+  修法是一支 `map.on('move')` 監聽器推 `viewTick` 逼那支效果重跑，
+  ⚠️ **而且只在 `!playingRef.current` 時推** —— 播放中那一圈本來就在重畫，
+  而鏡頭跟拍每一格都會發 `move`，跟著推是純粹白做。
 - 車身是固定的紅色插畫，輪子也不轉了（那是畫上去的），改成整台車輕輕上下浮動
   （`carBob`）＋一片靜止的地面陰影。
 - ⚠️⚠️ **頭外面那一圈不上軌跡色**（2026-09-02 使用者：「大頭不要有顏色的框框」）。
@@ -785,6 +801,34 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   一模一樣的），外星人那顆全站只有一張，`NEUTRAL_RING` 整個移除。
   ⚠️ 拿掉顏色圈時 `HEAD_PAD` **刻意維持 18** —— 它一變 `HEAD_BOX` 就變、頭跟著
   變大，而 `HEAD_BOTTOM_PAD`（下巴往下推多少）是照它算的。
+
+### 頭像朝哪一邊（`avatar_facing`，0025）
+
+⚠️⚠️ **車頭會跟著行進方向左右鏡射（`flip`），頭像不會** —— 它就是一張使用者上傳的圖。
+於是一張側臉朝左的頭像，在往東走的那一半路上變成「坐在車上看車尾」
+（2026-09-02 使用者：「頭像的方向 不一定跟車頭方向一致, 會導致看起來很怪」）。
+
+- 存的是**這張圖本來朝哪一邊**，鏡不鏡射由前端當場算：
+  `const mirror = (facing === 'left') !== flip;`（`flip` 為真＝車頭朝左）。
+  正臉的頭像兩個值都對，所以預設值 `'left'` 不必猜得準。
+- 欄位是 `User.avatar_facing TEXT NOT NULL DEFAULT 'left'`（0025）；
+  **寶寶沒有 `User` 那一列**，他的記在 `AppSetting.baby_avatar_facing`（k/v，不需要 migration），
+  跟 `baby_avatar` 同一個規矩、同樣跟著 `GET /api/auth/me` 回來（零額外請求）。
+- ⚠️ **maplibre 沒有辦法把一張 icon 左右翻過來**（沒有負的 `icon-size`，也沒有 mirror 屬性）。
+  所以鏡射版是**另外烤一張貼圖**：`bakeHead(src, mirror)` 先過一次
+  `mirrorSource()`，image id 尾巴加 `':m'`。一個人最多兩張，貼圖快取扛得住。
+  ⚠️ GIF 頭像每一格都要照樣鏡射（`bakeHead` 那一層本來就每格都跑，改在它裡面就自動涵蓋）。
+- 改的地方是 **`AvatarPicker` 的兩顆選填 prop**（`facing`／`onFacingChange`），
+  不是另做一套 UI —— 三個呼叫端（`/admin` 的白名單、`/admin` 的寶寶、帳號牌上的自己）
+  因此一起有了。⚠️ **`onFacingChange` 沒給就整組不端出來**：帳號牌那邊看
+  `canViewMap`，看不到地圖的人沒有那台車，多一組設定只是雜訊。
+- 路由兩支：`PUT /api/users/:id/avatar/facing`（本人或 `canManageOthers`）與
+  `PUT /api/admin/baby-avatar/facing`（`canManageOthers`）。值跟著
+  `/api/auth/me`（`user.avatar_facing`／`baby_avatar_facing`）、
+  `/api/track-members`（`avatar_facing`）與 `/api/admin/settings` 回來 ——
+  ⚠️ 多帶一欄**不多花讀取額度**（D1 算的是讀了幾列不是幾欄），所以不另外開查詢路由。
+- ⚠️ 前端一律 `=== 'right' ? 'right' : 'left'` 收斂：舊列、壞值、以及邊快取裡
+  躺著舊版後端回應時那一欄是 `undefined`，都要落在 `'left'` 上。
 
 ### 頭像支援 GIF 動圖
 

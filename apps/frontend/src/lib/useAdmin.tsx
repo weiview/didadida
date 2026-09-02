@@ -125,6 +125,15 @@ interface AuthValue {
    * 不改的話這一輪 session 裡走到 /map 還是畫舊的那張（值是 /auth/me 帶回來的）。
    */
   setBabyAvatar: (avatar: string | null) => void;
+  /**
+   * 後座那個寶寶的頭像**本來朝哪一邊**（見 FootprintMap 的鏡射規則）。
+   * 跟 babyAvatar 一樣是 /auth/me 帶回來的站台設定。
+   */
+  babyAvatarFacing: 'left' | 'right';
+  /** 站長在 /admin 換掉寶寶的朝向之後，就地把手上這份改掉（同 setBabyAvatar） */
+  setBabyAvatarFacing: (facing: 'left' | 'right') => void;
+  /** 換完自己的頭像朝向之後同步這裡的 user（同 setMyAvatar） */
+  setMyAvatarFacing: (facing: 'left' | 'right') => void;
   /** 登出：清掉站上與 Google 的 token，回到進站畫面 */
   logout: () => void;
 }
@@ -135,7 +144,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AuthState>({
     admin: false, guest: false, canViewMap: false,
     canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, babyAvatar: null, user: null,
+    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false,
+    babyAvatar: null, babyAvatarFacing: 'left', user: null,
   });
   const [checking, setChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -160,7 +170,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
         // 遮罩也不樂觀關掉：真正的值等 checkAuth() 回來。猜錯的方向要是
         // 「先攤開來再糊回去」，那一下就白做了
-        convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: true, babyAvatar: null, user: null,
+        convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: true,
+        babyAvatar: null, babyAvatarFacing: 'left', user: null,
       });
       checkAuth().then((next) => {
         if (!alive) return;
@@ -223,6 +234,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setState((prev) => ({ ...prev, babyAvatar: avatar }));
   }, []);
 
+  const setBabyAvatarFacing = useCallback((facing: 'left' | 'right') => {
+    setState((prev) => ({ ...prev, babyAvatarFacing: facing }));
+  }, []);
+
+  const setMyAvatarFacing = useCallback((facing: 'left' | 'right') => {
+    setState((prev) => (prev.user ? { ...prev, user: { ...prev.user, avatar_facing: facing } } : prev));
+  }, []);
+
   const logout = useCallback(() => {
     clearTokens();
     // 上線名單也要清。留著的話下一個登入的人會先看到上一個人的名單，
@@ -231,7 +250,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setState({
       admin: false, guest: false, canViewMap: false,
       canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-      convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, babyAvatar: null, user: null,
+      convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false,
+      babyAvatar: null, babyAvatarFacing: 'left', user: null,
     });
     setAuthError(null);
   }, []);
@@ -289,6 +309,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     convoyOverlapPct: state.convoyOverlapPct,
     restrictedBlur: state.restrictedBlur,
     babyAvatar: state.babyAvatar,
+    babyAvatarFacing: state.babyAvatarFacing,
     markNotificationsRead,
     canEdit,
     canAddTo,
@@ -301,9 +322,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     recolorSelf,
     setMyAvatar,
     setBabyAvatar,
+    setBabyAvatarFacing,
+    setMyAvatarFacing,
     logout,
   }), [state, checking, canManageOthers, canEdit, canAddTo, canReorderIn, unlock, login, loginWithGoogle,
-       authError, renameSelf, recolorSelf, setMyAvatar, setBabyAvatar, logout, markNotificationsRead]);
+       authError, renameSelf, recolorSelf, setMyAvatar, setBabyAvatar, setBabyAvatarFacing,
+       setMyAvatarFacing, logout, markNotificationsRead]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

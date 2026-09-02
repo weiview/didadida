@@ -43,7 +43,10 @@ const fmtUtc = (s: string) =>
   new Date(s.endsWith("Z") ? s : `${s.replace(" ", "T")}Z`).toLocaleString();
 
 export default function AdminPage() {
-  const { canManageOthers, checking, isAdmin, user: me, setMyAvatar, setBabyAvatar } = useAdmin();
+  const {
+    canManageOthers, checking, isAdmin, user: me,
+    setMyAvatar, setMyAvatarFacing, setBabyAvatar, setBabyAvatarFacing,
+  } = useAdmin();
 
   /*
    * 誰現在在線上。**只是看**，輪詢由全站唯一的 <PresenceToasts /> 開
@@ -152,6 +155,8 @@ export default function AdminPage() {
   const [seatPassenger, setSeatPassenger] = useState<number | null>(null);
   const [savingSeat, setSavingSeat] = useState(false);
   const [babyAvatarUrl, setBabyAvatarUrl] = useState<string | null>(null);
+  /** 寶寶那張圖本來朝哪一邊。車頭會翻面、頭像不會，見 FootprintMap 的鏡射規則 */
+  const [babyFacing, setBabyFacing] = useState<'left' | 'right'>('left');
 
   /*
    * GPS 軌跡資料夾的掃描結果。**刻意不在開頁時就跑** —— 那是一次 Google Drive
@@ -173,6 +178,7 @@ export default function AdminPage() {
       setRestrictedBlur(settings.restricted_blur === 1);
       setSeatPassenger(settings.seat_passenger_uid);
       setBabyAvatarUrl(settings.baby_avatar);
+      setBabyFacing(settings.baby_avatar_facing);
       setError(null);
     } catch (e: any) {
       setError(e.message || "讀取白名單失敗");
@@ -556,6 +562,12 @@ export default function AdminPage() {
             setBabyAvatar(avatar);
             setNotice(avatar ? "寶寶的頭像換好了。" : "寶寶的頭像移除了，後座會畫一隻小外星人。");
           }}
+          facing={babyFacing}
+          onFacingChange={(facing) => {
+            setBabyFacing(facing);
+            // 同 onChange：這一輪 session 裡走去 /map 就用新的，不必重整
+            setBabyAvatarFacing(facing);
+          }}
         />
       </AdminSection>
 
@@ -720,6 +732,12 @@ export default function AdminPage() {
                           setUsers((prev) => prev.map((u) => (u.id === user.id ? { ...u, avatar } : u)));
                           // 站長在這裡換自己的，右上角那顆圓鈕也要跟著換
                           if (user.id === me?.id) setMyAvatar(avatar);
+                        }}
+                        facing={user.avatar_facing === 'right' ? 'right' : 'left'}
+                        onFacingChange={(facing) => {
+                          setUsers((prev) => prev.map((u) => (
+                            u.id === user.id ? { ...u, avatar_facing: facing } : u)));
+                          if (user.id === me?.id) setMyAvatarFacing(facing);
                         }}
                       />
                     </div>

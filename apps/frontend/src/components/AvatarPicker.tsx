@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 import Avatar from "./Avatar";
 import { prepareAvatar } from "@/lib/avatar";
-import { removeAvatar, uploadAvatar, type AvatarTarget } from "@/lib/api";
+import { removeAvatar, setAvatarFacing, uploadAvatar, type AvatarTarget } from "@/lib/api";
 
 /**
  * 換頭像。**帳號牌與 /admin 後台共用同一個元件**（同一件事不要做兩套 UI）——
@@ -21,6 +21,7 @@ import { removeAvatar, uploadAvatar, type AvatarTarget } from "@/lib/api";
  */
 export default function AvatarPicker({
   userId, current, name, color, onChange, size = 64, hint,
+  facing, onFacingChange,
 }: {
   /** 換誰的。`'baby'` 是後座那個寶寶（他沒有帳號，圖記在站台設定上） */
   userId: AvatarTarget;
@@ -32,6 +33,13 @@ export default function AvatarPicker({
   size?: number;
   /** 蓋掉底下那句說明。沒給就是一般成員那一套（留言區＋地圖） */
   hint?: React.ReactNode;
+  /**
+   * 這張圖**本來朝哪一邊**。給了才會端出那兩顆方向鈕 ——
+   * 沒有地圖權限的人看不到那台車，多一組設定只是雜訊。
+   */
+  facing?: 'left' | 'right';
+  /** 換好方向之後通知呼叫端（它自己更新畫面）。沒給就不端出方向鈕 */
+  onFacingChange?: (facing: 'left' | 'right') => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
@@ -65,6 +73,24 @@ export default function AvatarPicker({
     }
   };
 
+  /*
+   * 換朝向。**不重傳圖** —— 只是 D1 上一個字串，地圖那邊會現場決定要不要鏡射。
+   * 先把畫面換過去再送（樂觀更新）：這是一個一眼就看得出對錯的開關，
+   * 等一趟往返才動看起來像沒反應；失敗再退回來並講原因。
+   */
+  const flip = async (next: 'left' | 'right') => {
+    if (busy || !onFacingChange || next === facing) return;
+    setBusy(true);
+    setError(null);
+    onFacingChange(next);
+    const result = await setAvatarFacing(userId, next);
+    if (!result.success) {
+      onFacingChange(facing ?? 'left');
+      setError(result.message ?? "設定頭像方向失敗");
+    }
+    setBusy(false);
+  };
+
   const drop = async () => {
     if (busy) return;
     setBusy(true);
@@ -94,6 +120,27 @@ export default function AvatarPicker({
             </button>
           )}
         </div>
+        {facing && onFacingChange && (
+          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 11, opacity: 0.7 }}>頭像朝向</span>
+            {(['left', 'right'] as const).map((f) => (
+              <button
+                key={f}
+                type="button"
+                disabled={busy}
+                onClick={() => flip(f)}
+                style={{
+                  ...btn,
+                  padding: "4px 8px",
+                  fontWeight: facing === f ? 700 : 400,
+                  background: facing === f ? "rgba(120, 100, 84, 0.16)" : btn.background,
+                }}
+              >
+                {f === 'left' ? "◀ 朝左" : "朝右 ▶"}
+              </button>
+            ))}
+          </div>
+        )}
         <input
           ref={inputRef}
           type="file"
@@ -111,6 +158,13 @@ export default function AvatarPicker({
           )}
           {" "}
           <strong>GIF 動圖會動</strong>（原檔直送，上限 2MB）。
+          {facing && onFacingChange && (
+            <>
+              {" "}地圖上的車會跟著行進方向左右翻面，<strong>頭像不會</strong> ——
+              「頭像朝向」講的是<strong>這張圖裡的臉朝哪一邊</strong>，
+              設對了車往哪邊開臉就朝哪邊。正面照兩邊都可以。
+            </>
+          )}
         </p>
         {animated && (
           <p style={{ margin: 0, fontSize: 11, color: "#8a6d3b", lineHeight: 1.6 }}>

@@ -99,7 +99,7 @@ export default function MapPage() {
    * 軌跡（GET 沒擋），但不該端出那些按鈕 —— 按了只會拿到 403。
    */
   const {
-    isAdmin, canManageOthers, canViewMap, canUseTools, convoyOverlapPct, babyAvatar,
+    isAdmin, canManageOthers, canViewMap, canUseTools, convoyOverlapPct, babyAvatar, babyAvatarFacing,
     checking: checkingAuth, user,
   } = useAdmin();
   const router = useRouter();
@@ -384,6 +384,17 @@ export default function MapPage() {
   const trackAvatars = useMemo(() => {
     const out: Record<number, string | null> = {};
     for (const m of members) out[m.id] = m.avatar ?? null;
+    return out;
+  }, [members]);
+
+  /**
+   * user_id → 這張頭像**本來朝哪一邊**。車頭會跟著行進方向翻面、頭像不會，
+   * 所以 FootprintMap 靠這個決定要不要換那張鏡射過的貼圖。
+   * 舊後端沒有這一欄（邊快取裡躺著舊回應）時當成朝左，跟欄位預設值一致。
+   */
+  const trackAvatarFacings = useMemo(() => {
+    const out: Record<number, 'left' | 'right'> = {};
+    for (const m of members) out[m.id] = m.avatar_facing === 'right' ? 'right' : 'left';
     return out;
   }, [members]);
 
@@ -1626,8 +1637,10 @@ export default function MapPage() {
         convoyOverlapPct={convoyOverlapPct}
         trackColors={trackColors}
         trackAvatars={trackAvatars}
+        trackAvatarFacings={trackAvatarFacings}
         trackSeats={trackSeats}
         babyAvatar={babyAvatar}
+        babyAvatarFacing={babyAvatarFacing}
         timelineColor={myColor}
         // 我自己被篩掉時，我的 Google 紀念層也跟著收 —— 那一層畫的就是我
         timelineLines={showTimeline && !meHidden ? timelineLines : undefined}

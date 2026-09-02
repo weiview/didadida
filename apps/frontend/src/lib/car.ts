@@ -262,12 +262,37 @@ const HEAD_BOX = HEAD_SIZE - HEAD_PAD * 2;
 interface BakedFrame { data: Uint8ClampedArray; delayMs: number; }
 
 /**
+ * 把頭像左右翻過來，翻完的那一張才交給 bakeHead 當來源。
+ *
+ * ⚠️⚠️ **maplibre 沒有辦法把一張 icon 鏡射**（沒有負的 icon-size、也沒有
+ * mirror 屬性），所以朝右的那一版是**另外烤一張圖**、掛在另一個 image id 上
+ * （見 FootprintMap 的 `ensureHead`）。一個人最多兩張，貼圖快取扛得住。
+ *
+ * 尺寸直接壓成 HEAD_BOX：來源可能是 256px 的頭像，也可能是一格 GIF，
+ * 統一成同一個大小之後底下那一整套（描邊、陰影）一個字都不用改。
+ */
+function mirrorSource(src: CanvasImageSource): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = HEAD_BOX;
+  c.height = HEAD_BOX;
+  const x = c.getContext('2d')!;
+  x.imageSmoothingQuality = 'high';
+  x.translate(HEAD_BOX, 0);
+  x.scale(-1, 1);
+  x.drawImage(src, 0, 0, HEAD_BOX, HEAD_BOX);
+  return c;
+}
+
+/**
  * 把一張去背頭像烤成地圖上的一顆大頭：外面一圈白邊 ＋ 一點陰影。
  *
  * canvas 沒有「描 alpha 邊」這種功能，只能把剪影往十六個方向各畫一次再把原圖
  * 蓋上去。十六個夠密了，再多只是拖慢，再少邊緣會出現扇形缺口。
+ *
+ * `mirror` ＝ 這張臉朝的方向跟車頭相反，要先左右翻過來（見 mirrorSource）。
  */
-function bakeHead(src: CanvasImageSource): Uint8ClampedArray {
+function bakeHead(src: CanvasImageSource, mirror = false): Uint8ClampedArray {
+  if (mirror) src = mirrorSource(src);
   const mask = (fill: string) => {
     const c = document.createElement('canvas');
     c.width = HEAD_SIZE;
@@ -360,6 +385,7 @@ function framesToImage(
  */
 export async function buildAvatarHead(
   url: string,
+  mirror = false,
   hooks?: { triggerRepaint: () => void; isAnimating: () => boolean },
 ): Promise<StaticImage | AnimatedImage> {
   const res = await fetch(url, { mode: 'cors' });
@@ -370,7 +396,7 @@ export async function buildAvatarHead(
     const gif = decodeGif(buf);
     if (gif && gif.frames.length > 1) {
       const baked = gif.frames.map((f) => ({
-        data: bakeHead(frameToCanvas(f.data, gif.width, gif.height)),
+        data: bakeHead(frameToCanvas(f.data, gif.width, gif.height), mirror),
         delayMs: f.delayMs,
       }));
       return framesToImage(baked, hooks.triggerRepaint, hooks.isAnimating);
@@ -379,7 +405,7 @@ export async function buildAvatarHead(
   }
 
   const bitmap = await createImageBitmap(new Blob([buf]));
-  const data = bakeHead(bitmap);
+  const data = bakeHead(bitmap, mirror);
   bitmap.close?.();
   return { width: HEAD_SIZE, height: HEAD_SIZE, data };
 }

@@ -31,8 +31,8 @@ const BADGE = 40;
 export default function AccountBadge() {
   const {
     isAdmin, isGuest, checking, user, isOwner, canManageOthers,
-    canViewComments, unreadNotifications, markNotificationsRead,
-    renameSelf, recolorSelf, setMyAvatar, logout,
+    canViewComments, canViewMap, unreadNotifications, markNotificationsRead,
+    renameSelf, recolorSelf, setMyAvatar, setMyAvatarFacing, logout,
   } = useAdmin();
 
   const [open, setOpen] = useState(false);
@@ -337,6 +337,11 @@ export default function AccountBadge() {
                     color={myColor ?? "#8a7f72"}
                     size={56}
                     onChange={setMyAvatar}
+                    {...(canViewMap ? {
+                      // 看不到地圖的人沒有那台車，多一組「頭像朝向」只是雜訊
+                      facing: (user.avatar_facing === 'right' ? 'right' : 'left') as 'left' | 'right',
+                      onFacingChange: setMyAvatarFacing,
+                    } : {})}
                   />
                 </div>
               )}

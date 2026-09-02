@@ -468,6 +468,14 @@ export interface CurrentUser {
    * 「名字首字 + track_color 的圓」。**同一張圖也是地圖上那顆大頭**。
    */
   avatar?: string | null;
+  /**
+   * 他那張頭像**本來朝哪一邊**（'left' / 'right'，見 migrations/0025）。
+   *
+   * 地圖上的車會跟著行進方向左右鏡射，頭像不會 —— 一張朝左的側臉在往右開的
+   * 那半段就變成臉朝車尾。存的是「圖朝哪邊」，要不要翻是畫的時候現算的。
+   * 舊後端沒有這一欄（undefined）→ 當 'left'。
+   */
+  avatar_facing?: 'left' | 'right';
 }
 
 /** 進站狀態。admin 與 guest 都是 false 代表連門都還沒進，該顯示進站畫面 */
@@ -512,6 +520,8 @@ export interface AuthState {
    * 沒設就是 null，合體時後座畫小外星人。
    */
   babyAvatar: string | null;
+  /** 寶寶那張頭像朝哪一邊（同 CurrentUser.avatar_facing，站長在 /admin 設） */
+  babyAvatarFacing: 'left' | 'right';
   user: CurrentUser | null;
 }
 
@@ -579,7 +589,8 @@ export async function checkAuth(): Promise<AuthState> {
   const locked: AuthState = {
     admin: false, guest: false, canViewMap: false,
     canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, babyAvatar: null, user: null,
+    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false,
+    babyAvatar: null, babyAvatarFacing: 'left', user: null,
   };
   if (typeof window === 'undefined') return locked;
   // 舊版把明文密碼存在這個 key。清掉已經留在使用者瀏覽器裡的那一份，
@@ -615,6 +626,8 @@ export async function checkAuth(): Promise<AuthState> {
         restrictedBlur: !!data.restricted_blur,
         // 舊後端不回這個欄位 —— 後座就畫小外星人，跟站長還沒傳寶寶頭像時一樣
         babyAvatar: data.baby_avatar ?? null,
+        // 舊後端不回這個欄位 —— 當 'left'（多數去背頭像是側臉朝左）
+        babyAvatarFacing: data.baby_avatar_facing === 'right' ? 'right' : 'left',
         user: data.user ?? null,
       };
     }
@@ -730,6 +743,33 @@ export async function removeAvatar(
 }
 
 /**
+ * 改「這張頭像本來朝哪一邊」。
+ *
+ * ⚠️ 跟頭像本身刻意**不是同一支路由**：換朝向不必重傳圖（也就不必再跑一次
+ * prepareAvatar），而且改自己那張不需要管理權限 —— 後端那道閘是
+ * 「可管理全站內容的人，或改自己那一列」。寶寶那張是全站設定，走後台那支。
+ */
+export async function setAvatarFacing(
+  target: AvatarTarget, facing: 'left' | 'right',
+): Promise<{ success: boolean; message?: string }> {
+  try {
+    const url = target === 'baby'
+      ? `${API_BASE_URL}/admin/baby-avatar/facing`
+      : `${API_BASE_URL}/users/${target}/avatar/facing`;
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ facing }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) return { success: true };
+    return { success: false, message: data.error || '設定頭像方向失敗' };
+  } catch (error: any) {
+    return { success: false, message: `連線錯誤: ${error.message}` };
+  }
+}
+
+/**
  * 站上的一個家人。只有畫地圖與色票列需要的三欄 ——
  * 信箱、權限那些是 /api/admin/users（站長專屬）的事。
  */
@@ -740,6 +780,8 @@ export interface TrackMember {
   track_color: string;
   /** 頭像網址。**地圖上車頂那顆大頭就是它**，null 就換小外星人上車 */
   avatar?: string | null;
+  /** 那張頭像本來朝哪一邊。見 CurrentUser.avatar_facing */
+  avatar_facing?: 'left' | 'right';
   /**
    * 他的 GPSLogger 資料夾綁好了沒。**代跑**（站長的瀏覽器替全家同步）
    * 靠它決定要掃誰。舊後端沒有這一欄（undefined）—— 那時候一律當成沒綁，
@@ -1396,6 +1438,8 @@ export interface SiteSettings {
   seat_passenger_uid: number | null;
   /** 後座那個寶寶的頭像網址，站長在 /admin 傳的（全站一張）。沒傳是 null */
   baby_avatar: string | null;
+  /** 寶寶那張頭像本來朝哪一邊。見 CurrentUser.avatar_facing */
+  baby_avatar_facing: 'left' | 'right';
 }
 
 /** PUT 的內容。開關是布林、門檻是數字，所以不能寫成 Partial<Record<…, boolean>> */
@@ -1419,6 +1463,7 @@ export async function fetchSiteSettings(): Promise<SiteSettings> {
     restricted_blur: data.restricted_blur ?? 0,
     seat_passenger_uid: data.seat_passenger_uid ?? null,
     baby_avatar: data.baby_avatar ?? null,
+    baby_avatar_facing: data.baby_avatar_facing === 'right' ? 'right' : 'left',
   };
 }
 
@@ -1441,6 +1486,7 @@ export async function updateSiteSettings(
         restricted_blur: data.restricted_blur ?? 0,
         seat_passenger_uid: data.seat_passenger_uid ?? null,
         baby_avatar: data.baby_avatar ?? null,
+        baby_avatar_facing: data.baby_avatar_facing === 'right' ? 'right' : 'left',
       },
     };
   }

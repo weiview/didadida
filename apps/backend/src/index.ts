@@ -163,6 +163,18 @@ const SETTING_BABY_AVATAR = "baby_avatar_key";
  * 合體時照原本的順序補位。
  */
 const SETTING_SEAT_PASSENGER = "seat_passenger_uid";
+/**
+ * 寶寶那張頭像本來朝哪一邊（見 migrations/0025）。寶寶沒有 User 那一列，
+ * 所以他的方向記在這裡（k/v，**不需要 migration**）。
+ */
+const SETTING_BABY_FACING = "baby_avatar_facing";
+
+/**
+ * 頭像上那張臉朝哪一邊。只有 'left'／'right' 兩個值 ——
+ * 舊列、壞值、沒設過一律當 'left'（正臉的頭像兩個值都對，猜錯不會壞掉什麼）。
+ */
+type AvatarFacing = "left" | "right";
+const normFacing = (v: any): AvatarFacing => (String(v ?? "") === "right" ? "right" : "left");
 
 /**
  * token 裡的身分。兩層，沒有第三層：
@@ -505,6 +517,11 @@ interface Actor {
    * 要給前端的是網址，用 avatarUrl() 換 —— 這裡存的是檔名，同一列上順手帶出來。
    */
   avatarKey: string | null;
+  /**
+   * 他那張頭像本來朝哪一邊（見 migrations/0025）。地圖上的車會左右鏡射、
+   * 頭像不會，前端拿這一格決定要不要烤一張鏡射版。同一列上，理由同 avatarKey。
+   */
+  avatarFacing: AvatarFacing;
 }
 
 /* ── 頭像 ──────────────────────────────────────────────────────────────────
@@ -573,7 +590,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
   // 沒有 uid 的舊 token／密碼登入：當站長（見 Identity 的註解）
   if (identity.uid == null) {
     const owner = await env.DB.prepare(
-      "SELECT id, name, email, track_color, avatar_key, track_drive_folder_id FROM User WHERE role = 'owner' AND active = 1 ORDER BY id LIMIT 1"
+      "SELECT id, name, email, track_color, avatar_key, avatar_facing, track_drive_folder_id FROM User WHERE role = 'owner' AND active = 1 ORDER BY id LIMIT 1"
     ).first<any>();
     if (owner) {
       return {
@@ -584,6 +601,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
         trackFolderId: owner.track_drive_folder_id ?? null,
         trackColor: trackColorFor(owner.id, owner.track_color),
         avatarKey: owner.avatar_key ?? null,
+        avatarFacing: normFacing(owner.avatar_facing),
       };
     }
     return {
@@ -593,13 +611,14 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
       canComment: true, canViewComments: true, canViewMap: true, canUseTools: true, trackFolderId: null,
       trackColor: trackColorFor(null, null),
       avatarKey: null,
+      avatarFacing: "left",
     };
   }
 
   const row = await env.DB.prepare(
     `SELECT id, name, email, role, can_manage_others, can_add_to_others, can_reorder_others,
             can_comment, can_view_comments, can_view_map, can_use_tools, notif_seen_at,
-            active, track_color, avatar_key, track_drive_folder_id
+            active, track_color, avatar_key, avatar_facing, track_drive_folder_id
        FROM User WHERE id = ?`
   ).bind(identity.uid).first<any>();
   // 列不見了或被移出白名單 —— 手上那張 token 立刻失效，不等它過期
@@ -626,6 +645,7 @@ async function resolveActor(request: Request, env: Env): Promise<Actor | null> {
     trackFolderId: row.track_drive_folder_id ?? null,
     trackColor: trackColorFor(row.id, row.track_color),
     avatarKey: row.avatar_key ?? null,
+    avatarFacing: normFacing(row.avatar_facing),
   };
 }
 
@@ -1158,6 +1178,11 @@ async function restrictedBlurOn(env: Env): Promise<boolean> {
 async function babyAvatarKey(env: Env): Promise<string | null> {
   const v = await getSettingCached(env, SETTING_BABY_AVATAR);
   return v && AVATAR_NAME_RE.test(v) ? v : null;
+}
+
+/** 寶寶那張頭像本來朝哪一邊。沒設過＝'left'（見 migrations/0025） */
+async function babyAvatarFacing(env: Env): Promise<AvatarFacing> {
+  return normFacing(await getSettingCached(env, SETTING_BABY_FACING));
 }
 
 /** 副駕駛是誰（User.id）。沒設過＝null，合體時照原本的順序補位 */
@@ -3375,6 +3400,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
            * AppSetting 換一個他用不到的網址。值走 getSettingCached（60 秒 memo）。
            */
           baby_avatar: canViewMap ? avatarUrl(url.origin, await babyAvatarKey(env)) : null,
+          // 那張圖本來朝哪一邊（見 migrations/0025）。同上，只發給看得到地圖的人
+          baby_avatar_facing: canViewMap ? await babyAvatarFacing(env) : "left",
           user: actor ? {
             id: actor.uid, name: actor.name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
@@ -3387,6 +3414,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             can_use_tools: actor.canUseTools ? 1 : 0,
             track_color: actor.trackColor,
             avatar: avatarUrl(url.origin, actor.avatarKey),
+            avatar_facing: actor.avatarFacing,
           } : null,
         }), { headers });
       }
@@ -3634,6 +3662,38 @@ if (method === "POST" && pathname === "/api/verify-password") {
       }
 
       /*
+       * 路由：他那張頭像本來朝哪一邊（見 migrations/0025）。
+       *
+       * 跟上面那支換頭像**同一道閘**（自己，或可管理全站內容的人）——
+       * 「這是不是我的臉」與「這張臉朝哪」是同一件事的兩半。
+       * 刻意不併進那一支：改方向不必重傳圖，而它的 body 是原始圖檔位元組，
+       * 塞不下 JSON。路徑切出來是 6 段，跟 /avatar（5 段）不會撞。
+       */
+      if (method === "PUT" && pathname.startsWith("/api/users/")
+          && pathname.endsWith("/avatar/facing") && pathname.split("/").length === 6) {
+        const targetId = Number(pathname.split("/")[3]);
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!Number.isInteger(targetId) || targetId <= 0) {
+          return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });
+        }
+        if (!actor.canManageOthers && actor.uid !== targetId) {
+          return forbidden(headers, "只能改自己的頭像");
+        }
+        const body: { facing?: any } = await request.json();
+        // 壞值一律當 left（見 normFacing）—— 這一格只影響畫面，不值得回 400
+        const facing = normFacing(body.facing);
+        const res = await env.DB.prepare("UPDATE User SET avatar_facing = ? WHERE id = ?")
+          .bind(facing, targetId).run();
+        if (!res.meta.changes) {
+          return new Response(JSON.stringify({ error: "找不到這個帳號" }), { status: 404, headers });
+        }
+        return new Response(JSON.stringify({ success: true, avatar_facing: facing }), { headers });
+      }
+
+      /*
        * 路由：站上的家人清單（id / 名字 / 顏色）。**任何管理員都讀得到**，
        * 不是站長專屬 —— 它不是白名單管理，是地圖圖例與色票列的資料來源：
        *
@@ -3651,7 +3711,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         // 沒有工具權限的人不列（見 TRACK_MEMBER_COND）。這一支同時餵地圖的
         // 圖例、成員篩選列、軌跡顏色與車上的大頭 —— 從源頭拿掉，四個地方一起乾淨
         const { results } = await env.DB.prepare(
-          `SELECT u.id, u.name, u.track_color, u.avatar_key, u.role, u.track_drive_folder_id FROM User u
+          `SELECT u.id, u.name, u.track_color, u.avatar_key, u.avatar_facing, u.role, u.track_drive_folder_id FROM User u
            WHERE u.active = 1 AND ${TRACK_MEMBER_COND} ORDER BY u.id`
         ).all();
         // 合體那台車上誰坐哪裡。駕駛固定是站長（那是資料裡本來就有的身分），
@@ -3664,6 +3724,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
           track_color: trackColorFor(Number(u.id), u.track_color),
           // 地圖要拿它畫車上的大頭 —— 沒設就是 null，那個人坐上去的是小外星人
           avatar: avatarUrl(url.origin, u.avatar_key),
+          /*
+           * 那張頭像本來朝哪一邊（見 migrations/0025）。車會左右鏡射、頭像不會，
+           * 前端拿它決定要不要烤一張鏡射版的貼圖。⚠️ 多帶一欄不多花讀取額度。
+           */
+          avatar_facing: normFacing(u.avatar_facing),
           /*
            * 他的 GPSLogger 資料夾綁好了沒。**代跑**（站長的瀏覽器替全家同步）
            * 靠這一格決定要掃誰，見 `/api/tracks/drive/files` 的 `?user_id=`。
@@ -3709,6 +3774,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             // 地圖上合體那台車：副駕是誰、後座那個寶寶長什麼樣
             seat_passenger_uid: Number(await getSetting(env, SETTING_SEAT_PASSENGER)) || null,
             baby_avatar: avatarUrl(url.origin, await getSetting(env, SETTING_BABY_AVATAR)),
+            baby_avatar_facing: normFacing(await getSetting(env, SETTING_BABY_FACING)),
           }), { headers });
         }
 
@@ -3756,6 +3822,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             restricted_blur: (await getSetting(env, SETTING_RESTRICTED_BLUR)) === "1" ? 1 : 0,
             seat_passenger_uid: Number(await getSetting(env, SETTING_SEAT_PASSENGER)) || null,
             baby_avatar: avatarUrl(url.origin, await getSetting(env, SETTING_BABY_AVATAR)),
+            baby_avatar_facing: normFacing(await getSetting(env, SETTING_BABY_FACING)),
           }), { headers });
         }
       }
@@ -3813,6 +3880,24 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }), { headers });
       }
 
+
+      /*
+       * 路由：寶寶那張頭像朝哪一邊。同一道閘（canManageOthers），值存在
+       * AppSetting（k/v，**不需要 migration**）—— 寶寶沒有 User 那一列。
+       */
+      if (method === "PUT" && pathname === "/api/admin/baby-avatar/facing") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.canManageOthers) {
+          return forbidden(headers, "只有站長或可管理全站內容的人可以改寶寶的頭像");
+        }
+        const body: { facing?: any } = await request.json();
+        const facing = normFacing(body.facing);
+        await setSetting(env, SETTING_BABY_FACING, facing);
+        return new Response(JSON.stringify({ success: true, baby_avatar_facing: facing }), { headers });
+      }
 
       /* ── 站長專用：Drive 備份對帳 ──────────────────────────────────────────
        *
@@ -4143,7 +4228,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
                    u.can_manage_others, u.can_add_to_others, u.can_reorder_others,
                    u.can_comment, u.can_view_comments, u.can_view_map, u.can_use_tools, u.active,
                    u.last_login_at, u.last_seen_at, u.created_at,
-                   u.track_color, u.avatar_key, u.track_drive_folder_id,
+                   u.track_color, u.avatar_key, u.avatar_facing, u.track_drive_folder_id,
                    (SELECT COUNT(*) FROM Album a WHERE a.user_id = u.id) AS album_count,
                    (SELECT COUNT(*) FROM Photo p JOIN Album a ON a.id = p.album_id WHERE a.user_id = u.id) AS photo_count,
                    (SELECT COUNT(*) FROM Photo p WHERE p.uploaded_by = u.id)
