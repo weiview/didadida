@@ -12,7 +12,7 @@ import { CONVOY_PCT_DEFAULT } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 import {
   buildAvatarHead, createAlienHead, createCarImage, seatOffset,
-  CAR_H, CAR_PIXEL_RATIO, HEAD_SIZE, HEAD_PIXEL_RATIO, NEUTRAL_RING,
+  CAR_H, CAR_PIXEL_RATIO, HEAD_SIZE, HEAD_PIXEL_RATIO,
   type CarSprite, type Seat,
 } from '@/lib/car';
 import { DEFAULT_TRACK_COLOR } from '@/lib/trackColors';
@@ -1633,25 +1633,26 @@ export default function FootprintMap({
    *
    * 收的是網址不是 user_id：後座那個寶寶不是 `User`（他的頭像存在 AppSetting 裡）。
    */
-  const ensureHead = useCallback((map: MapLibreMap, url: string | null, color: string) => {
-    const alien = `head:alien:${color}`;
+  const ensureHead = useCallback((map: MapLibreMap, url: string | null) => {
+    const alien = 'head:alien';
     if (!map.hasImage(alien)) {
       map.addImage(
         alien,
-        createAlienHead(() => map.triggerRepaint(), () => playingRef.current, color) as any,
+        createAlienHead(() => map.triggerRepaint(), () => playingRef.current) as any,
         { pixelRatio: HEAD_PIXEL_RATIO },
       );
     }
     if (!url) return alien;
 
-    // 顏色也進 id：外框是那個人的軌跡色，換色就得重做一張
-    const id = `head:${color}:${url}`;
+    // ⚠️ id 裡**不再有顏色**（外框拿掉了，見 car.ts 的 HALO）——
+    // 帶著顏色只會讓同一張頭像照人數做出好幾張一模一樣的貼圖
+    const id = `head:${url}`;
     if (map.hasImage(id)) return id;
     if (!headPending.current.has(id)) {
       headPending.current.add(id);
       // 給 hooks 才會解 GIF —— 動圖是一張會自己換格的 StyleImage，
       // 它跟車一樣要能叫地圖重畫下一幀
-      buildAvatarHead(url, color, {
+      buildAvatarHead(url, {
         triggerRepaint: () => map.triggerRepaint(),
         isAnimating: () => playingRef.current,
       })
@@ -3096,13 +3097,13 @@ export default function FootprintMap({
        *    得另外把真的那一份帶在 properties 上（`truth`）。
        */
       const putHead = (
-        url: string | null, color: string, scale: number,
+        url: string | null, scale: number,
         px: number, py: number, truth: [number, number],
       ) => {
         const ll = map.unproject([px, py]);
         headFeatures.push({
           type: 'Feature',
-          properties: { img: ensureHead(map, url, color), scale, lng: truth[0], lat: truth[1] },
+          properties: { img: ensureHead(map, url), scale, lng: truth[0], lat: truth[1] },
           geometry: { type: 'Point', coordinates: [ll.lng, ll.lat] },
         });
       };
@@ -3113,17 +3114,17 @@ export default function FootprintMap({
        * 下巴才會落在脖子上（並依使用者要求多蓋 1～2 px）。
        */
       const putSeat = (
-        seat: Seat, url: string | null, color: string, scale: number,
+        seat: Seat, url: string | null, scale: number,
         truth: [number, number], lift = 0,
       ) => {
         const off = seatOffset(seat, flip, now);
         const sink = HEAD_CSS_H * scale * HEAD_BOTTOM_PAD + NECK_OVERLAP;
-        putHead(url, color, scale, cpx.x + off.dx, cpx.y + off.dy + sink - lift, truth);
+        putHead(url, scale, cpx.x + off.dx, cpx.y + off.dy + sink - lift, truth);
       };
 
       if (n === 1) {
         const i = idx[0];
-        putSeat('driver', avatarFor(memberPaths[i].userId), colorFor(memberPaths[i].userId), 1, pos[i] ?? center);
+        putSeat('driver', avatarFor(memberPaths[i].userId), 1, pos[i] ?? center);
         return;
       }
 
@@ -3142,18 +3143,12 @@ export default function FootprintMap({
        * 後座 → 駕駛 → 副駕。頭大到會互相蓋住，由後往前畫才像一列坐著的人。
        */
       // 只要是合體軌跡，後座就一定有寶寶（使用者拍板）。還沒設頭像就先坐外星人
-      putSeat(
-        'rear', babyAvatar ?? null, NEUTRAL_RING,
-        SEAT_HEAD_SCALE * BABY_HEAD_SCALE, center, BABY_LIFT,
-      );
+      putSeat('rear', babyAvatar ?? null, SEAT_HEAD_SCALE * BABY_HEAD_SCALE, center, BABY_LIFT);
 
       // 這個順序就是「駕駛先畫、副駕後畫」，副駕因此蓋在最上面
       const seated: Seat[] = ['driver', 'passenger'];
       ordered.slice(0, seated.length).forEach((i, k) => {
-        putSeat(
-          seated[k], avatarFor(memberPaths[i].userId), colorFor(memberPaths[i].userId),
-          SEAT_HEAD_SCALE, pos[i] ?? center,
-        );
+        putSeat(seated[k], avatarFor(memberPaths[i].userId), SEAT_HEAD_SCALE, pos[i] ?? center);
       });
 
       /*
@@ -3164,7 +3159,7 @@ export default function FootprintMap({
       const extra = ordered.slice(seated.length);
       extra.forEach((i, k) => {
         putHead(
-          avatarFor(memberPaths[i].userId), colorFor(memberPaths[i].userId), HEAD_CROWD_SCALE,
+          avatarFor(memberPaths[i].userId), HEAD_CROWD_SCALE,
           cpx.x + (k - (extra.length - 1) / 2) * HEAD_STEP,
           // ⚠️ 頭錨在底部，而 HEAD_ROW_LIFT 說的是「頭的中心」離車頂多高 ——
           //    所以要再補半顆頭，不然這一排會整個往上飄半顆

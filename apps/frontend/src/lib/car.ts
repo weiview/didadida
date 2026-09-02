@@ -7,8 +7,8 @@
 // ── 這裡分成兩種圖 ────────────────────────────────────────────────
 //   車   `createCarImage()`    貼上去的插畫 ＋ 整台輕輕上下浮動 ＋ 地上一塊影子。
 //                              maplibre 的 StyleImageInterface：每畫一幀呼叫一次 render()。
-//   頭   `buildAvatarHead()`   從使用者的去背頭像現做（自己軌跡色的一圈外框 ＋
-//        `createAlienHead()`   外面再一圈白邊）。**GIF 會動**（見 lib/gifDecode.ts）。
+//   頭   `buildAvatarHead()`   從使用者的去背頭像現做（一圈白邊 ＋ 一點陰影，
+//        `createAlienHead()`   **沒有顏色的外框**）。**GIF 會動**（見 lib/gifDecode.ts）。
 //                              沒設頭像的人是會眨眼的外星人。
 //
 // 車與頭是**兩層**、每一幀各自定位（見 FootprintMap 的 project／unproject 那段），
@@ -239,29 +239,35 @@ export const HEAD_SIZE = 232;
 export const HEAD_PIXEL_RATIO = 2;
 
 /**
- * 沒有自己軌跡的人用的外框色 —— 目前只有後座那個寶寶（他不是 `User`，
- * 沒有 `track_color`）。車身以前會依人染色，現在是固定的插畫，這個值只剩這個用途。
+ * 頭外面那一圈白邊的粗細（裝置像素）。
+ *
+ * ⚠️⚠️ **這一圈只能是白的，不要再加軌跡色**（2026-09-02 使用者要求拿掉：
+ * 「大頭不要有顏色的框框」）。白邊留著是因為底圖（positron）幾乎是白的，
+ * 深色頭髮的頭不描一圈就會糊進路網 —— 它是可讀性，不是「誰是誰」。
+ * 代價是**合體時頭上看不出誰是誰了**，那件事線的顏色與圖例本來就在講。
  */
-export const NEUTRAL_RING = '#e8574a';
-
-/** 自己軌跡色那一圈的粗細（裝置像素）。這是「誰是誰」唯一的辨識 —— 車身現在是固定的插畫 */
-const RING = 10;
-/** 顏色圈外面再一圈白的。底圖（positron）幾乎是白的，深色軌跡色不加白邊會糊進路網 */
-const HALO = 5;
-/** 頭像本體的範圍：四周留給兩圈外框 */
-const HEAD_PAD = RING + HALO + 3;
+const HALO = 6;
+/** 白邊外面那點陰影的擴散半徑 */
+const SHADOW = 8;
+/**
+ * 頭像本體的範圍：四周留給白邊與陰影。
+ * ⚠️ `HEAD_PAD` 這個數字**不要順手改小**（拿掉顏色圈時也刻意維持 18）——
+ * `HEAD_BOX` 一變頭就跟著變大，而 FootprintMap 的 `HEAD_BOTTOM_PAD`
+ * （下巴要往下推多少才碰得到脖子）是照這個值算出來的。
+ */
+const HEAD_PAD = 18;
 const HEAD_BOX = HEAD_SIZE - HEAD_PAD * 2;
 
 /** 一格頭（已經加好外框的 RGBA）＋ 它要停留多久 */
 interface BakedFrame { data: Uint8ClampedArray; delayMs: number; }
 
 /**
- * 把一張去背頭像烤成地圖上的一顆大頭：軌跡色一圈、外面再一圈白。
+ * 把一張去背頭像烤成地圖上的一顆大頭：外面一圈白邊 ＋ 一點陰影。
  *
  * canvas 沒有「描 alpha 邊」這種功能，只能把剪影往十六個方向各畫一次再把原圖
  * 蓋上去。十六個夠密了，再多只是拖慢，再少邊緣會出現扇形缺口。
  */
-function bakeHead(src: CanvasImageSource, color: string): Uint8ClampedArray {
+function bakeHead(src: CanvasImageSource): Uint8ClampedArray {
   const mask = (fill: string) => {
     const c = document.createElement('canvas');
     c.width = HEAD_SIZE;
@@ -274,7 +280,6 @@ function bakeHead(src: CanvasImageSource, color: string): Uint8ClampedArray {
     return c;
   };
   const white = mask('#ffffff');
-  const tint = mask(color);
 
   const out = document.createElement('canvas');
   out.width = HEAD_SIZE;
@@ -291,11 +296,10 @@ function bakeHead(src: CanvasImageSource, color: string): Uint8ClampedArray {
 
   ctx.save();
   ctx.shadowColor = 'rgba(15,23,42,0.35)';
-  ctx.shadowBlur = RING;
-  ctx.shadowOffsetY = RING * 0.4;
-  stamp(white, RING + HALO);
+  ctx.shadowBlur = SHADOW;
+  ctx.shadowOffsetY = SHADOW * 0.4;
+  stamp(white, HALO);
   ctx.restore();
-  stamp(tint, RING);
   ctx.drawImage(src, HEAD_PAD, HEAD_PAD, HEAD_BOX, HEAD_BOX);
 
   return ctx.getImageData(0, 0, HEAD_SIZE, HEAD_SIZE).data;
@@ -356,7 +360,6 @@ function framesToImage(
  */
 export async function buildAvatarHead(
   url: string,
-  color: string,
   hooks?: { triggerRepaint: () => void; isAnimating: () => boolean },
 ): Promise<StaticImage | AnimatedImage> {
   const res = await fetch(url, { mode: 'cors' });
@@ -367,7 +370,7 @@ export async function buildAvatarHead(
     const gif = decodeGif(buf);
     if (gif && gif.frames.length > 1) {
       const baked = gif.frames.map((f) => ({
-        data: bakeHead(frameToCanvas(f.data, gif.width, gif.height), color),
+        data: bakeHead(frameToCanvas(f.data, gif.width, gif.height)),
         delayMs: f.delayMs,
       }));
       return framesToImage(baked, hooks.triggerRepaint, hooks.isAnimating);
@@ -376,7 +379,7 @@ export async function buildAvatarHead(
   }
 
   const bitmap = await createImageBitmap(new Blob([buf]));
-  const data = bakeHead(bitmap, color);
+  const data = bakeHead(bitmap);
   bitmap.close?.();
   return { width: HEAD_SIZE, height: HEAD_SIZE, data };
 }
@@ -386,13 +389,11 @@ export async function buildAvatarHead(
  * 連每 3.4 秒眨一次眼都留著。
  *
  * 這顆是**會動的**（要眨眼），所以走 StyleImageInterface 而不是靜態點陣圖。
- * 每個顏色一張（外框顏色不同），但 maplibre 只會對「這一幀真的用到」的圖
- * 呼叫 render，沒人在場的那幾張不花錢。
+ * 拿掉顏色外框之後**全站只有一張**（以前是每個軌跡色各一張）。
  */
 export function createAlienHead(
   triggerRepaint: () => void,
   isAnimating: () => boolean,
-  color: string,
 ): AnimatedImage {
   const settle = makeSettler(triggerRepaint, isAnimating);
   let ctx: CanvasRenderingContext2D | null = null;
@@ -404,22 +405,18 @@ export function createAlienHead(
     const cy = HEAD_SIZE * 0.5;
     const headR = HEAD_SIZE * 0.34;
 
-    // 頭。形狀已知，白邊與顏色圈直接用兩次 stroke 就好 ——
-    // 不必像頭像那樣堆十六層剪影
+    // 頭。形狀已知，白邊直接一次 stroke 就好 —— 不必像頭像那樣堆十六層剪影
     c.save();
     c.shadowColor = 'rgba(15,23,42,0.35)';
-    c.shadowBlur = RING;
-    c.shadowOffsetY = RING * 0.4;
+    c.shadowBlur = SHADOW;
+    c.shadowOffsetY = SHADOW * 0.4;
     c.strokeStyle = '#ffffff';
-    c.lineWidth = (RING + HALO) * 2;
+    c.lineWidth = HALO * 2;
     c.beginPath();
     c.ellipse(cx, cy, headR, headR * 1.14, 0, 0, Math.PI * 2);
     c.stroke();
     c.restore();
     // 路徑不在 save/restore 的狀態堆裡，restore 之後還是同一個橢圓
-    c.strokeStyle = color;
-    c.lineWidth = RING * 2;
-    c.stroke();
     c.fillStyle = '#6ee7a5';
     c.fill();
 
