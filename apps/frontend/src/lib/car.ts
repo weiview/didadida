@@ -43,24 +43,24 @@ const SPRITE_SRC: Record<CarSprite, string> = {
 };
 
 /**
- * 車的貼圖尺寸（裝置像素）。pixelRatio 2 → 畫面上 180×124 CSS px。
+ * 車的貼圖尺寸（裝置像素）。pixelRatio 2 → 畫面上 150×104 CSS px。
  *
  * ⚠️⚠️ **這個數字要跟 HEAD_SIZE 一起看** —— 使用者要的視覺是「大頭狗開車」，
- * 也就是頭大到不成比例。所以車刻意畫小（一顆頭 116 CSS px 對上 180 CSS px 寬的
- * 車身，超過六成），**車變小比頭變大有效**：頭再放大會糊（來源頭像只有 256px），
- * 而且三顆頭擠不進插畫上那三個座位。
+ * 也就是頭大到不成比例。所以車刻意畫小（一顆頭 116 CSS px 對上 150 CSS px 寬的
+ * 車身），**車變小比頭變大有效**：頭再放大會糊（來源頭像只有 256px），
+ * 而且座位間距是跟著 CAR_W 等比縮的，頭一放大就整團疊死。
  *
  * ⚠️ **兩張插畫在畫面上一樣大**（同一個裁切框做出來的，座位座標逐點對得上）——
  * 一個人的車不該因為他落單就縮小，而且合體／散開的那一瞬間頭才不會跳。
  */
 export const CAR_PIXEL_RATIO = 2;
-export const CAR_W = 360;
+export const CAR_W = 300;
 /** 插畫本身的高度（840×540 等比縮到 CAR_W） */
-const SPRITE_H = 231;
+const SPRITE_H = 193;
 /** 整台車上下浮動的幅度（裝置像素，±）。引擎在抖，不是在跳 */
-const BOB = 5;
+const BOB = 4;
 /** 插畫底下留給影子的空間 */
-const GROUND = 12;
+const GROUND = 10;
 export const CAR_H = SPRITE_H + BOB + GROUND;
 /** 沒有浮動時插畫左上角的 y */
 const SPRITE_TOP = CAR_H - GROUND - SPRITE_H;
@@ -69,15 +69,22 @@ const SPRITE_TOP = CAR_H - GROUND - SPRITE_H;
 export type Seat = 'passenger' | 'driver' | 'rear';
 
 /**
- * 三顆綠點的位置，正規化成插畫寬高的比例（插畫**車頭朝左**）。
+ * 三個座位**脖子的位置**，正規化成插畫寬高的比例（插畫**車頭朝左**）。
  *
- * 由使用者給的三張原圖量出來的：同一個裁切框 (0, 618, 2123, 1984)，
- * 駕駛與副駕那兩點在 solo／family 上是**同一個像素**，所以換圖時頭不會位移。
+ * ⚠️⚠️ **這裡標的是「下巴要落在哪裡」，不是頭的中心。** 插畫上那三個人是
+ * 沒有頭的身體，領口上留著一截脖子 —— 這張表就是那三截脖子的**上緣**
+ * （由 840×540 的插畫量出來：副駕 (339,52)、駕駛 (586,101)、後座 (695,86)）。
+ * 所以頭那一層是 `icon-anchor: 'bottom'`，下巴壓在這一點上、再往下蓋一點點
+ * （見 FootprintMap 的 `NECK_OVERLAP`）。
+ *
+ * 原本這裡放的是使用者畫在圖上那三顆綠點（頭的**中心**），但那是照插畫原本
+ * 那顆正常大小的頭標的：現在頭大了好幾倍，以中心對齊等於下巴直接插到車底盤，
+ * 整個身體被頭吃掉。**頭的大小會一直被調，脖子不會**，所以錨在脖子上。
  */
 export const SEATS: Record<Seat, { x: number; y: number }> = {
-  passenger: { x: 0.39945, y: 0.03727 }, // 最左邊那位（粉衣服拿相機）＝副駕
-  driver:    { x: 0.70100, y: 0.13414 }, // 中間握方向盤的＝駕駛
-  rear:      { x: 0.83552, y: 0.10157 }, // 最右邊的兒童座椅＝後座
+  passenger: { x: 0.40357, y: 0.09630 }, // 最左邊那位（粉衣服拿相機）＝副駕
+  driver:    { x: 0.69762, y: 0.18704 }, // 中間握方向盤的＝駕駛
+  rear:      { x: 0.82798, y: 0.15926 }, // 最右邊的兒童座椅＝後座
 };
 
 /**
@@ -92,8 +99,9 @@ export function carBob(t: number): number {
 }
 
 /**
- * 某個座位相對於「圖片底部中央」（icon-anchor: 'bottom' 的錨點）的位移，單位是
- * **CSS px、還沒乘上 icon-size**。呼叫端自己乘 scale 再加到 `map.project()` 的結果上。
+ * 某個座位的**脖子**相對於「圖片底部中央」（icon-anchor: 'bottom' 的錨點）的位移，
+ * 單位是 **CSS px**。呼叫端把它加到 `map.project()` 的結果上，頭那一層也錨在底部，
+ * 於是下巴就落在脖子上（頭再怎麼縮放，下巴都還在同一個點）。
  *
  * `flip` 跟 `createCarImage` 同一個意思：true ＝ 車頭朝左（插畫原本的方向），
  * false ＝ 鏡射成朝右，這時候 x 要換成 `1 - x`。
@@ -145,6 +153,7 @@ export function createCarImage(
   sprite: CarSprite,
   flip: boolean,
 ): AnimatedImage {
+  const settle = makeSettler(triggerRepaint, isAnimating);
   let ctx: CanvasRenderingContext2D | null = null;
   let img: HTMLImageElement | null = null;
 
@@ -186,9 +195,34 @@ export function createCarImage(
       }
 
       this.data = c.getImageData(0, 0, CAR_W, CAR_H).data;
-      if (isAnimating()) triggerRepaint();
+      settle();
       return true;
     },
+  };
+}
+
+/**
+ * 停著的時候也要**再要一次重繪**。
+ *
+ * ⚠️⚠️ maplibre 這一輪拿到的還是上一次的貼圖 —— `render()` 寫進 `this.data` 的
+ * 內容要等**下一次**重繪才會真的畫到畫面上。動畫在跑的時候每一格都有下一次，
+ * 所以看不出來；停著的時候沒有下一次，於是頭永遠停在 `data` 的初始值
+ * （外星人那顆是全透明的空陣列＝**畫面上只有車、沒有頭**）。
+ *
+ * 所以「不在播動畫」時，畫完要補一次 `triggerRepaint()`，而且**只補一次** ——
+ * 每次都補就變成常駐 rAF，整張地圖會一直重繪。`settled` 就是那個一次性的旗標，
+ * 動畫一開始跑就放掉（那時每一格本來就會排下一次）。
+ */
+function makeSettler(triggerRepaint: () => void, isAnimating: () => boolean) {
+  let settled = false;
+  return () => {
+    if (isAnimating()) {
+      settled = false;
+      triggerRepaint();
+    } else if (!settled) {
+      settled = true;
+      triggerRepaint();
+    }
   };
 }
 
@@ -287,6 +321,7 @@ function framesToImage(
   triggerRepaint: () => void,
   isAnimating: () => boolean,
 ): AnimatedImage {
+  const settle = makeSettler(triggerRepaint, isAnimating);
   const total = frames.reduce((s, f) => s + f.delayMs, 0) || 100;
   const t0 = performance.now();
   let shown = -1;
@@ -298,7 +333,7 @@ function framesToImage(
       let at = (performance.now() - t0) % total;
       let i = 0;
       while (i < frames.length - 1 && at >= frames[i].delayMs) { at -= frames[i].delayMs; i++; }
-      if (isAnimating()) triggerRepaint();
+      settle();
       // 同一格就回 false —— maplibre 才不會白白重上傳一次貼圖
       if (i === shown) return false;
       shown = i;
@@ -359,6 +394,7 @@ export function createAlienHead(
   isAnimating: () => boolean,
   color: string,
 ): AnimatedImage {
+  const settle = makeSettler(triggerRepaint, isAnimating);
   let ctx: CanvasRenderingContext2D | null = null;
 
   const draw = (c: CanvasRenderingContext2D, t: number) => {
@@ -420,7 +456,7 @@ export function createAlienHead(
       if (!ctx) return false;
       draw(ctx, performance.now() / 1000);
       this.data = ctx.getImageData(0, 0, HEAD_SIZE, HEAD_SIZE).data;
-      if (isAnimating()) triggerRepaint();
+      settle();
       return true;
     },
   };

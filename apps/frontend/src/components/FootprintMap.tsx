@@ -12,7 +12,7 @@ import { CONVOY_PCT_DEFAULT } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 import {
   buildAvatarHead, createAlienHead, createCarImage, seatOffset,
-  CAR_H, CAR_PIXEL_RATIO, HEAD_PIXEL_RATIO, NEUTRAL_RING,
+  CAR_H, CAR_PIXEL_RATIO, HEAD_SIZE, HEAD_PIXEL_RATIO, NEUTRAL_RING,
   type CarSprite, type Seat,
 } from '@/lib/car';
 import { DEFAULT_TRACK_COLOR } from '@/lib/trackColors';
@@ -328,22 +328,38 @@ const HEAD_HIDE_GAP_MS = 30 * 60 * 1000;
  */
 /** 車在畫面上有多高（CSS px）。貼圖是 2 倍解析度，見 car.ts 的 CAR_PIXEL_RATIO */
 const CAR_CSS_H = CAR_H / CAR_PIXEL_RATIO;
+/** 一整張頭貼圖在畫面上有多高（CSS px，還沒乘 icon-size）。含四周的透明邊 */
+const HEAD_CSS_H = HEAD_SIZE / HEAD_PIXEL_RATIO;
 
 /*
  * 座位上那幾顆頭的大小。**刻意誇張** —— 使用者要的就是「大頭狗開車」那種比例。
  *
- * 一個人的時候是 1（畫面上 116px，車身才 180px 寬）。合體時三顆頭要擠進
- * 插畫上那三個座位（副駕到駕駛只有 ~54px、駕駛到後座只有 ~24px），
+ * 一個人的時候是 1（畫面上 116px，車身才 150px 寬）。合體時三顆頭要擠進
+ * 插畫上那三個座位（副駕到駕駛只有 ~44px、駕駛到後座只有 ~20px），
  * 所以縮小一點並靠疊放順序讓後面的人露出頭頂。
  *
  * ⚠️ **要更誇張請去縮 car.ts 的 `CAR_W`，不要往上加這幾個數字** ——
- * 頭再放大會糊（來源頭像只有 256px），而且三顆頭會整團疊死。
+ * 頭再放大會糊（來源頭像只有 256px），而且座位間距是跟著 `CAR_W` 等比縮的，
+ * 頭一放大就整團疊死。
  */
 const SEAT_HEAD_SCALE = 0.62;
 /** 後座那個寶寶再小一點（他本來就比較小顆），也順便讓前面兩顆蓋得住他的下巴 */
 const BABY_HEAD_SCALE = 0.85;
-/** 寶寶再往上抬一點，讓頭頂從駕駛後面探出來 —— 不抬的話整顆被擋掉 */
-const BABY_LIFT = 12;
+/**
+ * 寶寶再往上抬一點，讓頭頂從駕駛後面探出來 —— 不抬的話整顆被擋掉。
+ * ⚠️ 錨點改成下巴之後這個值要比以前大：他的頭比較小，下巴對齊脖子時頭頂
+ * 反而比駕駛低。車一縮小，座位間距跟著縮，這個值就得再往上調。
+ */
+const BABY_LIFT = 18;
+
+/**
+ * 頭像底下那圈透明邊，佔整張頭貼圖高度的比例（car.ts 的 `HEAD_PAD` ＋
+ * avatar.ts contain-fit 留的白）。**下巴不在貼圖的最底下**，所以錨在底部之後
+ * 還要往下推這麼多，下巴才真的碰得到脖子。
+ */
+const HEAD_BOTTOM_PAD = 0.11;
+/** 推完再多壓進脖子幾 CSS px。使用者要的是「稍微蓋到 1～2 px」，接縫才不突兀 */
+const NECK_OVERLAP = 2;
 
 /** 座位不夠時多出來的人排在車頂上方。兩顆頭的水平間距（CSS px） */
 const HEAD_STEP = 26;
@@ -2426,8 +2442,14 @@ export default function FootprintMap({
           'icon-size': ['get', 'scale'],
           'icon-allow-overlap': true,
           'icon-ignore-placement': true,
-          // 錨在正中央：插畫上那顆綠點標的就是「頭的中心」
-          'icon-anchor': 'center',
+          /*
+           * ⚠️⚠️ **錨在底部，也就是下巴。** car.ts 的 `SEATS` 標的是插畫上那三截
+           * 脖子的上緣，頭要壓在脖子上、不是「中心對準座位」—— 頭現在大到不成
+           * 比例，以中心對齊等於下巴插進車底盤、整個身體被頭吃掉。
+           * 錨在底部另外還有一個好處：`icon-size` 怎麼縮放，下巴都還在同一點，
+           * 所以合體時三顆大小不同的頭一樣坐得好好的。
+           */
+          'icon-anchor': 'bottom',
           'icon-rotation-alignment': 'viewport',
           /*
            * ⚠️ 疊放順序一定要是 feature 的順序（預設的 'auto' 在
@@ -3085,13 +3107,18 @@ export default function FootprintMap({
         });
       };
 
-      /** 坐進插畫上某一個座位（綠點的位置）*/
+      /**
+       * 坐進插畫上某一個座位。`seatOffset` 給的是**脖子上緣**，而頭那一層錨在
+       * 貼圖底部 —— 底部到下巴之間還有一圈透明邊，所以要再往下推 `sink`，
+       * 下巴才會落在脖子上（並依使用者要求多蓋 1～2 px）。
+       */
       const putSeat = (
         seat: Seat, url: string | null, color: string, scale: number,
         truth: [number, number], lift = 0,
       ) => {
         const off = seatOffset(seat, flip, now);
-        putHead(url, color, scale, cpx.x + off.dx, cpx.y + off.dy - lift, truth);
+        const sink = HEAD_CSS_H * scale * HEAD_BOTTOM_PAD + NECK_OVERLAP;
+        putHead(url, color, scale, cpx.x + off.dx, cpx.y + off.dy + sink - lift, truth);
       };
 
       if (n === 1) {
@@ -3139,7 +3166,9 @@ export default function FootprintMap({
         putHead(
           avatarFor(memberPaths[i].userId), colorFor(memberPaths[i].userId), HEAD_CROWD_SCALE,
           cpx.x + (k - (extra.length - 1) / 2) * HEAD_STEP,
-          cpx.y - CAR_CSS_H - HEAD_ROW_LIFT,
+          // ⚠️ 頭錨在底部，而 HEAD_ROW_LIFT 說的是「頭的中心」離車頂多高 ——
+          //    所以要再補半顆頭，不然這一排會整個往上飄半顆
+          cpx.y - CAR_CSS_H - HEAD_ROW_LIFT + (HEAD_CSS_H * HEAD_CROWD_SCALE) / 2,
           pos[i] ?? center,
         );
       });
