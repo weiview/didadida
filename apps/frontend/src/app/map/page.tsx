@@ -10,7 +10,7 @@ import {
   fetchDriveGpxFiles, fetchDriveGpxText, ingestTrack, fetchTracks,
   editTrackPoints,
   saveTrackRaw, fetchTrackRaw, fetchTrackDays, updatePhotoGeo,
-  matchTrackShape, saveTrackMatched, fetchTrackMatched, deleteTrackMatched,
+  matchTrackShape, saveTrackMatched, fetchTrackMatched,
   fetchTimelineIndex, fetchTimelineMonth, fetchTrackMembers,
   type FootprintPoint, type Album, type TripSegment, type TrackPoint,
   type TrackPointEdit, type TrackDay, type MatchedTrack, type TrackMember,
@@ -76,7 +76,11 @@ const TIMELINE_DAY_PREFIX = 'timeline:';
  */
 const TIMELINE_MAX_DAYS = 62;
 
-/** 上次自動同步的時間戳（毫秒）存這個 key */
+/**
+ * 上次自動同步的時間戳（毫秒）存這個 key。
+ * 代跑（替別人同步）是**每個人各一個** key：`<這個>:u<uid>` ——
+ * 共用一個的話，站長自己剛同步過就會把全家的都當成剛跑過而整批跳過。
+ */
 const AUTO_SYNC_KEY = 'didadida:lastAutoSync';
 /**
  * 自動同步的冷卻時間。在頁面之間切來切去、重新整理都會重新掛載，
@@ -189,6 +193,15 @@ export default function MapPage() {
   // 自動同步一次掛載只跑一次。React 18 嚴格模式下 effect 會跑兩次，
   // 沒有這個閂的話同一次進頁會打兩趟 Drive
   const autoSyncStarted = useRef(false);
+  // 代跑（替全家同步）也是一次掛載只跑一次，理由同上
+  const autoSweepStarted = useRef(false);
+  /*
+   * 自動同步排成一條鏈，不並行。自己那一份與代跑的每一個人各自是一段，
+   * 但它們共用 syncing／syncLog 那一份畫面狀態，而且都要打 Drive 與
+   * Valhalla（後者條款寫明每秒最多一個請求）—— 同時跑起來的話 log 會互相
+   * 蓋掉，看起來像同步錯亂。同 resolveDuplicate 那條佇列的規矩。
+   */
+  const syncChain = useRef<Promise<void>>(Promise.resolve());
 
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
@@ -548,6 +561,23 @@ export default function MapPage() {
     return all.filter(m => m >= lo && m <= hi);
   }, [timelineIndex, from, to]);
 
+  /*
+   * 每個月檔的版本號 ＝ 索引裡那個月的點數。掛在網址上（`?v=`）讓後端敢回
+   * `immutable`，於是同一個月只會真的下載一次，之後每次打開地圖都是從瀏覽器
+   * 自己的快取拿 —— 這就是「Google 足跡每次登入都重跑一次」的那段等待。
+   * 重新匯入會讓點數變、網址跟著變，舊的那份就自動退場。
+   *
+   * ⚠️ 放在 ref 裡而不是直接讀 state：底下那個算折線的 effect 刻意沒把索引
+   *    列進相依（索引每次抓回來都是新物件，列進去等於每次進頁都重算一輪），
+   *    ref 才拿得到最新值又不會多觸發一次。
+   */
+  const monthVersions = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    monthVersions.current = new Map(
+      (timelineIndex?.months ?? []).map(m => [m.monthKey, m.points]),
+    );
+  }, [timelineIndex]);
+
   // 索引很小（144 筆），進頁就抓一次，之後不再重抓。
   // 不等「顯示 Google 足跡」被打開 —— 日期選擇器要靠它知道哪幾個月有足跡，
   // 而那個判斷跟這一層畫不畫出來無關
@@ -580,7 +610,7 @@ export default function MapPage() {
     (async () => {
       setPickerMonthLoading(true);
       try {
-        const data = await fetchTimelineMonth(pickerMonth);
+        const data = await fetchTimelineMonth(pickerMonth, monthVersions.current.get(pickerMonth));
         if (cancelled) return;
         // 抓不到也記成空的：索引與月檔不同步時才會這樣，不要每次翻回來都再問一次
         timelineCache.current.set(pickerMonth, data ?? {});
@@ -656,7 +686,7 @@ export default function MapPage() {
         const cache = timelineCache.current;
         for (const m of timelineMonths) {
           if (cache.has(m)) continue;
-          const data = await fetchTimelineMonth(m);
+          const data = await fetchTimelineMonth(m, monthVersions.current.get(m));
           if (cancelled) return;
           // 抓不到（索引與月檔不同步）也記成空的，免得每次重算都再問一次
           cache.set(m, data ?? {});
@@ -719,7 +749,12 @@ export default function MapPage() {
         for (const dayKey of dayKeys) {
           const data = await fetchTrackMatched(dayKey);
           if (cancelled) return;
-          if (!data?.segments?.length) { missing.push(dayKey); continue; }
+          // ⚠️ 只有「檔案不存在」才算沒貼過。`segments: []` 是貼過了、貼不出東西
+          // （整天沒移動、火車飛機、Valhalla 掛掉），那是一筆有效的紀錄 ——
+          // 把它也算成 missing 的話這幾天會每次進地圖都重跑一輪解析與請求，
+          // 而結果永遠還是空的。來源真的變了時後端 ingest 會自己刪掉這個檔
+          if (!data) { missing.push(dayKey); continue; }
+          if (!data.segments?.length) continue;
 
           let kept = 0;
           for (const s of data.segments) {
@@ -758,24 +793,39 @@ export default function MapPage() {
 
   /**
    * 同步足跡的本體：列出 Drive 上的 GPX、只抓 md5 有變的，在瀏覽器裡解析與抽稀，
-   * 再一天一次寫進 D1。沒有 cron —— 解析要用 DOMParser，Worker 沒有那個 API，
-   * 硬搬過去等於把半個前端也搬進 Worker，還會讓 gpx.ts 變成前後端各一份。
+   * 再一天一次寫進 D1。
+   *
+   * ⚠️⚠️ **解析永遠留在瀏覽器，不要再提「搬去 Worker 排 cron」這件事。**
+   * 免費版的 scheduled handler 跟一般請求一樣只有 **10ms CPU**（15 分鐘那個數字
+   * 是牆上時間不是 CPU），而實測光是掃一天的 GPX（Worker 沒有 DOMParser，
+   * 只能 regex）就要 5000 點 9ms／1 萬點 19ms／2 萬點 35ms —— 一天的軌跡動輒
+   * 上萬點，一開跑就超時，而且是**安靜地**超時。順帶還會讓 gpx.ts 變成前後端
+   * 各一份。瀏覽器的 CPU 不用錢，所以「每天固定自動同步」改成**代跑**：
+   * 可管理全站內容的人一進 /map，就順手把每個綁好資料夾的成員也掃一遍
+   * （`subject`），寫入那三支路由本來就對他開著。
    *
    * 手動按按鈕與開頁自動同步共用這一份，差別只在 force 與 quiet。
    *
+   * @param subject 代跑的對象；不給就是同步自己那一份
    * @returns 真正寫進去的那幾天（要拿去接著貼路）；Drive 讀取失敗回 null，
    *          跟「沒有需要同步的」（回空陣列）分開 —— 失敗不該消耗自動同步的冷卻時間
    */
   const runSync = useCallback(async (
-    { force = false, quiet = false }: { force?: boolean; quiet?: boolean } = {},
+    { force = false, quiet = false, subject }: {
+      force?: boolean;
+      quiet?: boolean;
+      subject?: { uid: number; name: string | null };
+    } = {},
   ): Promise<MatchTarget[] | null> => {
     setSyncing(true);
-    const log: string[] = ['正在讀取 Drive 檔案清單…'];
+    // 代跑時每一行都要寫出是誰的，不然畫面上看起來像自己的軌跡憑空多出好幾天
+    const who = subject ? `${subject.name || `#${subject.uid}`}：` : '';
+    const log: string[] = [`${who}正在讀取 Drive 檔案清單…`];
     setSyncLog([...log]);
 
-    const { files, error, code } = await fetchDriveGpxFiles();
+    const { files, error, code } = await fetchDriveGpxFiles(subject?.uid);
     if (error) {
-      setSyncLog([code === 'track_folder_unbound' ? error : `讀取失敗：${error}`]);
+      setSyncLog([who + (code === 'track_folder_unbound' ? error : `讀取失敗：${error}`)]);
       setSyncing(false);
       // 還沒綁資料夾不是失敗，是還沒設定。回空陣列讓開頁自動同步安靜地結束
       // （回 null 的話它會判定成 Drive 掛了，每次進地圖都跳一次紅字）
@@ -792,7 +842,7 @@ export default function MapPage() {
     const skipped = force ? 0 : files.filter(f => f.needsSync && f.ingestSource === 'manual').length;
     if (todo.length === 0) {
       setSyncLog([
-        `Drive 上有 ${files.length} 個軌跡檔，沒有需要同步的。`
+        `${who}Drive 上有 ${files.length} 個軌跡檔，沒有需要同步的。`
         + (skipped > 0 ? `（${skipped} 個手動編修或上傳過，已跳過）` : ''),
       ]);
       setSyncing(false);
@@ -800,7 +850,7 @@ export default function MapPage() {
     }
 
     log.length = 0;
-    log.push((quiet ? '自動同步：' : '')
+    log.push((quiet ? '自動同步：' : '') + who
       + (force
         ? `${files.length} 個軌跡檔，強制全部重新匯入`
           + (edited.length > 0 ? `（含 ${edited.length} 個手動編修或上傳過的，會被覆蓋）` : '')
@@ -862,7 +912,7 @@ export default function MapPage() {
       setSyncLog([...log]);
     }
 
-    log.push(`同步完成，共寫入 ${total} 個軌跡點。`);
+    log.push(`${who}同步完成，共寫入 ${total} 個軌跡點。`);
     setSyncLog([...log]);
     setSyncing(false);
     loadTracks();
@@ -963,6 +1013,13 @@ export default function MapPage() {
    *   火車、飛機、船直接跳過 —— 它們走的不是道路網，硬貼會把航線扭成公路。
    * - 每秒只送一個請求。FOSSGIS 是志工用捐款養的單一伺服器，條款寫明的上限。
    * - 來源 md5 沒變的日子整天跳過。每一趟都是一次別人家的請求，不重打。
+   * - ⚠️⚠️ **貼不出東西也要留下紀錄**（`segments: []` ＋ `emptyReason`），
+   *   不可以 `deleteTrackMatched()`。刪掉的話那一天在 R2 上就跟「還沒貼過」
+   *   一模一樣，每次進地圖都會被 `unmatchedKeys` 挑出來重跑一輪整天的解析
+   *   （而結果永遠還是空的）—— 使用者看到的就是「每次登入都重跑一次」。
+   *   唯一的例外是**請求真的失敗**（Valhalla 掛掉）：那是暫時的，維持沒有檔案
+   *   讓它下次再試。真正該讓結果消失的時機只有「那一天的點被重寫」，
+   *   而 `POST /api/tracks/ingest` 已經在後端自己刪了。
    */
   const runMatch = useCallback(async (
     targets: MatchTarget[],
@@ -979,7 +1036,12 @@ export default function MapPage() {
       // 來源沒變就整天跳過。舊結果沒有 sourceMd5，會落到 undefined 而重跑一次
       const existing = await fetchTrackMatched(dayKey);
       if (md5 && existing?.sourceMd5 === md5) {
-        log.push(`${dayKey}：來源未變，沿用上次結果（${existing.segments.length} 趟）`);
+        log.push(`${dayKey}：來源未變，沿用上次結果（`
+          + (existing.segments.length > 0
+            ? `${existing.segments.length} 趟`
+            // 空結果是「上次貼過了，貼不出東西」的紀錄，不是還沒貼
+            : existing.emptyReason === 'no_trips' ? '整天沒有移動' : '沒有走道路的趟')
+          + '）');
         setMatchLog([...log]);
         continue;
       }
@@ -994,8 +1056,13 @@ export default function MapPage() {
 
       const trips = extractTrips(rejectSpikes(parsed.points));
       if (trips.length === 0) {
-        // 這一天整天沒移動。清掉舊結果，免得畫面上留著一條跟現況無關的線
-        await deleteTrackMatched(dayKey);
+        // 這一天整天沒移動。⚠️ 存一份空結果而不是刪掉：刪掉的話畫面上是清乾淨了，
+        // 但這一天在 R2 上就跟「還沒貼過」一模一樣，下次進地圖又會被挑出來
+        // 重解析一次整天的點，結果永遠還是空的
+        await saveTrackMatched(dayKey, {
+          dayKey, builtAt: new Date().toISOString(), sourceMd5: md5 ?? undefined,
+          emptyReason: 'no_trips', segments: [],
+        });
         log.push(`${dayKey}：${parsed.points.length} 點裡沒有一趟真正的移動，略過`);
         setMatchLog([...log]);
         continue;
@@ -1006,6 +1073,11 @@ export default function MapPage() {
 
       const segments: MatchedTrack['segments'] = [];
       let dayPoints = 0;
+      // 送出去卻沒貼回來的趟數。「這一天貼不出東西」有兩種原因，處理方式相反：
+      // 火車飛機不走道路是**永久**的（記下來，別再問），Valhalla 掛掉是**暫時**的
+      // （志工維護的單機，壞掉是預期內的事）—— 把暫時的記成永久等於那一天再也
+      // 不會有貼路軌跡，除非來源檔的 md5 剛好變了
+      let failed = 0;
 
       for (let i = 0; i < trips.length; i++) {
         const trip = trips[i];
@@ -1030,6 +1102,7 @@ export default function MapPage() {
         const resp = await matchTrackShape(input.map(p => ({ lat: p.lat, lon: p.lng })), costing);
         const matched = resp ? buildMatchedTrack(input, resp) : null;
         if (!matched) {
+          failed++;
           log.push(`${label}：貼路失敗${resp?.error ? `（${resp.error}）` : ''}`);
           setMatchLog([...log]);
           continue;
@@ -1046,9 +1119,18 @@ export default function MapPage() {
         dayPoints += matched.length;
       }
 
-      if (segments.length === 0) {
-        await deleteTrackMatched(dayKey);
-        log.push(`${dayKey}：沒有貼出任何一趟`);
+      if (segments.length === 0 && failed > 0) {
+        // 送出去的請求真的失敗了。⚠️ 這一天**不留紀錄**（R2 上維持沒有這個檔），
+        // 下次才會被 unmatchedKeys 挑出來再試一次
+        log.push(`${dayKey}：${failed} 趟都貼路失敗，這一天先留著，之後會再試`);
+      } else if (segments.length === 0) {
+        // 每一趟都是火車／飛機／船。這是檔案本身決定的，重跑一百次結果一樣 ——
+        // 存一份空結果把它結案，不然每次進地圖都會再解析一次整天的點
+        await saveTrackMatched(dayKey, {
+          dayKey, builtAt: new Date().toISOString(), sourceMd5: md5 ?? undefined,
+          emptyReason: 'no_match', segments: [],
+        });
+        log.push(`${dayKey}：${trips.length} 趟都不走道路，沒有貼出任何一趟`);
       } else {
         const ok = await saveTrackMatched(dayKey, {
           dayKey, builtAt: new Date().toISOString(), sourceMd5: md5 ?? undefined, segments,
@@ -1109,11 +1191,14 @@ export default function MapPage() {
     for (const k of decided) attemptedMatch.current.add(k);
     if (gpsTargets.length === 0) return;
 
-    (async () => {
+    // 排進同一條鏈：代跑會讓自動同步跑上好幾分鐘，而 `matching` 是 state
+    // （設下去要等下一次 render 才看得到），光靠上面那道閂擋不住這中間插進來的
+    // 這一輪 —— 兩邊同時打 Valhalla 就破了「每秒一個請求」的自律
+    syncChain.current = syncChain.current.then(async () => {
       setAutoStatus(`貼路中…（${gpsTargets.length} 天）`);
       const requests = await runMatch(gpsTargets, { quiet: true });
       setAutoStatus(requests > 0 ? `已貼路 ${gpsTargets.length} 天，送出 ${requests} 個請求` : null);
-    })();
+    });
     // trackDays 只是拿來查 has_raw/md5，它變動時 rawDayKeys 也會跟著變並重讀一輪，
     // 不需要它自己觸發這個 effect
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1141,7 +1226,7 @@ export default function MapPage() {
     const last = Number(localStorage.getItem(AUTO_SYNC_KEY) ?? 0);
     if (Number.isFinite(last) && Date.now() - last < AUTO_SYNC_COOLDOWN_MS) return;
 
-    (async () => {
+    syncChain.current = syncChain.current.then(async () => {
       setAutoStatus('同步軌跡中…');
       const ingested = await runSync({ quiet: true });
       // null = Drive 讀取失敗。不寫時間戳，下次進頁還會再試一次
@@ -1153,8 +1238,54 @@ export default function MapPage() {
       setAutoStatus(`已同步 ${ingested.length} 天，貼路中…`);
       const requests = await runMatch(ingested, { quiet: true });
       setAutoStatus(`已同步 ${ingested.length} 天，貼路 ${requests} 趟`);
-    })();
+    });
   }, [isAdmin, canUseTools, runSync, runMatch]);
+
+  /*
+   * 代跑：可管理全站內容的人一進 /map，順手把**每個綁好 Drive 資料夾的成員**
+   * 也同步一遍（見 runSync 的註解為什麼不是 cron）。
+   *
+   * 它要解的問題是：GPSLogger 每天都在往各自的 Drive 丟檔，但那些檔只有
+   * 「本人自己打開 /map」才會被匯進來 —— 家裡多半只有站長會開地圖，
+   * 於是其他人的足跡可以躺在 Drive 上好幾個月沒進站。
+   *
+   * ⚠️ 四個刻意的界線：
+   * - **一個一個跑，不並行**（syncChain）：Drive 與 Valhalla 都禁不起同時開好幾條。
+   * - **每個人各自的冷卻時間戳**，而且**失敗不寫** —— 某個人的資料夾權限掉了
+   *   不該連累其他人，下次進頁還要再試他一次。
+   * - **永遠不 force**：force 會把手動編修過的日子整批洗掉，那是別人的資料。
+   * - `has_track_folder` 是 undefined（邊快取裡還躺著舊版後端的回應）時**當作沒綁**，
+   *   不然會對每一個成員各打一趟 Drive 只為了拿到一個 503。
+   *
+   * members 是非同步回來的，所以這支 effect 靠「有沒有人可掃」自己決定何時開跑，
+   * 而不是搶在 members 之前把閂關掉。
+   */
+  useEffect(() => {
+    if (!canManageOthers || !canUseTools || autoSweepStarted.current) return;
+    const others = members.filter(m => m.has_track_folder && m.id !== user?.id);
+    if (others.length === 0) return;
+    autoSweepStarted.current = true;
+
+    syncChain.current = syncChain.current.then(async () => {
+      for (const m of others) {
+        const who = m.name || `#${m.id}`;
+        const key = `${AUTO_SYNC_KEY}:u${m.id}`;
+        const last = Number(localStorage.getItem(key) ?? 0);
+        if (Number.isFinite(last) && Date.now() - last < AUTO_SYNC_COOLDOWN_MS) continue;
+
+        setAutoStatus(`同步 ${who} 的軌跡中…`);
+        const ingested = await runSync({ quiet: true, subject: { uid: m.id, name: m.name } });
+        if (!ingested) { setAutoStatus(`${who} 的軌跡同步失敗（詳見管理工具）`); continue; }
+
+        localStorage.setItem(key, String(Date.now()));
+        if (ingested.length === 0) { setAutoStatus(null); continue; }
+
+        setAutoStatus(`${who}：已同步 ${ingested.length} 天，貼路中…`);
+        const requests = await runMatch(ingested, { quiet: true });
+        setAutoStatus(`${who}：已同步 ${ingested.length} 天，貼路 ${requests} 趟`);
+      }
+    });
+  }, [canManageOthers, canUseTools, members, user?.id, runSync, runMatch]);
 
   const currentAlbum = albums.find(a => a.id === albumId);
 

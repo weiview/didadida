@@ -3594,7 +3594,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         // 沒有工具權限的人不列（見 TRACK_MEMBER_COND）。這一支同時餵地圖的
         // 圖例、成員篩選列、軌跡顏色與車上的大頭 —— 從源頭拿掉，四個地方一起乾淨
         const { results } = await env.DB.prepare(
-          `SELECT u.id, u.name, u.track_color, u.avatar_key FROM User u
+          `SELECT u.id, u.name, u.track_color, u.avatar_key, u.track_drive_folder_id FROM User u
            WHERE u.active = 1 AND ${TRACK_MEMBER_COND} ORDER BY u.id`
         ).all();
         return new Response(JSON.stringify((results as any[]).map((u) => ({
@@ -3604,6 +3604,16 @@ if (method === "POST" && pathname === "/api/verify-password") {
           track_color: trackColorFor(Number(u.id), u.track_color),
           // 地圖要拿它畫車上的大頭 —— 沒設就是 null，那個人坐上去的是小外星人
           avatar: avatarUrl(url.origin, u.avatar_key),
+          /*
+           * 他的 GPSLogger 資料夾綁好了沒。**代跑**（站長的瀏覽器替全家同步）
+           * 靠這一格決定要掃誰，見 `/api/tracks/drive/files` 的 `?user_id=`。
+           * ⚠️ 多帶一欄不多花任何讀取額度（D1 算的是讀了幾列不是幾欄），
+           * 所以不另外開一支路由 —— /map 本來就會打這一支。
+           * 只是布林不是資料夾 id：那個 id 是 Drive 的內部識別碼，
+           * 沒有任何一個前端功能需要它。
+           */
+          has_track_folder: !!(u.track_drive_folder_id
+            ?? (Number(u.id) === TRACK_LEGACY_UID ? env.GOOGLE_DRIVE_FOLDER_ID : null)),
         }))), { headers });
       }
 
@@ -8109,13 +8119,55 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
          * 由站長在 /admin 綁上去。沒綁的人這裡就直接說清楚，不要回空陣列
          * 讓人以為是「Drive 上沒檔案」。
          */
-        const folderId = trackFolderFor(env, viewer);
+        /*
+         * `?user_id=<uid>` ＝ **代跑**：可管理全站內容的人替別人列他的資料夾。
+         *
+         * ⚠️⚠️ 這是「每天固定自動同步」在免費額度裡唯一做得到的形狀。
+         * 後端 cron 解析 GPX **做不到**：scheduled handler 在免費版跟 HTTP 請求
+         * 一樣只有 **10ms CPU**（15 分鐘那個數字是牆上時間不是 CPU），
+         * 而實測光是掃一天的 GPX（沒有 DOMParser，只能 regex）就要
+         * 5000 點 9ms／1 萬點 19ms／2 萬點 35ms —— 一天的軌跡動輒上萬點，
+         * 一開跑就超時，而且是安靜地超時。**不要再往 Worker 搬解析。**
+         * 解析留在瀏覽器（那裡的 CPU 不用錢），缺的只有這一步「列別人的資料夾」
+         * —— 寫入那三支（ingest／raw/:key／matched/:key）本來就對
+         * canManageOthers 開著（見 canTouchTrackDay），一個都不用改。
+         */
+        const uidParam = url.searchParams.get("user_id");
+        let subjectUid = viewer.uid;
+        let subjectName: string | null = null;
+        let folderId = trackFolderFor(env, viewer);
+        if (uidParam) {
+          const wanted = Number(uidParam);
+          if (!Number.isInteger(wanted) || wanted <= 0) {
+            return new Response(JSON.stringify({ error: "user_id 不是一個帳號編號" }), { status: 400, headers });
+          }
+          if (wanted !== viewer.uid) {
+            if (!viewer.canManageOthers) {
+              return forbidden(headers, "只有可管理全站內容的人可以替別人同步軌跡");
+            }
+            const row = await env.DB.prepare(
+              "SELECT id, name, active, track_drive_folder_id FROM User WHERE id = ?"
+            ).bind(wanted).first<any>();
+            // 停權的人不代跑：他的軌跡在地圖上本來就不出現（TRACK_MEMBER_COND）
+            if (!row || row.active !== 1) {
+              return new Response(JSON.stringify({ error: "找不到這個成員" }), { status: 404, headers });
+            }
+            subjectUid = Number(row.id);
+            subjectName = row.name ?? null;
+            // 退回環境變數那條只對 uid 1 成立，理由同 trackFolderFor()
+            folderId = row.track_drive_folder_id
+              ?? (subjectUid === TRACK_LEGACY_UID ? (env.GOOGLE_DRIVE_FOLDER_ID ?? null) : null);
+          }
+        }
+
         if (!folderId) {
           // code 給前端判斷用：這不是故障，是「還沒設定」。開頁自動同步碰到它
           // 要安靜地跳過，不能每次進地圖都跳一次紅字
           return new Response(JSON.stringify({
             code: "track_folder_unbound",
-            error: "你還沒有綁定 Drive 軌跡資料夾。請把 GPSLogger 上傳的資料夾分享給站上的服務帳號，再請站長到後台綁定。",
+            error: subjectName
+              ? `${subjectName} 還沒有綁定 Drive 軌跡資料夾。`
+              : "你還沒有綁定 Drive 軌跡資料夾。請把 GPSLogger 上傳的資料夾分享給站上的服務帳號，再請站長到後台綁定。",
           }), { status: 503, headers });
         }
 
@@ -8132,8 +8184,11 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
            * 檔名 → day_key 的轉換**在這裡就做掉**，前端從頭到尾只看得到
            * 完整的 day_key。ingest、saveTrackRaw、貼路結果三者共用同一個 key，
            * 任何一處拿到裸檔名都會寫到別人（或不存在）的那一列去。
+           *
+           * ⚠️ 用 subjectUid 不是 viewer.uid —— 代跑時前綴要是**被同步的那個人**，
+           * 寫成站長自己的話全家的軌跡會整批落到站長名下（顏色、圖例、合體判定全錯）。
            */
-          const dayKey = trackDayKeyFor(viewer.uid, f.name);
+          const dayKey = trackDayKeyFor(subjectUid, f.name);
           const known = byKey.get(dayKey);
           return {
             dayKey,
@@ -8787,8 +8842,10 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         if (!object) {
           return new Response(JSON.stringify({ months: [] }), { headers });
         }
+        // ⚠️ 索引本身**絕對不能快取**：月檔那邊的 immutable 是靠索引裡的點數
+        // 當版本號換網址換來的，索引一舊，剛匯入的月份就永遠拿到舊的那一份
         return new Response(object.body, {
-          headers: { ...headers, "Content-Type": "application/json" },
+          headers: { ...headers, "Content-Type": "application/json", "Cache-Control": "no-store" },
         });
       }
 
@@ -8834,8 +8891,28 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         if (!object) {
           return new Response(JSON.stringify({ error: "這個月份還沒有資料" }), { status: 404, headers });
         }
+        /*
+         * 月檔只在重新匯入時才會變，而一次匯入就是好幾 MB —— 每次打開地圖
+         * 重抓一遍是「Google 足跡每次登入都重跑」最主要的那一段等待。
+         *
+         * ⚠️ 一律 `private`，永遠不可以是 `public`：這是某一個人完整的行蹤，
+         *    進不了共用邊緣快取（這支路由本來就不包 withEdgeCache）。
+         * ⚠️ `Vary: Authorization` 不是可有可無的 —— 同一個網址在不同人手上
+         *    回的是不同人的月檔（uid 取自 token），家人共用一台電腦時
+         *    沒有這一行就會拿到上一個登入者的足跡。
+         * 前端帶 `?v=<索引裡那個月的點數>`：內容變了網址就變，所以有 v 的
+         * 可以放心 immutable；沒帶 v 的（舊前端、手動打）只給一分鐘。
+         */
+        const stamp = url.searchParams.get("v");
         return new Response(object.body, {
-          headers: { ...headers, "Content-Type": "application/json" },
+          headers: {
+            ...headers,
+            "Content-Type": "application/json",
+            "Cache-Control": stamp
+              ? "private, max-age=31536000, immutable"
+              : "private, max-age=60",
+            "Vary": "Authorization",
+          },
         });
       }
 

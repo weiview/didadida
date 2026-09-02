@@ -623,6 +623,71 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - 前端**不必另外做「跳過這一張」** —— 相簿清單是伺服器過濾過的，`?photo=<id>` 深連結
   也是在那份清單裡找，找不到就什麼都不做。燈箱因此永遠不會落在不開放的那一格上。
 
+## 足跡：一次跑過就記下來，不重跑
+
+2026-09-02 修的。同步 Drive GPX、貼路、Google 時間軸三條路以前**每次進 `/map`
+都從頭再跑一次**（使用者的原話：「每次登入都會重跑一次」）。三條各有各的原因，
+但共通的規矩只有一條：**跑過的結果要留得下痕跡，而且「跑過但沒東西」也是一種結果。**
+
+- ⚠️⚠️ **貼路貼不出東西也要留紀錄**（`saveTrackMatched(dayKey, {segments: [], emptyReason})`），
+  **不可以 `deleteTrackMatched()`**。刪掉的話那一天在 R2 上跟「還沒貼過」一模一樣，
+  每次進地圖都會被 `unmatchedKeys` 挑出來，重解析一整天的點、重打 Valhalla，
+  而結果永遠還是空的。`emptyReason` 兩種：`no_trips`（整天沒有移動）、
+  `no_match`（每一趟都是火車／飛機／船，不走道路）—— 兩種都是**檔案本身決定的**，
+  重跑一百次一樣。
+  ⚠️ **例外是請求真的失敗**（Valhalla 是志工維護的單機，掛掉是預期內的事）：
+  那是暫時的，**維持沒有檔案**讓它下次再試。`runMatch` 裡因此有一個 `failed` 計數器，
+  分辨「永久的空」與「這次沒打通」。把暫時的記成永久＝那一天再也不會有貼路軌跡。
+  ⚠️ 真正該讓結果消失的時機只有一個：**那一天的點被重寫** —— 而
+  `POST /api/tracks/ingest` 已經在後端自己刪了，前端不必也不該再刪一次。
+  讀取端跟著改：只有 **`!data`（檔案不存在）** 才算 unmatched，`segments` 是空的不算。
+- **Google 時間軸的月檔改用瀏覽器 HTTP 快取，不再每次重抓**。一個月的 JSON 動輒
+  好幾 MB，而 `timelineCache` 是**每次掛載都重來**的 ref。作法是
+  `GET /api/timeline/month/:m?v=<索引裡那個月的點數>` ＋
+  `Cache-Control: private, max-age=31536000, immutable`：內容變了點數就變，
+  **換一把網址讓舊的再也沒人問得到**（同 `content_epoch` 那招）。
+  ⚠️ **索引本身一定要 `no-store`** —— 月檔的 immutable 完全靠索引裡那個點數是最新的。
+  ⚠️ **`Vary: Authorization` 不是可有可無的**：那是 `private`（瀏覽器自己那份）快取，
+  同一台電腦換一個人登入，沒有它就會讀到上一個人的足跡。
+  ⚠️ 沒帶 `?v=` 的（舊前端、手動打）只給 60 秒。
+- **開頁自動同步 Drive GPX 改成「代跑」**：可管理全站內容的人一進 `/map`，
+  順手把**每個綁好資料夾的成員**也掃一遍。見下一節。
+
+### 為什麼不用 cron：Worker 解不動 GPX
+
+使用者要的是「有串接 GPX 資料夾的所有人**每天固定**自動匯入」，而不是「誰開地圖誰才有」。
+最直覺的作法是後端 cron，**但那條路在免費額度裡做不到，實測過**：
+
+- 免費版的 **scheduled handler 跟一般請求一樣只有 10ms CPU**（15 分鐘那個數字是
+  牆上時間，不是 CPU）。
+- Worker 沒有 `DOMParser`，只能 regex 掃。實測（Node，最快的一次）：
+  2000 點 5.2ms／5000 點 9.4ms／1 萬點 19.4ms／2 萬點 35.1ms，**解析佔九成以上**
+  （`collapseStays` ≤1.2ms、`simplifyTrack` ≤0.2ms）。一天的軌跡動輒上萬點，
+  **一開跑就超時，而且是安靜地超時**。
+- 順帶還會讓 `gpx.ts` 變成前後端各一份（第四個兩份副本的檔）。
+
+**不要再往 Worker 搬 GPX 解析。** 解析留在瀏覽器（那裡的 CPU 不用錢），
+缺的只有一步「列**別人**的資料夾」：
+
+- `GET /api/tracks/drive/files?user_id=<uid>` ＝代跑。只有 `canManageOthers` 給過，
+  對方要 `active=1`（停權的人軌跡本來就不上地圖）。回來的 dayKey 已經帶著
+  **被同步那個人**的前綴 —— ⚠️ 寫成站長自己的話全家的軌跡會整批落到站長名下
+  （顏色、圖例、合體判定全錯）。
+- **寫入那三支一個都不用改**：`POST /api/tracks/ingest`、`PUT /api/tracks/raw/:dayKey`、
+  `PUT /api/tracks/matched/:dayKey` 本來就對 `canManageOthers` 開著（`canTouchTrackDay`）。
+- `GET /api/track-members` 多回一個 **`has_track_folder`** 布林，代跑靠它決定要掃誰。
+  ⚠️ 多帶一欄不多花讀取額度（D1 算的是讀了幾列不是幾欄），而 `/map` 本來就會打這一支
+  —— 所以**不另外開一支路由**。回布林不回資料夾 id：那是 Drive 的內部識別碼，
+  前端沒有任何功能需要它。
+- 前端（`app/map/page.tsx`）四道界線：**一個一個跑，不並行**（`syncChain` 那條
+  promise 鏈，自己那份、代跑的每個人、自動貼路全排在同一條上 —— Drive 與 Valhalla
+  都禁不起同時開好幾條，而 `matching` 是 state，設下去要等下一次 render 才擋得住人）；
+  **每個人各自的冷卻時間戳**（`didadida:lastAutoSync:u<uid>`，共用一個的話站長自己
+  剛跑過就會把全家都當成跑過）；**失敗不寫時間戳**；**永遠不 force**（force 會洗掉
+  手動編修過的日子，那是別人的資料）。
+  ⚠️ `has_track_folder` 是 `undefined`（邊快取裡躺著舊版後端的回應）時**當作沒綁**，
+  不然會對每個成員各打一趟 Drive 只為了換回一個 503。
+
 ## 足跡動畫：一起出遊的判定
 
 「合體成同一台車」是**兩層規則**，不是一條，兩層都在 `FootprintMap.tsx` 裡、**全在瀏覽器算**

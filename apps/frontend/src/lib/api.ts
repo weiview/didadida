@@ -720,6 +720,12 @@ export interface TrackMember {
   track_color: string;
   /** 頭像網址。**地圖上車頂那顆大頭就是它**，null 就換小外星人上車 */
   avatar?: string | null;
+  /**
+   * 他的 GPSLogger 資料夾綁好了沒。**代跑**（站長的瀏覽器替全家同步）
+   * 靠它決定要掃誰。舊後端沒有這一欄（undefined）—— 那時候一律當成沒綁，
+   * 代跑就只跑自己那一份，不會憑空對每個人各打一次 Drive。
+   */
+  has_track_folder?: boolean;
 }
 
 /**
@@ -3130,9 +3136,15 @@ export type Vehicle = 'walk' | 'bike' | 'motorbike' | 'car' | 'bus' | 'train' | 
  * `code === 'track_folder_unbound'` 是「這個人還沒被綁資料夾」，不是故障 ——
  * 呼叫端要能分辨，才不會在每次進頁時對還沒設定好的成員報錯。
  */
-export async function fetchDriveGpxFiles(): Promise<{ files: DriveGpxFile[]; error?: string; code?: string }> {
+export async function fetchDriveGpxFiles(
+  userId?: number | null,
+): Promise<{ files: DriveGpxFile[]; error?: string; code?: string }> {
   try {
-    const res = await fetch(`${API_BASE_URL}/tracks/drive/files`, { headers: getAuthHeaders() });
+    // 給了 userId 就是**代跑**（可管理全站內容的人替別人列他的資料夾）。
+    // 回來的 dayKey 已經帶著那個人的前綴，之後 ingest／存原文／貼路
+    // 三支都吃同一個 key，前端不需要（也不可以）自己拼前綴
+    const qs = userId == null ? '' : `?user_id=${encodeURIComponent(String(userId))}`;
+    const res = await fetch(`${API_BASE_URL}/tracks/drive/files${qs}`, { headers: getAuthHeaders() });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       return { files: [], error: body?.error || `伺服器回應 ${res.status}`, code: body?.code };
@@ -3322,7 +3334,15 @@ export async function fetchTrackMatched(dayKey: string): Promise<MatchedTrack | 
   }
 }
 
-/** 刪掉貼路結果。重貼之前先清掉，免得部分失敗時新舊混在一起 */
+/**
+ * 刪掉貼路結果，讓這一天回到「從來沒貼過」的狀態。
+ *
+ * ⚠️ 貼路流程本身**不呼叫它**。貼不出東西（整天沒移動、火車飛機、對方掛掉）
+ * 要存一份 `segments: []` 的空結果，不是刪掉 —— 刪掉的話那一天在
+ * `unmatchedKeys` 裡永遠是「還沒貼過」，每次進地圖都重跑一輪（見 map/page.tsx）。
+ * 真正該讓結果消失的時機只有一個：那一天的點被重寫，而
+ * `POST /api/tracks/ingest` 已經在後端自己刪了。
+ */
 export async function deleteTrackMatched(dayKey: string): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE_URL}/tracks/matched/${encodeURIComponent(dayKey)}`, {
@@ -3350,6 +3370,14 @@ export interface MatchedTrack {
    * 沒必要為了沒變的資料重打。舊的結果沒有這欄，會被當成「要重跑」。
    */
   sourceMd5?: string;
+  /**
+   * `segments` 是空的時候，為什麼是空的。
+   *
+   * 空結果是**有意義的紀錄**（「這一天貼過了，貼不出東西」），不是失敗 ——
+   * 沒有它就只能用「檔案不存在」表示，而那跟「還沒貼過」分不開，
+   * 於是每次進地圖都會再跑一次整天的解析與請求。
+   */
+  emptyReason?: 'no_trips' | 'no_match';
   segments: {
     /** 這一天的第幾趟。趟與趟之間不連線，所以每趟都要有自己的編號 */
     seg: number;
@@ -3460,10 +3488,21 @@ export async function saveTimelineIndex(months: TimelineMonthMeta[]): Promise<bo
 /** 一個月的內容：當地日 → [UTC 秒, 緯度, 經度, 時區偏移分鐘][] */
 export type TimelineMonthData = Record<string, [number, number, number, number][]>;
 
-/** 沒有這個月（404）回 null，不是錯誤 —— 索引與月檔可能不同步 */
-export async function fetchTimelineMonth(monthKey: string): Promise<TimelineMonthData | null> {
+/**
+ * 沒有這個月（404）回 null，不是錯誤 —— 索引與月檔可能不同步。
+ *
+ * `version` 是索引裡那個月的點數，當成版本號掛在網址上：後端看到它就回
+ * `immutable`，於是**同一個月只會真的下載一次**，之後每次打開地圖都從瀏覽器
+ * 自己的快取拿（一次匯入是好幾 MB，這就是「Google 足跡每次登入都重跑」的那段等待）。
+ * 重新匯入會讓點數變、網址跟著變，舊的那份就再也沒有人問得到 ——
+ * ⚠️ 所以版本號一定要來自**當下抓回來的索引**，不可以自己記一個在 localStorage。
+ */
+export async function fetchTimelineMonth(
+  monthKey: string, version?: number | string,
+): Promise<TimelineMonthData | null> {
   try {
-    const res = await fetch(`${API_BASE_URL}/timeline/month/${monthKey}`, {
+    const qs = version === undefined || version === null ? '' : `?v=${encodeURIComponent(String(version))}`;
+    const res = await fetch(`${API_BASE_URL}/timeline/month/${monthKey}${qs}`, {
       headers: getAuthHeaders(),
     });
     if (!res.ok) return null;
