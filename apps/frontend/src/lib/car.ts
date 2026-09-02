@@ -43,19 +43,24 @@ const SPRITE_SRC: Record<CarSprite, string> = {
 };
 
 /**
- * 車的貼圖尺寸（裝置像素）。pixelRatio 2 → 畫面上 260×179 CSS px。
+ * 車的貼圖尺寸（裝置像素）。pixelRatio 2 → 畫面上 180×124 CSS px。
+ *
+ * ⚠️⚠️ **這個數字要跟 HEAD_SIZE 一起看** —— 使用者要的視覺是「大頭狗開車」，
+ * 也就是頭大到不成比例。所以車刻意畫小（一顆頭 116 CSS px 對上 180 CSS px 寬的
+ * 車身，超過六成），**車變小比頭變大有效**：頭再放大會糊（來源頭像只有 256px），
+ * 而且三顆頭擠不進插畫上那三個座位。
  *
  * ⚠️ **兩張插畫在畫面上一樣大**（同一個裁切框做出來的，座位座標逐點對得上）——
  * 一個人的車不該因為他落單就縮小，而且合體／散開的那一瞬間頭才不會跳。
  */
 export const CAR_PIXEL_RATIO = 2;
-export const CAR_W = 520;
+export const CAR_W = 360;
 /** 插畫本身的高度（840×540 等比縮到 CAR_W） */
-const SPRITE_H = 334;
+const SPRITE_H = 231;
 /** 整台車上下浮動的幅度（裝置像素，±）。引擎在抖，不是在跳 */
-const BOB = 6;
+const BOB = 5;
 /** 插畫底下留給影子的空間 */
-const GROUND = 18;
+const GROUND = 12;
 export const CAR_H = SPRITE_H + BOB + GROUND;
 /** 沒有浮動時插畫左上角的 y */
 const SPRITE_TOP = CAR_H - GROUND - SPRITE_H;
@@ -189,8 +194,14 @@ export function createCarImage(
 
 /* ────────────────────────── 頭 ────────────────────────── */
 
-/** 頭的貼圖尺寸（裝置像素）。pixelRatio 2 → 畫面上 88 CSS px，比座位大得離譜，就是要誇張 */
-export const HEAD_SIZE = 176;
+/**
+ * 頭的貼圖尺寸（裝置像素）。pixelRatio 2 → 畫面上 116 CSS px，而整台車才 180 CSS px 寬
+ * —— 比座位大得離譜，就是要誇張（使用者的原話是「大頭狗開車」）。
+ *
+ * ⚠️ **上限是來源頭像的 256px**：`HEAD_BOX` 超過它就是把小圖放大，邊緣會糊。
+ * 還要更誇張的話請去縮 `CAR_W`，不要再往上加這個數字。
+ */
+export const HEAD_SIZE = 232;
 export const HEAD_PIXEL_RATIO = 2;
 
 /**
@@ -200,9 +211,9 @@ export const HEAD_PIXEL_RATIO = 2;
 export const NEUTRAL_RING = '#e8574a';
 
 /** 自己軌跡色那一圈的粗細（裝置像素）。這是「誰是誰」唯一的辨識 —— 車身現在是固定的插畫 */
-const RING = 8;
+const RING = 10;
 /** 顏色圈外面再一圈白的。底圖（positron）幾乎是白的，深色軌跡色不加白邊會糊進路網 */
-const HALO = 4;
+const HALO = 5;
 /** 頭像本體的範圍：四周留給兩圈外框 */
 const HEAD_PAD = RING + HALO + 3;
 const HEAD_BOX = HEAD_SIZE - HEAD_PAD * 2;
