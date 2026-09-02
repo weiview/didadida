@@ -2672,20 +2672,32 @@ export async function assignGeoBatch(params: {
   }
 }
 
-/** 把行程段套用到還沒有座標的照片 */
-export async function applyTripSegments(albumId?: number): Promise<number> {
+/**
+ * 把行程段套用到還沒有座標的照片。
+ *
+ * ⚠️ 回傳分三種而不是一個數字：`updated: 0` 有兩個完全不同的意思 ——
+ * 「站上根本還沒有任何行程段」與「有規則、但沒有照片落在它的時間範圍裡」。
+ * 呼叫端要對使用者講的話不一樣（前者該告訴他規則是怎麼建的），
+ * 混成同一個 0 就只能寫一句含糊的「補上 0 張」。
+ */
+export async function applyTripSegments(
+  albumId?: number,
+): Promise<{ updated: number; reason: 'ok' | 'no_segments' | 'failed' }> {
   try {
     const res = await fetch(`${API_BASE_URL}/photos/geo/apply-segments`, {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify({ albumId }),
     });
-    if (!res.ok) return 0;
+    if (!res.ok) return { updated: 0, reason: 'failed' };
     const data = await res.json();
-    return data.updated ?? 0;
+    return {
+      updated: data.updated ?? 0,
+      reason: data.reason === 'no segments' ? 'no_segments' : 'ok',
+    };
   } catch (err) {
     console.error(err);
-    return 0;
+    return { updated: 0, reason: 'failed' };
   }
 }
 

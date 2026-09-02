@@ -48,8 +48,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * 跟底部動作列的「指定地點」差在切入點：那邊要先自己找出哪些照片沒位置，
  * 這裡直接把整本相簿攤開、照拍攝日分組，缺什麼一眼看得到。
  *
- * 打開就先跑一次行程段套用（step 0）—— 之前建過的「這段時間我在這裡」規則
- * 本來就該先生效，剩下真正沒救的才需要人工處理。
+ * ⚠️⚠️ **打開這個視窗不會自己動任何一張照片**（2026-09-02 使用者要求改的）。
+ * 以前是一打開就無條件跑一次 `applyTripSegments()`，把以前建過的
+ * 「這段時間我在這裡」規則套到整本相簿還沒有座標的照片上，畫面上只留下一句
+ * 「已依既有行程段自動補上 n 張」的**事後報告**。使用者的原話是那些勾選項
+ * 「沒有作用」—— 他以為指定地點時那顆「同時建立行程段」管得到這件事，
+ * 但那顆只管**建立規則**，套用是這裡無條件做掉的，兩件事根本沒有連在一起。
+ * 現在改成一顆要按的按鈕：規則照樣留著，但**什麼時候生效由使用者決定**。
  *
  * 自己不寫座標：挑完照片一樣交回相簿頁給 AssignPlaceModal，
  * 行為與批次操作完全一致。這裡只多做一件事 —— 幫自帶 GPS 的照片補地名，
@@ -65,30 +70,21 @@ export default function PlaceCheckinModal({
   const revealedRestricted = useRevealedRestricted();
   const blurOf = (p: Photo) =>
     restrictedBlur && p.restricted === 1 && !revealedRestricted.has(p.id);
-  const [step0, setStep0] = useState<'idle' | 'running' | 'done'>('idle');
-  const [step0Applied, setStep0Applied] = useState(0);
+  /* 行程段套用：'idle' ＝ 還沒按（不是「還沒跑完」）。一打開永遠停在這裡 */
+  const [segState, setSegState] = useState<'idle' | 'running'>('idle');
+  const [segResult, setSegResult] = useState<{ text: string; ok: boolean } | null>(null);
   const [naming, setNaming] = useState<{ done: number; total: number } | null>(null);
   const [nameResult, setNameResult] = useState<string | null>(null);
 
-  // step 0：先讓既有的行程段規則生效，再讓人看剩下的
+  // 打開時只把畫面歸零，**不碰任何一張照片**（理由見元件上面那段）
   useEffect(() => {
     if (!isOpen) return;
     setSelected([]);
     setShowDone(false);
     setNaming(null);
     setNameResult(null);
-    setStep0('running');
-    let cancelled = false;
-    (async () => {
-      const applied = await applyTripSegments(albumId);
-      if (cancelled) return;
-      setStep0Applied(applied);
-      if (applied > 0) await onRefresh();
-      if (!cancelled) setStep0('done');
-    })();
-    return () => { cancelled = true; };
-    // onRefresh 每次 render 都是新的函式，放進 deps 會讓 step 0 無限重跑
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setSegState('idle');
+    setSegResult(null);
   }, [isOpen, albumId]);
 
   const buckets = useMemo(() => {
@@ -172,9 +168,33 @@ export default function PlaceCheckinModal({
     await onRefresh();
   }, [photos, selected, onRefresh]);
 
+  /**
+   * 把既有的行程段規則套到這本相簿還沒有座標的照片上。
+   *
+   * ⚠️ 三種結果要分開講：`updated: 0` 同時可能是「站上根本沒有行程段」與
+   * 「有規則但沒有照片落在範圍裡」，混成一句「補上 0 張」等於沒講。
+   * 前者還要順帶告訴使用者規則是怎麼來的 —— 不然那顆按鈕看起來就是壞的。
+   */
+  const handleApplySegments = useCallback(async () => {
+    setSegState('running');
+    setSegResult(null);
+    const { updated, reason } = await applyTripSegments(albumId);
+    if (updated > 0) await onRefresh();
+    setSegState('idle');
+    setSegResult(
+      reason === 'failed'
+        ? { text: '套用失敗，請稍後再試', ok: false }
+        : reason === 'no_segments'
+          ? { text: '還沒有任何行程段。選幾張照片按「指定地點」並勾「同時建立行程段」，才會留下這種規則', ok: false }
+          : updated > 0
+            ? { text: `已依既有行程段補上 ${updated} 張的位置`, ok: true }
+            : { text: '沒有照片落在既有行程段的時間範圍裡（只會填還沒有位置的照片）', ok: false },
+    );
+  }, [albumId, onRefresh]);
+
   if (!isOpen) return null;
 
-  const busy = step0 === 'running' || naming !== null;
+  const busy = segState === 'running' || naming !== null;
   const canAssign = selected.length > 0 && !busy;
   const namableSelected = photos.filter((p) => selected.includes(p.id) && stateOf(p) === 'unnamed').length;
 
@@ -211,17 +231,34 @@ export default function PlaceCheckinModal({
             自帶 GPS 但沒有地名的，可以直接反查地名（不會動到原本的座標）。
           </p>
 
-          {step0 === 'running' && (
-            <div style={{ fontSize: 13.5, color: '#64748b', marginBottom: 10 }}>
-              正在套用既有的行程段規則…
-            </div>
-          )}
-          {step0 === 'done' && step0Applied > 0 && (
+          {/*
+            * 行程段是**要按才生效**的，不是打開視窗的副作用（見元件上面那段）。
+            * 說明寫在按鈕旁邊：這個動作動的是整本相簿、不是選取的那幾張，
+            * 跟底下那顆「自動補地名」的作用範圍剛好相反，不講清楚會誤按。
+            */}
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10,
+          }}>
+            <button
+              onClick={handleApplySegments}
+              disabled={busy}
+              style={btn(!busy, false)}
+            >
+              {segState === 'running' ? '套用中…' : '🧭 用行程段補位置'}
+            </button>
+            <span style={{ fontSize: 12.5, color: '#64748b', lineHeight: 1.6 }}>
+              把以前建立的「這段時間我在這裡」規則，套到整本相簿還沒有位置的照片上
+            </span>
+          </div>
+          {segResult && (
             <div style={{
-              background: '#ecfdf5', border: '1px solid #a7f3d0', borderRadius: 10,
-              padding: '9px 12px', fontSize: 13.5, marginBottom: 10,
+              background: segResult.ok ? '#ecfdf5' : '#f8fafc',
+              border: `1px solid ${segResult.ok ? '#a7f3d0' : '#e2e8f0'}`,
+              color: segResult.ok ? '#0f172a' : '#475569',
+              borderRadius: 10, padding: '9px 12px', fontSize: 13.5, marginBottom: 10,
+              lineHeight: 1.6,
             }}>
-              已依既有行程段自動補上 {step0Applied} 張的位置
+              {segResult.text}
             </div>
           )}
 
@@ -249,7 +286,7 @@ export default function PlaceCheckinModal({
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 22px' }}>
           {days.length === 0 && (
             <p style={{ fontSize: 14, color: '#64748b', padding: '30px 0', textAlign: 'center' }}>
-              {step0 === 'running' ? '' : '這本相簿的照片都有位置與地名了 🎉'}
+              {segState === 'running' ? '' : '這本相簿的照片都有位置與地名了 🎉'}
             </p>
           )}
 

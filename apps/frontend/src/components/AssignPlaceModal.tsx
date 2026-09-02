@@ -605,7 +605,8 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
               <span>
                 同時建立行程段
                 <span style={{ color: '#64748b', display: 'block', fontSize: 12.5 }}>
-                  之後加進來的照片，只要落在這個時間範圍就會自動套用同一地點
+                  只是把「這段時間我在這裡」記下來當規則。之後在「地點」視窗按
+                  「用行程段補位置」時，落在這個時間範圍又還沒有位置的照片才會套用同一地點
                 </span>
               </span>
             </label>
