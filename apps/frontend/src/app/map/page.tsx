@@ -108,6 +108,9 @@ export default function MapPage() {
   // 管理工具整區收合。預設收起來 —— 平常來這一頁是要看地圖的，
   // 而貼路與同步都已經自動化，工具區不再是每次都要用的東西
   const [showAdminTools, setShowAdminTools] = useState(false);
+  // 行程段那一份也收起來（同一套收合寫法）。它是一張會愈長愈長的規則清單，
+  // 攤開時把上面的同步、貼路那些按鈕整個推到看不見的地方
+  const [showSegments, setShowSegments] = useState(false);
   const [syncing, setSyncing] = useState(false);
   // 同步過程逐行累積，每個檔案結束就更新一次 —— 這是一個會跑好幾秒的操作
   const [syncLog, setSyncLog] = useState<string[]>([]);
@@ -1825,8 +1828,18 @@ export default function MapPage() {
               can_manage_others 的人。一般成員看到刪除鈕只會拿到 403 */}
           {canManageOthers && (
           <>
-          <h3 style={{ fontSize: 15, marginBottom: 8 }}>行程段（{segments.length}）</h3>
-          {segments.length === 0 ? (
+          <button
+            onClick={() => setShowSegments(v => !v)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 8, padding: 0,
+              border: 'none', background: 'none', cursor: 'pointer',
+              fontSize: 15, fontWeight: 600, color: '#0f172a', marginBottom: 8,
+            }}
+          >
+            <span style={{ fontSize: 13, color: '#94a3b8' }}>{showSegments ? '▾' : '▸'}</span>
+            行程段（{segments.length}）
+          </button>
+          {!showSegments ? null : segments.length === 0 ? (
             <p style={{ fontSize: 13.5, color: '#64748b' }}>
               還沒有行程段。到相簿中選取照片後按「指定地點」，並勾選「同時建立行程段」即可建立。
             </p>
