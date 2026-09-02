@@ -99,7 +99,7 @@ export default function MapPage() {
    * 軌跡（GET 沒擋），但不該端出那些按鈕 —— 按了只會拿到 403。
    */
   const {
-    isAdmin, canManageOthers, canViewMap, canUseTools, convoyOverlapPct,
+    isAdmin, canManageOthers, canViewMap, canUseTools, convoyOverlapPct, babyAvatar,
     checking: checkingAuth, user,
   } = useAdmin();
   const router = useRouter();
@@ -384,6 +384,13 @@ export default function MapPage() {
   const trackAvatars = useMemo(() => {
     const out: Record<number, string | null> = {};
     for (const m of members) out[m.id] = m.avatar ?? null;
+    return out;
+  }, [members]);
+
+  /** user_id → 固定坐哪個位子（站長開車、指定的那位坐副駕）。沒指定的不列 */
+  const trackSeats = useMemo(() => {
+    const out: Record<number, 'driver' | 'passenger'> = {};
+    for (const m of members) if (m.seat) out[m.id] = m.seat;
     return out;
   }, [members]);
 
@@ -1619,6 +1626,8 @@ export default function MapPage() {
         convoyOverlapPct={convoyOverlapPct}
         trackColors={trackColors}
         trackAvatars={trackAvatars}
+        trackSeats={trackSeats}
+        babyAvatar={babyAvatar}
         timelineColor={myColor}
         // 我自己被篩掉時，我的 Google 紀念層也跟著收 —— 那一層畫的就是我
         timelineLines={showTimeline && !meHidden ? timelineLines : undefined}

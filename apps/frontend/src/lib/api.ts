@@ -506,6 +506,12 @@ export interface AuthState {
    * 看著螢幕」，不是權限。掀開狀態在 lib/restrictedReveal.ts。
    */
   restrictedBlur: boolean;
+  /**
+   * 後座那個寶寶的頭像網址（站長在 /admin 傳的，全站一張）。**只有看得到地圖的人拿得到**
+   * —— 其他人拿它沒有用途，而每個訪客的 /auth/me 都要多讀一列 AppSetting。
+   * 沒設就是 null，合體時後座畫小外星人。
+   */
+  babyAvatar: string | null;
   user: CurrentUser | null;
 }
 
@@ -573,7 +579,7 @@ export async function checkAuth(): Promise<AuthState> {
   const locked: AuthState = {
     admin: false, guest: false, canViewMap: false,
     canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, user: null,
+    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, babyAvatar: null, user: null,
   };
   if (typeof window === 'undefined') return locked;
   // 舊版把明文密碼存在這個 key。清掉已經留在使用者瀏覽器裡的那一份，
@@ -607,6 +613,8 @@ export async function checkAuth(): Promise<AuthState> {
         convoyOverlapPct: clampConvoyPct(data.convoy_overlap_pct),
         // 舊後端不回這個欄位 —— 當成關的（維持這個開關出現之前的樣子）
         restrictedBlur: !!data.restricted_blur,
+        // 舊後端不回這個欄位 —— 後座就畫小外星人，跟站長還沒傳寶寶頭像時一樣
+        babyAvatar: data.baby_avatar ?? null,
         user: data.user ?? null,
       };
     }
@@ -672,15 +680,27 @@ export function updateMyTrackColor(color: string | null) {
  * 同一個 <AvatarPicker> 元件在帳號牌與 /admin 兩邊共用。
  *
  * 送的是**原始的圖檔位元組**，不是 FormData：只有一個檔案，包一層兩邊都變麻煩。
- * Content-Type 要照實填，後端靠它決定副檔名（也只收 WebP／PNG —— JPEG 沒有 alpha）。
+ * Content-Type 要照實填，後端靠它決定副檔名（收 WebP／PNG／GIF —— JPEG 沒有 alpha，
+ * GIF 是為了動圖，位元組原封不動存進去，見 lib/avatar.ts）。
  */
 
+/**
+ * 頭像要換誰的。數字是某個帳號，`'baby'` 是**後座那個寶寶** ——
+ * 他沒有帳號（登不進來、沒有軌跡也不會留言），那張圖記在 AppSetting 上，
+ * 所以走的是另一支後台路由。⚠️ 但**元件只有一個**（AvatarPicker），
+ * 分岔只在這裡。
+ */
+export type AvatarTarget = number | 'baby';
+
+const avatarPath = (target: AvatarTarget) =>
+  target === 'baby' ? `${API_BASE_URL}/admin/baby-avatar` : `${API_BASE_URL}/users/${target}/avatar`;
+
 export async function uploadAvatar(
-  userId: number, blob: Blob, type: string,
+  target: AvatarTarget, blob: Blob, type: string,
 ): Promise<{ success: boolean; avatar?: string | null; message?: string }> {
   try {
     const token = typeof window !== 'undefined' ? localStorage.getItem(SITE_TOKEN_KEY) : '';
-    const res = await fetch(`${API_BASE_URL}/users/${userId}/avatar`, {
+    const res = await fetch(avatarPath(target), {
       method: 'POST',
       headers: { 'Content-Type': type, 'Authorization': `Bearer ${token}` },
       body: blob,
@@ -694,10 +714,10 @@ export async function uploadAvatar(
 }
 
 export async function removeAvatar(
-  userId: number,
+  target: AvatarTarget,
 ): Promise<{ success: boolean; message?: string }> {
   try {
-    const res = await fetch(`${API_BASE_URL}/users/${userId}/avatar`, {
+    const res = await fetch(avatarPath(target), {
       method: 'DELETE',
       headers: getAuthHeaders(),
     });
@@ -726,6 +746,12 @@ export interface TrackMember {
    * 代跑就只跑自己那一份，不會憑空對每個人各打一次 Drive。
    */
   has_track_folder?: boolean;
+  /**
+   * 合體那台車上他固定坐哪個位子。`driver` 是站長（爹地），`passenger` 是站長在
+   * /admin 指定的那一位（媽咪）。**沒指定的人是 undefined**，畫圖時排在他們後面
+   * 補位 —— 少了駕駛的車看起來像壞掉，所以位子是「排序」不是「保留席」。
+   */
+  seat?: 'driver' | 'passenger';
 }
 
 /**
@@ -1360,6 +1386,16 @@ export interface SiteSettings {
    * 它管的是站長自己那一份畫面：捲相簿時不要整片跳出來。
    */
   restricted_blur: number;
+  /**
+   * 合體那台車的副駕駛（媽咪）是誰的 uid，沒指定是 null。
+   *
+   * 刻意存 uid 不寫死信箱：這純粹是**畫圖時的座位順序**，站長換人、信箱改了
+   * 都不該要改程式。指到一個已經被刪掉的帳號也不會壞 —— 那就是沒有人被標成
+   * 副駕駛，後面的人照樣往前補位（見 TrackMember.seat）。
+   */
+  seat_passenger_uid: number | null;
+  /** 後座那個寶寶的頭像網址，站長在 /admin 傳的（全站一張）。沒傳是 null */
+  baby_avatar: string | null;
 }
 
 /** PUT 的內容。開關是布林、門檻是數字，所以不能寫成 Partial<Record<…, boolean>> */
@@ -1368,6 +1404,8 @@ export interface SiteSettingsPatch {
   guest_can_view_comments?: boolean;
   convoy_overlap_pct?: number;
   restricted_blur?: boolean;
+  /** 送 0 或 null 就是「沒有人是副駕駛」 */
+  seat_passenger_uid?: number | null;
 }
 
 export async function fetchSiteSettings(): Promise<SiteSettings> {
@@ -1379,6 +1417,8 @@ export async function fetchSiteSettings(): Promise<SiteSettings> {
     guest_can_view_comments: data.guest_can_view_comments ?? 0,
     convoy_overlap_pct: clampConvoyPct(data.convoy_overlap_pct),
     restricted_blur: data.restricted_blur ?? 0,
+    seat_passenger_uid: data.seat_passenger_uid ?? null,
+    baby_avatar: data.baby_avatar ?? null,
   };
 }
 
@@ -1399,6 +1439,8 @@ export async function updateSiteSettings(
         guest_can_view_comments: data.guest_can_view_comments ?? 0,
         convoy_overlap_pct: clampConvoyPct(data.convoy_overlap_pct),
         restricted_blur: data.restricted_blur ?? 0,
+        seat_passenger_uid: data.seat_passenger_uid ?? null,
+        baby_avatar: data.baby_avatar ?? null,
       },
     };
   }

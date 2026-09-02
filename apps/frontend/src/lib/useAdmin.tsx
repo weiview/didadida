@@ -69,6 +69,12 @@ interface AuthValue {
    */
   restrictedBlur: boolean;
   /**
+   * 後座那個寶寶的頭像（站長在 /admin 傳的，全站一張）。只有看得到地圖的人拿得到，
+   * 沒設就是 null（合體時後座畫小外星人）。只有 `/map` 用得到，但它跟著 /auth/me
+   * 回來就是零額外請求，所以放這裡而不是另開一支。
+   */
+  babyAvatar: string | null;
+  /**
    * 把通知全部標成已讀（後端只有一個時間戳，沒有逐則已讀）。
    * 成功就順手把 unreadNotifications 歸零，不必等下一次 /auth/me。
    */
@@ -114,6 +120,11 @@ interface AuthValue {
    * （那個元件也給站長代設別人用），這裡只負責讓右上角那顆圓鈕立刻換圖。
    */
   setMyAvatar: (avatar: string | null) => void;
+  /**
+   * 站長在 /admin 換掉後座那個寶寶的頭像之後，就地把手上這份改掉。
+   * 不改的話這一輪 session 裡走到 /map 還是畫舊的那張（值是 /auth/me 帶回來的）。
+   */
+  setBabyAvatar: (avatar: string | null) => void;
   /** 登出：清掉站上與 Google 的 token，回到進站畫面 */
   logout: () => void;
 }
@@ -124,7 +135,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AuthState>({
     admin: false, guest: false, canViewMap: false,
     canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, user: null,
+    convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, babyAvatar: null, user: null,
   });
   const [checking, setChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -149,7 +160,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
         // 遮罩也不樂觀關掉：真正的值等 checkAuth() 回來。猜錯的方向要是
         // 「先攤開來再糊回去」，那一下就白做了
-        convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: true, user: null,
+        convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: true, babyAvatar: null, user: null,
       });
       checkAuth().then((next) => {
         if (!alive) return;
@@ -208,6 +219,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setState((prev) => (prev.user ? { ...prev, user: { ...prev.user, avatar } } : prev));
   }, []);
 
+  const setBabyAvatar = useCallback((avatar: string | null) => {
+    setState((prev) => ({ ...prev, babyAvatar: avatar }));
+  }, []);
+
   const logout = useCallback(() => {
     clearTokens();
     // 上線名單也要清。留著的話下一個登入的人會先看到上一個人的名單，
@@ -216,7 +231,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setState({
       admin: false, guest: false, canViewMap: false,
       canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
-      convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, user: null,
+      convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false, babyAvatar: null, user: null,
     });
     setAuthError(null);
   }, []);
@@ -273,6 +288,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     unreadNotifications: state.unreadNotifications,
     convoyOverlapPct: state.convoyOverlapPct,
     restrictedBlur: state.restrictedBlur,
+    babyAvatar: state.babyAvatar,
     markNotificationsRead,
     canEdit,
     canAddTo,
@@ -284,9 +300,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     renameSelf,
     recolorSelf,
     setMyAvatar,
+    setBabyAvatar,
     logout,
   }), [state, checking, canManageOthers, canEdit, canAddTo, canReorderIn, unlock, login, loginWithGoogle,
-       authError, renameSelf, recolorSelf, setMyAvatar, logout, markNotificationsRead]);
+       authError, renameSelf, recolorSelf, setMyAvatar, setBabyAvatar, logout, markNotificationsRead]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

@@ -11,8 +11,9 @@ import type { FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
 import { CONVOY_PCT_DEFAULT } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 import {
-  buildAvatarHead, createAlienHead, createCarImage,
-  CAR_NEUTRAL, CAR_PIXEL_RATIO, CAR_SEAT_Y, HEAD_PIXEL_RATIO,
+  buildAvatarHead, createAlienHead, createCarImage, seatOffset,
+  CAR_H, CAR_PIXEL_RATIO, HEAD_PIXEL_RATIO, NEUTRAL_RING,
+  type CarSprite, type Seat,
 } from '@/lib/car';
 import { DEFAULT_TRACK_COLOR } from '@/lib/trackColors';
 
@@ -115,6 +116,20 @@ interface Props {
    * 不是不畫 —— 車上空著看起來像資料掉了。
    */
   trackAvatars?: Record<number, string | null>;
+  /**
+   * 誰坐哪個位子（`{ [user_id]: 'driver' | 'passenger' }`，同樣來自 `/api/track-members`）。
+   *
+   * 合體時車上的座位是**固定語意**的：站長開車、指定的那位坐副駕、後座是寶寶。
+   * 沒列在這裡的人照原本的順序補上剩下的位子，補不完的排到車頂上方。
+   */
+  trackSeats?: Record<number, 'driver' | 'passenger'>;
+  /**
+   * 後座那個寶寶的頭像網址（站長在 `/admin` 上傳，跟著 `/api/auth/me` 回來）。
+   *
+   * 他不是 `User`，沒有軌跡也沒有顏色 —— 只要是合體軌跡，後座就一定有他。
+   * 還沒設就坐外星人，跟沒設頭像的家人一樣（座椅空著看起來像壞掉）。
+   */
+  babyAvatar?: string | null;
   /**
    * Google 紀念層要用的顏色。那一層的線是頁面切好的座標陣列，帶不了 user_id，
    * 而它的內容永遠是**當下這個人自己的**時間軸（R2 key 依 uid 分開），
@@ -311,16 +326,28 @@ const HEAD_HIDE_GAP_MS = 30 * 60 * 1000;
  * 下面全是**螢幕像素**，所以每一幀都要 map.project／unproject 換算回經緯度 ——
  * 縮放地圖時頭才會一直好好坐在車上，而不是隨著比例尺飛走。
  */
-/** 兩顆頭的水平間距。比頭本身窄，讓他們稍微擠在一起，像擠在同一排座位上 */
+/** 車在畫面上有多高（CSS px）。貼圖是 2 倍解析度，見 car.ts 的 CAR_PIXEL_RATIO */
+const CAR_CSS_H = CAR_H / CAR_PIXEL_RATIO;
+
+/*
+ * 座位上那幾顆頭的大小。**刻意誇張** —— 使用者要的就是「頭很大的一台車」。
+ *
+ * 一個人的時候是 1（畫面上 88px，車身才 260px 寬）。合體時三顆頭要擠進
+ * 插畫上那三個座位（副駕到駕駛只有 ~78px、駕駛到後座只有 ~35px），
+ * 所以縮小一點並靠疊放順序讓後面的人露出頭頂。
+ */
+const SEAT_HEAD_SCALE = 0.68;
+/** 後座那個寶寶再小一點（他本來就比較小顆），也順便讓前面兩顆蓋得住他的下巴 */
+const BABY_HEAD_SCALE = 0.85;
+/** 寶寶再往上抬一點，讓頭頂從駕駛後面探出來 —— 不抬的話整顆被擋掉 */
+const BABY_LIFT = 6;
+
+/** 座位不夠時多出來的人排在車頂上方。兩顆頭的水平間距（CSS px） */
 const HEAD_STEP = 30;
-/** 錯開的高度。奇數位的人坐低一點（後座），才不會兩顆頭完全重疊 */
-const HEAD_TIER = 6;
-/** 人多的時候頭縮小一點，不然四個人的頭會比整台車還寬 */
+/** 排在車頂上那幾顆縮小一點，免得比整台車還寬 */
 const HEAD_CROWD_SCALE = 0.85;
-/** 車至少要有多寬（CSS px）才裝得下這幾顆頭。算車身縮放用 */
-const CAR_BASE_W = 100;
-/** 頭在車上的上下浮動幅度。每個人相位錯開，看起來就是各自在晃 */
-const HEAD_BOB = 2.5;
+/** 那一排離車頂多高（CSS px，指頭的中心） */
+const HEAD_ROW_LIFT = 26;
 
 /**
  * 判斷車頭朝哪邊時，往回看多久（毫秒的軌跡時間）。
@@ -1460,6 +1487,8 @@ export default function FootprintMap({
   timelineLines,
   trackColors,
   trackAvatars,
+  trackSeats,
+  babyAvatar,
   timelineColor = DEFAULT_TRACK_COLOR,
   focusPoint,
   seekTo,
@@ -1549,6 +1578,12 @@ export default function FootprintMap({
     [trackAvatars],
   );
 
+  /** 這個人固定坐哪。沒指定就回 null，由 placeCar 照順序遞補 */
+  const seatFor = useCallback(
+    (userId: number | null) => (userId != null && trackSeats?.[userId]) || null,
+    [trackSeats],
+  );
+
   /** 已經開始做的頭像貼圖。同一張只做一次（每張都要下載、描邊、讀回像素） */
   const headPending = useRef<Set<string>>(new Set());
   /**
@@ -1559,14 +1594,14 @@ export default function FootprintMap({
   /** 每台車現在車頭朝哪。key 是「車上有誰」，見 FACING_HYSTERESIS_PX */
   const facingRef = useRef<Map<string, 1 | -1>>(new Map());
 
-  /** 這個顏色、這個朝向的車。沒有就現做一台 */
-  const ensureCar = useCallback((map: MapLibreMap, color: string, flip: boolean) => {
-    const id = `car:${color}:${flip ? 'l' : 'r'}`;
+  /** 這張插畫、這個朝向的車。沒有就現做一台 */
+  const ensureCar = useCallback((map: MapLibreMap, sprite: CarSprite, flip: boolean) => {
+    const id = `car:${sprite}:${flip ? 'l' : 'r'}`;
     if (!map.hasImage(id)) {
       map.addImage(
         id,
         // 只有播放中才要求下一幀：暫停時地圖不該一直重畫
-        createCarImage(() => map.triggerRepaint(), () => playingRef.current, color, flip) as any,
+        createCarImage(() => map.triggerRepaint(), () => playingRef.current, sprite, flip) as any,
         { pixelRatio: CAR_PIXEL_RATIO },
       );
     }
@@ -1574,10 +1609,12 @@ export default function FootprintMap({
   }, []);
 
   /**
-   * 這個人的頭。有頭像就用他的頭像，**還沒做好或做不出來就先坐外星人** ——
+   * 這顆頭。有頭像就用他的頭像，**還沒做好或做不出來就先坐外星人** ——
    * icon-image 指到不存在的圖只會什麼都不畫，車上空一格看起來像壞掉。
+   *
+   * 收的是網址不是 user_id：後座那個寶寶不是 `User`（他的頭像存在 AppSetting 裡）。
    */
-  const ensureHead = useCallback((map: MapLibreMap, userId: number | null, color: string) => {
+  const ensureHead = useCallback((map: MapLibreMap, url: string | null, color: string) => {
     const alien = `head:alien:${color}`;
     if (!map.hasImage(alien)) {
       map.addImage(
@@ -1586,15 +1623,19 @@ export default function FootprintMap({
         { pixelRatio: HEAD_PIXEL_RATIO },
       );
     }
-    const url = avatarFor(userId);
     if (!url) return alien;
 
-    // 顏色也進 id：肩膀是那個人的軌跡色，換色就得重做一張
+    // 顏色也進 id：外框是那個人的軌跡色，換色就得重做一張
     const id = `head:${color}:${url}`;
     if (map.hasImage(id)) return id;
     if (!headPending.current.has(id)) {
       headPending.current.add(id);
-      buildAvatarHead(url, color)
+      // 給 hooks 才會解 GIF —— 動圖是一張會自己換格的 StyleImage，
+      // 它跟車一樣要能叫地圖重畫下一幀
+      buildAvatarHead(url, color, {
+        triggerRepaint: () => map.triggerRepaint(),
+        isAnimating: () => playingRef.current,
+      })
         .then((img) => {
           // 地圖可能已經被拆掉（換頁）——那就什麼都別做
           if (mapRef.current !== map) return;
@@ -1605,7 +1646,7 @@ export default function FootprintMap({
         .catch(() => {});
     }
     return alien;
-  }, [avatarFor]);
+  }, []);
 
   const trackLines = useMemo(() => groupLines(tracks, ownerByDay), [tracks, ownerByDay]);
 
@@ -2355,9 +2396,8 @@ export default function FootprintMap({
         type: 'symbol',
         source: 'vehicle',
         layout: {
-          // 每個 feature 自己指定要哪張車（顏色 × 朝左朝右）
+          // 每個 feature 自己指定要哪張車（一個人／全家 × 朝左朝右）
           'icon-image': ['get', 'img'],
-          // 人多的時候車要寬一點才裝得下那幾顆頭，見 CAR_BASE_W
           'icon-size': ['get', 'scale'],
           'icon-allow-overlap': true,
           'icon-ignore-placement': true,
@@ -2383,9 +2423,15 @@ export default function FootprintMap({
           'icon-size': ['get', 'scale'],
           'icon-allow-overlap': true,
           'icon-ignore-placement': true,
-          // 錨在下緣：那裡是小身體的底部，正好坐進座位
-          'icon-anchor': 'bottom',
+          // 錨在正中央：插畫上那顆綠點標的就是「頭的中心」
+          'icon-anchor': 'center',
           'icon-rotation-alignment': 'viewport',
+          /*
+           * ⚠️ 疊放順序一定要是 feature 的順序（預設的 'auto' 在
+           * icon-allow-overlap 打開時會照畫面 y 排）。頭大得會互相蓋住，
+           * 我們是刻意「後座先畫、副駕最後畫」讓前面的人蓋住後面的。
+           */
+          'symbol-z-order': 'source',
         },
       });
 
@@ -3005,45 +3051,94 @@ export default function FootprintMap({
       const n = idx.length;
       const key = idx.map((i) => memberPaths[i].userId ?? 'x').join(',');
       const flip = facingOf(key, center, prev) < 0;
-      // 獨行的人開自己顏色的車；合體那台不屬於任何一個人，用中性色
-      const carColor = n === 1 ? colorFor(memberPaths[idx[0]].userId) : CAR_NEUTRAL;
-      const headScale = n > 1 ? HEAD_CROWD_SCALE : 1;
-      const step = HEAD_STEP * headScale;
-      // 車至少要跟這排頭一樣寬，不然頭會掛在車外面
-      const carScale = Math.max(1, ((n - 1) * step + CAR_BASE_W * 0.5) / CAR_BASE_W);
+      // 一個人開自己那台，兩個人以上就是全家出遊那張（後座那個寶寶也在裡面）
+      const sprite: CarSprite = n === 1 ? 'solo' : 'family';
+      const cpx = map.project(center);
 
       carFeatures.push({
         type: 'Feature',
         // lng/lat 是給點下去那顆氣泡用的（Google 地圖連結要真的座標）。
         // 車的幾何本來就是形心，這裡是抄一份，properties 拿得到而已
-        properties: { img: ensureCar(map, carColor, flip), scale: carScale, lng: center[0], lat: center[1] },
+        properties: { img: ensureCar(map, sprite, flip), scale: 1, lng: center[0], lat: center[1] },
         geometry: { type: 'Point', coordinates: center },
       });
 
-      const cpx = map.project(center);
-      const seatY = cpx.y + CAR_SEAT_Y * carScale;
-      idx.forEach((i, k) => {
-        const color = colorFor(memberPaths[i].userId);
-        /*
-         * ⚠️ 頭的**幾何不是這個人真正的位置** —— 它是把車投影成像素、在座位上排好
-         *    再投影回來的（見上面那段註解）。所以點下去要開 Google 地圖時，
-         *    絕對不能拿 geometry 當座標，得另外把真的那一份帶在 properties 上。
-         */
-        const truth = pos[i] ?? center;
-        const ll = map.unproject([
-          cpx.x + (k - (n - 1) / 2) * step,
-          // 奇數位的人坐低一點（後座），加上各自錯開相位的上下晃動
-          seatY + (k % 2) * HEAD_TIER + Math.sin(now * 3 + k * 1.3) * HEAD_BOB,
-        ]);
+      /**
+       * 把一顆頭擺到螢幕上的某個位置。
+       *
+       * ⚠️ 頭的**幾何不是這個人真正的位置** —— 它是把車投影成像素、在座位上排好
+       *    再投影回來的。所以點下去要開 Google 地圖時，絕對不能拿 geometry 當座標，
+       *    得另外把真的那一份帶在 properties 上（`truth`）。
+       */
+      const putHead = (
+        url: string | null, color: string, scale: number,
+        px: number, py: number, truth: [number, number],
+      ) => {
+        const ll = map.unproject([px, py]);
         headFeatures.push({
           type: 'Feature',
-          // 後排的先畫，前排的才蓋得住他 —— 這一層的疊放順序就是 feature 的順序
-          properties: {
-            img: ensureHead(map, memberPaths[i].userId, color), scale: headScale,
-            lng: truth[0], lat: truth[1],
-          },
+          properties: { img: ensureHead(map, url, color), scale, lng: truth[0], lat: truth[1] },
           geometry: { type: 'Point', coordinates: [ll.lng, ll.lat] },
         });
+      };
+
+      /** 坐進插畫上某一個座位（綠點的位置）*/
+      const putSeat = (
+        seat: Seat, url: string | null, color: string, scale: number,
+        truth: [number, number], lift = 0,
+      ) => {
+        const off = seatOffset(seat, flip, now);
+        putHead(url, color, scale, cpx.x + off.dx, cpx.y + off.dy - lift, truth);
+      };
+
+      if (n === 1) {
+        const i = idx[0];
+        putSeat('driver', avatarFor(memberPaths[i].userId), colorFor(memberPaths[i].userId), 1, pos[i] ?? center);
+        return;
+      }
+
+      /*
+       * 座位是固定語意的：站長開車、指定的那位坐副駕。沒指定的人照原順序遞補 ——
+       * 媽咪跟小孩一起出門（爹地沒去）時總得有人開車，副駕空著才是壞掉。
+       */
+      const rank = (i: number) => {
+        const s = seatFor(memberPaths[i].userId);
+        return s === 'driver' ? 0 : s === 'passenger' ? 1 : 2;
+      };
+      const ordered = [...idx].sort((a, b) => rank(a) - rank(b) || idx.indexOf(a) - idx.indexOf(b));
+
+      /*
+       * 畫的順序＝疊放順序（見圖層那個 symbol-z-order: 'source'）：
+       * 後座 → 駕駛 → 副駕。頭大到會互相蓋住，由後往前畫才像一列坐著的人。
+       */
+      // 只要是合體軌跡，後座就一定有寶寶（使用者拍板）。還沒設頭像就先坐外星人
+      putSeat(
+        'rear', babyAvatar ?? null, NEUTRAL_RING,
+        SEAT_HEAD_SCALE * BABY_HEAD_SCALE, center, BABY_LIFT,
+      );
+
+      // 這個順序就是「駕駛先畫、副駕後畫」，副駕因此蓋在最上面
+      const seated: Seat[] = ['driver', 'passenger'];
+      ordered.slice(0, seated.length).forEach((i, k) => {
+        putSeat(
+          seated[k], avatarFor(memberPaths[i].userId), colorFor(memberPaths[i].userId),
+          SEAT_HEAD_SCALE, pos[i] ?? center,
+        );
+      });
+
+      /*
+       * 位子不夠的（四個人以上）排在車頂上方那一列。
+       * 三個座位是插畫畫死的，多出來的人硬塞會疊成一團 —— 寧可讓他們浮在上面，
+       * 至少「今天有幾個人在一起」還看得出來。
+       */
+      const extra = ordered.slice(seated.length);
+      extra.forEach((i, k) => {
+        putHead(
+          avatarFor(memberPaths[i].userId), colorFor(memberPaths[i].userId), HEAD_CROWD_SCALE,
+          cpx.x + (k - (extra.length - 1) / 2) * HEAD_STEP,
+          cpx.y - CAR_CSS_H - HEAD_ROW_LIFT,
+          pos[i] ?? center,
+        );
       });
     };
 
@@ -3099,7 +3194,10 @@ export default function FootprintMap({
       for (const f of carFeatures) { cx += f.geometry.coordinates[0]; cy += f.geometry.coordinates[1]; }
       map.setCenter([cx / carFeatures.length, cy / carFeatures.length]);
     }
-  }, [cursorT, memberPaths, convoys, colorFor, ensureCar, ensureHead, headTick, ready, playing]);
+  }, [
+    cursorT, memberPaths, convoys, colorFor, avatarFor, seatFor, babyAvatar,
+    ensureCar, ensureHead, headTick, ready, playing,
+  ]);
 
   // --- 播放迴圈 ---
   useEffect(() => {

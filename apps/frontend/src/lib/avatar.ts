@@ -22,12 +22,19 @@ const ALPHA_FLOOR = 16;
 
 export interface PreparedAvatar {
   blob: Blob;
-  /** 'image/webp' 或 'image/png'。後端只收這兩種 —— JPEG 沒有 alpha */
+  /** 'image/webp'、'image/png' 或 'image/gif'。後端只收這三種 —— JPEG 沒有 alpha */
   type: string;
   /** 原圖本來就是去背的嗎。false ＝ 我們幫他套了圓形遮罩 */
   hadAlpha: boolean;
+  /** 這是一支動圖嗎（GIF 原檔直送，沒有經過下面那一整套處理） */
+  animated: boolean;
   /** 給預覽用的 object URL。用完記得 revoke */
   previewUrl: string;
+}
+
+/** 這個檔案是 GIF 嗎。副檔名也認一次 —— 有些系統丟過來的 type 是空字串 */
+function isGifFile(file: File): boolean {
+  return file.type === 'image/gif' || /\.gif$/i.test(file.name);
 }
 
 /**
@@ -100,6 +107,24 @@ function scanAlpha(data: Uint8ClampedArray, w: number, h: number) {
  * 失敗時丟例外（訊息可以直接顯示給使用者）。
  */
 export async function prepareAvatar(file: File): Promise<PreparedAvatar> {
+  /*
+   * ⚠️⚠️ **GIF 整份原檔直送，一個像素都不碰。**
+   *
+   * 底下那一整套（裁透明邊界／圓形遮罩／重編）都要經過 canvas，而 canvas
+   * **只畫得出第一格** —— 送進去出來的就是一張靜止圖，動畫沒了，而且錯得很安靜
+   * （使用者看到的是自己那張圖，只是不會動）。
+   *
+   * 代價是動圖不會被裁邊也不會被套圓形遮罩：沒去背的方形 GIF 在地圖上就是一塊
+   * 方的。那件事挑檔案的時候講出來就好（見 AvatarPicker），比弄丟動畫划算。
+   */
+  if (isGifFile(file)) {
+    return {
+      blob: file, type: 'image/gif',
+      // 動圖一律不套圓形遮罩，所以也不必宣稱「沒有 alpha 已經幫你裁圓」
+      hadAlpha: true, animated: true,
+      previewUrl: URL.createObjectURL(file),
+    };
+  }
   const src = await decode(file);
   const sw = 'width' in src ? src.width : 0;
   const sh = 'height' in src ? src.height : 0;
@@ -168,5 +193,5 @@ export async function prepareAvatar(file: File): Promise<PreparedAvatar> {
     out.toBlob((b) => resolve(b), type, 0.92));
   if (!blob) throw new Error('產生頭像失敗');
 
-  return { blob, type, hadAlpha: hasAlpha, previewUrl: URL.createObjectURL(blob) };
+  return { blob, type, hadAlpha: hasAlpha, animated: false, previewUrl: URL.createObjectURL(blob) };
 }

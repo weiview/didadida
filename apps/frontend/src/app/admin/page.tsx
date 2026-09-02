@@ -43,7 +43,7 @@ const fmtUtc = (s: string) =>
   new Date(s.endsWith("Z") ? s : `${s.replace(" ", "T")}Z`).toLocaleString();
 
 export default function AdminPage() {
-  const { canManageOthers, checking, isAdmin, user: me, setMyAvatar } = useAdmin();
+  const { canManageOthers, checking, isAdmin, user: me, setMyAvatar, setBabyAvatar } = useAdmin();
 
   /*
    * 誰現在在線上。**只是看**，輪詢由全站唯一的 <PresenceToasts /> 開
@@ -144,6 +144,16 @@ export default function AdminPage() {
   const [savingConvoy, setSavingConvoy] = useState(false);
 
   /*
+   * 合體那台車的座位：副駕駛（媽咪）是誰，以及後座那個寶寶長什麼樣。
+   *
+   * 駕駛永遠是站長（爹地），沒有選項 —— 那是規則不是設定。寶寶沒有帳號，
+   * 所以他那張圖記在站台設定上而不是某一列 User（見後端 SETTING_BABY_AVATAR）。
+   */
+  const [seatPassenger, setSeatPassenger] = useState<number | null>(null);
+  const [savingSeat, setSavingSeat] = useState(false);
+  const [babyAvatarUrl, setBabyAvatarUrl] = useState<string | null>(null);
+
+  /*
    * GPS 軌跡資料夾的掃描結果。**刻意不在開頁時就跑** —— 那是一次 Google Drive
    * API 往返，而這一頁大多數時候是來加人或改權限的，資料夾設好之後幾年不會再動。
    * null ＝ 還沒按過那顆按鈕。
@@ -161,6 +171,8 @@ export default function AdminPage() {
       setConvoyPct(settings.convoy_overlap_pct);
       setSavedConvoyPct(settings.convoy_overlap_pct);
       setRestrictedBlur(settings.restricted_blur === 1);
+      setSeatPassenger(settings.seat_passenger_uid);
+      setBabyAvatarUrl(settings.baby_avatar);
       setError(null);
     } catch (e: any) {
       setError(e.message || "讀取白名單失敗");
@@ -273,6 +285,23 @@ export default function AdminPage() {
     setNotice(next
       ? "訪客現在看得到照片底下的留言了（還是留不了言）。"
       : "訪客看不到留言了，燈箱裡那一塊會整個消失。");
+  };
+
+  /** 換副駕駛。選「沒有人」就是送 null —— 那台車的後排照樣坐得滿，只是沒人被指名 */
+  const pickPassenger = async (next: number | null) => {
+    if (savingSeat) return;
+    setSavingSeat(true);
+    setNotice(null);
+    const result = await updateSiteSettings({ seat_passenger_uid: next });
+    setSavingSeat(false);
+    if (!result.success) return setError(result.message || "修改失敗");
+    setError(null);
+    const saved = result.settings!.seat_passenger_uid;
+    setSeatPassenger(saved);
+    const who = users.find((u) => u.id === saved);
+    setNotice(who
+      ? `合體的時候 ${who.name || who.email} 會坐在副駕駛座。`
+      : "沒有人被指定成副駕駛了，大家照名單順序補位。");
   };
 
   const toggleRestrictedBlur = async (next: boolean) => {
@@ -480,6 +509,54 @@ export default function AdminPage() {
           調低會讓「順路載一段」也算成一起出遊；調高則只有整趟幾乎一模一樣才合體。
           改完不必重貼路，家人下次開地圖就是新的判定。
         </p>
+      </AdminSection>
+
+      {/*
+        地圖上那台車。**座位是「排序」不是「保留席」** —— 站長不在這一趟裡的時候，
+        副駕駛會遞補去開車，不然畫面上會出現一台沒有駕駛的車。
+      */}
+      <AdminSection id="car" title="足跡地圖：車上的座位">
+        <p className={styles.hint}>
+          合體成同一台車的時候，<strong>站長固定坐駕駛座</strong>（那是規則，沒得選）。
+          副駕駛在這裡指定，其他人依名單順序坐後座。
+          <strong>只要是合體的軌跡，後座就一定有寶寶</strong> ——
+          他沒有帳號也沒有自己的軌跡，所以他的頭像存在這一格而不是白名單裡。
+        </p>
+        <div className={styles.formRow}>
+          <div className={styles.field}>
+            <label htmlFor="seat-passenger">副駕駛</label>
+            <select
+              id="seat-passenger"
+              className={styles.select}
+              value={seatPassenger ?? ""}
+              disabled={loading || savingSeat}
+              onChange={(e) => pickPassenger(e.target.value === "" ? null : Number(e.target.value))}
+            >
+              <option value="">沒有人（照名單順序）</option>
+              {users.filter((u) => u.active === 1).map((u) => (
+                <option key={u.id} value={u.id}>{u.name || u.email}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div className={styles.detailHead}>後座的寶寶</div>
+        <AvatarPicker
+          userId="baby"
+          current={babyAvatarUrl}
+          name="寶寶"
+          color="#f0a8b8"
+          size={64}
+          hint={<>
+            合體的軌跡後座固定坐這一位。<strong>建議用去背的 PNG</strong>，
+            在地圖上才是一顆大頭而不是一塊圓照片。沒傳就畫一隻小外星人。
+          </>}
+          onChange={(avatar) => {
+            setBabyAvatarUrl(avatar);
+            // 這一輪 session 裡走去 /map 就會用新的那張，不必重整
+            setBabyAvatar(avatar);
+            setNotice(avatar ? "寶寶的頭像換好了。" : "寶寶的頭像移除了，後座會畫一隻小外星人。");
+          }}
+        />
       </AdminSection>
 
       {/*

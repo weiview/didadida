@@ -145,6 +145,24 @@ const CONVOY_PCT_MAX = 100;
  * 遮罩本身純粹在瀏覽器（CSS filter），後端不因此少送任何位元組。
  */
 const SETTING_RESTRICTED_BLUR = "restricted_blur";
+/**
+ * 合體那台車後座那個寶寶的頭像（R2 上 `avatars/` 底下的檔名，跟 `User.avatar_key`
+ * 同一個命名空間、同一支 `/api/users/avatar/:name` 讀得到）。
+ *
+ * 為什麼是站台設定不是一列 User：**寶寶沒有帳號**（登不進來、沒有自己的軌跡、
+ * 也不會留言）。為了一張圖在白名單上多一個永遠不會被用到的帳號，會讓
+ * 「誰進得了站」那份名單多一個要解釋的例外。
+ */
+const SETTING_BABY_AVATAR = "baby_avatar_key";
+/**
+ * 合體那台車的副駕駛是誰（`User.id`）。駕駛固定是站長 —— 那是資料裡本來就有的
+ * 身分，不必再存一格。
+ *
+ * ⚠️ 刻意**不寫死信箱**：站長會換人、信箱也會換，而這是「畫圖時誰坐哪裡」這種
+ * 純外觀的事，值得站長在後台一個下拉選單決定。沒設過就是沒有人坐副駕，
+ * 合體時照原本的順序補位。
+ */
+const SETTING_SEAT_PASSENGER = "seat_passenger_uid";
 
 /**
  * token 裡的身分。兩層，沒有第三層：
@@ -501,6 +519,16 @@ interface Actor {
 /** R2 上的物件鍵 */
 const avatarR2Key = (name: string) => `avatars/${name}`;
 
+/**
+ * Content-Type → 副檔名。**GIF 是動圖那條路唯一的入口** ——
+ * 前端對它刻意不做 canvas 來回（那會把整支動畫壓成第一格），
+ * 所以這裡收到的就是使用者原本那個檔。JPEG 沒有 alpha，去背圖進不來，刻意不收。
+ */
+const avatarExt = (contentType: string): "webp" | "png" | "gif" | null =>
+  contentType === "image/webp" ? "webp"
+    : contentType === "image/png" ? "png"
+      : contentType === "image/gif" ? "gif" : null;
+
 /** 對外網址。沒設頭像回 null，前端據此退回預設頭像 */
 const avatarUrl = (host: string, name: string | null | undefined): string | null =>
   name ? `${host}/api/users/avatar/${name}` : null;
@@ -509,10 +537,17 @@ const avatarUrl = (host: string, name: string | null | undefined): string | null
  * 頭像檔名的白名單。**路徑穿越的唯一防線** —— 這個值會被接到 R2 鍵上，
  * 不擋的話 `../` 之類的東西可以撈到桶子裡的任何物件。
  */
-const AVATAR_NAME_RE = /^[A-Za-z0-9_-]+\.(webp|png)$/;
+const AVATAR_NAME_RE = /^[A-Za-z0-9_-]+\.(webp|png|gif)$/;
 
 /** 上傳上限。256px 見方的 WebP 通常 10～30KB，PNG 退路也不該超過這個數 */
 const AVATAR_MAX_BYTES = 512 * 1024;
+/**
+ * GIF 的上限另外開一格。動圖是**整份原檔存進 R2**（不能進 canvas 重編，
+ * 那會把它壓成一格靜態圖），所以本來就比 WebP 大一個量級。
+ * 2MB 已經夠一支一兩秒的頭像動圖，再大的請自己先減格數 ——
+ * R2 的儲存是免費額度裡真的會被吃掉的那一格。
+ */
+const AVATAR_GIF_MAX_BYTES = 2 * 1024 * 1024;
 
 /**
  * 同一個 request 只查一次 D1。
@@ -1114,6 +1149,21 @@ async function convoyOverlapPct(env: Env): Promise<number> {
  */
 async function restrictedBlurOn(env: Env): Promise<boolean> {
   return (await getSettingCached(env, SETTING_RESTRICTED_BLUR)) === "1";
+}
+
+/**
+ * 後座那個寶寶的頭像檔名。沒設過＝null（合體時後座畫小外星人）。
+ * 走 getSettingCached —— 它跟著 /api/auth/me 回去，那是每次進站都會打的路由。
+ */
+async function babyAvatarKey(env: Env): Promise<string | null> {
+  const v = await getSettingCached(env, SETTING_BABY_AVATAR);
+  return v && AVATAR_NAME_RE.test(v) ? v : null;
+}
+
+/** 副駕駛是誰（User.id）。沒設過＝null，合體時照原本的順序補位 */
+async function seatPassengerUid(env: Env): Promise<number | null> {
+  const n = Number(await getSettingCached(env, SETTING_SEAT_PASSENGER));
+  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 /** 留言內文上限。比 Story 的 200 寬，但別讓人在燈箱側欄貼一篇文章 */
@@ -3319,6 +3369,12 @@ if (method === "POST" && pathname === "/api/verify-password") {
            * 同樣跟著這一條回來（零額外請求），效期與手上那張進站 token 一致。
            */
           media_token: await mintMediaToken(env, actor?.canManageOthers ? 'admin' : 'basic'),
+          /*
+           * 合體那台車後座那個寶寶的頭像。**只發給看得到地圖的人** ——
+           * 其他人拿它沒有任何用途，而每一個訪客的 /auth/me 都要多讀一列
+           * AppSetting 換一個他用不到的網址。值走 getSettingCached（60 秒 memo）。
+           */
+          baby_avatar: canViewMap ? avatarUrl(url.origin, await babyAvatarKey(env)) : null,
           user: actor ? {
             id: actor.uid, name: actor.name, email: actor.email,
             role: actor.isOwner ? 'owner' : 'member',
@@ -3550,16 +3606,17 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const contentType = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
         // WebP 是常態，PNG 是「這個瀏覽器編不出 WebP」的退路（見前端 canEncodeWebp）。
         // JPEG 沒有 alpha，去背圖進不來，所以刻意不收
-        const ext = contentType === "image/webp" ? "webp" : contentType === "image/png" ? "png" : null;
+        const ext = avatarExt(contentType);
         if (!ext) {
-          return new Response(JSON.stringify({ error: "頭像只收 WebP 或 PNG（要留得住去背的透明背景）" }), { status: 400, headers });
+          return new Response(JSON.stringify({ error: "頭像只收 WebP、PNG 或 GIF（要留得住去背的透明背景）" }), { status: 400, headers });
         }
         const buffer = await request.arrayBuffer();
         if (buffer.byteLength === 0) {
           return new Response(JSON.stringify({ error: "沒有收到圖片" }), { status: 400, headers });
         }
-        if (buffer.byteLength > AVATAR_MAX_BYTES) {
-          return new Response(JSON.stringify({ error: "頭像檔案太大" }), { status: 413, headers });
+        const cap = ext === "gif" ? AVATAR_GIF_MAX_BYTES : AVATAR_MAX_BYTES;
+        if (buffer.byteLength > cap) {
+          return new Response(JSON.stringify({ error: `頭像檔案太大（上限 ${Math.round(cap / 1024)}KB）` }), { status: 413, headers });
         }
 
         // 亂數尾碼就是這條白名單路由的護欄，不能拿 uid 或時間戳充數
@@ -3594,9 +3651,12 @@ if (method === "POST" && pathname === "/api/verify-password") {
         // 沒有工具權限的人不列（見 TRACK_MEMBER_COND）。這一支同時餵地圖的
         // 圖例、成員篩選列、軌跡顏色與車上的大頭 —— 從源頭拿掉，四個地方一起乾淨
         const { results } = await env.DB.prepare(
-          `SELECT u.id, u.name, u.track_color, u.avatar_key, u.track_drive_folder_id FROM User u
+          `SELECT u.id, u.name, u.track_color, u.avatar_key, u.role, u.track_drive_folder_id FROM User u
            WHERE u.active = 1 AND ${TRACK_MEMBER_COND} ORDER BY u.id`
         ).all();
+        // 合體那台車上誰坐哪裡。駕駛固定是站長（那是資料裡本來就有的身分），
+        // 副駕是站長在後台指定的那一位。⚠️ 多帶一欄不多花讀取額度
+        const passengerUid = await seatPassengerUid(env);
         return new Response(JSON.stringify((results as any[]).map((u) => ({
           id: Number(u.id),
           name: u.name,
@@ -3614,6 +3674,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
            */
           has_track_folder: !!(u.track_drive_folder_id
             ?? (Number(u.id) === TRACK_LEGACY_UID ? env.GOOGLE_DRIVE_FOLDER_ID : null)),
+          /*
+           * 合體時固定坐哪個位子。沒指定的人不帶這一欄（undefined）——
+           * 前端把他們排在指定過的人後面補位。**位子是排序不是保留席**：
+           * 站長不在這一趟裡的時候，副駕那位要遞補去開車，
+           * 不然畫面上會出現一台沒有駕駛的車。
+           */
+          seat: u.role === "owner" ? "driver"
+            : (passengerUid != null && Number(u.id) === passengerUid) ? "passenger" : undefined,
         }))), { headers });
       }
 
@@ -3638,13 +3706,16 @@ if (method === "POST" && pathname === "/api/verify-password") {
             guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
             convoy_overlap_pct: await convoyOverlapPct(env),
             restricted_blur: (await getSetting(env, SETTING_RESTRICTED_BLUR)) === "1" ? 1 : 0,
+            // 地圖上合體那台車：副駕是誰、後座那個寶寶長什麼樣
+            seat_passenger_uid: Number(await getSetting(env, SETTING_SEAT_PASSENGER)) || null,
+            baby_avatar: avatarUrl(url.origin, await getSetting(env, SETTING_BABY_AVATAR)),
           }), { headers });
         }
 
         if (method === "PUT") {
           const body: {
             guest_can_view_map?: any; guest_can_view_comments?: any; convoy_overlap_pct?: any;
-            restricted_blur?: any;
+            restricted_blur?: any; seat_passenger_uid?: any;
           } = await request.json();
           if (body.guest_can_view_map !== undefined) {
             await setSetting(env, SETTING_GUEST_MAP, body.guest_can_view_map ? "1" : "0");
@@ -3666,14 +3737,80 @@ if (method === "POST" && pathname === "/api/verify-password") {
           if (body.restricted_blur !== undefined) {
             await setSetting(env, SETTING_RESTRICTED_BLUR, body.restricted_blur ? "1" : "0");
           }
+          if (body.seat_passenger_uid !== undefined) {
+            /*
+             * 副駕坐誰。null／0／空字串＝沒有人坐（存空字串，getSetting 讀回來是 null）。
+             * ⚠️ 刻意**不驗這個 id 存不存在**：它只是畫圖時的排序依據，指到一個
+             * 已經停權或刪掉的人，結果就是沒有人被標成副駕 —— 跟沒設一樣，
+             * 不會壞掉任何東西。為此多一次 D1 查詢不划算。
+             */
+            const uid = Math.round(Number(body.seat_passenger_uid));
+            await setSetting(env, SETTING_SEAT_PASSENGER,
+              Number.isInteger(uid) && uid > 0 ? String(uid) : "");
+          }
           return new Response(JSON.stringify({
             success: true,
             guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
             guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
             convoy_overlap_pct: await convoyOverlapPct(env),
             restricted_blur: (await getSetting(env, SETTING_RESTRICTED_BLUR)) === "1" ? 1 : 0,
+            seat_passenger_uid: Number(await getSetting(env, SETTING_SEAT_PASSENGER)) || null,
+            baby_avatar: avatarUrl(url.origin, await getSetting(env, SETTING_BABY_AVATAR)),
           }), { headers });
         }
+      }
+
+      /*
+       * 路由：後座那個寶寶的頭像。**canManageOthers**（同後台其他每一格）。
+       *
+       * 跟 `/api/users/:id/avatar` 幾乎一樣，差別只在存哪裡：寶寶沒有 User 那一列，
+       * 所以檔名記在 AppSetting（k/v，**不需要 migration**）。物件本身照樣躺在
+       * `avatars/` 底下，讀回來走同一支 `/api/users/avatar/:name` ——
+       * 那條路由在進站閘門的白名單上、護欄是「檔名猜不到」，多一張圖不改變任何事。
+       *
+       * body 一樣是原始位元組不是 multipart。舊檔在寫完設定之後才刪（best-effort）。
+       */
+      if ((method === "POST" || method === "DELETE") && pathname === "/api/admin/baby-avatar") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.canManageOthers) {
+          return forbidden(headers, "只有站長或可管理全站內容的人可以換寶寶的頭像");
+        }
+        const oldKey = await getSetting(env, SETTING_BABY_AVATAR);
+
+        if (method === "DELETE") {
+          await setSetting(env, SETTING_BABY_AVATAR, "");
+          if (oldKey) ctx.waitUntil(env.BUCKET.delete(avatarR2Key(oldKey)).catch(() => {}));
+          return new Response(JSON.stringify({ success: true, avatar: null }), { headers });
+        }
+
+        const contentType = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+        const ext = avatarExt(contentType);
+        if (!ext) {
+          return new Response(JSON.stringify({ error: "頭像只收 WebP、PNG 或 GIF（要留得住去背的透明背景）" }), { status: 400, headers });
+        }
+        const buffer = await request.arrayBuffer();
+        if (buffer.byteLength === 0) {
+          return new Response(JSON.stringify({ error: "沒有收到圖片" }), { status: 400, headers });
+        }
+        const cap = ext === "gif" ? AVATAR_GIF_MAX_BYTES : AVATAR_MAX_BYTES;
+        if (buffer.byteLength > cap) {
+          return new Response(JSON.stringify({ error: `頭像檔案太大（上限 ${Math.round(cap / 1024)}KB）` }), { status: 413, headers });
+        }
+        // 亂數尾碼就是這條白名單路由的護欄，理由同 User 的頭像
+        const rand = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+          .map((b) => b.toString(16).padStart(2, "0")).join("");
+        const name = `baby-${rand}.${ext}`;
+        await env.BUCKET.put(avatarR2Key(name), buffer, { httpMetadata: { contentType } });
+        await setSetting(env, SETTING_BABY_AVATAR, name);
+        if (oldKey && oldKey !== name) {
+          ctx.waitUntil(env.BUCKET.delete(avatarR2Key(oldKey)).catch(() => {}));
+        }
+        return new Response(JSON.stringify({
+          success: true, avatar: avatarUrl(url.origin, name),
+        }), { headers });
       }
 
 
