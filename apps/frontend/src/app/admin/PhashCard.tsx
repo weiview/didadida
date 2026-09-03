@@ -61,11 +61,20 @@ export default function PhashCard() {
   const [albums, setAlbums] = useState<Map<number, string>>(new Map());
   const [threshold, setThreshold] = useState(4);
   const [deleting, setDeleting] = useState<number | null>(null);
+  /*
+   * 已經刪掉的那幾張。⚠️⚠️ **刻意留在清單裡（劃掉），不從 items 拿走** ——
+   * 拿走的話下面那支 useMemo 會當場重新分組：一組只剩一張就整組消失，
+   * 而靠某一個雜湊串起來的那幾組也會散開。使用者正在一組裡逐張處理，
+   * 刪掉第一張整組就不見了，剩下的四張再也點不到（2026-09-03 使用者回報）。
+   * 重新分組要等他自己按「重新比對」。
+   */
+  const [deletedIds, setDeletedIds] = useState<Set<number>>(new Set());
 
   const run = async () => {
     setBusy(true);
     setMessage(null);
     setProgress(null);
+    setDeletedIds(new Set());
     try {
       /* 1. 把全站的清單抓回來 —— 跨相簿的重複正是特徵碼比對抓不到的那一種 */
       const all: PhashPhoto[] = [];
@@ -216,7 +225,9 @@ export default function PhashCard() {
     return out;
   }, [items, threshold]);
 
-  const dupCount = groups.reduce((n, g) => n + g.photos.length - 1, 0);
+  // 「多出來的」只算還沒被刪掉的那幾張，不然刪完數字不會動
+  const aliveIn = (g: Group) => g.photos.filter((p) => !deletedIds.has(p.id)).length;
+  const dupCount = groups.reduce((n, g) => n + Math.max(0, aliveIn(g) - 1), 0);
 
   const remove = async (photo: PhashPhoto) => {
     const where = albums.get(photo.album_id) || `相簿 #${photo.album_id}`;
@@ -234,8 +245,13 @@ export default function PhashCard() {
         return;
       }
       // 刪完不重抓（同「不開放」那顆快速鎖的理由）：整份清單重抓一次要好幾秒，
-      // 而且捲軸會跳回去，使用者得重新找剛剛看到哪一組
-      setItems((prev) => (prev ? prev.filter((p) => p.id !== photo.id) : prev));
+      // 而且捲軸會跳回去，使用者得重新找剛剛看到哪一組。
+      // ⚠️ 也不從 items 拿走，只記一筆「這張刪掉了」——見 deletedIds 上面那段。
+      setDeletedIds((prev) => {
+        const next = new Set(prev);
+        next.add(photo.id);
+        return next;
+      });
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "刪除失敗", ok: false });
     } finally {
@@ -252,7 +268,8 @@ export default function PhashCard() {
       </p>
       <p className={styles.hint}>
         比對<strong>全站</strong>一次做完，跨相簿的重複也找得到。算過的照片不會再算第二次，
-        新上傳的照片自己就帶著特徵值上來，所以這顆按鈕平常按一下很快。
+        新上傳的照片自己就帶著特徵值上來，所以這顆按鈕<strong>隨時都可以再按一次</strong>，
+        平常按一下很快 —— 之後又傳到同一張但特徵碼不同的照片，回來按「重新比對」就會出現。
         <strong>連拍</strong>（同一秒連按好幾張）畫面幾乎一樣，也會被圈在一起 ——
         所以下面每一張都要你自己看過再決定刪不刪。
       </p>
@@ -296,12 +313,16 @@ export default function PhashCard() {
 
       {groups.slice(0, MAX_GROUPS).map((g) => (
         <div key={g.key} className={styles.dupGroup}>
-          <div className={styles.detailHead}>這 {g.photos.length} 張長得一樣</div>
+          <div className={styles.detailHead}>
+            這 {g.photos.length} 張長得一樣
+            {g.photos.length - aliveIn(g) > 0 ? `（已刪 ${g.photos.length - aliveIn(g)} 張）` : ""}
+          </div>
           {g.photos.map((p) => {
-            const blurred = restrictedBlur && p.restricted === 1 && !revealed.has(p.id);
+            const gone = deletedIds.has(p.id);
+            const blurred = !gone && restrictedBlur && p.restricted === 1 && !revealed.has(p.id);
             const sameBytes = !!p.file_hash && p.file_hash === g.photos[0].file_hash;
             return (
-              <div key={p.id} className={styles.dupRow}>
+              <div key={p.id} className={gone ? `${styles.dupRow} ${styles.dupGone}` : styles.dupRow}>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   className={blurred ? `${styles.dupThumb} ${styles.dupBlur}` : styles.dupThumb}
@@ -332,13 +353,17 @@ export default function PhashCard() {
                     {sameBytes ? " · 特徵碼也一樣" : ""}
                   </span>
                 </div>
-                <button
-                  className={`${styles.button} ${styles.danger}`}
-                  onClick={() => remove(p)}
-                  disabled={deleting !== null}
-                >
-                  {deleting === p.id ? "刪除中..." : "刪除"}
-                </button>
+                {gone ? (
+                  <span className={styles.detailNote}>已刪除</span>
+                ) : (
+                  <button
+                    className={`${styles.button} ${styles.danger}`}
+                    onClick={() => remove(p)}
+                    disabled={deleting !== null}
+                  >
+                    {deleting === p.id ? "刪除中..." : "刪除"}
+                  </button>
+                )}
               </div>
             );
           })}

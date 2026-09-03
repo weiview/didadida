@@ -601,3 +601,21 @@
   flex-direction: column;
   gap: 2px;
 }
+
+/*
+ * 已經刪掉的那一列。⚠️ 刻意留在原地劃掉、不從清單裡拿走 ——
+ * 拿走的話那一組會當場重新分組，只剩一張就整組消失，
+ * 使用者正在逐張處理的那一組就不見了。
+ */
+.dupGone {
+  opacity: 0.45;
+}
+
+.dupGone .detailName {
+  text-decoration: line-through;
+  pointer-events: none;
+}
+
+.dupGone .dupThumb {
+  filter: grayscale(1);
+}
