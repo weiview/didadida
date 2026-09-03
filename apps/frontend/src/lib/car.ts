@@ -43,24 +43,27 @@ const SPRITE_SRC: Record<CarSprite, string> = {
 };
 
 /**
- * 車的貼圖尺寸（裝置像素）。pixelRatio 2 → 畫面上 150×104 CSS px。
+ * 車的貼圖尺寸（裝置像素）。pixelRatio 3 → 一個人的車在畫面上是 150×103 CSS px。
  *
  * ⚠️⚠️ **這個數字要跟 HEAD_SIZE 一起看** —— 使用者要的視覺是「大頭狗開車」，
  * 也就是頭大到不成比例。所以車刻意畫小（一顆頭 116 CSS px 對上 150 CSS px 寬的
  * 車身），**車變小比頭變大有效**：頭再放大會糊（來源頭像只有 256px），
  * 而且座位間距是跟著 CAR_W 等比縮的，頭一放大就整團疊死。
  *
- * ⚠️ **兩張插畫在畫面上一樣大**（同一個裁切框做出來的，座位座標逐點對得上）——
- * 一個人的車不該因為他落單就縮小，而且合體／散開的那一瞬間頭才不會跳。
+ * ⚠️ **合體那張會被放大**（`icon-size`，見 FootprintMap 的 `CONVOY_CAR_SCALE`）：
+ * 頭要各自坐在自己的脖子上又不互相遮擋，只能把脖子的間距撐開。所以這裡刻意
+ * 烤得比「一個人時的顯示尺寸」高解析（ratio 3 而不是 2，畫面尺寸完全沒變），
+ * 放大兩倍多之後才不會糊掉。**要改顯示大小請改 CAR_PIXEL_RATIO，不要改 CAR_W**
+ * —— 後者一動，SPRITE_H／BOB／GROUND 三個都要跟著等比重算。
  */
-export const CAR_PIXEL_RATIO = 2;
-export const CAR_W = 300;
+export const CAR_PIXEL_RATIO = 3;
+export const CAR_W = 450;
 /** 插畫本身的高度（840×540 等比縮到 CAR_W） */
-const SPRITE_H = 193;
+const SPRITE_H = 289;
 /** 整台車上下浮動的幅度（裝置像素，±）。引擎在抖，不是在跳 */
-const BOB = 4;
+const BOB = 6;
 /** 插畫底下留給影子的空間 */
-const GROUND = 10;
+const GROUND = 15;
 export const CAR_H = SPRITE_H + BOB + GROUND;
 /** 沒有浮動時插畫左上角的 y */
 const SPRITE_TOP = CAR_H - GROUND - SPRITE_H;
