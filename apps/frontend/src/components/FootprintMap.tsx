@@ -11,8 +11,8 @@ import type { FootprintPoint, TrackPoint, TrackPointEdit } from '@/lib/api';
 import { CONVOY_PCT_DEFAULT } from '@/lib/api';
 import { MOVER_EMOJI, metersBetween, segmentKey } from '@/lib/vehicles';
 import {
-  buildAvatarHead, createAlienHead, createCarImage, seatOffset, SEATS,
-  CAR_H, CAR_W, CAR_PIXEL_RATIO, HEAD_SIZE, HEAD_PIXEL_RATIO,
+  buildAvatarHead, createAlienHead, createCarImage, seatOffset, seatsOf, carSize,
+  CAR_PIXEL_RATIO, HEAD_SIZE, HEAD_PIXEL_RATIO,
   type CarSprite, type Seat,
 } from '@/lib/car';
 import { DEFAULT_TRACK_COLOR } from '@/lib/trackColors';
@@ -339,10 +339,15 @@ const HEAD_HIDE_GAP_MS = 30 * 60 * 1000;
  * 下面全是**螢幕像素**，所以每一幀都要 map.project／unproject 換算回經緯度 ——
  * 縮放地圖時頭才會一直好好坐在車上，而不是隨著比例尺飛走。
  */
-/** 車在畫面上有多高（CSS px）。貼圖是 2 倍解析度，見 car.ts 的 CAR_PIXEL_RATIO */
-const CAR_CSS_H = CAR_H / CAR_PIXEL_RATIO;
-/** 一個人那台車在畫面上有多寬（CSS px）。合體那台是這個乘 CONVOY_CAR_SCALE */
-const CAR_CSS_W = CAR_W / CAR_PIXEL_RATIO;
+/**
+ * 兩張插畫在畫面上的尺寸（CSS px）。
+ * ⚠️ **兩張是不同的畫**（family 後面拖著一台娃娃車），尺寸與座位都不共用 ——
+ * 要拿哪一組看當下畫的是哪一張。
+ */
+const CAR_CSS = {
+  solo: { w: carSize('solo').w / CAR_PIXEL_RATIO, h: carSize('solo').h / CAR_PIXEL_RATIO },
+  family: { w: carSize('family').w / CAR_PIXEL_RATIO, h: carSize('family').h / CAR_PIXEL_RATIO },
+} as const;
 /** 一整張頭貼圖在畫面上有多高（CSS px，還沒乘 icon-size）。含四周的透明邊 */
 const HEAD_CSS_H = HEAD_SIZE / HEAD_PIXEL_RATIO;
 /** 一整張頭貼圖在畫面上有多寬。貼圖是正方形，所以跟高一樣 */
@@ -351,16 +356,16 @@ const HEAD_CSS_W = HEAD_CSS_H;
 /*
  * 座位上那幾顆頭的大小。**刻意誇張** —— 使用者要的就是「大頭狗開車」那種比例。
  *
- * 一個人的時候是 1（畫面上 116px，車身才 150px 寬）。合體時三顆頭要擠進
- * 插畫上那三個座位（副駕到駕駛只有 ~44px、駕駛到後座只有 ~20px），
- * 所以縮小一點並靠疊放順序讓後面的人露出頭頂。
+ * 一個人的時候是 1（畫面上 116px，車身才 150px 寬）。合體那張插畫上副駕到駕駛
+ * 只隔 ~42 CSS px，而一顆座位頭就有 ~72 px，所以縮小一點並靠疊放順序讓後面的人
+ * 露出頭頂（寶寶在後面那台娃娃車上，離得遠，本來就不會被擋）。
  *
- * ⚠️ **要更誇張請去縮 car.ts 的 `CAR_W`，不要往上加這幾個數字** ——
- * 頭再放大會糊（來源頭像只有 256px），而且座位間距是跟著 `CAR_W` 等比縮的，
+ * ⚠️ **要更誇張請去縮 car.ts 的 `CAR_PIXEL_RATIO`（車變小），不要往上加這幾個
+ * 數字** —— 頭再放大會糊（來源頭像只有 256px），而且座位間距是跟著車寬等比縮的，
  * 頭一放大就整團疊死。
  */
 const SEAT_HEAD_SCALE = 0.62;
-/** 後座那個寶寶再小一點（他本來就比較小顆），也順便讓前面兩顆蓋得住他的下巴 */
+/** 拖車上那個寶寶再小一點 —— 他本來就比較小顆，插畫上那截脖子也細得多 */
 const BABY_HEAD_SCALE = 0.85;
 /**
  * 頭像底下那圈透明邊，佔整張頭貼圖高度的比例（car.ts 的 `HEAD_PAD` ＋
@@ -374,34 +379,34 @@ const NECK_OVERLAP = 2;
 /**
  * 合體時**兩顆頭的中心之間至少要離多遠**，以兩顆頭平均寬度的比例表示。
  * 這是 `CONVOY_CAR_SCALE` 唯一的旋鈕 —— 車要放多大完全由它決定（線性），
- * **嫌車大就調小這個數字**，不要去動 `SEATS` 或頭的大小。
+ * **嫌車大就調小這個數字**，不要去動座位表或頭的大小。
  *
- * 貼圖四周有透明邊（見 car.ts 的 HEAD_PAD），0.72 差不多是「兩個圓剛好擦邊」。
- * ⚠️ 現在是 **0.55**（2026-09-03 使用者：「車子太大了」，2.45 倍 → ~1.9 倍）：
- * 相鄰兩顆頭會**輕微重疊**，那是刻意換來的 —— 完全不重疊要 ~367 CSS px 寬的車。
- * 疊起來的先後由 push 的順序決定（寶寶最後，永遠在最上面）。
+ * 貼圖四周有透明邊（見 car.ts 的 HEAD_PAD），0.72 差不多是「兩個圓剛好擦邊」，
+ * 0.55 是「輕微重疊」。⚠️ **換上娃娃車那張插畫之後它算出來已經 < 1**
+ * （見 `CONVOY_CAR_SCALE`），也就是目前這個值沒有真的在放大車 ——
+ * 它現在是一道保險絲，換插畫或調頭的大小時才會重新咬進來。
  */
 const HEAD_GAP_RATIO = 0.55;
 
 /**
- * 合體時整台車要放大幾倍。
+ * 合體時整台車還要再放大幾倍。
  *
  * ⚠️⚠️ **頭一律坐在自己的脖子上，擠不下就放大車** —— 2026-09-03 使用者拍板
  * （在那之前是反過來的：頭橫向排開、車不動，代價是頭離開了脖子）。
- * 插畫上三個脖子只橫跨 ~64 CSS px，而一顆座位頭就有 ~72 px，其中駕駛到後座
- * 更只有 ~20 px —— 要讓三顆頭各自貼著脖子又不互相蓋住，**只有把脖子的間距
- * 撐開這一條路**，也就是整台車連同座位一起放大。
  *
- * 數字是從 car.ts 的 `SEATS` 現算的，不是寫死的 —— 換一張插畫、調
+ * 數字是從 car.ts 的座位表**現算的**，不是寫死的 —— 換一張插畫、調
  * `SEAT_HEAD_SCALE`／`BABY_HEAD_SCALE`／`HEAD_GAP_RATIO` 都會自動跟著變。
- * 以現在的值算出來是 ~1.9 倍（150 → ~281 CSS px 寬）。
+ * ⚠️ **以現在這張插畫算出來是 1，也就是不放大**：新的合體圖把寶寶搬到後面那台
+ * 娃娃車上，整張圖本來就比 solo 寬（195 vs 150 CSS px），副駕到駕駛隔了 ~42 px、
+ * 駕駛到寶寶隔了 ~75 px，兩段都夠 —— 舊圖那個「駕駛到後座只有 ~20 px」的死結
+ * 是換圖解掉的，不是靠放大解掉的。留著這段算式是為了換圖時還會自己咬住。
  *
- * ⚠️ **只放大車，頭不跟著放大** —— 頭跟著放大等於原地踏步，遮擋一模一樣。
- * 也因此「大頭狗」那個比例在合體時本來就會變得沒那麼誇張，那是這條規則的代價。
- * ⚠️ 車的貼圖為此烤成 ratio 3（見 car.ts），放大之後才不會糊。
+ * ⚠️ 真的咬進來的時候是**只放大車，頭不跟著放大** —— 頭跟著放大等於原地踏步，
+ * 遮擋一模一樣。⚠️ 車的貼圖為此烤成 ratio 3（見 car.ts），放大之後才不會糊。
  */
 const CONVOY_CAR_SCALE = (() => {
-  // 插畫上由左到右：副駕、駕駛、後座
+  const seats = seatsOf('family');
+  // 插畫上由左到右：副駕、駕駛、（拖車上的）寶寶
   const row: [Seat, number][] = [
     ['passenger', SEAT_HEAD_SCALE],
     ['driver', SEAT_HEAD_SCALE],
@@ -411,8 +416,8 @@ const CONVOY_CAR_SCALE = (() => {
   for (let i = 1; i < row.length; i++) {
     const [a, sa] = row[i - 1];
     const [b, sb] = row[i];
-    // 這兩個脖子在「一個人那台車」上隔多遠
-    const gap = Math.abs(SEATS[b].x - SEATS[a].x) * CAR_CSS_W;
+    // 這兩個脖子在合體那張插畫上隔多遠
+    const gap = Math.abs(seats[b].x - seats[a].x) * CAR_CSS.family.w;
     const want = HEAD_GAP_RATIO * HEAD_CSS_W * (sa + sb) / 2;
     if (gap > 0) need = Math.max(need, want / gap);
   }
@@ -2547,8 +2552,8 @@ export default function FootprintMap({
           'icon-allow-overlap': true,
           'icon-ignore-placement': true,
           /*
-           * ⚠️⚠️ **錨在底部，也就是下巴。** car.ts 的 `SEATS` 標的是插畫上那三截
-           * 脖子的上緣，頭要壓在脖子上、不是「中心對準座位」—— 頭現在大到不成
+           * ⚠️⚠️ **錨在底部，也就是下巴。** car.ts 的 `SPRITES[…].seats` 標的是插畫
+           * 上那三截脖子的上緣，頭要壓在脖子上、不是「中心對準座位」—— 頭現在大到不成
            * 比例，以中心對齊等於下巴插進車底盤、整個身體被頭吃掉。
            * 錨在底部另外還有一個好處：`icon-size` 怎麼縮放，下巴都還在同一點，
            * 所以合體時三顆大小不同的頭一樣坐得好好的。
@@ -2558,7 +2563,7 @@ export default function FootprintMap({
           /*
            * ⚠️ 疊放順序一定要是 feature 的順序（預設的 'auto' 在
            * icon-allow-overlap 打開時會照畫面 y 排）。頭大得會互相蓋住，
-           * 我們是刻意「後座先畫、副駕最後畫」讓前面的人蓋住後面的。
+           * 我們是刻意讓**寶寶最後畫**（永遠在最上面，使用者點名的那一顆）。
            */
           'symbol-z-order': 'source',
         },
@@ -3180,10 +3185,11 @@ export default function FootprintMap({
       const n = idx.length;
       const key = idx.map((i) => memberPaths[i].userId ?? 'x').join(',');
       const flip = facingOf(key, center, prev) < 0;
-      // 一個人開自己那台，兩個人以上就是全家出遊那張（後座那個寶寶也在裡面）
+      // 一個人開自己那台，兩個人以上就是全家出遊那張（後面拖著寶寶那台娃娃車）
       const sprite: CarSprite = n === 1 ? 'solo' : 'family';
       /*
-       * 合體那台要放大，三顆頭才坐得下（見 CONVOY_CAR_SCALE）。
+       * 合體那台擠不下的話要放大，三顆頭才坐得住（見 CONVOY_CAR_SCALE）——
+       * 換上娃娃車那張插畫之後算出來是 1，也就是目前不放大。
        * ⚠️ 座位的位移也要跟著乘 —— 車放大而座位沒動的話頭會全部落在車頭那一端。
        */
       const carScale = n === 1 ? 1 : CONVOY_CAR_SCALE;
@@ -3233,7 +3239,7 @@ export default function FootprintMap({
         seat: Seat, url: string | null, facing: 'left' | 'right', scale: number,
         truth: [number, number],
       ) => {
-        const off = seatOffset(seat, flip, now);
+        const off = seatOffset(sprite, seat, flip, now);
         const sink = HEAD_CSS_H * scale * HEAD_BOTTOM_PAD + NECK_OVERLAP;
         putHead(
           url, facing, scale,
@@ -3266,7 +3272,7 @@ export default function FootprintMap({
         scale: SEAT_HEAD_SCALE,
         truth: pos[i] ?? center,
       }));
-      // 只要是合體軌跡，後座就一定有寶寶（使用者拍板）。還沒設頭像就先坐外星人。
+      // 只要是合體軌跡，後面那台娃娃車就一定有寶寶（使用者拍板）。沒設頭像就先坐外星人。
       // ⚠️ 排在最後 ＝ 疊在最上面（symbol-z-order: 'source'），使用者要的就是
       //    「盡量讓後座寶寶顯示出來不要擋到」
       row.push({
@@ -3278,6 +3284,7 @@ export default function FootprintMap({
       });
 
       // 每一顆都正對自己的脖子。擠不擠得下是 CONVOY_CAR_SCALE 早就算好的事
+      // （寶寶在拖車上，離前面兩顆很遠，本來就不會互相擋到）
       row.forEach((r) => putSeat(r.seat, r.url, r.facing, r.scale, r.truth));
 
       /*
@@ -3292,7 +3299,7 @@ export default function FootprintMap({
           cpx.x + (k - (extra.length - 1) / 2) * HEAD_STEP,
           // ⚠️ 頭錨在底部，而 HEAD_ROW_LIFT 說的是「頭的中心」離車頂多高 ——
           //    所以要再補半顆頭，不然這一排會整個往上飄半顆
-          cpx.y - CAR_CSS_H * carScale - HEAD_ROW_LIFT + (HEAD_CSS_H * HEAD_CROWD_SCALE) / 2,
+          cpx.y - CAR_CSS.family.h * carScale - HEAD_ROW_LIFT + (HEAD_CSS_H * HEAD_CROWD_SCALE) / 2,
           pos[i] ?? center,
         );
       });

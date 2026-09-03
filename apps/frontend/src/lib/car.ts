@@ -1,8 +1,9 @@
 // 地圖上那台載著大頭的小車。**取代了原本自己畫的 canvas 小車**（更早之前是飛碟）。
 //
-// 現在車身是使用者給的去背插畫（`public/car-solo.webp`／`car-family.webp`），
-// 圖上原本有三顆綠色定位點標著「頭要放這裡」—— 打包時已經把點補掉，
-// 位置留在下面那張 `SEATS` 表裡。造型是刻意誇張的比例：車子一台、頭大得離譜。
+// 現在車身是使用者給的兩張去背插畫（`public/car-solo.webp`／`car-family.webp`），
+// 圖上原本有綠色定位點標著「頭要放這裡」—— 打包時已經把點補掉，脖子的位置量進
+// 下面那張 `SPRITES` 表裡。造型是刻意誇張的比例：車子一台、頭大得離譜。
+// ⚠️ **兩張是不同的畫**（長寬比、座位、影子都不一樣），所以那張表是逐張存的。
 //
 // ── 這裡分成兩種圖 ────────────────────────────────────────────────
 //   車   `createCarImage()`    貼上去的插畫 ＋ 整台輕輕上下浮動 ＋ 地上一塊影子。
@@ -37,58 +38,85 @@ export interface StaticImage {
 /** 兩張插畫。一個人出門用 solo，合體（兩個人以上）用 family */
 export type CarSprite = 'solo' | 'family';
 
-const SPRITE_SRC: Record<CarSprite, string> = {
-  solo: '/car-solo.webp',
-  family: '/car-family.webp',
-};
-
-/**
- * 車的貼圖尺寸（裝置像素）。pixelRatio 3 → 一個人的車在畫面上是 150×103 CSS px。
- *
- * ⚠️⚠️ **這個數字要跟 HEAD_SIZE 一起看** —— 使用者要的視覺是「大頭狗開車」，
- * 也就是頭大到不成比例。所以車刻意畫小（一顆頭 116 CSS px 對上 150 CSS px 寬的
- * 車身），**車變小比頭變大有效**：頭再放大會糊（來源頭像只有 256px），
- * 而且座位間距是跟著 CAR_W 等比縮的，頭一放大就整團疊死。
- *
- * ⚠️ **合體那張會被放大**（`icon-size`，見 FootprintMap 的 `CONVOY_CAR_SCALE`）：
- * 頭要各自坐在自己的脖子上又不互相遮擋，只能把脖子的間距撐開。所以這裡刻意
- * 烤得比「一個人時的顯示尺寸」高解析（ratio 3 而不是 2，畫面尺寸完全沒變），
- * 放大兩倍多之後才不會糊掉。**要改顯示大小請改 CAR_PIXEL_RATIO，不要改 CAR_W**
- * —— 後者一動，SPRITE_H／BOB／GROUND 三個都要跟著等比重算。
- */
-export const CAR_PIXEL_RATIO = 3;
-export const CAR_W = 450;
-/** 插畫本身的高度（840×540 等比縮到 CAR_W） */
-const SPRITE_H = 289;
-/** 整台車上下浮動的幅度（裝置像素，±）。引擎在抖，不是在跳 */
-const BOB = 6;
-/** 插畫底下留給影子的空間 */
-const GROUND = 15;
-export const CAR_H = SPRITE_H + BOB + GROUND;
-/** 沒有浮動時插畫左上角的 y */
-const SPRITE_TOP = CAR_H - GROUND - SPRITE_H;
-
 /** 座位。命名是「這台車上的位置」，誰坐哪裡由 FootprintMap 決定 */
 export type Seat = 'passenger' | 'driver' | 'rear';
 
 /**
- * 三個座位**脖子的位置**，正規化成插畫寬高的比例（插畫**車頭朝左**）。
+ * 車的貼圖解析度倍率。pixelRatio 3 → 一個人的車在畫面上是 150×103 CSS px。
  *
- * ⚠️⚠️ **這裡標的是「下巴要落在哪裡」，不是頭的中心。** 插畫上那三個人是
- * 沒有頭的身體，領口上留著一截脖子 —— 這張表就是那三截脖子的**上緣**
- * （由 840×540 的插畫量出來：副駕 (339,52)、駕駛 (586,101)、後座 (695,86)）。
- * 所以頭那一層是 `icon-anchor: 'bottom'`，下巴壓在這一點上、再往下蓋一點點
- * （見 FootprintMap 的 `NECK_OVERLAP`）。
+ * ⚠️⚠️ **這個數字要跟 HEAD_SIZE 一起看** —— 使用者要的視覺是「大頭狗開車」，
+ * 也就是頭大到不成比例。所以車刻意畫小（一顆頭 116 CSS px 對上 150 CSS px 寬的
+ * 車身），**車變小比頭變大有效**：頭再放大會糊（來源頭像只有 256px），
+ * 而且座位間距是跟著車寬等比縮的，頭一放大就整團疊死。
  *
- * 原本這裡放的是使用者畫在圖上那三顆綠點（頭的**中心**），但那是照插畫原本
- * 那顆正常大小的頭標的：現在頭大了好幾倍，以中心對齊等於下巴直接插到車底盤，
- * 整個身體被頭吃掉。**頭的大小會一直被調，脖子不會**，所以錨在脖子上。
+ * **要改顯示大小請改這個數字，不要改 `SPRITES` 裡的 w／h** —— 後者是插畫本身的
+ * 長寬比，一動就得整組重算。
  */
-export const SEATS: Record<Seat, { x: number; y: number }> = {
-  passenger: { x: 0.40357, y: 0.09630 }, // 最左邊那位（粉衣服拿相機）＝副駕
-  driver:    { x: 0.69762, y: 0.18704 }, // 中間握方向盤的＝駕駛
-  rear:      { x: 0.82798, y: 0.15926 }, // 最右邊的兒童座椅＝後座
+export const CAR_PIXEL_RATIO = 3;
+/** 整台車上下浮動的幅度（裝置像素，±）。引擎在抖，不是在跳 */
+const BOB = 6;
+/** 插畫底下留給影子的空間 */
+const GROUND = 15;
+
+/**
+ * 兩張插畫各自的尺寸、座位與影子。
+ *
+ * ⚠️⚠️ **兩張是不同的畫，不是同一台車的兩個版本**（2026-09-03 換圖之後）：
+ * 長寬比不一樣（solo 1.56／family 2.14 —— 合體那張後面拖著一台娃娃車），
+ * 所以尺寸、座位、影子**通通得分開存**，不可以再共用一份 `SEATS`。
+ * 兩張的**車身**在畫面上大小差不多，family 多出來的寬度全是那台拖車。
+ *
+ * `seats` 是三個座位**脖子的位置**，正規化成插畫寬高的比例（插畫**車頭朝左**）。
+ * ⚠️⚠️ 標的是「**下巴要落在哪裡**」，不是頭的中心。插畫上那幾個人是沒有頭的
+ * 身體，領口上留著一截脖子 —— 這裡存的就是那截脖子的**上緣**。所以頭那一層是
+ * `icon-anchor: 'bottom'`，下巴壓在這一點上、再往下蓋一點點（見 FootprintMap
+ * 的 `NECK_OVERLAP`）。**頭的大小會一直被調，脖子不會**，所以錨在脖子上；
+ * 換一張同構圖的插畫只要重量這幾個小數。
+ *
+ * `shadow` 是地上那塊影子的中心與半徑（同樣是寬度的比例）——
+ * ⚠️ family 的中心**不在圖片正中央**：影子只鋪在車身底下，鋪到拖車那邊
+ * 看起來會像整台車陷進地裡。
+ */
+const SPRITES: Record<CarSprite, {
+  src: string;
+  /** 插畫本身的寬高（裝置像素） */
+  w: number;
+  h: number;
+  seats: Record<Seat, { x: number; y: number }>;
+  shadow: { cx: number; rx: number };
+}> = {
+  solo: {
+    src: '/car-solo.webp',
+    w: 450, h: 289, // 840×540 等比縮下來
+    seats: {
+      passenger: { x: 0.40357, y: 0.09630 },
+      driver:    { x: 0.69762, y: 0.18704 }, // 握方向盤的那位（solo 只畫了他）
+      rear:      { x: 0.82798, y: 0.15926 },
+    },
+    shadow: { cx: 0.5, rx: 0.3 },
+  },
+  family: {
+    src: '/car-family.webp',
+    w: 585, h: 273, // 2911×1359 等比縮下來；車身寬度跟 solo 對齊，其餘是拖車
+    seats: {
+      passenger: { x: 0.29096, y: 0.10817 }, // 粉衣服拿相機的＝副駕
+      driver:    { x: 0.50601, y: 0.18764 }, // 黃衣服握方向盤的＝駕駛
+      rear:      { x: 0.88990, y: 0.15453 }, // ⚠️ 後面那台娃娃車裡的寶寶，不是車內的兒童座椅
+    },
+    shadow: { cx: 0.36, rx: 0.22 },
+  },
 };
+
+/** 那張插畫烤成貼圖之後的完整尺寸（裝置像素，含浮動與影子留的空間） */
+export function carSize(sprite: CarSprite): { w: number; h: number } {
+  const s = SPRITES[sprite];
+  return { w: s.w, h: s.h + BOB + GROUND };
+}
+
+/** 那張插畫上三個座位的脖子（正規化座標，車頭朝左） */
+export function seatsOf(sprite: CarSprite): Record<Seat, { x: number; y: number }> {
+  return SPRITES[sprite].seats;
+}
 
 /**
  * 這一瞬間整台車浮多高（裝置像素，往上是負的）。
@@ -109,14 +137,16 @@ export function carBob(t: number): number {
  * `flip` 跟 `createCarImage` 同一個意思：true ＝ 車頭朝左（插畫原本的方向），
  * false ＝ 鏡射成朝右，這時候 x 要換成 `1 - x`。
  */
-export function seatOffset(seat: Seat, flip: boolean, t: number): { dx: number; dy: number } {
-  const s = SEATS[seat];
+export function seatOffset(sprite: CarSprite, seat: Seat, flip: boolean, t: number): { dx: number; dy: number } {
+  const def = SPRITES[sprite];
+  const { w, h } = carSize(sprite);
+  const s = def.seats[seat];
   const nx = flip ? s.x : 1 - s.x;
-  const px = nx * CAR_W;
-  const py = SPRITE_TOP + carBob(t) + s.y * SPRITE_H;
+  const px = nx * w;
+  const py = (h - GROUND - def.h) + carBob(t) + s.y * def.h;
   return {
-    dx: (px - CAR_W / 2) / CAR_PIXEL_RATIO,
-    dy: (py - CAR_H) / CAR_PIXEL_RATIO, // 負的（錨點在圖片底部）
+    dx: (px - w / 2) / CAR_PIXEL_RATIO,
+    dy: (py - h) / CAR_PIXEL_RATIO, // 負的（錨點在圖片底部）
   };
 }
 
@@ -128,7 +158,7 @@ export function seatOffset(seat: Seat, flip: boolean, t: number): { dx: number; 
  */
 const spriteCache = new Map<string, HTMLImageElement>();
 function loadSprite(sprite: CarSprite, onReady: () => void): HTMLImageElement {
-  const src = SPRITE_SRC[sprite];
+  const src = SPRITES[sprite].src;
   const hit = spriteCache.get(src);
   if (hit) {
     if (!hit.complete) hit.addEventListener('load', onReady, { once: true });
@@ -157,17 +187,21 @@ export function createCarImage(
   flip: boolean,
 ): AnimatedImage {
   const settle = makeSettler(triggerRepaint, isAnimating);
+  const def = SPRITES[sprite];
+  const { w: W, h: H } = carSize(sprite);
+  /** 沒有浮動時插畫左上角的 y */
+  const spriteTop = H - GROUND - def.h;
   let ctx: CanvasRenderingContext2D | null = null;
   let img: HTMLImageElement | null = null;
 
   return {
-    width: CAR_W,
-    height: CAR_H,
-    data: new Uint8Array(CAR_W * CAR_H * 4),
+    width: W,
+    height: H,
+    data: new Uint8Array(W * H * 4),
     onAdd() {
       const canvas = document.createElement('canvas');
-      canvas.width = CAR_W;
-      canvas.height = CAR_H;
+      canvas.width = W;
+      canvas.height = H;
       ctx = canvas.getContext('2d', { willReadFrequently: true });
       img = loadSprite(sprite, triggerRepaint);
     },
@@ -177,12 +211,14 @@ export function createCarImage(
       // 用絕對時間而不是「從 onAdd 起算」：好幾台車各自算會各浮各的，
       // 同一幀裡兩台車的相位不同看起來很怪
       const t = performance.now() / 1000;
-      c.clearRect(0, 0, CAR_W, CAR_H);
+      c.clearRect(0, 0, W, H);
 
-      // 地上的影子。**不跟著浮動**，車彈起來影子才會「留在地上」
+      // 地上的影子。**不跟著浮動**，車彈起來影子才會「留在地上」。
+      // ⚠️ 鏡射的時候影子也要跟著換邊（family 的影子不在正中央）
+      const scx = (flip ? def.shadow.cx : 1 - def.shadow.cx) * W;
       c.fillStyle = 'rgba(15,23,42,0.22)';
       c.beginPath();
-      c.ellipse(CAR_W / 2, CAR_H - GROUND * 0.55, CAR_W * 0.3, GROUND * 0.36, 0, 0, Math.PI * 2);
+      c.ellipse(scx, H - GROUND * 0.55, W * def.shadow.rx, GROUND * 0.36, 0, 0, Math.PI * 2);
       c.fill();
 
       if (img && img.complete && img.naturalWidth > 0) {
@@ -190,14 +226,14 @@ export function createCarImage(
         if (!flip) {
           // 插畫本來就朝左，朝右那一版靠鏡射（maplibre 沒辦法逐 feature 鏡射，
           // 所以左右各做一張圖）
-          c.translate(CAR_W, 0);
+          c.translate(W, 0);
           c.scale(-1, 1);
         }
-        c.drawImage(img, 0, SPRITE_TOP + carBob(t), CAR_W, SPRITE_H);
+        c.drawImage(img, 0, spriteTop + carBob(t), W, def.h);
         c.restore();
       }
 
-      this.data = c.getImageData(0, 0, CAR_W, CAR_H).data;
+      this.data = c.getImageData(0, 0, W, H).data;
       settle();
       return true;
     },
@@ -236,7 +272,7 @@ function makeSettler(triggerRepaint: () => void, isAnimating: () => boolean) {
  * —— 比座位大得離譜，就是要誇張（使用者的原話是「大頭狗開車」）。
  *
  * ⚠️ **上限是來源頭像的 256px**：`HEAD_BOX` 超過它就是把小圖放大，邊緣會糊。
- * 還要更誇張的話請去縮 `CAR_W`，不要再往上加這個數字。
+ * 還要更誇張的話請去縮 `CAR_PIXEL_RATIO`（車變小），不要再往上加這個數字。
  */
 export const HEAD_SIZE = 232;
 export const HEAD_PIXEL_RATIO = 2;
