@@ -551,3 +551,53 @@
   color: var(--text-light);
   line-height: 1.6;
 }
+
+/* ── 相片的像素比對：一組長得一樣的照片 ─────────────────────── */
+
+.dupGroup {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fafafa;
+}
+
+.dupRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid #eee;
+}
+
+.dupRow:first-of-type {
+  border-top: none;
+}
+
+/*
+ * 縮圖刻意小：這裡是「先認出是哪一張」，真的要看細節請按檔名開新分頁。
+ * 一組可能有五六張，再大就得捲。
+ */
+.dupThumb {
+  width: 72px;
+  height: 72px;
+  flex: 0 0 72px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #eee;
+}
+
+/* 不開放的照片：糊的是 img 本身不是外框（同格線那邊的規矩），點一下暫時掀開 */
+.dupBlur {
+  filter: blur(10px);
+  transform: scale(1.06);
+  cursor: pointer;
+}
+
+.dupInfo {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}

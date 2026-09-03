@@ -121,7 +121,7 @@ export interface Tag {
  * （新照片的 `url` 已經就是 800px 那顆，退到底也不會變大，但舊資料還在。）
  */
 export function photoThumbSrc(
-  photo: { url: string; thumb_url?: string; thumb_sm_url?: string },
+  photo: { url: string; thumb_url?: string | null; thumb_sm_url?: string | null },
   size: 'sm' | 'md' = 'md',
 ): string {
   return size === 'sm'
@@ -289,6 +289,7 @@ export interface Photo {
 // 避免兩邊各維護一份字串聯集而慢慢長歪。
 export type { GeoSource, TimeSource } from './geo';
 import type { GeoSource, TimeSource } from './geo';
+import { dhashFromBlob } from './phash';
 
 export interface FootprintPoint {
   id: number;
@@ -1163,6 +1164,63 @@ export async function scanMotionPhotos(
   });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '掃描動態照片失敗');
   return await res.json();
+}
+
+/* ── 相片的像素比對（phash）─────────────────────────────────────────────── */
+
+/** 比對清單裡的一列。欄位刻意少 —— 全站幾千列要一次抓完 */
+export interface PhashPhoto {
+  id: number;
+  album_id: number;
+  /** 上傳當下的客戶端檔名 */
+  title: string;
+  media_type?: string;
+  /** 縮圖逐級退回：400px → 800px → url（Google 同步進來的舊照片只有最後一個） */
+  url: string;
+  thumb_url?: string | null;
+  thumb_sm_url?: string | null;
+  /** null ＝還沒算過（存量全是 null，欄位早就在但從來沒人餵過） */
+  phash: string | null;
+  file_hash: string | null;
+  taken_at: string | null;
+  created_at: string | null;
+  restricted?: number;
+}
+
+export interface PhashPage {
+  items: PhashPhoto[];
+  next_cursor: number;
+  done: boolean;
+  /** 只有第一頁會給（相簿名字在前端記憶體裡對，不用 JOIN 撈） */
+  albums?: { id: number; name: string }[];
+  /** 只有第一頁會給 */
+  total?: number;
+}
+
+/**
+ * 抓一頁照片清單來做像素比對。⚠️ 呼叫端自己拿 `next_cursor` 迴圈跑到 `done`
+ * （同 scanMotionPhotos／backfillVideoMeta 的規矩）。
+ */
+export async function fetchPhashPage(cursor = 0, limit = 500): Promise<PhashPage> {
+  const params = new URLSearchParams({ cursor: String(cursor), limit: String(limit) });
+  const res = await fetch(`${API_BASE_URL}/admin/phash?${params}`, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '抓不到照片清單');
+  return await res.json();
+}
+
+/**
+ * 把瀏覽器算好的 dHash 寫回 `Photo.phash`。**掃過就不必再掃**，
+ * 所以整站的縮圖只會被抓這一次。一趟最多 200 筆（後端也擋著）。
+ */
+export async function savePhashes(hashes: { id: number; phash: string }[]): Promise<number> {
+  if (hashes.length === 0) return 0;
+  const res = await fetch(`${API_BASE_URL}/admin/phash`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ hashes }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '寫不回特徵值');
+  return Number((await res.json()).written ?? 0);
 }
 
 /* ── 免費額度用量 ────────────────────────────────────────────────────────── */
@@ -2112,6 +2170,19 @@ export async function uploadPhoto(
   // R2 的物件鍵副檔名由後端依 blob.type 決定，這裡的檔名只是 FormData 的擺設
   formData.append('thumb', md, 'thumb');
   if (sm) formData.append('thumb_sm', sm, 'thumb_sm');
+
+  /*
+   * 像素特徵值（dHash）。⚠️ **算的是 400px 那顆縮圖**，跟後台「相片的像素比對」
+   * 掃存量時抓的是同一份位元組 —— 兩邊算出來一定一樣，新照片才不必再被掃一次。
+   * 沒有 sm（極少數編不出 400px 的）就不送，之後由後台那一格補算。
+   * ⚠️ 絕不往外丟：算不出來只是「這張比不出重複」，跟上傳成不成功無關。
+   */
+  if (sm) {
+    try {
+      const phash = await dhashFromBlob(sm);
+      if (phash) formData.append('phash', phash);
+    } catch { /* 比對是加分項，掛掉不影響上傳 */ }
+  }
 
   if (exifData) {
     try {

@@ -2540,6 +2540,16 @@ async function backfillVideoMeta(
  *    真的是動態照片才多讀 1–2 次（見 motionPhoto.ts 的 readMotionOffset）。
  */
 
+/* ── 相片的像素比對 ───────────────────────────────────────────────────────
+ *
+ * 一頁端幾列給前端。列數不是瓶頸（D1 算的是讀了幾列），瓶頸是回應大小，
+ * 所以只端比對真的用得到的那幾欄。
+ */
+const PHASH_PAGE_DEFAULT = 500;
+const PHASH_PAGE_MAX = 1000;
+/** 一趟最多收回幾個算好的雜湊。每一筆是一句 UPDATE，走 D1 batch 一次送出去 */
+const PHASH_WRITE_MAX = 200;
+
 /** 一趟最多掃幾張。一般照片 1 次讀取、動態照片 2–3 次，抓 subrequest 預算 */
 const MOTION_SCAN_MAX_LIMIT = 16;
 const MOTION_SCAN_DEFAULT_LIMIT = 10;
@@ -4141,6 +4151,106 @@ if (method === "POST" && pathname === "/api/verify-password") {
           found_total_before: Number(hits?.n ?? 0),
           ...result,
         }), { headers });
+      }
+
+      /* ── 後台：相片的像素比對 ─────────────────────────────────────────────
+       *
+       * `file_hash` 比的是**位元組**，所以 Google 相簿匯入（Google 自己轉過檔）、
+       * 換一台機器／換一個瀏覽器重傳的同一張照片，特徵碼一定對不上。
+       * 這一格比的是**畫面本身**：把 400px 縮圖縮成 9×8 灰階算 dHash（64 bit），
+       * 再兩兩比漢明距離。
+       *
+       * ⚠️⚠️ **雜湊在瀏覽器算，不在 Worker。** Worker 沒有影像解碼器，也沒有
+       * 10ms CPU 以外的預算（同「旋轉」那條）。後端只做兩件事：把清單分頁端出去
+       * （GET）、把算好的值收回來（POST）。算過的寫進 `Photo.phash` ——
+       * 那一欄早就在（`schema.sql`），`POST /api/upload` 也早就在存它，只是前端
+       * 從來沒有餵過，所以存量全是 NULL。**不需要 migration。**
+       * 掃過一次就不必再掃；新上傳的照片自己會帶著 phash 上來。
+       * ⚠️ 兩支都**不包 withEdgeCache**、回 `no-store` —— 回應裡是全站的照片清單。
+       */
+      if (pathname === "/api/admin/phash") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.canManageOthers) {
+          return forbidden(headers, "這會看到全站的照片，只有可以管理全站內容的帳號能做");
+        }
+        const noStore = { ...headers, "Cache-Control": "no-store" };
+
+        /*
+         * 一頁照 id 往下走。⚠️ 前端要拿**整站**的清單才比得出跨相簿的重複，
+         * 所以這裡不做任何過濾 —— 連不開放的那幾張也端出去（看得到它們正是
+         * canManageOthers 這個閘的意思）。
+         */
+        if (method === "GET") {
+          const cursor = Math.max(Number(url.searchParams.get("cursor") ?? 0) || 0, 0);
+          const limit = Math.min(
+            Math.max(Number(url.searchParams.get("limit") ?? PHASH_PAGE_DEFAULT) || PHASH_PAGE_DEFAULT, 1),
+            PHASH_PAGE_MAX,
+          );
+          const page = await env.DB.prepare(`
+            SELECT id, album_id, title, media_type, url, thumb_url, thumb_sm_url,
+                   phash, file_hash, taken_at, created_at, restricted
+              FROM Photo
+             WHERE id > ?
+             ORDER BY id
+             LIMIT ?
+          `).bind(cursor, limit).all<any>();
+          const items = page.results || [];
+
+          /*
+           * 相簿名字**不用 JOIN 撈**（同 drive-pending 的規矩）：那是一張幾十列的
+           * 小表，整張撈回去在前端記憶體裡對，比每一列都 JOIN 一次便宜。
+           * 總數與相簿清單只在第一頁給，後面幾頁不必重複端。
+           */
+          const first = cursor === 0;
+          const albums = first
+            ? ((await env.DB.prepare("SELECT id, name FROM Album ORDER BY id").all<any>()).results || [])
+            : undefined;
+          const total = first
+            ? Number((await env.DB.prepare("SELECT COUNT(*) AS n FROM Photo").first<any>())?.n ?? 0)
+            : undefined;
+
+          return new Response(JSON.stringify({
+            success: true,
+            items,
+            next_cursor: items.length > 0 ? items[items.length - 1].id : cursor,
+            done: items.length < limit,
+            ...(albums ? { albums } : {}),
+            ...(total !== undefined ? { total } : {}),
+          }), { headers: noStore });
+        }
+
+        /*
+         * 收回算好的雜湊。一句 UPDATE 兩個參數，走 `env.DB.batch` 一次送出去
+         * （D1 的綁定參數上限是**每一句** 100 個，batch 不受影響）。
+         * ⚠️ 值一律驗過再寫（16 個十六進位字元）—— 前端算壞了不該把垃圾灌進 D1，
+         * 而且分組完全靠這一欄，一筆壞值就是一組假的重複。
+         */
+        if (method === "POST") {
+          const body = await request.json().catch(() => ({})) as { hashes?: unknown };
+          const raw = Array.isArray(body.hashes) ? body.hashes : [];
+          const seen = new Set<number>();
+          const rows: { id: number; phash: string }[] = [];
+          for (const r of raw) {
+            const id = Number((r as any)?.id);
+            const phash = String((r as any)?.phash ?? "").toLowerCase();
+            if (!Number.isFinite(id) || id <= 0) continue;
+            if (!/^[0-9a-f]{16}$/.test(phash)) continue;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            rows.push({ id, phash });
+            if (rows.length >= PHASH_WRITE_MAX) break;
+          }
+          if (rows.length > 0) {
+            const stmt = env.DB.prepare("UPDATE Photo SET phash = ? WHERE id = ?");
+            await env.DB.batch(rows.map((r) => stmt.bind(r.phash, r.id)));
+          }
+          return new Response(JSON.stringify({ success: true, written: rows.length }), { headers: noStore });
+        }
+
+        return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405, headers });
       }
 
       /* ── 後台：免費額度用量 ────────────────────────────────────────────────

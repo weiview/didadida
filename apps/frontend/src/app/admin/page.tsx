@@ -16,6 +16,7 @@ import AdminSection from "./AdminSection";
 import DriveCompareCard from "./DriveCompareCard";
 import VideoMetaCard from "./VideoMetaCard";
 import MotionScanCard from "./MotionScanCard";
+import PhashCard from "./PhashCard";
 import UsageCard from "./UsageCard";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import Avatar from "@/components/Avatar";
@@ -982,6 +983,14 @@ export default function AdminPage() {
       <VideoMetaCard />
 
       <MotionScanCard />
+
+      {/*
+        相片的像素比對。`file_hash` 比的是位元組，所以重新編碼過的同一張照片
+        （Google 相簿匯入拿到的是 Google 轉過的檔、換一台電腦重傳）永遠對不上。
+        這一格改比畫面本身（dHash），雜湊在瀏覽器算完寫回 `Photo.phash`
+        —— 那一欄早就在，只是一直沒有人餵過它。找到的每一組都要人自己逐張確認才刪。
+      */}
+      <PhashCard />
 
       {/*
         免費額度用量。這個站整個蓋在 Cloudflare 的免費額度上，而「還剩多少」
