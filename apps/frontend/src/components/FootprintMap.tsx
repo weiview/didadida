@@ -357,14 +357,19 @@ const HEAD_CSS_W = HEAD_CSS_H;
  * 座位上那幾顆頭的大小。**刻意誇張** —— 使用者要的就是「大頭狗開車」那種比例。
  *
  * 一個人的時候是 1（畫面上 116px，車身才 150px 寬）。合體那張插畫上副駕到駕駛
- * 只隔 ~42 CSS px，而一顆座位頭就有 ~72 px，所以縮小一點並靠疊放順序讓後面的人
+ * 只隔 ~42 CSS px，一顆座位頭就有 ~71 px，所以縮小一點並靠疊放順序讓後面的人
  * 露出頭頂（寶寶在後面那台娃娃車上，離得遠，本來就不會被擋）。
  *
- * ⚠️ **要更誇張請去縮 car.ts 的 `CAR_PIXEL_RATIO`（車變小），不要往上加這幾個
- * 數字** —— 頭再放大會糊（來源頭像只有 256px），而且座位間距是跟著車寬等比縮的，
- * 頭一放大就整團疊死。
+ * ⚠️ 2026-09-03 使用者要「合體的頭像再放大一點」，0.62 → 0.72。**放大的代價是
+ * 車跟著變大**，不是頭跟頭疊得更死 —— 這個數字一過 ~0.657，底下那道
+ * `CONVOY_CAR_SCALE` 就咬進來把合體那台車撐開（現在 195 → ~214 CSS px），
+ * 好讓脖子的間距跟著頭一起長。那正是使用者拍板的「頭不能離開脖子，
+ * 擠不下就把車放大」。
+ *
+ * ⚠️ **要更誇張請去縮 car.ts 的 `CAR_PIXEL_RATIO`（車變小），不要再往上加這個
+ * 數字** —— 頭再放大會糊（來源頭像只有 256px），而車也會一路被撐大。
  */
-const SEAT_HEAD_SCALE = 0.62;
+const SEAT_HEAD_SCALE = 0.72;
 /** 拖車上那個寶寶再小一點 —— 他本來就比較小顆，插畫上那截脖子也細得多 */
 const BABY_HEAD_SCALE = 0.85;
 /**
@@ -382,9 +387,10 @@ const NECK_OVERLAP = 2;
  * **嫌車大就調小這個數字**，不要去動座位表或頭的大小。
  *
  * 貼圖四周有透明邊（見 car.ts 的 HEAD_PAD），0.72 差不多是「兩個圓剛好擦邊」，
- * 0.55 是「輕微重疊」。⚠️ **換上娃娃車那張插畫之後它算出來已經 < 1**
- * （見 `CONVOY_CAR_SCALE`），也就是目前這個值沒有真的在放大車 ——
- * 它現在是一道保險絲，換插畫或調頭的大小時才會重新咬進來。
+ * 0.55 是「輕微重疊」—— 那個重疊量使用者在舊插畫上已經看過並且接受了。
+ * ⚠️ 2026-09-03 把 `SEAT_HEAD_SCALE` 加到 0.72 之後**它又咬進來了**
+ * （算出來 ~1.10，合體車 195 → ~214 CSS px），所以嫌車大請調小這一個，
+ * 不要回頭去縮頭。
  */
 const HEAD_GAP_RATIO = 0.55;
 
@@ -396,10 +402,10 @@ const HEAD_GAP_RATIO = 0.55;
  *
  * 數字是從 car.ts 的座位表**現算的**，不是寫死的 —— 換一張插畫、調
  * `SEAT_HEAD_SCALE`／`BABY_HEAD_SCALE`／`HEAD_GAP_RATIO` 都會自動跟著變。
- * ⚠️ **以現在這張插畫算出來是 1，也就是不放大**：新的合體圖把寶寶搬到後面那台
- * 娃娃車上，整張圖本來就比 solo 寬（195 vs 150 CSS px），副駕到駕駛隔了 ~42 px、
- * 駕駛到寶寶隔了 ~75 px，兩段都夠 —— 舊圖那個「駕駛到後座只有 ~20 px」的死結
- * 是換圖解掉的，不是靠放大解掉的。留著這段算式是為了換圖時還會自己咬住。
+ * ⚠️ **現在算出來是 ~1.10**（合體車 195 → ~214 CSS px），瓶頸永遠是副駕到駕駛
+ * 那一段（隔 ~42 px，駕駛到拖車上的寶寶隔了 ~75 px 一直很鬆）。
+ * 換上娃娃車那張插畫時它一度掉回 1（＝不放大），是 2026-09-03 把座位頭
+ * 從 0.62 加到 0.72 又讓它咬回來的 —— 這正是它該有的行為。
  *
  * ⚠️ 真的咬進來的時候是**只放大車，頭不跟著放大** —— 頭跟著放大等於原地踏步，
  * 遮擋一模一樣。⚠️ 車的貼圖為此烤成 ratio 3（見 car.ts），放大之後才不會糊。
@@ -435,6 +441,13 @@ const HEAD_CROWD_SCALE = 0.6;
 const HEAD_STEP = HEAD_CSS_W * HEAD_CROWD_SCALE * 0.72;
 /** 那一排離車頂多高（CSS px，指頭的中心） */
 const HEAD_ROW_LIFT = 30;
+
+/**
+ * 使用者放開手之後，跟拍還要再讓多久（毫秒）才把鏡頭接回車上。
+ * 滾輪縮放與拖曳放開都有慣性補間，太短就會在慣性滑到一半時被 `setCenter`
+ * 砍斷（見 `camHoldRef`）；太長則是「停下來了鏡頭卻遲遲不跟」。
+ */
+const CAMERA_HOLD_MS = 700;
 
 /**
  * 判斷車頭朝哪邊時，往回看多久（毫秒的軌跡時間）。
@@ -1701,6 +1714,23 @@ export default function FootprintMap({
    * setState ＋ 重新渲染，白花效能（而且那時候本來就每幀重算了）。
    */
   const [viewTick, setViewTick] = useState(0);
+  /**
+   * 使用者自己在動鏡頭（拖曳、滾輪縮放、雙指捏合、雙擊放大）到什麼時候為止
+   * （`performance.now()` 的時間戳）。播放中的跟拍看它決定這一幀讓不讓開。
+   *
+   * ⚠️⚠️ **不讓開的話播放中根本縮放不了地圖**（2026-09-03 使用者回報）：
+   * 跟拍每一幀都 `map.setCenter()`，而 maplibre 的 `jumpTo` 開頭就是
+   * `this.stop()` → `handlers.stop(false)` —— 那一句會把**正在進行中的手勢**
+   * 整個中止掉。滾輪縮放是一段有慣性的補間，於是每一幀都被砍掉一次，
+   * 畫面上就是滾了沒反應。
+   *
+   * 手勢結束後還多留 `CAMERA_HOLD_MS`，等慣性滑完才把鏡頭接回車上 ——
+   * 這中間車照跑，接回去時就是一次小跳，比「滾一格被打斷一次」好太多。
+   * ⚠️ **只擋 `setCenter`，不碰縮放** —— 使用者調好的縮放比例本來就該留著。
+   */
+  const camHoldRef = useRef(0);
+  /** 手指／滑鼠還按著（拖曳或捏合中），放開之前一律不接手鏡頭 */
+  const camDragRef = useRef(false);
   /** 每台車現在車頭朝哪。key 是「車上有誰」，見 FACING_HYSTERESIS_PX */
   const facingRef = useRef<Map<string, 1 | -1>>(new Map());
 
@@ -2079,7 +2109,38 @@ export default function FootprintMap({
     if (!map || !ready) return;
     const bump = () => { if (!playingRef.current) setViewTick((v) => v + 1); };
     map.on('move', bump);
-    return () => { map.off('move', bump); };
+
+    /*
+     * 播放中要讓使用者自己縮放／拖曳地圖，所以得知道「他現在正在動鏡頭」。
+     *
+     * ⚠️ 刻意聽 DOM 事件而不是 maplibre 的 `movestart`／`moveend`：跟拍那一句
+     * `setCenter` 自己就會同步發一輪 movestart／move／moveend（`jumpTo` 的行為），
+     * 分不出是誰發的就會把自己的跟拍當成使用者的手勢。DOM 事件只有真的有人
+     * 碰到畫布時才會來。
+     * ⚠️ 用 `getCanvasContainer()` 不是 canvas：maplibre 的手勢監聽器掛在那一層。
+     */
+    const el = map.getCanvasContainer();
+    const hold = (ms: number) => {
+      camHoldRef.current = Math.max(camHoldRef.current, performance.now() + ms);
+    };
+    const onWheel = () => hold(CAMERA_HOLD_MS);
+    const onDown = () => { camDragRef.current = true; };
+    const onUp = () => { camDragRef.current = false; hold(CAMERA_HOLD_MS); };
+    const onDbl = () => hold(CAMERA_HOLD_MS);
+    el.addEventListener('wheel', onWheel, { passive: true });
+    el.addEventListener('pointerdown', onDown);
+    el.addEventListener('pointerup', onUp);
+    el.addEventListener('pointercancel', onUp);
+    el.addEventListener('dblclick', onDbl);
+
+    return () => {
+      map.off('move', bump);
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('pointerdown', onDown);
+      el.removeEventListener('pointerup', onUp);
+      el.removeEventListener('pointercancel', onUp);
+      el.removeEventListener('dblclick', onDbl);
+    };
   }, [ready]);
 
   /*
@@ -3350,8 +3411,14 @@ export default function FootprintMap({
      *
      * 好幾台車時對準它們的形心：跟著其中一台跑的話，其他人隨時會被甩出畫面，
      * 而「大家分頭在哪」正是多身分播放要看的東西。
+     *
+     * ⚠️⚠️ **使用者自己在動鏡頭的時候整段讓開**（`camHoldRef`／`camDragRef`）——
+     * `setCenter` → `jumpTo` → `handlers.stop(false)` 會把進行中的手勢砍掉，
+     * 不讓開的話播放中就縮放不了地圖。放開手（＋慣性滑完）之後下一幀自動接回車上，
+     * 而縮放比例是使用者剛剛調好的那個：這裡從頭到尾只設中心，不碰 zoom。
      */
-    if (playing && carFeatures.length > 0) {
+    const userDrivingCamera = camDragRef.current || performance.now() < camHoldRef.current;
+    if (playing && carFeatures.length > 0 && !userDrivingCamera) {
       let cx = 0;
       let cy = 0;
       for (const f of carFeatures) { cx += f.geometry.coordinates[0]; cy += f.geometry.coordinates[1]; }

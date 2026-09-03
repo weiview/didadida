@@ -3495,9 +3495,15 @@ export interface MatchedTrack {
  * `userIds` 是**顯示篩選**，不是隱私牆（家人本來就互相看得到）。它的意義在額度：
  * 後端有全域 20000 點上限，只看自己時多人的點不必一起讀進來。空陣列 = 不篩選。
  */
+/**
+ * ⚠️⚠️ **失敗回 `null`，不是空陣列。** 空陣列的意思是「這段範圍真的沒有軌跡」，
+ * 而那句話會直接寫在 `/map` 上。網路抖一下、邊快取回個 5xx 就吞成空陣列的話，
+ * 畫面上是一句安靜的假話（使用者回報的「有時候突然說沒有足跡，重新選一次日期
+ * 才出現」就是這麼來的）—— 呼叫端要分得出這兩件事才有辦法講真話。
+ */
 export async function fetchTracks(
   opts: { from?: string; to?: string; dayKey?: string; userIds?: number[] } = {},
-): Promise<TrackPoint[]> {
+): Promise<TrackPoint[] | null> {
   try {
     const qs = new URLSearchParams();
     if (opts.from) qs.set('from', opts.from);
@@ -3505,11 +3511,11 @@ export async function fetchTracks(
     if (opts.dayKey) qs.set('day_key', opts.dayKey);
     if (opts.userIds?.length) qs.set('user_id', opts.userIds.join(','));
     const res = await fetch(`${API_BASE_URL}/tracks?${qs.toString()}`, { headers: getAuthHeaders() });
-    if (!res.ok) return [];
+    if (!res.ok) return null;
     return await res.json();
   } catch (err) {
     console.error(err);
-    return [];
+    return null;
   }
 }
 

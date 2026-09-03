@@ -91,6 +91,8 @@ const AUTO_SYNC_COOLDOWN_MS = 60 * 60 * 1000;
 export default function MapPage() {
   const [points, setPoints] = useState<FootprintPoint[]>([]);
   const [tracks, setTracks] = useState<TrackPoint[]>([]);
+  /** 上一趟軌跡讀失敗了嗎。⚠️ 跟「真的沒有軌跡」是兩件事，見 loadTracks */
+  const [tracksFailed, setTracksFailed] = useState(false);
   const [albums, setAlbums] = useState<Album[]>([]);
   const [segments, setSegments] = useState<TripSegment[]>([]);
   /**
@@ -336,15 +338,42 @@ export default function MapPage() {
     return members.map(m => m.id).filter(id => !hiddenUsers.has(id)).join(',');
   }, [members, hiddenUsers]);
 
+  /**
+   * 發號碼牌用的流水號。**每一趟 `loadTracks` 領一號，回來時號碼不是最新的
+   * 就整份丟掉。**
+   *
+   * ⚠️⚠️ 沒有這道閂就是使用者回報的那個「選了日期突然說沒有足跡，重新選一次
+   * 才出現」（2026-09-03）：這一支同時有四個呼叫端（換日期、換成員篩選、
+   * 同步完、貼路完），而每一趟都是一次網路往返 —— **舊的那趟晚回來就會把新的
+   * 結果蓋掉**，蓋成空的畫面上就寫「這段範圍沒有軌跡」。而且錯得很安靜：
+   * 重新選一次日期＝再發一趟，這次沒被蓋到就好了，所以症狀是時好時壞。
+   * ⚠️ 不能只靠 effect 的 cleanup（`cancelled`）—— 手動呼叫的那三處根本沒有
+   * cleanup 可以掛。
+   */
+  const tracksSeq = useRef(0);
+
   const loadTracks = useCallback(async () => {
-    if (!isAdmin || skipTracks) { setTracks([]); return; }
+    const seq = ++tracksSeq.current;
+    const apply = (next: TrackPoint[]) => {
+      if (seq !== tracksSeq.current) return;
+      setTracks(next);
+      setTracksFailed(false);
+    };
+    if (!isAdmin || skipTracks) { apply([]); return; }
     // 全部關掉：不必打 API，答案一定是空的
-    if (hiddenUsers.size > 0 && !visibleUserIds) { setTracks([]); return; }
-    setTracks(await fetchTracks({
+    if (hiddenUsers.size > 0 && !visibleUserIds) { apply([]); return; }
+    const data = await fetchTracks({
       from: trackFrom,
       to: trackTo,
       userIds: visibleUserIds ? visibleUserIds.split(',').map(Number) : undefined,
-    }));
+    });
+    /*
+     * ⚠️ 讀失敗**不要清空手上那份**，也絕不能講成「這段範圍沒有軌跡」——
+     * 那是兩件完全不同的事，而使用者只看得到畫面上那句話。留著舊的清單
+     * ＋一句「讀取失敗」，他才知道要再選一次日期（見 fetchTracks 的註解）。
+     */
+    if (data === null) { if (seq === tracksSeq.current) setTracksFailed(true); return; }
+    apply(data);
     // hiddenUsers 只透過 visibleUserIds 影響結果，但「全關」那條捷徑要看得到它
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin, trackFrom, trackTo, skipTracks, visibleUserIds, hiddenUsers.size]);
@@ -1604,20 +1633,23 @@ export default function MapPage() {
           )}
           {/* 軌跡整條線是登入才有的東西，訪客連「這段範圍沒有軌跡」都不該看到 ——
               那句話會讓人以為換個日期就找得到 */}
-          {isAdmin && <div style={{ fontSize: 12, color: '#7c3aed', marginTop: 2 }}>
+          {isAdmin && <div style={{ fontSize: 12, color: tracksFailed ? '#9b2c2c' : '#7c3aed', marginTop: 2 }}>
             {/* 貼路已經是自動的，所以這裡不再叫人去按什麼。剩下的只有兩種情況：
-                正在補（matching）、或這段範圍根本沒有軌跡 */}
-            {matchedLoading ? '讀取軌跡…'
-              : matching ? '貼路中…'
-                : routeTracks.length > 0
-                  ? `軌跡 ${routeTracks.length} 點`
-                    + (matchedDays > 0 ? `／貼路 ${matchedDays} 天` : '')
-                    + (timelineTracks.length > 0 ? `／Google 歷史 ${timelineTracks.length} 點` : '')
-                  : skipTracks
-                    ? ''
-                    : tracks.length === 0 && timelineDaysInRange.length === 0
-                      ? '這段範圍沒有軌跡'
-                      : '這段範圍畫不出軌跡（來源太疏或整天沒移動）'}
+                正在補（matching）、或這段範圍根本沒有軌跡。
+                ⚠️ 讀失敗要排在最前面講，而且**不可以講成「沒有軌跡」** ——
+                那是一句會讓人相信的假話（見 loadTracks） */}
+            {tracksFailed ? '軌跡讀取失敗，請重新選一次日期'
+              : matchedLoading ? '讀取軌跡…'
+                : matching ? '貼路中…'
+                  : routeTracks.length > 0
+                    ? `軌跡 ${routeTracks.length} 點`
+                      + (matchedDays > 0 ? `／貼路 ${matchedDays} 天` : '')
+                      + (timelineTracks.length > 0 ? `／Google 歷史 ${timelineTracks.length} 點` : '')
+                    : skipTracks
+                      ? ''
+                      : tracks.length === 0 && timelineDaysInRange.length === 0
+                        ? '這段範圍沒有軌跡'
+                        : '這段範圍畫不出軌跡（來源太疏或整天沒移動）'}
           </div>}
         </div>
       </div>
