@@ -4,11 +4,8 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useAdmin } from "@/lib/useAdmin";
 import AvatarPicker from "./AvatarPicker";
-import {
-  fetchNotifications, fetchTrackMembers,
-  type NotificationItem, type TrackMember,
-} from "@/lib/api";
-import { TRACK_PALETTE } from "@/lib/trackColors";
+import { fetchNotifications, type NotificationItem } from "@/lib/api";
+import { uploadSummary } from "@/lib/uploadSummary";
 
 /**
  * 右上角的帳號牌。收合時只有一顆圓鈕（顯示名稱的第一個字），點開才是整張卡。
@@ -31,8 +28,8 @@ const BADGE = 40;
 export default function AccountBadge() {
   const {
     isAdmin, isGuest, checking, user, isOwner, canManageOthers,
-    canViewComments, canViewMap, unreadNotifications, markNotificationsRead,
-    renameSelf, recolorSelf, setMyAvatar, setMyAvatarFacing, logout,
+    unreadNotifications, markNotificationsRead,
+    renameSelf, setMyAvatar, logout,
   } = useAdmin();
 
   const [open, setOpen] = useState(false);
@@ -41,16 +38,6 @@ export default function AccountBadge() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  /*
-   * 其他家人各自是什麼顏色。只為了在色票上標「這個 OO 在用」——
-   * **不擋**（使用者定調：標出來就好，硬性唯一只會讓後來的人沒得選）。
-   *
-   * null ＝ 還沒問過。點開面板才去問，而且只問一次：這是一顆平常收著的按鈕，
-   * 為了它在每一頁都多打一支 API 不值得。
-   */
-  const [members, setMembers] = useState<TrackMember[] | null>(null);
-  // 正在存的那個顏色。整排一起鎖住，不然連點兩下會有兩個請求互相覆蓋
-  const [savingColor, setSavingColor] = useState<string | null>(null);
   /*
    * 通知。**沒有另外做一顆鈴鐺** —— 右上角這顆圓鈕已經是全站唯一的個人角落，
    * 再擺一個浮動按鈕只會跟 FAB／回到頂端那疊搶位置（見 cornerStack.ts）。
@@ -76,7 +63,7 @@ export default function AccountBadge() {
    * 打開會看到一片「都已讀」，使用者根本不知道哪幾則是新的。
    */
   useEffect(() => {
-    if (!open || !isAdmin || !canViewComments || user?.id == null) return;
+    if (!open || !isAdmin || user?.id == null) return;
     let alive = true;
     fetchNotifications().then(({ items }) => {
       if (!alive) return;
@@ -86,18 +73,12 @@ export default function AccountBadge() {
     return () => { alive = false; };
     // unreadNotifications 刻意不進相依：標成已讀會把它歸零，進去就會再跑一次
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, isAdmin, canViewComments, user?.id]);
+  }, [open, isAdmin, user?.id]);
 
   useEffect(() => {
     if (editing) inputRef.current?.focus();
   }, [editing]);
 
-  useEffect(() => {
-    if (!open || !isAdmin || user?.id == null || members !== null) return;
-    let alive = true;
-    fetchTrackMembers().then((list) => { if (alive) setMembers(list); });
-    return () => { alive = false; };
-  }, [open, isAdmin, user?.id, members]);
 
   useEffect(() => {
     if (!open) return;
@@ -129,11 +110,11 @@ export default function AccountBadge() {
         ? "家庭成員（可管理全站內容）"
         : "家庭成員（只能管自己的內容）";
 
-  // 我現在的顏色。後端一律回算好的值，沒有就是舊後端 —— 那時整排都不標選中
+  /*
+   * 我在地圖上的顏色。這裡只拿來當頭像的底色 —— **換色的入口在 /admin**
+   * （2026-09-04 使用者要求搬過去，跟頭像朝向一起收進後台設定）。
+   */
   const myColor = user?.track_color ?? null;
-  /** 這個顏色被誰佔著（我自己不算）。標示用，**不阻止**選同色 */
-  const usedBy = (hex: string) =>
-    members?.find((m) => m.id !== user?.id && m.track_color === hex) ?? null;
 
   const startRename = () => {
     setDraft(user?.name ?? "");
@@ -153,19 +134,6 @@ export default function AccountBadge() {
     else setError(result.message || "改名失敗");
   };
 
-  const pickColor = async (hex: string) => {
-    if (savingColor || hex === myColor) return;
-    setSavingColor(hex);
-    setError(null);
-    const result = await recolorSelf(hex);
-    setSavingColor(null);
-    if (result.success) {
-      // 我剛佔走的顏色要立刻反映在「誰在用什麼」上，不然別人的標記會停在舊值
-      setMembers((prev) => prev?.map((m) => (m.id === user?.id ? { ...m, track_color: hex } : m)) ?? prev);
-    } else {
-      setError(result.message || "換色失敗");
-    }
-  };
 
   return (
     <>
@@ -306,9 +274,11 @@ export default function AccountBadge() {
                 <div style={{ fontSize: 12, opacity: 0.75, marginTop: 8 }}>{roleLabel}</div>
               )}
 
-              {/* 通知。看得到留言才看得到通知 —— 被關掉留言權限的人收到一則
-                  「有人回覆你」卻點不進去看，只是白白讓人著急 */}
-              {isAdmin && canViewComments && user?.id != null && (
+              {/* 通知。**兩種混在同一份清單裡**：留言，以及有人傳了新的照片／影片。
+                  ⚠️ 這裡刻意**不看 `canViewComments`**（2026-09-04 加上傳通知時放寬的）
+                  —— 過濾留言那半由後端負責（看不到留言的人那一段整個不查），
+                  前端跟著擋的話他會連「有人上傳了新照片」都收不到。 */}
+              {isAdmin && user?.id != null && (
                 <div style={{ marginTop: 12 }}>
                   <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>通知</div>
                   {notifs === null ? (
@@ -318,15 +288,21 @@ export default function AccountBadge() {
                   ) : (
                     <div style={{ maxHeight: 240, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
                       {notifs.map((n) => (
-                        <NotificationRow key={n.comment_id} item={n} onGo={() => setOpen(false)} />
+                        // ⚠️ key 要 kind ＋ id 一起：留言與上傳的 id 各自從 1 開始，
+                        // 只用 id 兩種會撞在一起
+                        <NotificationRow key={`${n.kind}-${n.id}`} item={n} onGo={() => setOpen(false)} />
                       ))}
                     </div>
                   )}
                 </div>
               )}
 
-              {/* 頭像。跟顏色一樣是**每個人自己的**東西，所以放這裡不放後台
-                  （站長要代設在 /admin 也有一份，同一個元件）。 */}
+              {/* 頭像。換圖是**每個人自己的**事，留在這裡。
+                  ⚠️ 「頭像朝哪一邊」與「軌跡顏色」**2026-09-04 搬去 /admin 了**
+                  （使用者要求：朝向的按鈕跟車上座位放一起，顏色也一併進後台）。
+                  那兩件事都是「這台車看起來對不對」，站長要調得動別人的；
+                  留一份在這裡就變成同一件事兩個入口，遲早走鐘。
+                  一般成員要換色或轉向請站長改。 */}
               {isAdmin && user?.id != null && (
                 <div style={{ marginTop: 12 }}>
                   <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>頭像</div>
@@ -337,11 +313,6 @@ export default function AccountBadge() {
                     color={myColor ?? "#8a7f72"}
                     size={56}
                     onChange={setMyAvatar}
-                    {...(canViewMap ? {
-                      // 看不到地圖的人沒有那台車，多一組「頭像朝向」只是雜訊
-                      facing: (user.avatar_facing === 'right' ? 'right' : 'left') as 'left' | 'right',
-                      onFacingChange: setMyAvatarFacing,
-                    } : {})}
                   />
                 </div>
               )}
@@ -352,53 +323,6 @@ export default function AccountBadge() {
                 <button type="button" onClick={startRename} style={{ ...plainBtn, marginTop: 12, width: "100%" }}>
                   ✎ 修改顯示名稱
                 </button>
-              )}
-
-              {/* 軌跡顏色。跟改名同一個條件（要有帳號列才存得進去）。
-                  放在帳號牌而不是後台：顏色是**每個人自己的**，不是站長分配的。
-                  別人已經在用的顏色會標上他的名字，但照樣按得下去 —— 全家出遊
-                  想跟老婆同色是他們家的事，站上不該替他們決定。 */}
-              {isAdmin && user?.id != null && (
-                <div style={{ marginTop: 12 }}>
-                  <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>
-                    地圖上的軌跡顏色
-                  </div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                    {TRACK_PALETTE.map(({ hex, name }) => {
-                      const taken = usedBy(hex);
-                      const mine = myColor === hex;
-                      return (
-                        <button
-                          key={hex}
-                          type="button"
-                          onClick={() => pickColor(hex)}
-                          disabled={savingColor !== null}
-                          title={taken ? `${name}（${taken.name || "另一位家人"}已經在用）` : name}
-                          aria-label={name}
-                          aria-pressed={mine}
-                          style={{
-                            width: 24,
-                            height: 24,
-                            borderRadius: "50%",
-                            // 用 backgroundColor 而不是 background 簡寫：底下還要疊
-                            // 一個 backgroundImage，簡寫會把它洗掉
-                            backgroundColor: hex,
-                            cursor: savingColor ? "progress" : "pointer",
-                            // 選中的那顆用一圈白邊 + 外框撐出來，不靠打勾 ——
-                            // 24px 上的符號在深色底上幾乎看不見
-                            border: mine ? "2px solid #fff" : "1px solid rgba(0, 0, 0, 0.18)",
-                            boxShadow: mine ? `0 0 0 2px ${hex}` : "none",
-                            opacity: savingColor && savingColor !== hex ? 0.45 : 1,
-                            // 別人在用：右下角一個小白點，只是提示，不是禁止標誌
-                            backgroundImage: taken
-                              ? "radial-gradient(circle at 78% 78%, rgba(255,255,255,0.95) 0 3px, transparent 3px)"
-                              : undefined,
-                          }}
-                        />
-                      );
-                    })}
-                  </div>
-                </div>
               )}
 
               {/* 「可管理全站內容」＝共同站長，後台每一格都給（見 /admin 那一頁
@@ -435,16 +359,28 @@ export default function AccountBadge() {
   );
 }
 
-/** 通知的一行。整行是連結，點下去開到那張照片的燈箱 */
+/**
+ * 通知的一行。整行是連結，點下去開到那張照片的燈箱。
+ *
+ * ⚠️ **上傳那種點的是相簿，不是某一張** —— 它指的是一整批（`photo_id` 是 null），
+ * 硬要挑一張出來當代表就得在後端多一次查詢，而使用者要的本來就是「去看那一批」。
+ */
 function NotificationRow({ item, onGo }: { item: NotificationItem; onGo: () => void }) {
+  const isUpload = item.kind === "upload";
   const who = item.actor_name || "有人";
-  const what = REASON_TEXT[item.reason] ?? "留言了";
+  const what = isUpload
+    ? `傳了 ${uploadSummary(item.photos, item.videos)}`
+    : REASON_TEXT[item.reason] ?? "留言了";
   /*
    * 預覽裡不留 `@[uid]` 這種原始標記 —— 這裡沒有名字對照表（那要另外打一支
    * /users/mentionable），而理由那一行本來就已經講了「提到了你」，
    * 標記留著只是雜訊。直接拿掉。
+   *
+   * 上傳那種沒有內文，第二行改講進了哪一本相簿。
    */
-  const preview = item.body.replace(/@\[\d+\]\s*/g, "").trim();
+  const preview = isUpload
+    ? (item.album_name ? `到「${item.album_name}」` : "")
+    : item.body.replace(/@\[\d+\]\s*/g, "").trim();
 
   const inner = (
     <>
@@ -492,7 +428,15 @@ function NotificationRow({ item, onGo }: { item: NotificationItem; onGo: () => v
   if (item.album_id == null) return <div style={{ ...style, opacity: 0.6 }}>{inner}</div>;
 
   return (
-    <Link href={`/album?id=${item.album_id}&photo=${item.photo_id}`} onClick={onGo} style={style}>
+    <Link
+      // ⚠️ 相簿頁是 `/album?id=<相簿>`，**不是** `/album/<相簿>` ——
+      // 靜態匯出的站沒有 [id] 那一層，多打一段路徑就是實實在在的 404
+      href={item.photo_id == null
+        ? `/album?id=${item.album_id}`
+        : `/album?id=${item.album_id}&photo=${item.photo_id}`}
+      onClick={onGo}
+      style={style}
+    >
       {inner}
     </Link>
   );

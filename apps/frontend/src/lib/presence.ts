@@ -59,10 +59,20 @@ export interface PresenceSnapshot {
   self: number | null;
   /** 第一次抓回來之前是 false —— 在那之前不要跳任何「上線囉」 */
   ready: boolean;
+  /**
+   * 站上最後一批上傳的 `UploadEvent.id`（沒有人傳過東西就是 0）。
+   *
+   * ⚠️ 這裡**只留一個 id，不留內容** —— 它存在的唯一理由是「跟上一份比，
+   * 變大了就跳提示」。要顯示什麼在跳的當下就交給提示了（見下面的
+   * `PresenceToast`），留在快照裡只會讓每個看 `usePresence()` 的元件
+   * （那條橫幅、每一顆頭像上的燈）都跟著多重畫一次。
+   */
+  uploadId: number;
 }
 
 const EMPTY: PresenceSnapshot = {
   seen: new Map(), people: new Map(), onlineMs: DEFAULT_ONLINE_MS, self: null, ready: false,
+  uploadId: 0,
 };
 
 let snapshot: PresenceSnapshot = EMPTY;
@@ -94,16 +104,43 @@ export function isOnline(uid: number | null | undefined, snap: PresenceSnapshot 
   return Date.now() - t < snap.onlineMs;
 }
 
-/* ── 「XXX 上線囉」 ────────────────────────────────────────────────────────
+/* ── 左下角那幾則提示 ─────────────────────────────────────────────────────
  *
- * 誰從離線變成上線就跳一次。三條規則都是為了不吵人：
- *   ① 第一次抓回來不跳（不然一進站就被五個人的提示蓋滿）
- *   ② 自己不跳
- *   ③ **上一份快照裡明確是離線的**才跳 —— 上一份根本沒有這個人（新加入白名單、
- *      或是他之前 last_seen_at 是 NULL）不算「剛上線」，那只是我們第一次知道他
+ * 兩種，**共用同一趟輪詢**：
+ *
+ * ①「XXX 上線囉」：誰從離線變成上線就跳一次。三條規則都是為了不吵人：
+ *      ⓐ 第一次抓回來不跳（不然一進站就被五個人的提示蓋滿）
+ *      ⓑ 自己不跳
+ *      ⓒ **上一份快照裡明確是離線的**才跳 —— 上一份根本沒有這個人（新加入白名單、
+ *         或是他之前 last_seen_at 是 NULL）不算「剛上線」，那只是我們第一次知道他
+ *
+ * ②「XXX 傳了 n 張照片」：2026-09-04 加的（使用者要求「有任何人上傳照片或影片時
+ *    要全站通知」）。⚠️⚠️ **刻意不另外開一支路由，也不另外開一個計時器** ——
+ *    它搭的是同一支 `GET /api/presence`（那一趟順手多回一列最新的 UploadEvent），
+ *    所以這個功能的送達成本是**零次額外請求**。三條規則跟①完全同一套：
+ *      ⓐ 第一次抓回來不跳（`prev.ready` 為 false ＝ 剛進站，那不是「剛剛發生的」）
+ *      ⓑ 自己傳的不跳（他人就站在上傳的進度條前面）
+ *      ⓒ id **變大**才跳 —— 同一批不會因為每分鐘問一次就跳第二遍
+ *
+ *    ⚠️ 這只是「剛好在線上的人會看到」的那一半。真正留得下來的是帳號牌上
+ *    那份通知清單（`GET /api/notifications`）—— 沒開著網站的人靠它補看。
  */
 
-export interface PresenceToast { key: number; name: string }
+export type PresenceToast =
+  | { key: number; kind: 'online'; name: string }
+  | {
+      key: number;
+      kind: 'upload';
+      name: string;
+      photos: number;
+      videos: number;
+      /**
+       * 進了哪一本。⚠️ 刻意**只有名字，沒有 id** —— 這一則是不吃點擊的
+       * （整疊 `pointer-events: none`，蓋在頁面上攔下來的每一下都是使用者
+       * 本來要按的東西）。想點進去看的路在帳號牌那份通知清單上。
+       */
+      albumName: string | null;
+    };
 
 const toastListeners = new Set<(t: PresenceToast) => void>();
 let toastSeq = 0;
@@ -149,8 +186,11 @@ async function poll() {
     const onlineMs = data.online_ms ?? DEFAULT_ONLINE_MS;
     const { self } = data;
 
+    const up = data.upload;
+    const uploadId = up ? up.id : 0;
+
     const prev = snapshot;
-    const next: PresenceSnapshot = { seen, people, onlineMs, self, ready: true };
+    const next: PresenceSnapshot = { seen, people, onlineMs, self, ready: true, uploadId };
 
     // 誰剛上線（規則見上面）
     if (prev.ready) {
@@ -162,9 +202,30 @@ async function poll() {
         const before = prev.seen.get(uid);
         if (before == null) return;                      // 上一份不知道他 —— 不算剛上線
         if (now - before < prev.onlineMs) return;        // 上一份就已經在線上了
-        const toast: PresenceToast = { key: ++toastSeq, name: people.get(uid)?.name || '有人' };
+        const toast: PresenceToast = {
+          key: ++toastSeq, kind: 'online', name: people.get(uid)?.name || '有人',
+        };
         toastListeners.forEach((fn) => fn(toast));
       });
+    }
+
+    /*
+     * 有人傳了新東西（規則見上面）。
+     * ⚠️ `prev.ready` 要擋在最前面：一進站手上那份是 EMPTY（uploadId 0），
+     *    不擋的話站上最後一批上傳**不管多久以前**都會在每個人開站的當下跳出來。
+     * ⚠️ 名字用後端算好的 `actor_name`，不去 `people` 裡撈 —— 傳東西的人可能
+     *    已經被停權（那份名單就沒有他了），而事情確實發生過。
+     */
+    if (prev.ready && up && uploadId > prev.uploadId && up.user_id !== self) {
+      const toast: PresenceToast = {
+        key: ++toastSeq,
+        kind: 'upload',
+        name: up.actor_name || '有人',
+        photos: up.photos,
+        videos: up.videos,
+        albumName: up.album_name,
+      };
+      toastListeners.forEach((fn) => fn(toast));
     }
 
     publish(next);

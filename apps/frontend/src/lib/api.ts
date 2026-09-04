@@ -568,22 +568,78 @@ export interface PresenceRow {
 }
 
 /**
- * 誰在線上 —— 同一趟順便回報「我還在」（心跳）。
+ * 最新一批上傳，跟著心跳回來的。
+ *
+ * ⚠️ **舊後端不回這一段**（邊快取裡也可能還躺著舊回應），所以整個是選填的。
+ */
+export interface PresenceUpload {
+  id: number;
+  user_id: number;
+  actor_name: string;
+  album_id: number | null;
+  album_name: string | null;
+  photos: number;
+  videos: number;
+  created_at: string | null;
+}
+
+/**
+ * 誰在線上 —— 同一趟順便回報「我還在」（心跳），**以及最新一批上傳**。
+ *
+ * ⚠️ 上傳通知刻意搭這一支的便車：站上已經有一條 60 秒的輪詢，
+ * 「家裡多了新照片」跟「誰上線了」是同一個節奏的事，不值得再開一支端點
+ * 與一個計時器（見後端 GET /api/presence）。
  *
  * 狀態與輪詢在 lib/presence.ts，這裡只負責那一趟 fetch（api.ts 是全站唯一的
  * API 客戶端）。失敗一律往外丟，讓 presence.ts 決定要不要保留上一份快照。
  */
 export async function fetchPresence(): Promise<{
   users: PresenceRow[]; online_ms: number | null; self: number | null;
+  upload: PresenceUpload | null;
 }> {
   const res = await fetch(`${API_BASE_URL}/presence`, { headers: getAuthHeaders() });
   if (!res.ok) throw new Error(`presence ${res.status}`);
   const data = await res.json();
+  const up = data?.upload;
   return {
     users: Array.isArray(data?.users) ? data.users as PresenceRow[] : [],
     online_ms: Number(data?.online_ms) > 0 ? Number(data.online_ms) : null,
     self: typeof data?.self === 'number' ? data.self : null,
+    upload: up && Number(up.id) > 0 ? {
+      id: Number(up.id),
+      user_id: Number(up.user_id),
+      actor_name: String(up.actor_name ?? ''),
+      album_id: up.album_id == null ? null : Number(up.album_id),
+      album_name: up.album_name == null ? null : String(up.album_name),
+      photos: Number(up.photos ?? 0),
+      videos: Number(up.videos ?? 0),
+      created_at: up.created_at ?? null,
+    } : null,
   };
+}
+
+/**
+ * 宣告「我剛剛傳了一批照片／影片」，全站成員會收到一則提示與一筆通知。
+ *
+ * ⚠️ **一批打一次**（前端整批收工時），不是一張打一次 —— 逐張打就是幾百次
+ * Workers 請求。失敗一律吞掉：通知掉一則無所謂，
+ * **絕不能讓它把剛剛傳完的那批講成失敗**。
+ */
+export async function announceUpload(
+  input: { albumId: number | null; photos: number; videos: number },
+): Promise<void> {
+  if (input.photos + input.videos <= 0) return;
+  try {
+    await fetch(`${API_BASE_URL}/uploads/announce`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        album_id: input.albumId, photos: input.photos, videos: input.videos,
+      }),
+    });
+  } catch {
+    /* 通知不是上傳的一部分，吞掉 */
+  }
 }
 
 export async function checkAuth(): Promise<AuthState> {
@@ -655,13 +711,14 @@ export function logout(): void {
 }
 
 /**
- * 改自己的個人設定。就顯示名稱與軌跡顏色兩欄改得動，信箱與權限都不行。
+ * 改自己的個人設定。**只剩顯示名稱一欄**，信箱與權限都不行。
  *
- * 兩個都是選填、各自獨立更新 —— 只送顏色不會把名字洗掉。
- * `track_color` 送 null 是清掉（退回依 uid 的預設色），不是「不要改」。
+ * ⚠️ 軌跡顏色曾經也在這一支（那時候每個人自己挑自己的）。2026-09-04
+ *    顏色與頭像朝向一起搬進站長後台，改由 `setUserTrackColor()` 統一負責。
+ *    **不要再把 track_color 加回來** —— 同一件事兩個實作遲早走鐘。
  */
 async function updateMe(
-  patch: { name?: string; track_color?: string | null },
+  patch: { name?: string },
   failMessage: string,
 ): Promise<{ success: boolean; user?: CurrentUser; message?: string }> {
   try {
@@ -683,9 +740,28 @@ export function updateMyName(name: string) {
   return updateMe({ name }, '改名失敗');
 }
 
-/** 挑自己在地圖上的軌跡顏色。只收 TRACK_PALETTE 裡的值，null 是退回預設色 */
-export function updateMyTrackColor(color: string | null) {
-  return updateMe({ track_color: color }, '換色失敗');
+/**
+ * 挑某個人在地圖上的軌跡顏色。只收 TRACK_PALETTE 裡的值，null 是退回預設色。
+ *
+ * ⚠️ 刻意**不走** `PUT /api/admin/users/:id` —— 那一支有兩道閂（站長那一列動不得、
+ * 自己那一列動不得），而站長本來就該改得動自己與別人的顏色。所以另開一支
+ * `PUT /api/users/:id/track-color`，閘是「站長，或本人」。
+ */
+export async function setUserTrackColor(
+  userId: number, color: string | null,
+): Promise<{ success: boolean; track_color?: string; message?: string }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/users/${userId}/track-color`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ track_color: color }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) return { success: true, track_color: data.track_color };
+    return { success: false, message: data.error || '換色失敗' };
+  } catch (error: any) {
+    return { success: false, message: `連線錯誤: ${error.message}` };
+  }
 }
 
 /* ── 頭像 ──────────────────────────────────────────────────────────────────
@@ -1630,18 +1706,33 @@ export async function fetchMentionableUsers(): Promise<MentionableUser[]> {
 
 /* ── 通知 ────────────────────────────────────────────────────────────────── */
 
+/**
+ * 通知清單裡的一則。**兩種混在同一份清單裡**（照 created_at 排），
+ * 用 `kind` 分辨：留言（`comment`）與有人上傳了新照片／影片（`upload`）。
+ *
+ * ⚠️ React 的 key 要用 **`kind` ＋ `id`** 組出來 —— 兩種的 id 各自從 1 開始，
+ * 只用 id 會撞在一起。
+ */
 export interface NotificationItem {
+  kind: 'comment' | 'upload';
+  /** 該類別自己的主鍵（留言是 comment_id、上傳是 UploadEvent.id） */
+  id: number;
+  /** 留言才有意義，上傳是 0 */
   comment_id: number;
-  /** 'mention' | 'reply' | 'photo' | 'album'。一則留言對同一個人只會有一個理由 */
+  /** 'mention' | 'reply' | 'photo' | 'album' | 'upload'。一則留言對同一個人只會有一個理由 */
   reason: string;
   created_at: string;
   unread: boolean;
-  photo_id: number;
+  /** ⚠️ 上傳那種是 null（它指的是一整批，不是某一張） */
+  photo_id: number | null;
   album_id: number | null;
   album_name: string | null;
   photo_title: string | null;
   thumb: string | null;
   body: string;
+  /** 上傳那種：這一批有幾張照片、幾支影片。留言一律是 0 */
+  photos: number;
+  videos: number;
   actor_id: number;
   actor_name: string | null;
   color: string;

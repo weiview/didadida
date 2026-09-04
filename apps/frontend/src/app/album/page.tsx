@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, Suspense, useMemo, useCallback } from "rea
 import styles from "./album.module.css";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, setPhotosRestricted, applyRestrictedPatch, hasMotion, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, setPhotosRestricted, applyRestrictedPatch, hasMotion, announceUpload, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
 import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive, pushVideoToDrive } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
@@ -243,6 +243,11 @@ function AlbumContent() {
   const driveRef = useRef<{ folderId: string; token: string } | null>(null);
   /** 重複那幾張補傳成功的，等整個佇列走完再一起丟給補地點的視窗 */
   const dupUploadedRef = useRef<UploadedPhoto[]>([]);
+  /**
+   * 上面那一串裡有幾支是影片。全站通知那則要分開講「幾張照片、幾支影片」，
+   * 而 `UploadedPhoto` 只有 id／lat／lng，分不出來（同 IngestResult 的計數）。
+   */
+  const dupUploadedVideosRef = useRef(0);
 
   // 批次刪除 State
   const [selectedPhotos, setSelectedPhotos] = useState<number[]>([]);
@@ -1040,8 +1045,22 @@ function AlbumContent() {
     }
 
     const uploaded = dupUploadedRef.current;
+    const videos = dupUploadedVideosRef.current;
     dupUploadedRef.current = [];
+    dupUploadedVideosRef.current = 0;
     if (uploaded.length === 0) return;
+
+    /*
+     * 全站通知。這條路（重複視窗按「兩張都留」／「取代」）跟一般上傳一樣是
+     * **真的多出照片**，所以同樣要通知；理由與注意事項見 finishIngest 那邊。
+     * ⚠️ 「取代」是先傳新的再刪掉舊的 —— 那也是一張新照片，照樣算。
+     */
+    void announceUpload({
+      albumId: id ? Number(id) : null,
+      photos: uploaded.length - videos,
+      videos,
+    });
+
     await loadData();
     if (uploaded.some((p) => p.lat === null || p.lng === null)) {
       setPostUploadIds(uploaded.map((p) => p.id));
@@ -1099,6 +1118,7 @@ function AlbumContent() {
           return;
         }
         dupUploadedRef.current.push(result.photo);
+        dupUploadedVideosRef.current++;
       } else {
         dupUploadedRef.current.push(result.photo);
         // Drive 沿用整批那次的授權；沒有就記進待補清單，跟一般上傳一樣
@@ -1187,6 +1207,17 @@ function AlbumContent() {
      * 出現在相簿裡），不講的話使用者只會覺得「我重傳了，什麼事都沒發生」。
      */
     backfilled: string[];
+    /**
+     * 這一趟**真的多出來**幾張照片／幾支影片。全站通知那則要講的就是這句話
+     * （「XXX 傳了 12 張照片、2 支影片」）。
+     *
+     * ⚠️ 為什麼不從 `uploaded` 數：那是一串 `UploadedPhoto`（只有 id／lat／lng），
+     *    看不出哪一筆是影片。為此把 api.ts 那個型別撐大只是為了數數，不划算。
+     * ⚠️ **補備份的那幾個（`backfilled`）不算** —— 站上一格新的都沒多出來，
+     *    通知別人「有新東西」是句假話。重複視窗跳過的那幾張同理。
+     */
+    newPhotos: number;
+    newVideos: number;
     reauth: GoogleReauthError | null;
   };
 
@@ -1220,6 +1251,9 @@ function AlbumContent() {
     const dupes: PendingDuplicate[] = [];
     const failures: string[] = [];
     const backfilled: string[] = [];
+    // 全站通知要講「幾張照片、幾支影片」，而 uploaded 裡分不出來（見 IngestResult）
+    let newPhotos = 0;
+    let newVideos = 0;
     let reauth: GoogleReauthError | null = null;
 
     /*
@@ -1319,6 +1353,8 @@ function AlbumContent() {
               await pushVideoToDrive(drive, result.photo.id, rawFile,
                 (sent, size) => onProgress(i + 1, total, source.name, { sent, total: size }));
               uploaded.push(result.photo);
+              // ⚠️ 數在這裡不是上一行：影片沒送上 Drive 是要回滾整列的（見下面的 catch）
+              newVideos++;
             } catch (err) {
               console.error(`影片 ${rawFile.name} 沒送上 Drive，收掉剛建的那一列`, err);
               // 回滾失敗要另外講：那一格還在相簿裡，而且點開只有靜止畫面
@@ -1374,6 +1410,7 @@ function AlbumContent() {
         );
         if (result.status === 'ok') {
           uploaded.push(result.photo);
+          newPhotos++;
           /*
            * 4K 與原始檔送 Drive。失敗**只是少一份備份**，照片本身已經在 R2 了。
            *
@@ -1464,7 +1501,7 @@ function AlbumContent() {
     // 累加而不是覆蓋：連傳兩批都沒接上 Drive 時，第一批不該被第二批洗掉
     if (missedDrive.length > 0) setPendingDriveBatch((prev) => [...prev, ...missedDrive]);
 
-    return { uploaded, dupes, failures, backfilled, reauth };
+    return { uploaded, dupes, failures, backfilled, newPhotos, newVideos, reauth };
   };
 
   /** 匯入收尾。視窗順序是固定的：重複清單疊在補地點上面，先決定要不要傳 */
@@ -1497,6 +1534,22 @@ function AlbumContent() {
       }
       if (blocks.length > 0) alert(blocks.join('\n\n'));
     }
+
+    /*
+     * 全站通知「有人傳了新東西」（2026-09-04 加的）。
+     *
+     * ⚠️ **一批只發一則**，不是一張一則 —— 傳三百張的話別人會被三百則蓋滿，
+     *    而他們想知道的本來就只有「多了新東西，去看看」。
+     * ⚠️ `void` 不 await：通知掛掉不該讓使用者卡在上傳的收尾上（announceUpload
+     *    自己也把錯誤吞掉了）。它是加分項，照片早就進去了。
+     * ⚠️ 零張時 announceUpload 自己會直接 return —— 全部都是重複／失敗的那一趟
+     *    不該通知任何人。
+     */
+    void announceUpload({
+      albumId: id ? Number(id) : null,
+      photos: result.newPhotos,
+      videos: result.newVideos,
+    });
 
     await loadData(); // 重新整理照片。要 await，補件視窗才拿得到縮圖
 

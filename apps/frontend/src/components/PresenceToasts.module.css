@@ -1,5 +1,5 @@
 /*
- * 「XXX 上線囉」的提示條。
+ * 左下角那幾則提示條（「XXX 上線囉」與「XXX 傳了 n 張照片」）。
  *
  * 位置刻意選左下角：右上角是帳號牌、右下角是回到頂端鈕，塞在那兩處會蓋掉
  * 使用者正在按的東西。左下角在每一頁都是空的。
@@ -31,12 +31,22 @@
   animation: slideIn 220ms ease-out;
 }
 
-/* 綠燈，跟頭像右下角那顆同一個顏色 */
+/* 綠燈，跟頭像右下角那顆同一個顏色。⚠️ 只有「上線囉」那一則用得到它 */
 .dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #22c55e;
+  flex-shrink: 0;
+}
+
+/*
+ * 上傳那一則的圖示。跟綠燈占的位置一樣寬，兩種提示疊在一起時左邊那一欄才對得齊。
+ * emoji 不吃 flex-shrink 的預設值（會被文字擠扁），所以明寫。
+ */
+.icon {
+  font-size: 14px;
+  line-height: 1;
   flex-shrink: 0;
 }
 

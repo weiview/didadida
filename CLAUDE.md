@@ -266,13 +266,14 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0023）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0026）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
 現有表：`User`／`Album`／`Photo`／`PhotoFts`(FTS5, bigram)／`Tag`／`PhotoTag`／`Favorite`／
 `TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`／`Comment`／`CommentNotify`／
-`Place`（打卡地點簿，0023，見「指定地點」）。
+`Place`（打卡地點簿，0023，見「指定地點」）／`UploadEvent`（有人上傳的全站通知，0026，
+見「有人上傳了：全站通知」）。
 **沒有多餘的表**—— `ShareLink`（從沒實作的分享連結）與 `TrackSegment`（拿掉的逐段交通工具）
 已由 0012 刪除，`database/schema.sql` 裡那兩塊 `CREATE TABLE` 也一併移除了。
 
@@ -314,9 +315,11 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - `LOCAL_TIME_EXPR` = `COALESCE(p.taken_at_local, …)`，用到它的 SQL **必須把 Photo 別名為 `p`**。
 - `geo_source` 權威由高而低：`manual` > `exif` > `track` > `timeline` > `segment` > `interpolated`。
 - `TrackDay.day_key` 是**不透明字串**（多身分之後還帶使用者前綴），**不要拿去解析日期**。
-- `Comment`／`CommentNotify` 見「留言」一節；`Place` 見「指定地點」一節。
+- `Comment`／`CommentNotify` 見「留言」一節；`Place` 見「指定地點」一節；
+  `UploadEvent` 見「有人上傳了：全站通知」一節。
 - **DROP TABLE 要由子表往父表**：`CommentNotify→Comment→Favorite→PhotoTag→TripSegment→
-  Photo→Album→TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→User`（`Place` 沒有外鍵，
+  UploadEvent→Photo→Album→TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→User`
+  （`UploadEvent` 指著 `User` 與 `Album`，要排在那兩張前面；`Place` 沒有外鍵，
   排哪裡都行）。開著外鍵時照字母序刪
   會 FK failed，而且是**跑到一半才炸**（`d1 execute --file` 是單一交易，會整包回滾）。
 
@@ -376,9 +379,12 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 誰在線上：綠燈與「XXX 上線囉」
 
-2026-08-28 加的。一支端點 `GET /api/presence` **同時做兩件事**：把我自己的
-`last_seen_at` 推到現在（心跳），並回全站成員的 `last_seen_at`。分成兩支等於
-每分鐘兩次請求，而它們本來就是同一個節奏。
+2026-08-28 加的。一支端點 `GET /api/presence` **同時做三件事**：把我自己的
+`last_seen_at` 推到現在（心跳）、回全站成員的 `last_seen_at`，以及**順手多回
+一列最新的 `UploadEvent`**（2026-09-04 加，見「有人上傳了：全站通知」）。
+分成兩支等於每分鐘兩次請求，而它們本來就是同一個節奏。
+⚠️ 那一列是**跟 roster 同一趟 `env.DB.batch`** 撈的 —— 一次往返、`LIMIT 1` 倒著
+讀主鍵，所以「全站上傳通知」這個功能的送達成本是**零次額外請求**。
 
 - **`User.last_seen_at`（0022）跟 `last_login_at` 是兩件事，兩欄都留著。**
   `last_login_at` 只有真的重新認證那一次才寫，而進站 token 有效期 **7 天** ——
@@ -434,6 +440,69 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   是**選填的**，邊快取裡還躺著舊回應時退回「名字首字 ＋ 預設色」。
 - 「XXX 上線囉」一則留 **10 秒**（`TOAST_MS`）。本來 4 秒，使用者反映來不及看 ——
   提示在左下角，而人多半正在看照片。整疊本來就不吃點擊，賴久一點擋不到東西。
+- ⚠️ 左下角那疊現在有**兩種**提示（`PresenceToast` 是個 discriminated union，
+  `kind` 分 `online`／`upload`），共用同一份輪詢、同一個計時器、同一套「不吵人」規則。
+  上傳那一則**不可以沿用那顆綠燈** —— 綠色在這個站只講一件事（這個人現在在線上），
+  拿它當上傳的圖示會讓兩則看起來是同一種；換成相機圖示（`.icon`），寬度跟綠燈對齊
+  好讓兩種疊在一起時左欄還是齊的。
+
+## 有人上傳了：全站通知
+
+2026-09-04 加的（使用者：「當有任何人上傳照片或影片時 要全站通知 有新增 照片或影片」）。
+使用者拍板要**兩種都做**：左下角當場跳一則（在線上的人看得到），以及帳號牌那份
+**留得下來的清單**（沒開著網站的人回來補看）。**只有成員**收得到。
+
+- **表是 `UploadEvent`（0026），一批一列，而且刻意不 fan-out。**
+  一次上傳動輒幾百張 —— 逐張寫就是幾百列 D1 寫入；而這則通知對每個成員長得
+  一模一樣，`CommentNotify` 那套 `(comment_id, user_id)` 逐人列在這裡沒有意義
+  （「誰讀過了」照舊靠 `User.notif_seen_at` 一個時間戳比 `created_at`）。
+  五個人 × 一批 ＝ 還是一列，一年幾百列，**不需要定期清理**。
+- **寫入只有一支 `POST /api/uploads/announce`**（成員限定）。
+  ⚠️ 它**不驗證上傳真的發生過** —— 上傳是「前端一張一張打 `/api/upload`」，
+  後端這一頭根本不知道一批到哪裡結束。最壞是有人自己打 API 讓家裡跳一則假提示，
+  為了防到那個程度得把整條上傳流程改成有交易邊界的，不划算。
+  ⚠️ INSERT 失敗（相簿在這中間被刪掉之類的 FK 錯）**只回 `success:false`，絕不往外丟**
+  —— 通知掉一則無所謂，把剛剛傳完的那批講成失敗就糟了。
+- **前端在「一批收工」時打一次**，兩個呼叫端（`app/album/page.tsx`）：
+  `finishIngest()`（一般上傳）與 `finishDuplicateQueue()`（重複視窗那條背景佇列）。
+  ⚠️ `void` 不 await：通知掛掉不該讓人卡在上傳的收尾上（`announceUpload` 自己也
+  把錯誤吞掉了）。
+  ⚠️ **張數要另外數，不能從 `result.uploaded` 數** —— `UploadedPhoto` 只有
+  `id`／`lat`／`lng`，分不出哪一筆是影片。所以 `IngestResult` 多兩個計數
+  `newPhotos`／`newVideos`（在兩個成功點各 `++`），重複佇列那條多一個
+  `dupUploadedVideosRef`。
+  ⚠️ **影片要數在 `pushVideoToDrive` 成功之後** —— Drive 失敗是要 `deletePhoto()`
+  回滾整列的，數早了就會通知一張已經不存在的照片。
+  ⚠️ **補備份的那幾個（`backfilled`）不算**，重複視窗跳過的也不算：站上一格新的
+  都沒多出來，通知別人「有新東西」是句假話。零張時 `announceUpload` 自己直接 return。
+- **提示那一半搭 `GET /api/presence` 的順風車，零次額外請求**（見「誰在線上」）。
+  `PresenceSnapshot` 只多存一個 **`uploadId`**（最新那列的 id），**刻意不存內容** ——
+  要顯示什麼在跳的當下就交給提示了，留在快照裡只會讓每個 `usePresence()` 的元件
+  （那條橫幅、每一顆頭像上的燈）跟著多重畫一次。
+  跳的規則跟「XXX 上線囉」**同一套**：① `prev.ready` 為 false 不跳
+  （⚠️ 不擋的話站上最後一批上傳**不管多久以前**都會在每個人開站的當下跳出來，
+  因為 EMPTY 的 `uploadId` 是 0）；② 自己傳的不跳；③ id **變大**才跳
+  （同一批不會因為每分鐘問一次就跳第二遍）。
+  ⚠️ 名字用後端算好的 `actor_name`，不去 `people` 裡撈 —— 傳東西的人可能已經被停權
+  （那份名單就沒有他了），而事情確實發生過。
+  ⚠️ 那一則**不吃點擊**（整疊 `pointer-events: none`），所以它只帶相簿**名字沒有 id**；
+  想點進去看的路在帳號牌那份清單上。
+- **清單那一半併進既有的 `GET /api/notifications`**，不另外開一支。回應的 `items`
+  現在是兩種混在一起（`kind: 'comment' | 'upload'`），照 `created_at` 字串比排序
+  （兩張表都是 D1 的 `'YYYY-MM-DD HH:MM:SS'` UTC，格式一樣所以字串比就是時間比）
+  再 `slice(0, 30)`。前端的 React key 要 **`${kind}-${id}`** —— 兩張表的 id 各自從 1 開始。
+  上傳那一則 `photo_id` 是 null（一整批沒有「哪一張」可以點），所以連結指的是相簿，
+  `album_id` 也是 null 時整則**不做成連結**。
+  ⚠️ 上傳那一句**不看 `can_view_comments`** —— 那一欄管的是留言，「家裡多了新照片」
+  跟它無關。
+  ⚠️ 兩句都帶 `WHERE (e.)user_id != ?`：自己傳的不通知自己（同留言的 fan-out）。
+- ⚠️⚠️ **未讀數（`/api/auth/me` 的 `unread_notifications`）要跟清單同一套條件**，
+  不然紅點會停在一個點進去什麼都沒有的數字上（同 drive-pending 的清單與 COUNT）。
+  現在是**兩個純量子查詢併在同一句** `SELECT a + b AS n`：留言那半看
+  `can_view_comments`（看不到的人整段不加），上傳那半一律加。
+  分兩句就是每個人每次進站多一趟往返。
+- ⚠️ 訪客整個不參與：他沒有 `User` 那一列（同留言、同 presence），
+  `/api/notifications` 對他是 401，presence 對他零 D1 動作。
 
 ## 手勢：捏合改欄數、燈箱裡放大照片
 
@@ -875,9 +944,29 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   `mirrorSource()`，image id 尾巴加 `':m'`。一個人最多兩張，貼圖快取扛得住。
   ⚠️ GIF 頭像每一格都要照樣鏡射（`bakeHead` 那一層本來就每格都跑，改在它裡面就自動涵蓋）。
 - 改的地方是 **`AvatarPicker` 的兩顆選填 prop**（`facing`／`onFacingChange`），
-  不是另做一套 UI —— 三個呼叫端（`/admin` 的白名單、`/admin` 的寶寶、帳號牌上的自己）
-  因此一起有了。⚠️ **`onFacingChange` 沒給就整組不端出來**：帳號牌那邊看
-  `canViewMap`，看不到地圖的人沒有那台車，多一組設定只是雜訊。
+  不是另做一套 UI —— 呼叫端（`/admin` 的白名單、`/admin` 的寶寶）因此一起有了。
+  ⚠️ **`onFacingChange` 沒給就整組不端出來**。
+- ⚠️⚠️ **朝向與軌跡顏色 2026-09-04 從帳號牌整批搬進 `/admin`**（使用者要求
+  「站長 頭像朝向的按鈕移動到 後台設定 跟 足跡地圖:車上座位放一起」，並拍板
+  **兩格都從帳號牌搬走**）。現在：
+  - 「足跡地圖：車上的座位」那一格（`AdminSection id="car"`）現在端出**這台車上
+    那三顆頭**的頭像＋朝向：駕駛座（站長，固定）、**副駕駛（`AppSetting.seat_passenger_uid`
+    指到的媽咪）**、後座的寶寶。座位與朝向本來就是同一件事（誰坐哪、臉朝哪），
+    分在兩頁等於要對照著調。⚠️ 副駕駛那一格**刻意排除站長** —— 上面那個 select
+    端的是所有成員，站長被選進去的話這裡會出現兩顆一模一樣的頭像（連 key 都會撞）。
+  - **其他人的頭像／朝向／顏色在白名單那一格**，每一列的「▸ 頭像與顏色」底下
+    （`AvatarPicker` ＋ `TrackColorPicker`）。兩處是同一個元件、同一支路由，
+    改哪邊都一樣 —— 車上那一格只是把最常調的那兩顆挪到座位旁邊。
+  - **帳號牌只剩換頭像。** 一般成員因此改不了自己的顏色與朝向，要改請站長 ——
+    這是使用者明確接受的取捨（他要的是一個地方調完整台車）。
+  - 顏色的寫入改走 **`PUT /api/users/:id/track-color`**（自己，或 `canManageOthers`），
+    ⚠️ **不要再把 `track_color` 加回 `PUT /api/me`** —— 那一支現在**只剩顯示名稱**，
+    同一件事兩個實作遲早走鐘。⚠️ 也**不可以搭 `PUT /api/admin/users/:id`**：
+    那支有「站長那一列動不得、自己那一列也動不得」兩道刻意的閂，而顏色正是站長
+    最需要改的兩列（他自己的、另一個站長的）—— 閂是為了權限，顏色不是權限。
+  - 色票列本身抽成 `components/TrackColorPicker.tsx`（`/admin` 的白名單與座位那格
+    共用），`useAdmin()` 那支改名 `setMyTrackColor()` 且**只改本地 context**
+    （真正的寫入由呼叫端那支路由負責）。
 - 路由兩支：`PUT /api/users/:id/avatar/facing`（本人或 `canManageOthers`）與
   `PUT /api/admin/baby-avatar/facing`（`canManageOthers`）。值跟著
   `/api/auth/me`（`user.avatar_facing`／`baby_avatar_facing`）、

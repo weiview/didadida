@@ -3,7 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
   AuthState, CONVOY_PCT_DEFAULT, CurrentUser, checkAuth, consumeAuthHash, googleLoginUrl,
-  logout as clearTokens, markNotificationsSeen, updateMyName, updateMyTrackColor,
+  logout as clearTokens, markNotificationsSeen, updateMyName,
   verifyGuest, verifyLogin,
 } from './api';
 import { resetPresence } from './presence';
@@ -111,10 +111,13 @@ interface AuthValue {
   /** 改自己的顯示名稱，成功會同步更新這裡的 user */
   renameSelf: (name: string) => Promise<{ success: boolean; message?: string }>;
   /**
-   * 挑自己在地圖上的軌跡顏色（只收 TRACK_PALETTE 裡的值）。
-   * 顏色是**每個人自己的**，所以在帳號牌上改，不在站長後台。
+   * 站長在 /admin 改完**自己那一列**的軌跡顏色之後，就地把手上這份改掉。
+   *
+   * ⚠️ 這是純粹的本地 setter，不打任何 API —— 真的寫入由
+   * `setUserTrackColor()` 負責（2026-09-04 顏色從帳號牌搬進後台，
+   * 改任何人都是同一支路由）。同 setMyAvatarFacing 那一套。
    */
-  recolorSelf: (color: string) => Promise<{ success: boolean; message?: string }>;
+  setMyTrackColor: (color: string) => void;
   /**
    * 換完自己的頭像之後同步這裡的 user。上傳本身由 <AvatarPicker> 打
    * （那個元件也給站長代設別人用），這裡只負責讓右上角那顆圓鈕立刻換圖。
@@ -218,12 +221,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return { success: result.success, message: result.message };
   }, []);
 
-  const recolorSelf = useCallback(async (color: string) => {
-    const result = await updateMyTrackColor(color);
-    if (result.success && result.user) {
-      setState((prev) => ({ ...prev, user: result.user! }));
-    }
-    return { success: result.success, message: result.message };
+  const setMyTrackColor = useCallback((color: string) => {
+    setState((prev) => (prev.user ? { ...prev, user: { ...prev.user, track_color: color } } : prev));
   }, []);
 
   const setMyAvatar = useCallback((avatar: string | null) => {
@@ -319,14 +318,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loginWithGoogle,
     authError,
     renameSelf,
-    recolorSelf,
+    setMyTrackColor,
     setMyAvatar,
     setBabyAvatar,
     setBabyAvatarFacing,
     setMyAvatarFacing,
     logout,
   }), [state, checking, canManageOthers, canEdit, canAddTo, canReorderIn, unlock, login, loginWithGoogle,
-       authError, renameSelf, recolorSelf, setMyAvatar, setBabyAvatar, setBabyAvatarFacing,
+       authError, renameSelf, setMyTrackColor, setMyAvatar, setBabyAvatar, setBabyAvatarFacing,
        setMyAvatarFacing, logout, markNotificationsRead]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

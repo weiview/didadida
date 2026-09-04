@@ -1,11 +1,14 @@
 'use client';
 
 /**
- * 「XXX 上線囉」，以及**全站唯一開輪詢的地方**。
+ * 左下角那幾則提示（「XXX 上線囉」與「XXX 傳了 n 張照片」），
+ * 以及**全站唯一開輪詢的地方**。
  *
  * 兩件事綁在同一個元件上是刻意的：輪詢只能有一份，而這個元件掛在 layout.tsx，
  * 每一頁都在。頭像上那些燈只是 usePresence() 看同一份快照，不會各自開計時器。
  *
+ * ⚠️ 上傳那一則**搭的是同一趟輪詢**（見 lib/presence.ts）—— 這個功能沒有
+ *    自己的請求，也沒有自己的計時器。
  * ⚠️ **訪客整個不掛**（`user` 是 null）—— 他沒有 User 那一列，後端也只會回空清單，
  *    開計時器等於每分鐘白打一次請求。
  */
@@ -13,6 +16,7 @@
 import { useEffect, useState } from 'react';
 import { useAdmin } from '@/lib/useAdmin';
 import { PresenceToast, subscribePresenceToasts, usePresencePoll } from '@/lib/presence';
+import { uploadSummary } from '@/lib/uploadSummary';
 import styles from './PresenceToasts.module.css';
 
 /**
@@ -47,8 +51,18 @@ export default function PresenceToasts() {
     <div className={styles.stack} aria-live="polite">
       {toasts.map((t) => (
         <div key={t.key} className={styles.toast}>
-          <span className={styles.dot} />
-          <span><span className={styles.name}>{t.name}</span> 上線囉</span>
+          {/* ⚠️ 上傳那一則**不可以沿用那顆綠燈** —— 綠色在這個站只講一件事
+              （這個人現在在線上），拿它當上傳的圖示會讓兩則提示看起來是同一種。
+              換成相機圖示：一眼就分得出「有人來了」跟「多了新東西」。 */}
+          {t.kind === 'upload'
+            ? <span className={styles.icon} aria-hidden>📸</span>
+            : <span className={styles.dot} />}
+          <span>
+            <span className={styles.name}>{t.name}</span>
+            {t.kind === 'upload'
+              ? ` 傳了 ${uploadSummary(t.photos, t.videos)}${t.albumName ? `到「${t.albumName}」` : ''}`
+              : ' 上線囉'}
+          </span>
         </div>
       ))}
     </div>

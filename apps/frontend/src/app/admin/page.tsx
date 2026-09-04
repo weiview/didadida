@@ -21,6 +21,7 @@ import UsageCard from "./UsageCard";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import Avatar from "@/components/Avatar";
 import AvatarPicker from "@/components/AvatarPicker";
+import TrackColorPicker from "@/components/TrackColorPicker";
 
 /**
  * 站長後台：誰能用 Google 登入進來當管理員，以及他們各自能動到什麼。
@@ -46,7 +47,7 @@ const fmtUtc = (s: string) =>
 export default function AdminPage() {
   const {
     canManageOthers, checking, isAdmin, user: me,
-    setMyAvatar, setMyAvatarFacing, setBabyAvatar, setBabyAvatarFacing,
+    setMyAvatar, setMyAvatarFacing, setMyTrackColor, setBabyAvatar, setBabyAvatarFacing,
   } = useAdmin();
 
   /*
@@ -529,6 +530,12 @@ export default function AdminPage() {
           <strong>只要是合體的軌跡，後座就一定有寶寶</strong> ——
           他沒有帳號也沒有自己的軌跡，所以他的頭像存在這一格而不是白名單裡。
         </p>
+        <p className={styles.hint}>
+          每個座位底下那兩顆方向鈕是<strong>「這張頭像本來朝哪一邊」</strong>：
+          車頭會跟著行進方向左右翻面，頭像不會 —— 一張側臉朝左的頭像，
+          在往東走的那半段路上就變成坐在車上看車尾。選對了系統會自己決定
+          什麼時候要把它鏡射過來。正臉的頭像兩個值都對，不必管。
+        </p>
         <div className={styles.formRow}>
           <div className={styles.field}>
             <label htmlFor="seat-passenger">副駕駛</label>
@@ -546,6 +553,42 @@ export default function AdminPage() {
             </select>
           </div>
         </div>
+        {/*
+          駕駛座與副駕駛的頭像＋朝向。**2026-09-04 從帳號牌搬過來的**（使用者要求：
+          頭像朝向的按鈕跟車上座位放在一起，而且要調得動媽咪那一顆）。在那之前
+          方向鈕只長在每個人自己的帳號牌上，站長看著一張坐反的臉卻沒有地方改。
+
+          ⚠️ 這裡端的是**這台車上的兩個座位**，不是全部的人 —— 其他人的頭像在
+          底下白名單那一格，每一列自己有一顆。兩邊都是同一個 `AvatarPicker`、
+          同一支路由，改哪邊都一樣（同一件事不要做兩套 UI）。
+          ⚠️ 副駕駛那一格**刻意排除站長** —— 上面那個 select 端的是所有成員，
+          站長被選進去的話這裡會出現兩顆一模一樣的頭像（連 key 都會撞）。
+        */}
+        {[
+          { label: "駕駛座（站長，固定）", seat: users.find((u) => u.role === "owner") },
+          { label: "副駕駛", seat: users.find((u) => u.id === seatPassenger && u.role !== "owner") },
+        ].map(({ label, seat }) => (seat ? (
+          <div key={seat.id}>
+            <div className={styles.detailHead}>{label}</div>
+            <AvatarPicker
+              userId={seat.id}
+              current={seat.avatar}
+              name={seat.name || seat.email}
+              color={seat.track_color ?? "#8a7f72"}
+              size={64}
+              facing={seat.avatar_facing === 'right' ? 'right' : 'left'}
+              onChange={(avatar) => {
+                setUsers((prev) => prev.map((u) => (u.id === seat.id ? { ...u, avatar } : u)));
+                if (seat.id === me?.id) setMyAvatar(avatar);
+              }}
+              onFacingChange={(facing) => {
+                setUsers((prev) => prev.map((u) => (
+                  u.id === seat.id ? { ...u, avatar_facing: facing } : u)));
+                if (seat.id === me?.id) setMyAvatarFacing(facing);
+              }}
+            />
+          </div>
+        ) : null))}
         <div className={styles.detailHead}>後座的寶寶</div>
         <AvatarPicker
           userId="baby"
@@ -718,7 +761,7 @@ export default function AdminPage() {
                       className={styles.linkButton}
                       onClick={() => setOpenAvatar((v) => (v === user.id ? null : user.id))}
                     >
-                      {openAvatar === user.id ? "▾ 頭像" : "▸ 頭像"}
+                      {openAvatar === user.id ? "▾ 頭像與顏色" : "▸ 頭像與顏色"}
                     </button>
                   </div>
 
@@ -739,6 +782,28 @@ export default function AdminPage() {
                           setUsers((prev) => prev.map((u) => (
                             u.id === user.id ? { ...u, avatar_facing: facing } : u)));
                           if (user.id === me?.id) setMyAvatarFacing(facing);
+                        }}
+                      />
+                      {/*
+                        * 軌跡顏色。**2026-09-04 從帳號牌搬過來的**（使用者要求：
+                        * 顏色與頭像朝向都收進後台設定）—— 在那之前每個人在自己的
+                        * 帳號牌上挑，於是站長改不了別人的、也看不出誰跟誰撞色。
+                        * 現在入口只剩這裡一個，一般成員要換色請站長改。
+                        *
+                        * ⚠️ 走的是 `PUT /api/users/:id/track-color`，**不是**
+                        * `PUT /api/admin/users/:id` —— 後者有兩道閂（站長那一列
+                        * 動不得、自己那一列動不得），而顏色本來就該改得動這兩列。
+                        */}
+                      <div className={styles.detailHead}>地圖上的軌跡顏色</div>
+                      <TrackColorPicker
+                        userId={user.id}
+                        current={user.track_color}
+                        others={users}
+                        onChange={(hex) => {
+                          setUsers((prev) => prev.map((u) => (
+                            u.id === user.id ? { ...u, track_color: hex } : u)));
+                          // 站長在這裡換自己的，右上角那顆圓鈕與地圖也要跟著換
+                          if (user.id === me?.id) setMyTrackColor(hex);
                         }}
                       />
                     </div>

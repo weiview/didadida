@@ -3356,20 +3356,34 @@ if (method === "POST" && pathname === "/api/verify-password") {
          */
         const canViewComments = actor !== null ? actor.canViewComments : await guestCanViewComments(env);
         let unread = 0;
-        if (actor?.uid != null && actor.canViewComments) {
+        if (actor?.uid != null) {
           /*
-           * ⚠️ 未讀數要跟 /api/notifications 那支**用同一套條件**，不然紅點會停在
-           *    一個點進去什麼都沒有的數字上（跟 drive-pending 的清單與 COUNT 是
-           *    同一個道理）。
+           * ⚠️⚠️ 未讀數要跟 /api/notifications 那支**用同一套條件**，不然紅點會
+           *    停在一個點進去什麼都沒有的數字上（跟 drive-pending 的清單與 COUNT
+           *    是同一個道理）。那邊有兩種東西，這裡就要數兩種：
+           *      ① 留言（看 can_view_comments，看不到的人這一段整個不加）
+           *      ② 有人上傳照片／影片（UploadEvent，**不看 can_view_comments**，
+           *         自己傳的不算）
+           *
+           * 兩個 COUNT 併在**同一句**裡（各是一個純量子查詢）—— 分兩句就是
+           * 每個人每次進站多一趟往返。
            */
-          const unreadRestricted = canSeeRestricted(actor) ? "" : `
-               AND EXISTS (SELECT 1 FROM Comment c JOIN Photo p ON p.id = c.photo_id
-                            WHERE c.id = CommentNotify.comment_id AND p.restricted = 0)`;
-          const row = await env.DB.prepare(`
-            SELECT COUNT(*) AS n FROM CommentNotify
-             WHERE user_id = ?
-               AND created_at > COALESCE((SELECT notif_seen_at FROM User WHERE id = ?), '')${unreadRestricted}
-          `).bind(actor.uid, actor.uid).first<any>();
+          const seenExpr = "COALESCE((SELECT notif_seen_at FROM User WHERE id = ?), '')";
+          const parts: string[] = [];
+          const unreadBinds: any[] = [];
+          if (actor.canViewComments) {
+            const unreadRestricted = canSeeRestricted(actor) ? "" : `
+                   AND EXISTS (SELECT 1 FROM Comment c JOIN Photo p ON p.id = c.photo_id
+                                WHERE c.id = CommentNotify.comment_id AND p.restricted = 0)`;
+            parts.push(`(SELECT COUNT(*) FROM CommentNotify
+                          WHERE user_id = ? AND created_at > ${seenExpr}${unreadRestricted})`);
+            unreadBinds.push(actor.uid, actor.uid);
+          }
+          parts.push(`(SELECT COUNT(*) FROM UploadEvent
+                        WHERE user_id != ? AND created_at > ${seenExpr})`);
+          unreadBinds.push(actor.uid, actor.uid);
+          const row = await env.DB.prepare(`SELECT ${parts.join(" + ")} AS n`)
+            .bind(...unreadBinds).first<any>();
           unread = Number(row?.n ?? 0);
         }
         return new Response(JSON.stringify({
@@ -3430,14 +3444,13 @@ if (method === "POST" && pathname === "/api/verify-password") {
       }
 
       /*
-       * 路由：改自己的個人設定。就兩個欄位 ——
+       * 路由：改自己的個人設定。**只剩顯示名稱一個欄位** ——
        * 信箱是身分（改了等於換人），權限不能自己給自己加。
        *
-       *   name         顯示名稱
-       *   track_color  他的軌跡在地圖上的顏色。**每個人自己挑自己的**（使用者定調），
-       *                所以是這裡而不是站長後台。送 null 就是清掉，退回依 uid 的預設色。
-       *
-       * 兩個都是選填、各自獨立更新 —— 只送顏色不會把名字洗掉。
+       * ⚠️ 軌跡顏色曾經也在這裡（那時候「每個人自己挑自己的」）。2026-09-04
+       *    使用者要求把顏色與頭像朝向一起搬進站長後台，於是改由
+       *    `PUT /api/users/:id/track-color` 統一負責（站長改任何人、本人改自己）。
+       *    **不要再把 track_color 加回這一支** —— 同一件事兩個實作遲早走鐘。
        */
       if (method === "PUT" && pathname === "/api/me") {
         const actor = await currentActor(request, env);
@@ -3448,40 +3461,19 @@ if (method === "POST" && pathname === "/api/verify-password") {
           // 空資料庫的密碼登入，沒有列可以改
           return new Response(JSON.stringify({ error: "no_account" }), { status: 409, headers });
         }
-        const body = await request.json().catch(() => ({})) as { name?: string; track_color?: unknown };
+        const body = await request.json().catch(() => ({})) as { name?: string };
 
-        const sets: string[] = [];
-        const binds: any[] = [];
-
-        let name = actor.name;
-        if (body.name !== undefined) {
-          name = String(body.name ?? "").trim();
-          if (!name) {
-            return new Response(JSON.stringify({ error: "顯示名稱不能空白" }), { status: 400, headers });
-          }
-          if (name.length > 40) {
-            return new Response(JSON.stringify({ error: "顯示名稱最多 40 個字" }), { status: 400, headers });
-          }
-          sets.push("name = ?");
-          binds.push(name);
-        }
-
-        let trackColor = actor.trackColor;
-        if (body.track_color !== undefined) {
-          const color = normalizeTrackColor(body.track_color);
-          if (color === undefined) {
-            return new Response(JSON.stringify({ error: "不是調色盤裡的顏色" }), { status: 400, headers });
-          }
-          sets.push("track_color = ?");
-          binds.push(color);
-          trackColor = trackColorFor(actor.uid, color);
-        }
-
-        if (sets.length === 0) {
+        if (body.name === undefined) {
           return new Response(JSON.stringify({ error: "沒有要變更的內容" }), { status: 400, headers });
         }
-        await env.DB.prepare(`UPDATE User SET ${sets.join(", ")} WHERE id = ?`)
-          .bind(...binds, actor.uid).run();
+        const name = String(body.name ?? "").trim();
+        if (!name) {
+          return new Response(JSON.stringify({ error: "顯示名稱不能空白" }), { status: 400, headers });
+        }
+        if (name.length > 40) {
+          return new Response(JSON.stringify({ error: "顯示名稱最多 40 個字" }), { status: 400, headers });
+        }
+        await env.DB.prepare("UPDATE User SET name = ? WHERE id = ?").bind(name, actor.uid).run();
 
         return new Response(JSON.stringify({
           success: true,
@@ -3491,7 +3483,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
             can_manage_others: actor.canManageOthers ? 1 : 0,
             can_add_to_others: actor.canAddToOthers ? 1 : 0,
             can_reorder_others: actor.canReorderOthers ? 1 : 0,
-            track_color: trackColor,
+            track_color: actor.trackColor,
             avatar: avatarUrl(url.origin, actor.avatarKey),
           },
         }), { headers });
@@ -3544,11 +3536,34 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * 誰在線上。整張撈是刻意的 —— User 是幾十列的小表，而「離線的人也要
          * 畫一顆灰燈」本來就需要全部的人。停權的不列（他登不進來，永遠是灰的）。
          */
-        const { results: rows } = await env.DB.prepare(
+        /*
+         * ⚠️ 順便把「最新一批上傳」一起問回來（2026-09-04 加的）。
+         *
+         * 這是「有人上傳照片或影片就全站通知」那個功能的**送達管道** ——
+         * 刻意不另外開一支路由、也不另外開一個計時器：站上已經有一條 60 秒的
+         * 心跳在跑（就是這一支），而「家裡多了新東西」跟「誰上線了」是同一個
+         * 節奏的事。多這一段的代價是每人每分鐘多讀 1 列（UploadEvent 照 PK
+         * 倒著讀 LIMIT 1）＋ JOIN 到的兩列，五個人整天也才幾千列，
+         * 對每日 500 萬列的讀取額度是雜訊。
+         *
+         * ⚠️ 用 `batch` 跟名單那句一起送 —— 兩句分開就是兩趟往返。
+         * ⚠️ 這一段整個排在訪客那道分岔**後面**：訪客零 D1 動作那條規矩不變。
+         */
+        const [rosterRes, uploadRes] = await env.DB.batch<any>([
           // ⚠️ 多帶 track_color／avatar_key **不多花任何讀取額度**（D1 算的是讀了
           //    幾列不是幾欄），而「誰在線上」那條橫幅要拿它們畫頭像
-          "SELECT id, name, track_color, avatar_key, last_seen_at FROM User WHERE active = 1"
-        ).all<any>();
+          env.DB.prepare("SELECT id, name, track_color, avatar_key, last_seen_at FROM User WHERE active = 1"),
+          env.DB.prepare(
+            `SELECT e.id, e.user_id, e.album_id, e.photos, e.videos, e.created_at,
+                    u.name AS actor_name, al.name AS album_name
+               FROM UploadEvent e
+               JOIN User u ON u.id = e.user_id
+               LEFT JOIN Album al ON al.id = e.album_id
+              ORDER BY e.id DESC LIMIT 1`
+          ),
+        ]);
+        const rows: any[] = rosterRes?.results ?? [];
+        const up: any = uploadRes?.results?.[0] ?? null;
 
         return new Response(JSON.stringify({
           users: rows.map((r: any) => ({
@@ -3564,6 +3579,22 @@ if (method === "POST" && pathname === "/api/verify-password") {
           })),
           online_ms: PRESENCE_ONLINE_MS,
           self: actor.uid,
+          /*
+           * 最新一批上傳。前端拿它跟上一次的快照比 id：**變大**才跳提示，
+           * 所以第一次抓回來（手上沒有上一份）什麼都不會跳 —— 跟「XXX 上線囉」
+           * 那三條不吵人的規則完全同一套（見前端 lib/presence.ts）。
+           * 站上還沒有人傳過東西時是 null。
+           */
+          upload: up ? {
+            id: Number(up.id),
+            user_id: Number(up.user_id),
+            actor_name: String(up.actor_name ?? ""),
+            album_id: up.album_id == null ? null : Number(up.album_id),
+            album_name: up.album_name == null ? null : String(up.album_name),
+            photos: Number(up.photos ?? 0),
+            videos: Number(up.videos ?? 0),
+            created_at: up.created_at ? `${String(up.created_at).replace(" ", "T")}Z` : null,
+          } : null,
         }), { headers: presenceHeaders });
       }
 
@@ -3701,6 +3732,52 @@ if (method === "POST" && pathname === "/api/verify-password") {
           return new Response(JSON.stringify({ error: "找不到這個帳號" }), { status: 404, headers });
         }
         return new Response(JSON.stringify({ success: true, avatar_facing: facing }), { headers });
+      }
+
+      /*
+       * 路由：改某個人在地圖上的軌跡顏色。
+       *
+       * ⚠️ 2026-09-04 搬過來的。以前顏色掛在 `PUT /api/me`（每個人在帳號牌上
+       *    挑自己的），使用者要求把它跟頭像朝向一起收進站長後台，於是改成
+       *    **跟 /avatar/facing 完全同一道閘**：自己，或可管理全站內容的人。
+       *
+       * ⚠️ **不可以搭 `PUT /api/admin/users/:id` 那一支。** 那支有兩道刻意的閂
+       *    （站長那一列動不得、自己那一列也動不得，見「身分與權限」），而顏色
+       *    正是站長最需要改的兩列 —— 他自己的，跟另一個站長的。閂是為了權限，
+       *    顏色不是權限。
+       *
+       * 路徑切出來是 5 段，跟 /avatar（也是 5 段）靠最後一段區分，
+       * 所以這裡與那一支都要 endsWith 比對，不能只看長度。
+       */
+      if (method === "PUT" && pathname.startsWith("/api/users/")
+          && pathname.endsWith("/track-color") && pathname.split("/").length === 5) {
+        const targetId = Number(pathname.split("/")[3]);
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!Number.isInteger(targetId) || targetId <= 0) {
+          return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers });
+        }
+        if (!actor.canManageOthers && actor.uid !== targetId) {
+          return forbidden(headers, "只能改自己的顏色");
+        }
+        const body = await request.json().catch(() => ({})) as { track_color?: unknown };
+        // null／空字串＝清掉，退回依 uid 的預設色；不在調色盤裡的一律 400
+        // （靜靜存起來的話站長會以為色票壞了）
+        const color = normalizeTrackColor(body.track_color);
+        if (color === undefined) {
+          return new Response(JSON.stringify({ error: "不是調色盤裡的顏色" }), { status: 400, headers });
+        }
+        const res = await env.DB.prepare("UPDATE User SET track_color = ? WHERE id = ?")
+          .bind(color, targetId).run();
+        if (!res.meta.changes) {
+          return new Response(JSON.stringify({ error: "找不到這個帳號" }), { status: 404, headers });
+        }
+        // 回算好的那個值，理由同 Actor.trackColor：退讓規則只寫在後端一處
+        return new Response(JSON.stringify({
+          success: true, track_color: trackColorFor(targetId, color),
+        }), { headers });
       }
 
       /*
@@ -7325,60 +7402,119 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
 
       /* ── 通知 ──────────────────────────────────────────────────────────────
        *
+       * 清單裡有**兩種**東西，來源兩張表：
+       *   ① 留言（CommentNotify，逐人 fan-out，看 User.can_view_comments）
+       *   ② 有人上傳照片／影片（UploadEvent，0026，一批一列、不 fan-out）
+       *
+       * ⚠️ **上傳那種不看 can_view_comments。** 那一格管的是留言，而「家裡多了
+       *    新照片」跟留言無關 —— 所以不能沿用舊的那道 early return，
+       *    要改成「留言那一段跳過」。
+       *
        * 未讀**數**不在這裡，在 /api/auth/me（那一條每次進站都會打，紅點跟著它
-       * 回來就是零額外請求）。這一條是點開清單才打的。
+       * 回來就是零額外請求）。⚠️ 那邊的數字必須跟這裡**同一套條件**，
+       * 兩邊都改到，不然紅點會停在一個點進去什麼都沒有的數字上。
        */
       if (method === "GET" && pathname === "/api/notifications") {
         const actor = await currentActor(request, env);
         if (!actor || actor.uid == null) {
           return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
         }
-        if (!actor.canViewComments) {
-          return new Response(JSON.stringify({ items: [], seen_at: null }), { headers });
-        }
-        const me = await env.DB.prepare("SELECT notif_seen_at FROM User WHERE id = ?")
-          .bind(actor.uid).first<any>();
-        const seenAt: string | null = me?.notif_seen_at ?? null;
         /*
-         * 每一則通知都帶著縮圖、相簿名與留言內文 —— 照片被標成不開放之後，
+         * 每一則留言通知都帶著縮圖、相簿名與內文 —— 照片被標成不開放之後，
          * 那幾則就不該再出現在別人的清單上。查詢本來就 JOIN 了 Photo p，
          * 多這一段條件不多花任何一次讀取。
          */
         const notifRestricted = canSeeRestricted(actor) ? "" : " AND p.restricted = 0";
-        const { results } = await env.DB.prepare(`
-          SELECT n.comment_id, n.reason, n.created_at,
-                 c.photo_id, c.body, c.parent_id,
-                 au.id AS actor_id, au.name AS actor_name, au.track_color,
-                 p.album_id, p.title,
-                 COALESCE(p.thumb_sm_url, p.thumb_url, p.url) AS thumb,
-                 al.name AS album_name
-            FROM CommentNotify n
-            JOIN Comment c  ON c.id  = n.comment_id
-            JOIN User au    ON au.id = c.user_id
-            JOIN Photo p    ON p.id  = c.photo_id
-            LEFT JOIN Album al ON al.id = p.album_id
-           WHERE n.user_id = ?${notifRestricted}
-           ORDER BY n.created_at DESC, n.comment_id DESC
-           LIMIT 30
-        `).bind(actor.uid).all();
-        return new Response(JSON.stringify({
-          seen_at: seenAt,
-          items: (results as any[]).map((r) => ({
+        /*
+         * 三句一起送（batch ＝ 一趟往返）。⚠️ 順序就是下面取結果的順序，
+         * 留言那一句是選配的，所以它排最後。
+         */
+        const stmts: D1PreparedStatement[] = [
+          env.DB.prepare("SELECT notif_seen_at FROM User WHERE id = ?").bind(actor.uid),
+          // ⚠️ 自己傳的不算通知（同留言的 fan-out：自己留的言不會通知自己）
+          env.DB.prepare(`
+            SELECT e.id, e.user_id, e.album_id, e.photos, e.videos, e.created_at,
+                   u.name AS actor_name, u.track_color, al.name AS album_name
+              FROM UploadEvent e
+              JOIN User u ON u.id = e.user_id
+              LEFT JOIN Album al ON al.id = e.album_id
+             WHERE e.user_id != ?
+             ORDER BY e.created_at DESC, e.id DESC
+             LIMIT 30
+          `).bind(actor.uid),
+        ];
+        if (actor.canViewComments) {
+          stmts.push(env.DB.prepare(`
+            SELECT n.comment_id, n.reason, n.created_at,
+                   c.photo_id, c.body, c.parent_id,
+                   au.id AS actor_id, au.name AS actor_name, au.track_color,
+                   p.album_id, p.title,
+                   COALESCE(p.thumb_sm_url, p.thumb_url, p.url) AS thumb,
+                   al.name AS album_name
+              FROM CommentNotify n
+              JOIN Comment c  ON c.id  = n.comment_id
+              JOIN User au    ON au.id = c.user_id
+              JOIN Photo p    ON p.id  = c.photo_id
+              LEFT JOIN Album al ON al.id = p.album_id
+             WHERE n.user_id = ?${notifRestricted}
+             ORDER BY n.created_at DESC, n.comment_id DESC
+             LIMIT 30
+          `).bind(actor.uid));
+        }
+        const res = await env.DB.batch<any>(stmts);
+        const seenAt: string | null = res[0]?.results?.[0]?.notif_seen_at ?? null;
+        const uploadRows: any[] = res[1]?.results ?? [];
+        const commentRows: any[] = actor.canViewComments ? (res[2]?.results ?? []) : [];
+
+        const isUnread = (at: any) => seenAt == null || String(at) > seenAt;
+        const items = [
+          ...commentRows.map((r) => ({
+            kind: "comment" as const,
+            // id 是給前端當 React key 用的（跟 kind 合起來才唯一）
+            id: Number(r.comment_id),
             comment_id: Number(r.comment_id),
             reason: r.reason,
             created_at: r.created_at,
-            unread: seenAt == null || String(r.created_at) > seenAt,
+            unread: isUnread(r.created_at),
             photo_id: Number(r.photo_id),
             album_id: r.album_id == null ? null : Number(r.album_id),
             album_name: r.album_name ?? null,
             photo_title: r.title ?? null,
             thumb: r.thumb ?? null,
             body: r.body,
+            photos: 0,
+            videos: 0,
             actor_id: Number(r.actor_id),
             actor_name: r.actor_name,
             color: trackColorFor(Number(r.actor_id), r.track_color),
           })),
-        }), { headers });
+          ...uploadRows.map((r) => ({
+            kind: "upload" as const,
+            id: Number(r.id),
+            comment_id: 0,
+            reason: "upload",
+            created_at: r.created_at,
+            unread: isUnread(r.created_at),
+            // 上傳通知指的是一整批，沒有「哪一張」可以點 —— 點的是相簿
+            photo_id: null,
+            album_id: r.album_id == null ? null : Number(r.album_id),
+            album_name: r.album_name ?? null,
+            photo_title: null,
+            thumb: null,
+            body: "",
+            photos: Number(r.photos ?? 0),
+            videos: Number(r.videos ?? 0),
+            actor_id: Number(r.user_id),
+            actor_name: r.actor_name,
+            color: trackColorFor(Number(r.user_id), r.track_color),
+          })),
+        ]
+          // 兩張表的 created_at 都是 D1 的 'YYYY-MM-DD HH:MM:SS'（UTC），
+          // 格式一樣所以字串比就是時間比
+          .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+          .slice(0, 30);
+
+        return new Response(JSON.stringify({ seen_at: seenAt, items }), { headers });
       }
 
       /*
@@ -7394,6 +7530,55 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         }
         await env.DB.prepare("UPDATE User SET notif_seen_at = datetime('now') WHERE id = ?")
           .bind(actor.uid).run();
+        return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      /*
+       * 路由：宣告「我剛剛傳了一批照片／影片」。全站通知的**唯一寫入口**。
+       *
+       * ⚠️ **一批打一次，不是一張打一次。** 一次上傳動輒幾百張，逐張打就是
+       *    幾百次 Workers 請求 ＋ 幾百列 D1 寫入。前端在整批收工時（finishIngest
+       *    與背景重複佇列收工）各打一次，這裡就一列。
+       *
+       * ⚠️ **成員限定。** 訪客傳不了東西，也沒有 User 那一列可以掛。
+       *
+       * ⚠️ 這一支**不做任何驗證上傳真的發生過**的事 —— 它只是一則廣播，
+       *    最壞的情況是有人自己打 API 讓家裡跳一則假提示。要防到那個程度
+       *    得在上傳路徑上累計，而上傳是「前端一張一張打 /api/upload」，
+       *    後端這一頭根本不知道一批到哪裡結束。
+       */
+      if (method === "POST" && pathname === "/api/uploads/announce") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (actor.uid == null) {
+          return new Response(JSON.stringify({ error: "no_account" }), { status: 409, headers });
+        }
+        const body = await request.json().catch(() => ({})) as
+          { album_id?: unknown; photos?: unknown; videos?: unknown };
+        const clamp = (v: unknown) => {
+          const n = Math.floor(Number(v));
+          return Number.isFinite(n) && n > 0 ? Math.min(n, 100000) : 0;
+        };
+        const photos = clamp(body.photos);
+        const videos = clamp(body.videos);
+        // 一張都沒成功就不要吵人（前端整批失敗時也會走到這裡）
+        if (photos + videos <= 0) {
+          return new Response(JSON.stringify({ success: true, skipped: true }), { headers });
+        }
+        const albumId = Number(body.album_id);
+        const album = Number.isInteger(albumId) && albumId > 0 ? albumId : null;
+        try {
+          await env.DB.prepare(
+            "INSERT INTO UploadEvent (user_id, album_id, photos, videos) VALUES (?, ?, ?, ?)"
+          ).bind(actor.uid, album, photos, videos).run();
+        } catch (e) {
+          // 相簿在這中間被刪掉之類的（FK）。通知掉一則無所謂，
+          // **絕不能讓它把剛剛傳完的那批講成失敗**
+          console.error("upload announce failed", e);
+          return new Response(JSON.stringify({ success: false }), { headers });
+        }
         return new Response(JSON.stringify({ success: true }), { headers });
       }
 
