@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useAdmin } from "@/lib/useAdmin";
 import AvatarPicker from "./AvatarPicker";
+import Avatar from "./Avatar";
 import { fetchNotifications, type NotificationItem } from "@/lib/api";
 import { uploadSummary } from "@/lib/uploadSummary";
 
@@ -312,6 +313,15 @@ export default function AccountBadge() {
                     name={displayName}
                     color={myColor ?? "#8a7f72"}
                     size={56}
+                    /*
+                      ⚠️ 帳號牌那張卡是**站上每一頁都按得到的東西**，
+                      不是設定頁 —— 它要小。底下那段固定的說明（去背 PNG、
+                      GIF 上限、朝向怎麼算）留在 /admin 那一格講一次就好
+                      （2026-09-04 使用者：「下面更換頭像的下面說明文字全部移除」）。
+                      ⚠️ 挑完檔案才冒出來的那兩句（動圖不裁邊、沒偵測到透明背景）
+                      與錯誤訊息**不受這個開關影響**，那是針對剛剛那張圖的回饋。
+                    */
+                    notes={false}
                     onChange={setMyAvatar}
                   />
                 </div>
@@ -384,15 +394,22 @@ function NotificationRow({ item, onGo }: { item: NotificationItem; onGo: () => v
 
   const inner = (
     <>
+      {/*
+        左邊那一格：**留言那種放照片，上傳那種放人**。
+        留言是針對某一張照片的，縮圖才認得出是哪一張；上傳指的是一整批，
+        沒有「哪一張」可以放。
+        ⚠️⚠️ 以前上傳那種畫的是一塊**他的軌跡顏色**的方塊（2026-09-04 使用者：
+        「通知 出現紅色框框 這應該是顯示該角色的頭像?」）—— 那個顏色在這個站
+        只有一個意思（地圖上那條線是誰的），拿它當通知的圖示看起來就是一塊
+        沒來由的色塊。改成那個人的頭像，`Avatar` 沒頭像時自己會退回
+        「名字首字 ＋ 他的顏色」，於是同一顆元件兩種情況都對。
+      */}
       {item.thumb ? (
         // eslint-disable-next-line @next/next/no-img-element
         <img src={item.thumb} alt="" width={34} height={34}
              style={{ borderRadius: 6, objectFit: "cover", flexShrink: 0 }} />
       ) : (
-        <span style={{
-          width: 34, height: 34, borderRadius: 6, flexShrink: 0,
-          background: item.color, display: "inline-block",
-        }} />
+        <Avatar src={item.actor_avatar} name={item.actor_name} color={item.color} size={34} />
       )}
       <span style={{ minWidth: 0 }}>
         <span style={{ fontSize: 12, lineHeight: 1.5, display: "block" }}>

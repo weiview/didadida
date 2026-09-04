@@ -1735,6 +1735,13 @@ export interface NotificationItem {
   videos: number;
   actor_id: number;
   actor_name: string | null;
+  /**
+   * 做這件事的人自己的頭像（沒設就是 null）。
+   *
+   * ⚠️ 舊後端（或邊快取裡躺著的舊回應）沒有這一欄 —— 型別因此是選填的，
+   *    拿不到就退回「名字首字 ＋ 他的顏色」那顆（`components/Avatar.tsx` 自己會做）。
+   */
+  actor_avatar?: string | null;
   color: string;
 }
 

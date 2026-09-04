@@ -528,13 +528,29 @@ export default function AdminPage() {
           合體成同一台車的時候，<strong>站長固定坐駕駛座</strong>（那是規則，沒得選）。
           副駕駛在這裡指定，其他人依名單順序坐後座。
           <strong>只要是合體的軌跡，後座就一定有寶寶</strong> ——
-          他沒有帳號也沒有自己的軌跡，所以他的頭像存在這一格而不是白名單裡。
+          他沒有帳號也沒有自己的軌跡，所以他的頭像存在這一格而不是白名單裡，
+          沒傳就畫一隻小外星人。
+        </p>
+        {/*
+          ⚠️ 整格的說明**只講這一次**。以前是每顆 AvatarPicker 自己印一份，
+          於是同一段話在這一格裡連印三遍（駕駛、副駕、寶寶各一），三顆頭被
+          推得老遠 —— 現在三顆都傳 `notes={false}`，話收在這裡講完。
+        */}
+        <p className={styles.hint}>
+          每個座位底下是那個人的<strong>頭像、頭像朝向</strong>與
+          <strong>地圖上的軌跡顏色</strong>（寶寶沒有自己的軌跡，所以他只有頭像）。
+          頭像<strong>建議用去背的 PNG</strong>，在地圖上才是一顆大頭而不是一塊圓照片；
+          GIF 動圖會動。
         </p>
         <p className={styles.hint}>
-          每個座位底下那兩顆方向鈕是<strong>「這張頭像本來朝哪一邊」</strong>：
+          <strong>「頭像朝向」講的是這張圖裡的臉朝哪一邊</strong>：
           車頭會跟著行進方向左右翻面，頭像不會 —— 一張側臉朝左的頭像，
           在往東走的那半段路上就變成坐在車上看車尾。選對了系統會自己決定
           什麼時候要把它鏡射過來。正臉的頭像兩個值都對，不必管。
+          <br />
+          這一格只端<strong>車上這三顆頭</strong>。
+          其他人的頭像、朝向與顏色在底下<strong>「白名單」</strong>那一格，
+          每一列的「▸ 頭像與顏色」點開就是。
         </p>
         <div className={styles.formRow}>
           <div className={styles.field}>
@@ -576,6 +592,7 @@ export default function AdminPage() {
               name={seat.name || seat.email}
               color={seat.track_color ?? "#8a7f72"}
               size={64}
+              notes={false}
               facing={seat.avatar_facing === 'right' ? 'right' : 'left'}
               onChange={(avatar) => {
                 setUsers((prev) => prev.map((u) => (u.id === seat.id ? { ...u, avatar } : u)));
@@ -587,6 +604,22 @@ export default function AdminPage() {
                 if (seat.id === me?.id) setMyAvatarFacing(facing);
               }}
             />
+            {/*
+              軌跡顏色也在這裡（2026-09-04 使用者：「後台沒看到軌跡顏色? 你放哪?」）。
+              它本來只長在白名單那一列的「▸ 頭像與顏色」底下，藏得太深。
+              ⚠️ 同一個元件、同一支路由 —— 兩邊改哪個都一樣，不是兩套 UI。
+              ⚠️ 寶寶沒有這一排：他沒有帳號，也沒有自己的軌跡。
+            */}
+            <TrackColorPicker
+              userId={seat.id}
+              current={seat.track_color}
+              others={users}
+              onChange={(hex) => {
+                setUsers((prev) => prev.map((u) => (
+                  u.id === seat.id ? { ...u, track_color: hex } : u)));
+                if (seat.id === me?.id) setMyTrackColor(hex);
+              }}
+            />
           </div>
         ) : null))}
         <div className={styles.detailHead}>後座的寶寶</div>
@@ -596,10 +629,7 @@ export default function AdminPage() {
           name="寶寶"
           color="#f0a8b8"
           size={64}
-          hint={<>
-            合體的軌跡後座固定坐這一位。<strong>建議用去背的 PNG</strong>，
-            在地圖上才是一顆大頭而不是一塊圓照片。沒傳就畫一隻小外星人。
-          </>}
+          notes={false}
           onChange={(avatar) => {
             setBabyAvatarUrl(avatar);
             // 這一輪 session 裡走去 /map 就會用新的那張，不必重整

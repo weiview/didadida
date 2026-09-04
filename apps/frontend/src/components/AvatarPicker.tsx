@@ -21,7 +21,7 @@ import { removeAvatar, setAvatarFacing, uploadAvatar, type AvatarTarget } from "
  */
 export default function AvatarPicker({
   userId, current, name, color, onChange, size = 64, hint,
-  facing, onFacingChange,
+  facing, onFacingChange, notes = true,
 }: {
   /** 換誰的。`'baby'` 是後座那個寶寶（他沒有帳號，圖記在站台設定上） */
   userId: AvatarTarget;
@@ -40,6 +40,16 @@ export default function AvatarPicker({
   facing?: 'left' | 'right';
   /** 換好方向之後通知呼叫端（它自己更新畫面）。沒給就不端出方向鈕 */
   onFacingChange?: (facing: 'left' | 'right') => void;
+  /**
+   * 底下那段說明要不要印。
+   *
+   * ⚠️ 同一頁擺**好幾顆**這個元件時一律關掉（`/admin` 的車上三個座位就是）——
+   * 那段字是固定的，一顆一份等於同一句話連印三次，把三顆頭推得老遠。
+   * 關掉的時候那些話**必須由呼叫端在整格的開頭講一次**，不是省略掉。
+   * ⚠️ 只關這一段：挑完檔案才冒出來的那兩句（動圖不裁邊、沒偵測到透明背景）
+   * 是**針對剛剛那張圖**的回饋，不是重複的樣板字，照樣要印。
+   */
+  notes?: boolean;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
@@ -148,24 +158,26 @@ export default function AvatarPicker({
           style={{ display: "none" }}
           onChange={(e) => pick(e.target.files?.[0])}
         />
-        <p style={{ margin: 0, fontSize: 11, opacity: 0.6, lineHeight: 1.6 }}>
-          {/* 講清楚它會出現在哪裡 —— 使用者不會預期留言用的頭像跑到地圖上去 */}
-          {hint ?? (
-            <>
-              留言區和地圖上那台車坐的都是這張。<strong>建議用去背的 PNG</strong>，
-              在地圖上才是一顆大頭而不是一塊圓照片。
-            </>
-          )}
-          {" "}
-          <strong>GIF 動圖會動</strong>（原檔直送，上限 2MB）。
-          {facing && onFacingChange && (
-            <>
-              {" "}地圖上的車會跟著行進方向左右翻面，<strong>頭像不會</strong> ——
-              「頭像朝向」講的是<strong>這張圖裡的臉朝哪一邊</strong>，
-              設對了車往哪邊開臉就朝哪邊。正面照兩邊都可以。
-            </>
-          )}
-        </p>
+        {notes && (
+          <p style={{ margin: 0, fontSize: 11, opacity: 0.6, lineHeight: 1.6 }}>
+            {/* 講清楚它會出現在哪裡 —— 使用者不會預期留言用的頭像跑到地圖上去 */}
+            {hint ?? (
+              <>
+                留言區和地圖上那台車坐的都是這張。<strong>建議用去背的 PNG</strong>，
+                在地圖上才是一顆大頭而不是一塊圓照片。
+              </>
+            )}
+            {" "}
+            <strong>GIF 動圖會動</strong>（原檔直送，上限 2MB）。
+            {facing && onFacingChange && (
+              <>
+                {" "}地圖上的車會跟著行進方向左右翻面，<strong>頭像不會</strong> ——
+                「頭像朝向」講的是<strong>這張圖裡的臉朝哪一邊</strong>，
+                設對了車往哪邊開臉就朝哪邊。正面照兩邊都可以。
+              </>
+            )}
+          </p>
+        )}
         {animated && (
           <p style={{ margin: 0, fontSize: 11, color: "#8a6d3b", lineHeight: 1.6 }}>
             動圖是原檔上傳的，<strong>不會幫你裁邊也不會裁成圓形</strong> ——

@@ -7434,7 +7434,8 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           // ⚠️ 自己傳的不算通知（同留言的 fan-out：自己留的言不會通知自己）
           env.DB.prepare(`
             SELECT e.id, e.user_id, e.album_id, e.photos, e.videos, e.created_at,
-                   u.name AS actor_name, u.track_color, al.name AS album_name
+                   u.name AS actor_name, u.track_color, u.avatar_key,
+                   al.name AS album_name
               FROM UploadEvent e
               JOIN User u ON u.id = e.user_id
               LEFT JOIN Album al ON al.id = e.album_id
@@ -7448,6 +7449,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
             SELECT n.comment_id, n.reason, n.created_at,
                    c.photo_id, c.body, c.parent_id,
                    au.id AS actor_id, au.name AS actor_name, au.track_color,
+                   au.avatar_key,
                    p.album_id, p.title,
                    COALESCE(p.thumb_sm_url, p.thumb_url, p.url) AS thumb,
                    al.name AS album_name
@@ -7486,6 +7488,8 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
             videos: 0,
             actor_id: Number(r.actor_id),
             actor_name: r.actor_name,
+            // ⚠️ 多帶 avatar_key **不多花讀取額度**（D1 算的是讀了幾列不是幾欄）
+            actor_avatar: avatarUrl(url.origin, r.avatar_key),
             color: trackColorFor(Number(r.actor_id), r.track_color),
           })),
           ...uploadRows.map((r) => ({
@@ -7506,6 +7510,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
             videos: Number(r.videos ?? 0),
             actor_id: Number(r.user_id),
             actor_name: r.actor_name,
+            actor_avatar: avatarUrl(url.origin, r.avatar_key),
             color: trackColorFor(Number(r.user_id), r.track_color),
           })),
         ]
