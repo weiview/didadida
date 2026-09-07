@@ -74,10 +74,10 @@ export default function PostUploadReviewModal({
           maxHeight: '88vh', overflowY: 'auto', padding: 22, color: '#0f172a',
         }}
       >
-        <h3 style={{ margin: '0 0 4px', fontSize: 18 }}>剛上傳的照片</h3>
+        <h3 style={{ margin: '0 0 4px', fontSize: 18 }}>本次上傳的照片</h3>
         <p style={{ margin: '0 0 14px', fontSize: 13, color: '#64748b', lineHeight: 1.7 }}>
-          這批共 {photos.length} 張，其中 <strong>{missingGeoIds.length} 張沒有位置</strong>（已預先勾選）。
-          可以現在就一次補上地點或修正時間，之後也能隨時在相簿頁重選照片再改。
+          本批共 {photos.length} 張，其中 <strong>{missingGeoIds.length} 張沒有位置資訊</strong>（已預先勾選）。
+          可在此一次補上地點或修正時間，也可日後在相簿頁重新選取修改。
         </p>
 
         <div style={{
@@ -92,7 +92,7 @@ export default function PostUploadReviewModal({
               background: '#fff', cursor: 'pointer', fontSize: 13,
             }}
           >
-            {allSelected ? '全部取消' : '全選'}
+            {allSelected ? '取消全選' : '全選'}
           </button>
         </div>
 
@@ -147,7 +147,7 @@ export default function PostUploadReviewModal({
         </div>
 
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
-          <button onClick={onClose} style={actionBtn(true, false)}>稍後再說</button>
+          <button onClick={onClose} style={actionBtn(true, false)}>稍後處理</button>
           <button
             onClick={() => canAct && onFixTime(selected)}
             disabled={!canAct}

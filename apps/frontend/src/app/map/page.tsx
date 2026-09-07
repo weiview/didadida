@@ -1042,7 +1042,7 @@ export default function MapPage() {
     log.push(`匯入完成，共寫入 ${total} 個軌跡點。`
       // 貼路是那個 effect 依「畫面上選的日期」自動補的，所以只在有原文時提一句，
       // 不保證馬上發生 —— 傳的是三年前那一天就得先把日期切過去
-      + (ingested.length > 0 ? '把日期切到那幾天就會自動貼路。' : ''));
+      + (ingested.length > 0 ? '切換到該日期範圍後會自動貼路。' : ''));
     setSyncLog([...log]);
     setSyncing(false);
     loadTracks();
@@ -1090,7 +1090,7 @@ export default function MapPage() {
           + (existing.segments.length > 0
             ? `${existing.segments.length} 趟`
             // 空結果是「上次貼過了，貼不出東西」的紀錄，不是還沒貼
-            : existing.emptyReason === 'no_trips' ? '整天沒有移動' : '沒有走道路的趟')
+            : existing.emptyReason === 'no_trips' ? '當日無移動' : '無行經道路的行程')
           + '）');
         setMatchLog([...log]);
         continue;
@@ -1113,7 +1113,7 @@ export default function MapPage() {
           dayKey, builtAt: new Date().toISOString(), sourceMd5: md5 ?? undefined,
           emptyReason: 'no_trips', segments: [],
         });
-        log.push(`${dayKey}：${parsed.points.length} 點裡沒有一趟真正的移動，略過`);
+        log.push(`${dayKey}：${parsed.points.length} 點中無移動行程，略過`);
         setMatchLog([...log]);
         continue;
       }
@@ -1137,7 +1137,7 @@ export default function MapPage() {
         const costing = costingFor(vehicle);
         const label = `${dayKey} 第 ${i + 1} 趟`;
         if (!costing) {
-          log.push(`${label}：${vehicleLabel(vehicle)}不走道路，跳過`);
+          log.push(`${label}：${vehicleLabel(vehicle)}非道路交通方式，跳過`);
           setMatchLog([...log]);
           continue;
         }
@@ -1172,7 +1172,7 @@ export default function MapPage() {
       if (segments.length === 0 && failed > 0) {
         // 送出去的請求真的失敗了。⚠️ 這一天**不留紀錄**（R2 上維持沒有這個檔），
         // 下次才會被 unmatchedKeys 挑出來再試一次
-        log.push(`${dayKey}：${failed} 趟都貼路失敗，這一天先留著，之後會再試`);
+        log.push(`${dayKey}：${failed} 趟貼路失敗，保留此日，稍後重試`);
       } else if (segments.length === 0) {
         // 每一趟都是火車／飛機／船。這是檔案本身決定的，重跑一百次結果一樣 ——
         // 存一份空結果把它結案，不然每次進地圖都會再解析一次整天的點
@@ -1180,7 +1180,7 @@ export default function MapPage() {
           dayKey, builtAt: new Date().toISOString(), sourceMd5: md5 ?? undefined,
           emptyReason: 'no_match', segments: [],
         });
-        log.push(`${dayKey}：${trips.length} 趟都不走道路，沒有貼出任何一趟`);
+        log.push(`${dayKey}：${trips.length} 趟皆非道路交通方式，未產生貼路結果`);
       } else {
         const ok = await saveTrackMatched(dayKey, {
           dayKey, builtAt: new Date().toISOString(), sourceMd5: md5 ?? undefined, segments,
@@ -1497,10 +1497,10 @@ export default function MapPage() {
             }}
             title={
               !from || from !== to
-                ? '先選一個單獨的日子'
+                ? '請先選擇單一日期'
                 : jumpTimes.length === 0
-                  ? '這一天沒有 GPS 紀錄'
-                  : '角色會跳到這一刻的位置'
+                  ? '此日無 GPS 紀錄'
+                  : '跳至該時刻的位置'
             }
             style={{
               padding: '6px 10px', borderRadius: 7, border: '1px solid #cbd5e1',
@@ -1510,10 +1510,10 @@ export default function MapPage() {
           >
             <option value="">
               {!from || from !== to
-                ? '先選一個單獨的日子'
+                ? '請先選擇單一日期'
                 : jumpTimes.length === 0
-                  ? '這天沒有 GPS 紀錄'
-                  : '選一個時刻'}
+                  ? '此日無 GPS 紀錄'
+                  : '選擇時刻'}
             </option>
             {jumpTimes.map((o) => (
               <option key={o.t} value={o.t}>{o.label}</option>
@@ -1548,7 +1548,7 @@ export default function MapPage() {
             checked={showPhotos}
             onChange={(e) => setShowPhotos(e.target.checked)}
           />
-          <span title="地圖上的照片圓點、聚合數字與縮圖。關掉只是不畫，照片資料本身不受影響（縮圖也不會再去下載）。">
+          <span title="關閉後僅隱藏地圖上的照片圓點與縮圖，不影響照片資料。">
             顯示照片
           </span>
         </label>
@@ -1560,7 +1560,7 @@ export default function MapPage() {
               checked={showTimeline}
               onChange={(e) => setShowTimeline(e.target.checked)}
             />
-            <span title="從 Google 時間軸匯入的足跡，畫成最底層的細線，顏色跟著你自己的軌跡色。唯讀 —— 不修正、不貼路，也不會拿來推算照片位置。跟貼路軌跡是兩個獨立開關，可以同時開著對照。">
+            <span title="顯示自 Google 時間軸匯入的足跡，以細線繪製於底層。僅供檢視，不會修正、貼路或用於推算照片位置。可與軌跡同時開啟對照。">
               顯示 Google 足跡
             </span>
           </label>
@@ -1589,7 +1589,7 @@ export default function MapPage() {
                 })}
               />
               <span
-                title={`地圖上只顯示打勾的人。取消勾選只是不畫，資料還在。`}
+                title={`僅顯示勾選的成員，取消勾選不影響資料。`}
                 style={{ display: 'flex', gap: 5, alignItems: 'center', opacity: hidden ? 0.5 : 1 }}
               >
                 <span style={{
@@ -1610,7 +1610,7 @@ export default function MapPage() {
           {autoStatus && (
             <div
               style={{ fontSize: 12, color: '#0891b2', marginTop: 2 }}
-              title="開啟這一頁時會自動去 Drive 看有沒有新的軌跡檔（每小時最多一次）；另外選定日期後，這段範圍裡還沒貼過路的 GPS 軌跡會自動補上。沒有 GPS 軌跡的日子直接用 Google 歷史的原始點畫，不貼路。"
+              title="進入本頁時會自動檢查 Google Drive 是否有新的軌跡檔（每小時最多一次）。選定日期後，範圍內尚未貼路的 GPS 軌跡會自動補上；無 GPS 軌跡的日期則直接以 Google 足跡原始點繪製。"
             >
               {autoStatus}
             </div>
@@ -1627,8 +1627,8 @@ export default function MapPage() {
                 : timelineStats && timelineStats.points > 0
                   ? `Google 足跡 ${timelineStats.points.toLocaleString()} 點 / ${timelineStats.days} 天`
                   : timelineIndex && timelineIndex.months.length === 0
-                    ? '還沒匯入過 Google 足跡（管理工具裡有匯入按鈕）'
-                    : '這段範圍沒有 Google 足跡'}
+                    ? '尚未匯入 Google 足跡（可於管理工具匯入）'
+                    : '此範圍無 Google 足跡'}
             </div>
           )}
           {/* 軌跡整條線是登入才有的東西，訪客連「這段範圍沒有軌跡」都不該看到 ——
@@ -1638,7 +1638,7 @@ export default function MapPage() {
                 正在補（matching）、或這段範圍根本沒有軌跡。
                 ⚠️ 讀失敗要排在最前面講，而且**不可以講成「沒有軌跡」** ——
                 那是一句會讓人相信的假話（見 loadTracks） */}
-            {tracksFailed ? '軌跡讀取失敗，請重新選一次日期'
+            {tracksFailed ? '軌跡讀取失敗，請重新選擇日期'
               : matchedLoading ? '讀取軌跡…'
                 : matching ? '貼路中…'
                   : routeTracks.length > 0
@@ -1648,8 +1648,8 @@ export default function MapPage() {
                     : skipTracks
                       ? ''
                       : tracks.length === 0 && timelineDaysInRange.length === 0
-                        ? '這段範圍沒有軌跡'
-                        : '這段範圍畫不出軌跡（來源太疏或整天沒移動）'}
+                        ? '此範圍無軌跡'
+                        : '此範圍無法繪製軌跡（資料點過於稀疏或當日無移動）'}
           </div>}
         </div>
       </div>
@@ -1751,7 +1751,7 @@ export default function MapPage() {
               disabled={syncing}
               onClick={() => gpxInputRef.current?.click()}
               style={{ ...toolBtn, borderColor: '#7c3aed', color: '#7c3aed' }}
-              title="直接選手機或電腦上的 .gpx 檔匯入。同名的檔案視為同一天，會整批取代。"
+              title="從本機選擇 .gpx 檔匯入。同名檔案視為同一天，將整批取代。"
             >
               📄 手動上傳 GPX
             </button>
@@ -1772,7 +1772,7 @@ export default function MapPage() {
               gap: 6, alignItems: 'center', cursor: 'pointer',
             }}>
               <input type="checkbox" checked={forceSync} onChange={(e) => setForceSync(e.target.checked)} />
-              <span title="平常只會重抓內容有變的檔案。停留點濃縮的結果是匯入當下算好寫進資料庫的，調整參數後要勾這個才會重算。">
+              <span title="一般僅重新匯入內容有變更的檔案。調整參數後需勾選此項才會重新計算停留點。">
                 強制重新匯入
               </span>
             </label>
@@ -1856,7 +1856,7 @@ export default function MapPage() {
                         + `任何人不必登入就能在地圖上看到這本相簿的${n > 0 ? ` ${n} 個` : ''}拍攝位置`
                         + `（含經緯度與地點名稱）。\n`
                         + `軌跡不受影響，訪客一律看不到。\n\n`
-                        + `個別標記為私密的照片仍不會出現。隨時可以再關掉。`,
+                        + `個別標記為不開放的照片仍不會出現。可隨時關閉。`,
                       );
                       // 取消時要主動觸發一次重繪，把 DOM 上已經被勾起來的框推回去 ——
                       // state 沒變的話 React 不會重新渲染，畫面會停在「已勾選」的假象
@@ -1870,8 +1870,8 @@ export default function MapPage() {
                 <span>
                   公開「{currentAlbum.name}」的打卡點
                   <span style={{ display: 'block', color: '#64748b', fontSize: 12.5 }}>
-                    預設不公開。開啟後訪客只看得到這本相簿的拍攝位置，軌跡一律不公開。
-                    個別標記為私密的照片仍不會出現在地圖上。
+                    預設不公開。開啟後訪客僅能看到本相簿的拍攝位置，軌跡一律不公開。
+                    個別標記為不開放的照片仍不會出現在地圖上。
                   </span>
                 </span>
               </label>
@@ -1895,7 +1895,7 @@ export default function MapPage() {
           </button>
           {!showSegments ? null : segments.length === 0 ? (
             <p style={{ fontSize: 13.5, color: '#64748b' }}>
-              還沒有行程段。到相簿中選取照片後按「指定地點」，並勾選「同時建立行程段」即可建立。
+              尚無行程段。於相簿中選取照片後點選「指定地點」，並勾選「同時建立行程段」即可建立。
             </p>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

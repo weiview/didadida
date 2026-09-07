@@ -30,11 +30,11 @@ const MAX_ROUNDS = 400;
 const MAX_ITEMS = 300;
 
 const HOW_LABEL: Record<string, string> = {
-  tagged: "檔案自己寫了時區",
-  derived: "檔名交叉驗證推出時區",
-  instant: "只有 UTC 瞬間",
-  wall: "只有牆上時間（當 +8）",
-  none: "讀不到時間",
+  tagged: "檔案內含時區",
+  derived: "由檔名交叉驗證推得時區",
+  instant: "僅有 UTC 時間",
+  wall: "僅有當地時間，以 +8 計",
+  none: "無時間資訊",
 };
 
 /** 「有沒有值」在這裡要看得出來 —— 空的那一邊寫「—」，不要留一片空白 */
@@ -106,7 +106,7 @@ export default function VideoMetaCard() {
         if (res.done) break;
         if (rounds >= MAX_ROUNDS) {
           setMessage({
-            text: `跑了 ${MAX_ROUNDS} 輪還沒完，先停下來。再按一次會從頭接著跑。`,
+            text: `已處理 ${MAX_ROUNDS} 輪仍未完成，暫停處理。再按一次會從中斷處繼續。`,
             ok: false,
           });
           break;
@@ -123,29 +123,29 @@ export default function VideoMetaCard() {
        */
       const tail = totals && totals.all > 0
         ? `站上共 ${totals.all} 支影片`
-          + (totals.noDrive ? `，其中 ${totals.noDrive} 支沒有 Drive 備份（讀不到檔）` : "")
+          + (totals.noDrive ? `，其中 ${totals.noDrive} 支無 Drive 備份，無法讀取` : "")
           + "。"
-        : "站上目前沒有影片。";
+        : "目前沒有影片。";
 
       setMessage(
         compare
           ? {
-              text: `重讀了 ${scanned} 支影片，其中 ${updated} 支跟站上存的不一樣`
-                + (failed ? `，${failed} 支讀不到（見下面）` : "")
-                + "。這一趟一個字都沒有寫進去。",
+              text: `已讀取 ${scanned} 支影片，其中 ${updated} 支與站上資料不同`
+                + (failed ? `，${failed} 支無法讀取，詳見下方` : "")
+                + "。本次未寫入任何資料。",
               ok: failed === 0,
             }
           : {
-              text: `讀了 ${scanned} 支影片，改寫 ${updated} 支`
-                + (failed ? `，${failed} 支讀不到（見下面）` : "")
-                + (keptGeo ? `。${keptGeo} 支的座標維持原樣（那是手動標的打卡地點）` : "")
+              text: `已讀取 ${scanned} 支影片，更新 ${updated} 支`
+                + (failed ? `，${failed} 支無法讀取，詳見下方` : "")
+                + (keptGeo ? `。${keptGeo} 支保留原有座標，因其為手動設定的地點` : "")
                 + "。"
-                + (scanned === 0 ? `沒有可以回讀的影片：${tail}` : ""),
+                + (scanned === 0 ? `沒有可讀取的影片：${tail}` : ""),
               ok: failed === 0,
             },
       );
     } catch (e) {
-      setMessage({ text: e instanceof Error ? e.message : "回讀失敗", ok: false });
+      setMessage({ text: e instanceof Error ? e.message : "讀取失敗", ok: false });
     } finally {
       setBusy(false);
     }
@@ -156,24 +156,20 @@ export default function VideoMetaCard() {
     : items;
 
   return (
-    <AdminSection id="video-meta" title="影片的 Metadata">
+    <AdminSection id="video-meta" title="影片資訊">
       <p className={styles.hint}>
-        影片檔自己記著拍攝時間、座標、機身型號、解析度、編碼 —— 這些全在檔案的
-        moov 裡（就是影片版的 EXIF），只是早期上傳時站上沒有讀。這顆按鈕把影片的
-        原始檔從 Google Drive 讀回來，把裡面的資訊寫回站上，燈箱那塊
-        <strong>影片的 Metadata</strong> 就看得到了。
+        影片檔案本身記錄了拍攝時間、座標、裝置型號、解析度與編碼等資訊。
+        早期上傳的影片未讀取這些資料，可在此從 Google Drive 讀回原始檔補上，
+        補上後會顯示在照片檢視畫面的影片資訊中。
       </p>
       <p className={styles.hint}>
-        <strong>會覆蓋手動填過的拍攝時間</strong> —— 檔案自己寫的才是事實。
-        但只蓋<strong>檔案裡真的有值</strong>的那幾格：讀不到時間的維持原樣，
-        不會把你補好的清掉；手動在地圖上標過的打卡地點座標也不碰。
-        一次看幾支就回報一次，可以按著不管，跑完會講結果。
+        回讀會<strong>覆蓋手動填寫的拍攝時間</strong>，但只覆蓋檔案中確實有值的欄位：
+        檔案沒有時間的維持原狀，手動標記的地點座標也不會變動。
       </p>
 
       <p className={styles.hint}>
-        覆蓋沒有還原鍵，動手之前想先看差在哪就按<strong>重讀比對</strong> ——
-        它照樣去 Drive 讀，但<strong>一個字都不寫</strong>，
-        只把「站上存的」跟「檔案裡寫的」並排列出來。
+        覆蓋無法還原。若要先確認差異，請按<strong>重讀比對</strong>，
+        它同樣會讀取 Drive，但不寫入任何資料，只並列顯示站上與檔案中的內容。
       </p>
 
       <div className={styles.formRow}>
@@ -182,7 +178,7 @@ export default function VideoMetaCard() {
           onClick={() => run(false)}
           disabled={busy}
         >
-          {busy ? "處理中..." : "回讀並覆蓋"}
+          {busy ? "處理中…" : "回讀並覆蓋"}
         </button>
         <button
           className={styles.button}
@@ -214,7 +210,7 @@ export default function VideoMetaCard() {
         <div className={styles.detail}>
           <div className={styles.detailHead}>
             {mode === "compare"
-              ? `跟站上不一樣的（${shown.length}${more ? ` / 另有 ${more} 支未列出` : ""}）`
+              ? `與站上資料不同（${shown.length}${more ? ` / 另有 ${more} 支未列出` : ""}）`
               : `逐支結果（${shown.length}${more ? ` / 另有 ${more} 支未列出` : ""}）`}
           </div>
           {shown.map((it) => (
@@ -229,13 +225,13 @@ export default function VideoMetaCard() {
                 href={`/album?id=${it.album_id}&photo=${it.id}`}
                 target="_blank"
                 rel="noreferrer"
-                title="在新分頁看這支影片"
+                title="在新分頁開啟這支影片"
               >
                 {it.title || `#${it.id}`}
               </a>
               <span className={styles.detailNote}>
                 {it.error
-                  ? `讀不到：${it.error}`
+                  ? `無法讀取：${it.error}`
                   : mode === "compare"
                   ? [
                       // 站上存的 → 檔案裡讀到的。兩邊都攤開，改不改由使用者決定
@@ -253,10 +249,10 @@ export default function VideoMetaCard() {
                         ? `座標 ${it.lat.toFixed(5)}, ${it.lng.toFixed(5)}`
                         : null,
                       // 座標沒動的理由要講出來，不然看起來像漏掉了
-                      it.kept_manual_geo ? "座標維持手動標的地點" : null,
-                      it.wrote_exif ? "metadata 已更新" : null,
+                      it.kept_manual_geo ? "保留手動設定的座標" : null,
+                      it.wrote_exif ? "Metadata 已更新" : null,
                       !it.wrote_time && !it.wrote_geo && !it.wrote_exif
-                        ? `沒有變動（${HOW_LABEL[it.how] ?? it.how}）`
+                        ? `無變動（${HOW_LABEL[it.how] ?? it.how}）`
                         : null,
                     ]
                       .filter(Boolean)

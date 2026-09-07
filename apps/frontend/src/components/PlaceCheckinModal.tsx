@@ -161,9 +161,9 @@ export default function PlaceCheckinModal({
     const updated = items.length > 0 ? await setPlaceNames(items) : 0;
     setNaming(null);
 
-    const rest = groups.size > keys.length ? `，還有 ${groups.size - keys.length} 個位置這次沒查（一次上限 ${REVERSE_CAP} 個，可再按一次）` : '';
-    const none = missed > 0 ? `，${missed} 張附近查不到地標` : '';
-    setNameResult(`已補上 ${updated} 張的地名${none}${rest}`);
+    const rest = groups.size > keys.length ? `，另有 ${groups.size - keys.length} 個位置未查詢（單次上限 ${REVERSE_CAP} 個，可再按一次）` : '';
+    const none = missed > 0 ? `，${missed} 張附近查無地標` : '';
+    setNameResult(`已為 ${updated} 張照片補上地名${none}${rest}`);
     setSelected([]);
     await onRefresh();
   }, [photos, selected, onRefresh]);
@@ -185,10 +185,10 @@ export default function PlaceCheckinModal({
       reason === 'failed'
         ? { text: '套用失敗，請稍後再試', ok: false }
         : reason === 'no_segments'
-          ? { text: '還沒有任何行程段。選幾張照片按「指定地點」並勾「同時建立行程段」，才會留下這種規則', ok: false }
+          ? { text: '尚未建立任何行程段。選取照片後按「指定地點」，並勾選「同時建立行程段」即可建立', ok: false }
           : updated > 0
-            ? { text: `已依既有行程段補上 ${updated} 張的位置`, ok: true }
-            : { text: '沒有照片落在既有行程段的時間範圍裡（只會填還沒有位置的照片）', ok: false },
+            ? { text: `已依既有行程段為 ${updated} 張照片補上位置`, ok: true }
+            : { text: '沒有照片落在既有行程段的時間範圍內（僅填入尚無位置的照片）', ok: false },
     );
   }, [albumId, onRefresh]);
 
@@ -225,10 +225,10 @@ export default function PlaceCheckinModal({
         }}
       >
         <div style={{ padding: '22px 22px 0' }}>
-          <h3 style={{ margin: '0 0 4px', fontSize: 18 }}>整理這本相簿的地點</h3>
+          <h3 style={{ margin: '0 0 4px', fontSize: 18 }}>整理相簿地點</h3>
           <p style={{ margin: '0 0 12px', fontSize: 13, color: '#64748b', lineHeight: 1.7 }}>
-            照拍攝日期排開，缺什麼一眼看得到。挑幾張 →「指定地點」建立打卡；
-            自帶 GPS 但沒有地名的，可以直接反查地名（不會動到原本的座標）。
+            依拍攝日期排列，可快速找出缺少位置的照片。選取照片後按「指定地點」即可標記；
+            已有 GPS 座標但缺少地名的，可直接反查地名，原有座標不會變動。
           </p>
 
           {/*
@@ -247,7 +247,7 @@ export default function PlaceCheckinModal({
               {segState === 'running' ? '套用中…' : '🧭 用行程段補位置'}
             </button>
             <span style={{ fontSize: 12.5, color: '#64748b', lineHeight: 1.6 }}>
-              把以前建立的「這段時間我在這裡」規則，套到整本相簿還沒有位置的照片上
+              將既有的行程段規則，套用至整本相簿中尚無位置的照片
             </span>
           </div>
           {segResult && (
@@ -266,8 +266,8 @@ export default function PlaceCheckinModal({
             display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 13,
             color: '#475569', marginBottom: 10,
           }}>
-            <span><span style={{ color: '#b45309' }}>●</span> 沒有位置 {buckets.none.length} 張</span>
-            <span><span style={{ color: '#0284c7' }}>●</span> 有座標缺地名 {buckets.unnamed.length} 張</span>
+            <span><span style={{ color: '#b45309' }}>●</span> 無位置 {buckets.none.length} 張</span>
+            <span><span style={{ color: '#0284c7' }}>●</span> 有座標、缺地名 {buckets.unnamed.length} 張</span>
             <span><span style={{ color: '#10b981' }}>●</span> 已完成 {buckets.done.length} 張</span>
           </div>
 
@@ -278,7 +278,7 @@ export default function PlaceCheckinModal({
             <span style={{ color: '#475569' }}>已選取 {selected.length} 張</span>
             <label style={{ display: 'flex', gap: 7, alignItems: 'center', cursor: 'pointer' }}>
               <input type="checkbox" checked={showDone} onChange={(e) => setShowDone(e.target.checked)} />
-              <span>連已完成的一起顯示（要改已經指定過的就打開）</span>
+              <span>顯示已完成的照片（如需修改已指定的地點請開啟）</span>
             </label>
           </div>
         </div>
@@ -286,7 +286,7 @@ export default function PlaceCheckinModal({
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 22px' }}>
           {days.length === 0 && (
             <p style={{ fontSize: 14, color: '#64748b', padding: '30px 0', textAlign: 'center' }}>
-              {segState === 'running' ? '' : '這本相簿的照片都有位置與地名了 🎉'}
+              {segState === 'running' ? '' : '本相簿的照片都已有位置與地名'}
             </p>
           )}
 
@@ -301,7 +301,7 @@ export default function PlaceCheckinModal({
                   borderBottom: '1px solid #f1f5f9', marginBottom: 8, zIndex: 1,
                 }}>
                   <strong style={{ fontSize: 14 }}>
-                    {day || '沒有拍攝時間'}
+                    {day || '無拍攝時間'}
                     <span style={{ color: '#94a3b8', fontWeight: 400, fontSize: 12.5 }}>
                       {'  '}{list.length} 張
                     </span>
@@ -313,7 +313,7 @@ export default function PlaceCheckinModal({
                       background: '#fff', cursor: 'pointer', fontSize: 12.5,
                     }}
                   >
-                    {allSel ? '取消整天' : '選整天'}
+                    {allSel ? '取消全天' : '選取全天'}
                   </button>
                 </div>
 
@@ -385,7 +385,7 @@ export default function PlaceCheckinModal({
         <div style={{ padding: '14px 22px 20px', borderTop: '1px solid #f1f5f9' }}>
           {naming && (
             <div style={{ fontSize: 13, color: '#64748b', marginBottom: 10 }}>
-              反查地名中… {naming.done} / {naming.total} 個位置（刻意放慢，Photon 是免費的志工服務）
+              反查地名中… {naming.done} / {naming.total} 個位置（為避免影響服務，查詢速度已放慢）
             </div>
           )}
           {nameResult && (

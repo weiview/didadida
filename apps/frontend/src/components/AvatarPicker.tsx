@@ -73,7 +73,7 @@ export default function AvatarPicker({
       if (result.success) onChange(result.avatar ?? null);
       else setError(result.message ?? "頭像上傳失敗");
     } catch (e: any) {
-      setError(e?.message || "這個檔案處理不了");
+      setError(e?.message || "無法處理這個檔案");
     } finally {
       // 預覽只是處理過程的產物，上傳完畫面吃的是後端回來的網址
       if (previewUrl) URL.revokeObjectURL(previewUrl);
@@ -96,7 +96,7 @@ export default function AvatarPicker({
     const result = await setAvatarFacing(userId, next);
     if (!result.success) {
       onFacingChange(facing ?? 'left');
-      setError(result.message ?? "設定頭像方向失敗");
+      setError(result.message ?? "朝向設定失敗");
     }
     setBusy(false);
   };
@@ -122,7 +122,7 @@ export default function AvatarPicker({
       <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 6 }}>
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           <button type="button" style={btn} disabled={busy} onClick={() => inputRef.current?.click()}>
-            {busy ? "處理中…" : current ? "換一張" : "上傳頭像"}
+            {busy ? "處理中…" : current ? "更換" : "上傳頭像"}
           </button>
           {current && (
             <button type="button" style={{ ...btn, color: "#9b2c2c" }} disabled={busy} onClick={drop}>
@@ -163,30 +163,29 @@ export default function AvatarPicker({
             {/* 講清楚它會出現在哪裡 —— 使用者不會預期留言用的頭像跑到地圖上去 */}
             {hint ?? (
               <>
-                留言區和地圖上那台車坐的都是這張。<strong>建議用去背的 PNG</strong>，
-                在地圖上才是一顆大頭而不是一塊圓照片。
+                此頭像會顯示於留言區與足跡地圖上的車輛。
+                <strong>建議使用去背的 PNG</strong>，在地圖上的顯示效果較佳。
               </>
             )}
             {" "}
-            <strong>GIF 動圖會動</strong>（原檔直送，上限 2MB）。
+            <strong>支援 GIF 動圖</strong>（以原檔上傳，上限 2MB）。
             {facing && onFacingChange && (
               <>
-                {" "}地圖上的車會跟著行進方向左右翻面，<strong>頭像不會</strong> ——
-                「頭像朝向」講的是<strong>這張圖裡的臉朝哪一邊</strong>，
-                設對了車往哪邊開臉就朝哪邊。正面照兩邊都可以。
+                {" "}地圖上的車輛會依行進方向左右翻轉，頭像則不會。
+                「頭像朝向」指的是這張圖片中臉部面向的方向，設定正確後臉部會與車頭一致。
+                正面照兩種設定皆可。
               </>
             )}
           </p>
         )}
         {animated && (
           <p style={{ margin: 0, fontSize: 11, color: "#8a6d3b", lineHeight: 1.6 }}>
-            動圖是原檔上傳的，<strong>不會幫你裁邊也不會裁成圓形</strong> ——
-            四周有白底的話地圖上就是一塊方的。
+            動圖以原檔上傳，不會裁邊也不會裁成圓形。若圖片四周有白底，在地圖上會顯示為方形。
           </p>
         )}
         {!animated && hadAlpha === false && (
           <p style={{ margin: 0, fontSize: 11, color: "#8a6d3b", lineHeight: 1.6 }}>
-            這張圖沒有透明背景，已經自動裁成圓形。
+            這張圖片沒有透明背景，已自動裁切為圓形。
           </p>
         )}
         {error && (

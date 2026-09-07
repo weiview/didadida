@@ -96,7 +96,7 @@ export default function AccountBadge() {
   // 還在問後端「這張 token 算不算數」的期間不畫。先畫成訪客再跳成管理員會閃一下
   if (checking || (!isAdmin && !isGuest)) return null;
 
-  const displayName = user?.name?.trim() || (isAdmin ? "家庭成員" : "訪客");
+  const displayName = user?.name?.trim() || (isAdmin ? "成員" : "訪客");
   const initial = Array.from(displayName)[0] ?? "?";
   /* 對外一律講「家庭成員」，不講「管理員」—— 這站是給家人用的，
      管理員是內部的權限說法。站長還是站長，那是他自己看得懂的身分。
@@ -108,8 +108,8 @@ export default function AccountBadge() {
     : isOwner
       ? "站長"
       : canManageOthers
-        ? "家庭成員（可管理全站內容）"
-        : "家庭成員（只能管自己的內容）";
+        ? "成員（可管理全站內容）"
+        : "成員（僅能管理自己的內容）";
 
   /*
    * 我在地圖上的顏色。這裡只拿來當頭像的底色 —— **換色的入口在 /admin**
@@ -132,7 +132,7 @@ export default function AccountBadge() {
     const result = await renameSelf(next);
     setSaving(false);
     if (result.success) setEditing(false);
-    else setError(result.message || "改名失敗");
+    else setError(result.message || "名稱修改失敗");
   };
 
 
@@ -256,7 +256,7 @@ export default function AccountBadge() {
               />
               <div style={{ display: "flex", gap: 8 }}>
                 <button type="button" onClick={submitRename} disabled={!draft.trim() || saving} style={primaryBtn}>
-                  {saving ? "儲存中..." : "儲存"}
+                  {saving ? "儲存中…" : "儲存"}
                 </button>
                 <button type="button" onClick={() => setEditing(false)} style={plainBtn}>取消</button>
               </div>
@@ -285,7 +285,7 @@ export default function AccountBadge() {
                   {notifs === null ? (
                     <div style={{ fontSize: 12, opacity: 0.55 }}>載入中…</div>
                   ) : notifs.length === 0 ? (
-                    <div style={{ fontSize: 12, opacity: 0.55 }}>還沒有通知</div>
+                    <div style={{ fontSize: 12, opacity: 0.55 }}>目前沒有通知</div>
                   ) : (
                     <div style={{ maxHeight: 240, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
                       {notifs.map((n) => (
@@ -379,7 +379,7 @@ function NotificationRow({ item, onGo }: { item: NotificationItem; onGo: () => v
   const isUpload = item.kind === "upload";
   const who = item.actor_name || "有人";
   const what = isUpload
-    ? `傳了 ${uploadSummary(item.photos, item.videos)}`
+    ? `上傳了 ${uploadSummary(item.photos, item.videos)}`
     : REASON_TEXT[item.reason] ?? "留言了";
   /*
    * 預覽裡不留 `@[uid]` 這種原始標記 —— 這裡沒有名字對照表（那要另外打一支
@@ -389,7 +389,7 @@ function NotificationRow({ item, onGo }: { item: NotificationItem; onGo: () => v
    * 上傳那種沒有內文，第二行改講進了哪一本相簿。
    */
   const preview = isUpload
-    ? (item.album_name ? `到「${item.album_name}」` : "")
+    ? (item.album_name ? `至「${item.album_name}」` : "")
     : item.body.replace(/@\[\d+\]\s*/g, "").trim();
 
   const inner = (
@@ -460,10 +460,10 @@ function NotificationRow({ item, onGo }: { item: NotificationItem; onGo: () => v
 }
 
 const REASON_TEXT: Record<string, string> = {
-  mention: "提到了你",
-  reply: "回覆了你的留言",
-  photo: "在你傳的照片下留言",
-  album: "在你的相簿裡留言",
+  mention: "在留言中提到您",
+  reply: "回覆了您的留言",
+  photo: "在您上傳的照片留言",
+  album: "在您的相簿留言",
 };
 
 const plainBtn: React.CSSProperties = {

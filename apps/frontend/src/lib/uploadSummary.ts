@@ -13,5 +13,5 @@ export function uploadSummary(photos: number, videos: number): string {
   if (videos > 0) parts.push(`${videos} 支影片`);
   // 兩邊都是 0 理論上進不來（後端與 announceUpload 都擋著），但清單是照
   // D1 的舊列畫的，講一句籠統的話總比畫出一行空白好
-  return parts.length ? parts.join("、") : "新的東西";
+  return parts.length ? parts.join("、") : "新的內容";
 }

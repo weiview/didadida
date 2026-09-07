@@ -98,7 +98,7 @@ export default function CustomSelect<T extends string | number>({
     }
 
     if (selectedValues.length === options.length) {
-      return "全選標籤 (所有)";
+      return "已選取全部標籤";
     }
 
     if (selectedValues.length === 1) {
@@ -216,7 +216,7 @@ export default function CustomSelect<T extends string | number>({
                     cursor: "pointer"
                   }}
                 >
-                  清除重設
+                  清除
                 </button>
               )}
             </div>

@@ -73,7 +73,7 @@ export default function MotionScanCard() {
         if (res.done) break;
         if (rounds >= MAX_ROUNDS) {
           setMessage({
-            text: `跑了 ${MAX_ROUNDS} 輪還沒完，先停下來。再按一次會從剛剛的位置接著跑。`,
+            text: `已掃描 ${MAX_ROUNDS} 輪仍未完成，暫停處理。再按一次會從中斷處繼續。`,
             ok: false,
           });
           break;
@@ -87,11 +87,11 @@ export default function MotionScanCard() {
        * 所以這句話要講清楚「再按一次會重試」，不然使用者會以為那幾張沒救了。
        */
       setMessage({
-        text: `看了 ${scanned} 張照片，其中 ${found} 張有動畫`
-          + (already ? `（連同先前掃到的，站上共 ${already + found} 張）` : "")
-          + (failed ? `。${failed} 張讀不到（見下面），再按一次會重試` : "")
+        text: `已掃描 ${scanned} 張照片，其中 ${found} 張含動態影片`
+          + (already ? `（含先前掃描結果，全站共 ${already + found} 張）` : "")
+          + (failed ? `。${failed} 張無法讀取，詳見下方，再按一次會重試` : "")
           + "。"
-          + (scanned === 0 ? "所有照片都掃過了，沒有新的要看。" : ""),
+          + (scanned === 0 ? "所有照片皆已掃描完成。" : ""),
         ok: failed === 0,
       });
     } catch (e) {
@@ -104,13 +104,13 @@ export default function MotionScanCard() {
   return (
     <AdminSection id="motion-scan" title="Android 動態照片">
       <p className={styles.hint}>
-        Android 手機拍照時會在照片裡藏一段一兩秒的短片。站上<strong>不另外存那段影片</strong>
-        —— 它本來就在 Drive 上那份原始檔的尾巴，燈箱要播的時候現切。
+        部分 Android 手機拍照時會在照片中附帶一段一至兩秒的短片。
+        站上不另外儲存這段影片，播放時直接從 Drive 上的原始檔即時擷取。
       </p>
       <p className={styles.hint}>
-        新上傳的照片在瀏覽器裡就看過了，這顆按鈕是給<strong>以前傳上來的</strong>那些：
-        把原始檔的檔頭從 Drive 讀回來，找出哪幾張有動畫。掃過的不會再掃第二次，
-        中途關掉也沒關係，下次接著跑。
+        新上傳的照片會自動偵測，此功能用於掃描先前上傳的照片：
+        從 Drive 讀取原始檔的檔頭，找出含有動態影片的照片。
+        已掃描過的不會重複處理，中途離開也可於下次繼續。
       </p>
 
       <div className={styles.formRow}>
@@ -119,7 +119,7 @@ export default function MotionScanCard() {
           onClick={run}
           disabled={busy}
         >
-          {busy ? "掃描中..." : "掃描動態照片"}
+          {busy ? "掃描中…" : "掃描動態照片"}
         </button>
       </div>
 
@@ -139,7 +139,7 @@ export default function MotionScanCard() {
       {items.length > 0 && (
         <div className={styles.detail}>
           <div className={styles.detailHead}>
-            有動畫的與讀不到的（{items.length}{more ? ` / 另有 ${more} 張未列出` : ""}）
+            含動態影片與無法讀取的項目（{items.length}{more ? ` / 另有 ${more} 張未列出` : ""}）
           </div>
           {items.map((it) => (
             <div key={it.id} className={styles.detailRow}>
@@ -153,12 +153,12 @@ export default function MotionScanCard() {
                 href={`/album?id=${it.album_id}&photo=${it.id}`}
                 target="_blank"
                 rel="noreferrer"
-                title="在新分頁看這張照片"
+                title="在新分頁開啟這張照片"
               >
                 {it.title || `#${it.id}`}
               </a>
               <span className={styles.detailNote}>
-                {it.error ? `讀不到：${it.error}` : `有動畫（從第 ${it.offset.toLocaleString()} 個位元組開始）`}
+                {it.error ? `無法讀取：${it.error}` : `含動態影片（起始位元組 ${it.offset.toLocaleString()}）`}
               </span>
             </div>
           ))}

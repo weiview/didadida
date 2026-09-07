@@ -20,7 +20,7 @@ interface SlideConfirmModalProps {
 export default function SlideConfirmModal({
   isOpen,
   title = "確認刪除",
-  message = "確定要執行刪除動作嗎？",
+  message = "確定要執行刪除嗎？",
   children,
   onConfirm,
   onCancel
@@ -137,7 +137,7 @@ export default function SlideConfirmModal({
             color: 'var(--text-light)', userSelect: 'none', pointerEvents: 'none',
             fontSize: '0.95rem', fontWeight: 500
           }}>
-            {isConfirmed ? '已解鎖！請點擊確定刪除' : '向右滑動以解鎖刪除'}
+            {isConfirmed ? '已解鎖，請點擊確定刪除' : '向右滑動以解鎖'}
           </div>
           
           <div

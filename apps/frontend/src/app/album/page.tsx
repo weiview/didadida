@@ -770,7 +770,7 @@ function AlbumContent() {
         }
       } else if (visibleNoDate > 0) {
         // 整個畫面都是還沒補時間的那一疊
-        setCurrentTimelineDate("還沒有拍攝時間");
+        setCurrentTimelineDate("無拍攝時間");
       }
 
       // 無限滾動：當滾動距離頁面底部小於 1000px 時自動載入更多
@@ -839,8 +839,8 @@ function AlbumContent() {
       if (googlePickerWaiting && !uploadProgress) {
         return [{
           key: 'busy',
-          label: '選相片中... 按這裡取消',
-          title: '在 Google 那個視窗選完就會自動接手，不用回來按。不想匯了才按這顆',
+          label: '選取相片中…（點擊取消）',
+          title: '在 Google 視窗選取完成後會自動接手；如需取消匯入才需點擊此處',
           onClick: () => cancelGoogleSyncRef.current?.(),
         }];
       }
@@ -849,8 +849,8 @@ function AlbumContent() {
         key: 'busy',
         disabled: true,
         label: syncingGoogle
-          ? (uploadProgress ? `匯入中... (${uploadProgress.current}/${uploadProgress.total})` : "準備 Google 相簿...")
-          : (uploadProgress ? `上傳中... (${uploadProgress.current}/${uploadProgress.total})` : "上傳中..."),
+          ? (uploadProgress ? `匯入中…（${uploadProgress.current}/${uploadProgress.total}）` : "準備 Google 相簿…")
+          : (uploadProgress ? `上傳中…（${uploadProgress.current}/${uploadProgress.total}）` : "上傳中…"),
       }];
     }
 
@@ -867,7 +867,7 @@ function AlbumContent() {
             label: '本機上傳',
             // 排在最貼近 FAB 的位置：Picker 會把 GPS 洗掉，本機上傳才留得住 EXIF，
             // 是預設該走的路
-            title: '從這台裝置選檔案。EXIF（含 GPS）會完整保留',
+            title: '從本機選擇檔案，完整保留 EXIF（含 GPS 位置）',
             onClick: handleUploadClick,
           },
           {
@@ -875,11 +875,11 @@ function AlbumContent() {
             // 永遠是「匯入」，沒有「連結 Google 相簿」那一態 —— 人已經是用
             // Google 身分登入的，匯入就走他自己那份授權（後端換 token）
             label: '從 Google 相簿匯入',
-            title: 'Google Picker 不會給位置資訊，匯入後要自己補地點',
+            title: 'Google 相簿不提供位置資訊，匯入後需自行指定地點',
             onClick: () => {
               // 絕對同步開啟空視窗取得權限，突破任何阻擋器
               const popup = window.open("", "GooglePicker", "width=1000,height=800,menubar=no,toolbar=no,location=no,status=no");
-              if (popup) popup.document.write("<html><body style='font-family:sans-serif;text-align:center;margin-top:20%;'>載入 Google 相簿中...</body></html>");
+              if (popup) popup.document.write("<html><body style='font-family:sans-serif;text-align:center;margin-top:20%;'>載入 Google 相簿中…</body></html>");
               handleGoogleSync(popup);
             },
           },
@@ -899,7 +899,7 @@ function AlbumContent() {
       {
         key: 'place',
         label: '地點',
-        title: '整本相簿攤開，照日期看哪些照片還缺位置或地名',
+        title: '依拍攝日期檢視整本相簿，找出缺少位置或地名的照片',
         onClick: () => setShowPlaceCheckin(true),
       },
       { key: 'edit', label: '編輯照片', onClick: () => setIsEditingPhotos(true) },
@@ -924,9 +924,9 @@ function AlbumContent() {
     setDriveError(
       needsLink
         ? (err as DriveWriterError).reason === 'not_linked'
-          ? '後端還沒有站長的 Drive 授權'
-          : '站長的 Drive 授權失效了（被撤銷，或換過 Google OAuth 設定）'
-        : err instanceof Error ? err.message : 'Google Drive 沒接上',
+          ? '尚未取得站長的 Google Drive 授權'
+          : '站長的 Google Drive 授權已失效'
+        : err instanceof Error ? err.message : '無法連線至 Google Drive',
     );
   };
 
@@ -991,7 +991,7 @@ function AlbumContent() {
     if (stillMissing.length === 0) setDriveNeedsLink(false);
     // 逐張講原因：「還有 N 張沒補成功」查不出 N 張各自卡在哪
     setDriveError(stillMissing.length > 0
-      ? `還有 ${stillMissing.length} 張沒補成功，可以再按一次。\n${reasons.slice(0, 5).join('\n')}`
+      ? `還有 ${stillMissing.length} 張未完成，可再試一次。\n${reasons.slice(0, 5).join('\n')}`
       : null);
     await loadData();
   };
@@ -1040,7 +1040,7 @@ function AlbumContent() {
     if (failures.length > 0) {
       const shown = failures.slice(0, 10).join('\n');
       const rest = failures.length - 10;
-      alert(`有 ${failures.length} 張重複的照片沒處理成功：\n\n${shown}`
+      alert(`有 ${failures.length} 張重複照片處理失敗：\n\n${shown}`
         + (rest > 0 ? `\n…另外還有 ${rest} 張` : ''));
     }
 
@@ -1105,7 +1105,7 @@ function AlbumContent() {
        */
       if (item.video) {
         try {
-          if (!driveRef.current) throw new Error('Drive 沒接上，影片沒有地方存');
+          if (!driveRef.current) throw new Error('無法連線至 Google Drive，影片無法儲存');
           await pushVideoToDrive(driveRef.current, result.photo.id, item.file);
         } catch (err) {
           console.error('影片沒送上 Drive，收掉剛建的那一列', err);
@@ -1113,8 +1113,8 @@ function AlbumContent() {
           //    而使用者以為「跳過了」—— 講出來，讓他知道要手動刪
           const rolled = await deletePhoto(result.photo.id);
           dupFailuresRef.current.push(rolled
-            ? `${name}：影片沒送上 Drive（${errText(err)}）`
-            : `${name}：影片沒送上 Drive，而且那一格沒收掉，請手動刪除（${errText(err)}）`);
+            ? `${name}：影片上傳 Google Drive 失敗（${errText(err)}）`
+            : `${name}：影片上傳 Google Drive 失敗，且未能移除已建立的項目，請手動刪除（${errText(err)}）`);
           return;
         }
         dupUploadedRef.current.push(result.photo);
@@ -1152,7 +1152,7 @@ function AlbumContent() {
         const failed = (await Promise.all(replaceIds.map((pid) => deletePhoto(pid))))
           .filter((ok) => !ok).length;
         if (failed > 0) {
-          dupFailuresRef.current.push(`${name}：新照片已上傳，但有 ${failed} 張舊照片沒刪掉`);
+          dupFailuresRef.current.push(`${name}：新照片已上傳，但有 ${failed} 張舊照片未刪除`);
         }
       }
     } catch (err) {
@@ -1328,14 +1328,14 @@ function AlbumContent() {
             const twin = incompleteTwin(result.existing, 'video');
             if (twin) {
               if (!drive) {
-                failures.push(`${source.name}：這支影片站上已經有了，但 Drive 沒接上，原始檔補不了`);
+                failures.push(`${source.name}：此影片已存在，但無法連線至 Google Drive，原始檔無法補齊`);
               } else {
                 try {
                   await pushVideoToDrive(drive, twin.id, rawFile,
                     (sent, size) => onProgress(i + 1, total, source.name, { sent, total: size }));
-                  backfilled.push(`${source.name}：補上了 Drive 的影片原始檔`);
+                  backfilled.push(`${source.name}：已補上 Google Drive 的影片原始檔`);
                 } catch (err) {
-                  failures.push(`${source.name}：影片原始檔沒補上 Drive（${errText(err)}）`);
+                  failures.push(`${source.name}：影片原始檔補齊失敗（${errText(err)}）`);
                 }
               }
               continue;
@@ -1349,7 +1349,7 @@ function AlbumContent() {
             });
           } else if (result.status === 'ok') {
             try {
-              if (!drive) throw new Error('Drive 沒接上，影片沒有地方存');
+              if (!drive) throw new Error('無法連線至 Google Drive，影片無法儲存');
               await pushVideoToDrive(drive, result.photo.id, rawFile,
                 (sent, size) => onProgress(i + 1, total, source.name, { sent, total: size }));
               uploaded.push(result.photo);
@@ -1360,8 +1360,8 @@ function AlbumContent() {
               // 回滾失敗要另外講：那一格還在相簿裡，而且點開只有靜止畫面
               const rolled = await deletePhoto(result.photo.id);
               failures.push(rolled
-                ? `${source.name}：影片沒送上 Drive（${errText(err)}）`
-                : `${source.name}：影片沒送上 Drive，而且那一格沒收掉，請手動刪除（${errText(err)}）`);
+                ? `${source.name}：影片上傳 Google Drive 失敗（${errText(err)}）`
+                : `${source.name}：影片上傳 Google Drive 失敗，且未能移除已建立的項目，請手動刪除（${errText(err)}）`);
             }
           } else {
             failures.push(`${source.name}：${result.reason}`);
@@ -1384,8 +1384,8 @@ function AlbumContent() {
         const gifSource = isGifFile(rawFile);
         if (gifSource && rawFile.size > GIF_MAX_BYTES) {
           // 後端也會擋（那道才是真的關），但在這裡就講清楚，省一趟白傳的上傳
-          failures.push(`${source.name}：GIF 太大了（${Math.round(rawFile.size / 1024 / 1024)}MB），`
-            + `上限 ${Math.round(GIF_MAX_BYTES / 1024 / 1024)}MB。這種長度的動畫請錄成影片上傳`);
+          failures.push(`${source.name}：GIF 檔案過大（${Math.round(rawFile.size / 1024 / 1024)}MB），`
+            + `上限 ${Math.round(GIF_MAX_BYTES / 1024 / 1024)}MB，較長的動畫請改以影片格式上傳`);
           continue;
         }
         // GIF 在 Drive 上沒有「衍生的 4K」那一份
@@ -1454,12 +1454,12 @@ function AlbumContent() {
             if (!drive) {
               // Drive 沒接上：交給橫幅那顆「補傳這批」，別把使用者晾在這裡
               missedDrive.push({ photoId: twin.id, file: rawFile, need });
-              backfilled.push(`${source.name}：站上已經有了，Drive 缺 ${needLabel(need)}，已排進待補清單`);
+              backfilled.push(`${source.name}：此檔案已存在，Google Drive 缺少 ${needLabel(need)}，已加入待補清單`);
             } else {
               try {
                 const res = await pushPhotoToDrive(drive, twin.id, rawFile, need);
                 if (res.ok) {
-                  backfilled.push(`${source.name}：補上了 Drive 的 ${needLabel(need)}`);
+                  backfilled.push(`${source.name}：已補上 Google Drive 的 ${needLabel(need)}`);
                 } else {
                   // 半套照樣進待補清單，`need` 只留這次還是沒成功的那一半
                   missedDrive.push({
@@ -1469,11 +1469,11 @@ function AlbumContent() {
                       original: need.original && res.original !== 'ok',
                     },
                   });
-                  failures.push(`${source.name}：Drive 缺的那份沒補成功（${res.reason || 'Drive 上傳失敗'}）`);
+                  failures.push(`${source.name}：補齊 Google Drive 備份失敗（${res.reason || 'Drive 上傳失敗'}）`);
                 }
               } catch (err) {
                 missedDrive.push({ photoId: twin.id, file: rawFile, need });
-                failures.push(`${source.name}：Drive 缺的那份沒補成功（${errText(err)}）`);
+                failures.push(`${source.name}：補齊 Google Drive 備份失敗（${errText(err)}）`);
               }
             }
             continue;
@@ -1524,11 +1524,11 @@ function AlbumContent() {
       };
       const blocks: string[] = [];
       if (result.failures.length > 0) {
-        blocks.push(section(`有 ${result.failures.length} 個檔案沒上傳成功：`, result.failures));
+        blocks.push(section(`有 ${result.failures.length} 個檔案上傳失敗：`, result.failures));
       }
       if (result.backfilled.length > 0) {
         blocks.push(section(
-          `有 ${result.backfilled.length} 個檔案站上已經有了，缺的備份已經自動補上：`,
+          `有 ${result.backfilled.length} 個檔案已存在，缺少的備份已自動補齊：`,
           result.backfilled,
         ));
       }
@@ -1583,7 +1583,7 @@ function AlbumContent() {
       await finishIngest(result);
     } catch (err) {
       console.error('上傳流程整個中斷', err);
-      alert(`上傳中斷了：${errText(err)}`);
+      alert(`上傳已中斷：${errText(err)}`);
     } finally {
       setUploading(false);
       setUploadProgress(null);
@@ -1605,7 +1605,7 @@ function AlbumContent() {
      * 而使用者從頭到尾沒看到任何可以挑照片的地方。
      */
     if (!popup) {
-      alert("瀏覽器擋掉了選相片的視窗。請允許這個網站開啟彈出式視窗，再按一次「從 Google 相簿匯入」。");
+      alert("瀏覽器封鎖了選取視窗。請允許本站開啟彈出式視窗後，再次點選「從 Google 相簿匯入」。");
       return;
     }
     try {
@@ -1617,7 +1617,7 @@ function AlbumContent() {
       // 每次匯入都必須建立新的 Google Picker Session (舊 Session 無法重複選照片)
       const session = await createGooglePickerSession();
       if (!session || (session as any).error || !session.pickerUri) {
-        alert("無法建立 Google Picker，請稍後再試。");
+        alert("無法開啟 Google 相簿選取視窗，請稍後再試。");
         setSyncingGoogle(false);
         popup?.close();
         return;
@@ -1682,8 +1682,8 @@ function AlbumContent() {
           stopPolling();
           setSyncingGoogle(false);
           alert(lastPollError
-            ? `同步逾時，已自動取消。最後一次查詢的錯誤：${lastPollError}`
-            : "同步逾時，已自動取消。");
+            ? `匯入逾時，已自動取消。最後一次查詢的錯誤：${lastPollError}`
+            : "匯入逾時，已自動取消。");
           return;
         }
 
@@ -1729,7 +1729,7 @@ function AlbumContent() {
           if (res.mediaItems.length === 0) {
             setSyncingGoogle(false);
             setUploadProgress(null);
-            alert("Google 說你選完了，但一個項目都沒回傳。請再試一次；一直這樣的話把 Console 的訊息給我。");
+            alert("Google 回報選取已完成，但未取得任何項目，請再試一次。");
             return;
           }
           // 這行是刻意留著的：下次再有「匯不進來」時，這裡直接看得出 Google 回了什麼
@@ -1766,7 +1766,7 @@ function AlbumContent() {
             // ⚠️ 只擋明確講「還在處理／失敗」的。列舉值還有一個 UNSPECIFIED，
             //    寫成「不是 READY 就擋」會把它一起擋掉 —— 拿不準的一律讓它去試
             if (isVideoItem && (status === 'PROCESSING' || status === 'FAILED')) {
-              skipped.push(`${filename}：Google 那邊還沒處理好這支影片（${status}），等一下再匯`);
+              skipped.push(`${filename}：Google 尚未處理完成此影片（${status}），請稍後再匯入`);
               continue;
             }
             // Picker 把時間放在 mediaItem.createTime，舊回應在 mediaMetadata 底下
@@ -1782,7 +1782,7 @@ function AlbumContent() {
           if (sources.length === 0) {
             setSyncingGoogle(false);
             setUploadProgress(null);
-            if (skipped.length > 0) alert(`這批沒有東西可以匯入：\n\n${skipped.join('\n')}`);
+            if (skipped.length > 0) alert(`本次沒有可匯入的項目：\n\n${skipped.join('\n')}`);
             return;
           }
 
@@ -1803,12 +1803,12 @@ function AlbumContent() {
             await finishIngest(result);
           } catch (err) {
             console.error('Google 匯入流程整個中斷', err);
-            alert(`匯入中斷了：${errText(err)}`);
+            alert(`匯入已中斷：${errText(err)}`);
           } finally {
             setSyncingGoogle(false);
             setUploadProgress(null);
           }
-          if (skipped.length > 0) alert(`有 ${skipped.length} 個項目沒匯進來：\n\n${skipped.join('\n')}`);
+          if (skipped.length > 0) alert(`有 ${skipped.length} 個項目未匯入：\n\n${skipped.join('\n')}`);
         }
       };
 
@@ -1934,7 +1934,7 @@ function AlbumContent() {
       }));
       const success = await reorderPhotos(updates);
       if (!success) {
-        alert("儲存排序失敗");
+        alert("排序儲存失敗");
         loadData(); // 恢復原狀
       }
     }
@@ -2059,7 +2059,7 @@ function AlbumContent() {
             <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
               <input 
                 type="text" 
-                placeholder="搜尋 Story 或檔名..." 
+                placeholder="搜尋 Story 或檔名" 
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
                 className={styles.searchInput}
@@ -2097,9 +2097,9 @@ function AlbumContent() {
                 value={sortBy}
                 onChange={(val) => setSortBy(val as any)}
                 options={[
-                  { value: "custom", label: "自訂排序 (可拖曳)" },
-                  { value: "upload_date", label: "依上傳日期 (新到舊)" },
-                  { value: "taken_date", label: "依拍攝日期 (新到舊)" }
+                  { value: "custom", label: "自訂排序（可拖曳）" },
+                  { value: "upload_date", label: "依上傳日期（新到舊）" },
+                  { value: "taken_date", label: "依拍攝日期（新到舊）" }
                 ]}
               />
             </div>
@@ -2132,12 +2132,12 @@ function AlbumContent() {
                 value={gridColumns || 0}
                 onChange={(val) => setGridColumns(Number(val))}
                 options={[
-                  { value: 0, label: "縮圖版面: 自動" },
-                  { value: 1, label: "縮圖版面: 1 欄 (大圖)" },
-                  { value: 2, label: "縮圖版面: 2 欄 (雙排)" },
-                  { value: 3, label: "縮圖版面: 3 欄 (精緻)" },
-                  { value: 4, label: "縮圖版面: 4 欄 (多張)" },
-                  { value: 5, label: "縮圖版面: 5 欄 (密集)" }
+                  { value: 0, label: "版面：自動" },
+                  { value: 1, label: "版面：1 欄" },
+                  { value: 2, label: "版面：2 欄" },
+                  { value: 3, label: "版面：3 欄" },
+                  { value: 4, label: "版面：4 欄" },
+                  { value: 5, label: "版面：5 欄" }
                 ]}
               />
             </div>
@@ -2200,7 +2200,7 @@ function AlbumContent() {
                 }}
               >
                 <span>
-                  🏷️ {selectedTags.length === 0 ? '所有標籤' : selectedTags.length === availableTags.length ? '全選標籤 (所有)' : `已選取 ${selectedTags.length} 個標籤`}
+                  🏷️ {selectedTags.length === 0 ? '所有標籤' : selectedTags.length === availableTags.length ? '已選取全部標籤' : `已選取 ${selectedTags.length} 個標籤`}
                 </span>
                 <span style={{ fontSize: '0.8rem', color: '#888' }}>選擇 ❯</span>
               </button>
@@ -2213,8 +2213,8 @@ function AlbumContent() {
               <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}>
                 {[
                   { value: "custom", label: "自訂排序" },
-                  { value: "upload_date", label: "依上傳日期 (新到舊)" },
-                  { value: "taken_date", label: "依拍攝日期 (新到舊)" }
+                  { value: "upload_date", label: "依上傳日期（新到舊）" },
+                  { value: "taken_date", label: "依拍攝日期（新到舊）" }
                 ].map(opt => {
                   const isSelected = sortBy === opt.value;
                   return (
@@ -2248,11 +2248,11 @@ function AlbumContent() {
               <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}>
                 {[
                   { value: 0, label: "自動" },
-                  { value: 1, label: "1 欄 (大圖)" },
-                  { value: 2, label: "2 欄 (雙排)" },
-                  { value: 3, label: "3 欄 (精緻)" },
-                  { value: 4, label: "4 欄 (多張)" },
-                  { value: 5, label: "5 欄 (密集)" }
+                  { value: 1, label: "1 欄" },
+                  { value: 2, label: "2 欄" },
+                  { value: 3, label: "3 欄" },
+                  { value: 4, label: "4 欄" },
+                  { value: 5, label: "5 欄" }
                 ].map(opt => {
                   const isSelected = (gridColumns || 0) === opt.value;
                   return (
@@ -2299,13 +2299,13 @@ function AlbumContent() {
                   }}
                   style={{ background: 'none', border: 'none', color: 'var(--accent-color, #d1bfae)', fontWeight: 600, fontSize: '0.88rem', cursor: 'pointer' }}
                 >
-                  {selectedTags.length === availableTags.length ? '取消全選' : '全選所有標籤'}
+                  {selectedTags.length === availableTags.length ? '取消全選' : '全選'}
                 </button>
               </div>
 
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', justifyContent: 'center', padding: '6px 4px 20px 4px' }}>
                 {availableTags.length === 0 ? (
-                  <div style={{ padding: '20px', color: '#888', fontSize: '0.9rem' }}>本相簿尚無相片標籤</div>
+                  <div style={{ padding: '20px', color: '#888', fontSize: '0.9rem' }}>本相簿尚未建立標籤</div>
                 ) : (
                   availableTags.map(t => {
                     const isSelected = selectedTags.includes(t.id);
@@ -2408,11 +2408,11 @@ function AlbumContent() {
           background: '#fef3c7', border: '1px solid #fcd34d', color: '#78350f',
           fontSize: 13.5, lineHeight: 1.7,
         }}>
-          照片已經上傳，但 <strong>Google Drive 沒接上</strong>（{driveError}），
-          這批只有 R2 的版本，缺 4K 與原始檔備份。
+          照片已上傳，但<strong>無法連線至 Google Drive</strong>（{driveError}），
+          本批僅有網站版本，缺少 4K 與原始檔備份。
           {driveBatchProgress ? (
             <div style={{ marginTop: 8 }}>
-              補傳中... {driveBatchProgress.current} / {driveBatchProgress.total}
+              補傳中… {driveBatchProgress.current} / {driveBatchProgress.total}
             </div>
           ) : driveNeedsLink ? (
             /*
@@ -2428,10 +2428,10 @@ function AlbumContent() {
             isOwner ? (
               <div style={{ marginTop: 8 }}>
                 <div style={{ fontSize: 13, marginBottom: 8 }}>
-                  用 Google 登入一次就會把授權收回來。這批照片要回來之後
-                  <strong>把同一批檔案再拖進來一次</strong>補上 ——
-                  站上會認出是同一個檔，只補缺的那一份，相簿裡不會多一格
-                  （離開這一頁會忘記剛才選了哪些）。
+                  重新以 Google 登入即可恢復授權。回到本頁後，
+                  <strong>將同一批檔案再上傳一次</strong>即可補齊：
+                  系統會辨識為同一個檔案，僅補上缺少的備份，相簿不會重複。
+                  （離開本頁後不會保留目前選取的檔案。）
                 </div>
                 <button
                   type="button"
@@ -2446,8 +2446,8 @@ function AlbumContent() {
               </div>
             ) : (
               <div style={{ marginTop: 8, fontSize: 13 }}>
-                這要站長處理：請站長用 Google 登入一次，後端會自己把授權收回來。
-                之後回到這裡把同一批檔案再拖進來一次就補得上（不會多一格）。
+                此問題需由站長處理：請站長重新以 Google 登入以恢復授權。
+                之後回到本頁，將同一批檔案再上傳一次即可補齊，相簿不會重複。
               </div>
             )
           ) : (
@@ -2473,8 +2473,8 @@ function AlbumContent() {
                 </button>
               ) : (
                 <div style={{ fontSize: 13 }}>
-                  把同一批檔案<strong>再拖進來上傳一次</strong>就補得上 ——
-                  站上會認出是同一個檔，只補缺的那一份，相簿裡不會多一格。
+                  將同一批檔案<strong>再上傳一次</strong>即可補齊：
+                  系統會辨識為同一個檔案，僅補上缺少的備份，相簿不會重複。
                 </div>
               )}
             </div>
@@ -2495,7 +2495,7 @@ function AlbumContent() {
             />
           </div>
           <p className={styles.progressText}>
-            背景處理重複的照片 ({dupJobs.done} / {dupJobs.queued})
+            背景處理重複項目（{dupJobs.done} / {dupJobs.queued}）
           </p>
         </div>
       )}
@@ -2513,7 +2513,7 @@ function AlbumContent() {
             />
           </div>
           <p className={styles.progressText}>
-            正在處理: {uploadProgress.fileName} ({uploadProgress.current} / {uploadProgress.total})
+            正在處理：{uploadProgress.fileName}（{uploadProgress.current} / {uploadProgress.total}）
             {uploadProgress.bytes && (
               <> · 上傳 {formatBytes(uploadProgress.bytes.sent)} / {formatBytes(uploadProgress.bytes.total)}</>
             )}
@@ -2522,7 +2522,7 @@ function AlbumContent() {
       )}
 
       {loading ? (
-        <div className={styles.loading}>載入照片中...</div>
+        <div className={styles.loading}>載入照片中…</div>
       ) : (
         <div 
           className={styles.photoGrid}
@@ -2548,7 +2548,7 @@ function AlbumContent() {
                    * 既有的封面清掉，這裡擋的是反過來的順序。
                    */
                   if (photo.restricted === 1) {
-                    alert("這一張設成不開放了，不能當相簿封面");
+                    alert("已設為不開放的照片無法作為相簿封面");
                     return;
                   }
                   // 在編輯模式下，若點擊已是封面的照片則取消封面設定，否則設為新封面
@@ -2666,7 +2666,7 @@ function AlbumContent() {
                     className={`${styles.restrictedBadge} ${styles.restrictedBadgeBtn}`}
                     onClick={(e) => { e.stopPropagation(); toggleRestrictedReveal(photo.id); }}
                   >
-                    🔒 不開放 · {isBlurred(photo) ? '點一下顯示' : '收回'}
+                    🔒 不開放 · {isBlurred(photo) ? '點擊顯示' : '收合'}
                   </button>
                 ) : (
                   <span className={styles.restrictedBadge}>🔒 不開放</span>
@@ -2689,12 +2689,12 @@ function AlbumContent() {
                   disabled={restrictBusyId === photo.id}
                   aria-pressed={photo.restricted === 1}
                   title={photo.restricted === 1
-                    ? "目前不開放：只有可管理全站內容的人看得到。按一下改回開放"
-                    : "按一下設成不開放：只有可管理全站內容的人看得到"}
+                    ? "目前為不開放，僅可管理全站內容的成員可見。點擊改為開放"
+                    : "點擊設為不開放，僅可管理全站內容的成員可見"}
                   onClick={async (e) => {
                     e.stopPropagation();
                     const ok = await handleToggleRestricted(photo.id, photo.restricted !== 1);
-                    if (!ok) alert("設定失敗，請再試一次");
+                    if (!ok) alert("設定失敗，請稍後再試");
                   }}
                 >
                   {photo.restricted === 1 ? "🔒" : "🔓"}
@@ -2717,7 +2717,7 @@ function AlbumContent() {
           ))}
           {displayPhotos.length === 0 && (
             <div className={styles.emptyState}>
-              <p>找不到符合條件的照片，或是相簿空空如也！</p>
+              <p>沒有符合條件的照片</p>
             </div>
           )}
         </div>
@@ -2829,7 +2829,7 @@ function AlbumContent() {
             disabled={selectedPhotos.length === 0 || isBatchDeleting}
             style={{ opacity: selectedPhotos.length === 0 ? 0.5 : 1 }}
           >
-            {isBatchDeleting ? '刪除中...' : `刪除 ${selectedPhotos.length} 個項目`}
+            {isBatchDeleting ? '刪除中…' : `刪除 ${selectedPhotos.length} 個項目`}
           </button>
 
           {/* 「編輯／完成」的切換鈕原本在頁首，編輯模式下 FAB 收起，出口就放在這排的尾端 */}
@@ -2849,7 +2849,7 @@ function AlbumContent() {
       <SlideConfirmModal 
         isOpen={showDeleteConfirm}
         title="確認刪除"
-        message={`確定要刪除選取的 ${selectedPhotos.length} 張照片嗎？此動作無法復原。`}
+        message={`確定刪除選取的 ${selectedPhotos.length} 張照片？此動作無法復原。`}
         onConfirm={handleBatchDeletePhotos}
         onCancel={() => setShowDeleteConfirm(false)}
       />
@@ -2934,7 +2934,7 @@ function AlbumContent() {
           // 一定要等重抓完才決定下一步：不等的話跳回打卡畫面看到的是舊資料，
           // 剛指定好的那批還會掛在「沒有位置」底下
           const fresh = await loadData();
-          const skipped = skippedExif > 0 ? `，${skippedExif} 張已有 GPS 未覆蓋` : '';
+          const skipped = skippedExif > 0 ? `，${skippedExif} 張已有 GPS 座標未覆蓋` : '';
 
           if (!returnToCheckin) {
             alert(`已為 ${updated} 張照片指定地點${skipped}`);
@@ -2947,10 +2947,10 @@ function AlbumContent() {
             (p) => p.lat == null || p.lng == null || !p.place_name?.trim(),
           ).length;
           if (left > 0) {
-            alert(`已為 ${updated} 張照片指定地點${skipped}，還有 ${left} 張要處理`);
+            alert(`已為 ${updated} 張照片指定地點${skipped}，另有 ${left} 張待處理`);
             setShowPlaceCheckin(true);
           } else {
-            alert(`已為 ${updated} 張照片指定地點${skipped}。這本相簿都有位置與地名了 🎉`);
+            alert(`已為 ${updated} 張照片指定地點${skipped}。本相簿的照片皆已有位置與地名`);
           }
         }}
       />
@@ -2981,7 +2981,7 @@ function AlbumContent() {
           lastSelectedIndexRef.current = null;
           // 失敗一律逐張講原因，收工一次講完 —— 批次跑到一半 alert 會蓋住還在跑的那幾張
           const parts = [`已旋轉 ${rotated.length} 張`];
-          if (skipped > 0) parts.push(`${skipped} 個影片／GIF 未處理`);
+          if (skipped > 0) parts.push(`${skipped} 個影片或 GIF 未處理`);
           let msg = parts.join('，');
           if (failures.length > 0) {
             // 每一張各自一行，`，` 串起來會擠成一團看不出有幾張
@@ -3003,7 +3003,7 @@ ${failures.join(`
           setSelectedPhotos([]);
           lastSelectedIndexRef.current = null;
           loadData();
-          const skipped = skippedNoTime > 0 ? `，${skippedNoTime} 張沒有拍攝時間未處理` : '';
+          const skipped = skippedNoTime > 0 ? `，${skippedNoTime} 張無拍攝時間未處理` : '';
           alert(`已為 ${updated} 張照片${what}${skipped}`);
         }}
       />
@@ -3013,7 +3013,7 @@ ${failures.join(`
 
 export default function AlbumPage() {
   return (
-    <Suspense fallback={<div className={styles.loading}>載入中...</div>}>
+    <Suspense fallback={<div className={styles.loading}>載入中…</div>}>
       <AlbumContent />
     </Suspense>
   );

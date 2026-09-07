@@ -31,12 +31,12 @@ const MAX_ROUNDS = 200;
 
 const LABELS: Record<string, { name: string; note: string }> = {
   r2_storage: { name: "R2 儲存空間", note: "縮圖、GIF 動畫、頭像、GPS 軌跡" },
-  r2_class_a: { name: "R2 寫入類操作（class A）", note: "上傳、換縮圖的鍵、列出物件" },
-  r2_class_b: { name: "R2 讀取類操作（class B）", note: "每看一張沒被邊快取接住的縮圖" },
+  r2_class_a: { name: "R2 寫入類操作（class A）", note: "上傳、更新縮圖、列出物件" },
+  r2_class_b: { name: "R2 讀取類操作（class B）", note: "讀取未命中快取的縮圖" },
   d1_storage: { name: "D1 資料庫大小", note: "照片、相簿、軌跡點、留言" },
-  d1_rows_read: { name: "D1 讀取列數", note: "相簿清單一次就要掃幾百到幾千列" },
-  d1_rows_written: { name: "D1 寫入列數", note: "上傳、改資料、上線心跳" },
-  workers_requests: { name: "Workers 請求數", note: "每一次 API 呼叫（含圖片）" },
+  d1_rows_read: { name: "D1 讀取列數", note: "載入相簿清單等查詢" },
+  d1_rows_written: { name: "D1 寫入列數", note: "上傳、修改資料、上線狀態" },
+  workers_requests: { name: "Workers 請求數", note: "每一次 API 呼叫，含圖片" },
 };
 
 const PERIOD: Record<string, string> = { now: "目前", day: "今天", month: "本月" };
@@ -83,8 +83,8 @@ function Bar({ m }: { m: UsageMetric }) {
           *    不寫的話使用者會以為這一格真的沒用到任何額度。
           */}
         {m.error ? `　⚠️ ${m.error}`
-          : !known && m.key === "r2_storage" ? "　（還沒掃過，按下面那顆「重新掃描 R2」）"
-          : !known ? "　（需要 CF_API_TOKEN，見下面）"
+          : !known && m.key === "r2_storage" ? "　（尚未掃描，請按下方「重新掃描 R2」）"
+          : !known ? "　（需要 CF_API_TOKEN，說明如下）"
           : ""}
       </div>
     </div>
@@ -104,7 +104,7 @@ export default function UsageCard() {
     try {
       setReport(await getUsage());
     } catch (e) {
-      setMessage({ text: e instanceof Error ? e.message : "讀取用量失敗", ok: false });
+      setMessage({ text: e instanceof Error ? e.message : "載入用量失敗", ok: false });
     } finally {
       setBusy(false);
     }
@@ -124,7 +124,7 @@ export default function UsageCard() {
         if (state.done) break;
         if (rounds >= MAX_ROUNDS) {
           setMessage({
-            text: `掃了 ${MAX_ROUNDS} 輪還沒完，先停下來。再按一次會從剛剛的位置接著跑。`,
+            text: `已掃描 ${MAX_ROUNDS} 輪仍未完成，暫停處理。再按一次會從中斷處繼續。`,
             ok: false,
           });
           break;
@@ -144,8 +144,8 @@ export default function UsageCard() {
   return (
     <AdminSection id="usage" title="免費額度用量">
       <p className={styles.hint}>
-        這個站整個蓋在 Cloudflare 的免費額度上，<strong>條滿了就是額度用完</strong>
-        （之後的請求會被擋掉，或是開始計費）。七成之後條會變黃、九成變紅。
+        本站運行於 Cloudflare 免費額度。進度條滿即表示額度用盡，後續請求會被拒絕或開始計費。
+        用量達七成轉為黃色、九成轉為紅色。
       </p>
 
       <div className={styles.formRow}>
@@ -154,10 +154,10 @@ export default function UsageCard() {
           onClick={load}
           disabled={busy || scanning}
         >
-          {busy ? "讀取中..." : report ? "重新整理" : "看用量"}
+          {busy ? "載入中…" : report ? "重新整理" : "查看用量"}
         </button>
         <button className={styles.button} onClick={rescan} disabled={busy || scanning}>
-          {scanning ? `掃描 R2 中...（${scanned.toLocaleString()} 顆）` : "重新掃描 R2"}
+          {scanning ? `掃描 R2 中…（${scanned.toLocaleString()} 個物件）` : "重新掃描 R2"}
         </button>
       </div>
 
@@ -172,7 +172,7 @@ export default function UsageCard() {
           </div>
 
           <p className={styles.usageNote} style={{ marginTop: "0.8rem" }}>
-            量到的時間：{new Date(report.generated_at).toLocaleString("zh-TW")}
+            統計時間：{new Date(report.generated_at).toLocaleString("zh-TW")}
             {scan?.scanned_at && `　｜　R2 上次掃描：${new Date(scan.scanned_at).toLocaleString("zh-TW")}`}
           </p>
 
@@ -183,33 +183,32 @@ export default function UsageCard() {
           {!report.analytics.configured && (
             <details className={styles.guide}>
               <summary className={styles.guideSummary}>
-                有四條是「未設定」？把 Cloudflare 的用量 token 補上
+                有項目顯示「未設定」？請設定 Cloudflare 用量 token
               </summary>
               <div className={styles.guideBody}>
                 <p>
-                  今日 Workers 請求數、R2 的操作次數、D1 的讀寫列數這幾格，
-                  Worker 自己量不出來（它不知道自己今天被打了幾次），只能跟
-                  Cloudflare 問。要一把<strong>帳號層級</strong>的 API token：
+                  今日 Workers 請求數、R2 操作次數與 D1 讀寫列數無法由本站自行統計，
+                  必須向 Cloudflare 查詢，需要一組<strong>帳號層級</strong>的 API token：
                 </p>
                 <ol className={styles.guideList}>
                   <li>Cloudflare 後台 → 右上角頭像 → <span className={styles.code}>API Tokens</span> → Create Token → Custom token。</li>
-                  <li>權限給 <span className={styles.code}>Account</span> → <span className={styles.code}>Account Analytics</span> → <span className={styles.code}>Read</span>，其他都不用。</li>
+                  <li>權限選擇 <span className={styles.code}>Account</span> → <span className={styles.code}>Account Analytics</span> → <span className={styles.code}>Read</span>，其餘不需要。</li>
                   <li>
-                    在 <span className={styles.code}>apps/backend</span> 底下灌進兩個環境（會問你貼值，
-                    <strong>不要用管線餵</strong>，管線會多存一個換行）：
+                    在 <span className={styles.code}>apps/backend</span> 底下寫入兩個環境（依提示貼上值，
+                    <strong>請勿使用管線傳入</strong>，會多存一個換行）：
                     <div className={styles.mono}>npx wrangler secret put CF_API_TOKEN</div>
                     <div className={styles.mono}>npx wrangler secret put CF_API_TOKEN --env dev</div>
                   </li>
                   <li>
-                    帳號 id 也要一起灌（值在 <span className={styles.code}>npx wrangler whoami</span>
-                    那張表的 Account ID）：
+                    帳號 ID 也需一併設定（值取自 <span className={styles.code}>npx wrangler whoami</span>
+                    的 Account ID）：
                     <div className={styles.mono}>npx wrangler secret put CF_ACCOUNT_ID</div>
                     <div className={styles.mono}>npx wrangler secret put CF_ACCOUNT_ID --env dev</div>
                   </li>
                 </ol>
                 <p>
-                  第 3 步不能省：列出帳號要的是 <span className={styles.code}>Account Settings: Read</span>，
-                  而這裡只給了 Analytics 的讀取權限，所以 token 自己問不出它屬於哪個帳號。
+                  第 4 步不可省略：查詢帳號清單需要 <span className={styles.code}>Account Settings: Read</span>，
+                  而此 token 僅有 Analytics 讀取權限，無法自行判斷所屬帳號。
                 </p>
               </div>
             </details>
@@ -217,7 +216,7 @@ export default function UsageCard() {
 
           {report.analytics.errors.length > 0 && (
             <div className={styles.detail}>
-              <div className={styles.detailHead}>跟 Cloudflare 要數字時出的狀況</div>
+              <div className={styles.detailHead}>向 Cloudflare 查詢時發生的錯誤</div>
               {report.analytics.errors.map((e, i) => (
                 <div key={i} className={styles.detailRow}>
                   <span className={styles.detailNote}>{e}</span>
@@ -229,20 +228,20 @@ export default function UsageCard() {
           {scan && (
             <details className={styles.guide}>
               <summary className={styles.guideSummary}>
-                R2 裡放了什麼（{scan.objects.toLocaleString()} 顆 ／ {fmtBytes(scan.bytes)}
-                {scan.done ? "" : "，還沒掃完"}）
+                R2 內容明細（{scan.objects.toLocaleString()} 個物件 ／ {fmtBytes(scan.bytes)}
+                {scan.done ? "" : "，尚未掃描完成"}）
               </summary>
               <div className={styles.guideBody}>
                 <p>
-                  這是<strong>這個環境自己那一顆 bucket</strong> 的掃描結果。
-                  上面那條 R2 儲存空間在有 token 的時候用的是整個帳號的數字
-                  （prod ＋ dev 加起來），帳單看的是後者。
+                  此為<strong>本環境單一 bucket</strong> 的掃描結果。
+                  上方的 R2 儲存空間在設定 token 後顯示的是整個帳號的數字
+                  （正式站與測試站合計），帳單以後者為準。
                 </p>
                 {kinds.map(([kind, v]) => (
                   <div key={kind} className={styles.detailRow}>
                     <span className={styles.detailName}>{kind}</span>
                     <span className={styles.detailNum}>
-                      {v.objects.toLocaleString()} 顆 ／ {fmtBytes(v.bytes)}
+                      {v.objects.toLocaleString()} 個 ／ {fmtBytes(v.bytes)}
                     </span>
                   </div>
                 ))}
@@ -254,7 +253,7 @@ export default function UsageCard() {
             || report.breakdown.workers.length > 0
             || report.breakdown.d1.length > 0) && (
             <details className={styles.guide}>
-              <summary className={styles.guideSummary}>明細（哪些操作、哪個 Worker、哪個資料庫）</summary>
+              <summary className={styles.guideSummary}>詳細數據</summary>
               <div className={styles.guideBody}>
                 {report.breakdown.workers.length > 0 && (
                   <>
@@ -274,7 +273,7 @@ export default function UsageCard() {
                       <div key={b.name} className={styles.detailRow}>
                         <span className={styles.detailName}>{b.name}</span>
                         <span className={styles.detailNum}>
-                          {fmtBytes(b.bytes)} ／ {b.objects.toLocaleString()} 顆
+                          {fmtBytes(b.bytes)} ／ {b.objects.toLocaleString()} 個
                         </span>
                       </div>
                     ))}
@@ -282,7 +281,7 @@ export default function UsageCard() {
                 )}
                 {report.breakdown.r2_ops.length > 0 && (
                   <>
-                    <div className={styles.guideHead}>R2 本月的操作（cls ＝ 收費分級）</div>
+                    <div className={styles.guideHead}>R2 本月操作（cls 為收費分級）</div>
                     {report.breakdown.r2_ops.map((o) => (
                       <div key={o.name} className={styles.detailRow}>
                         <span className={styles.detailName}>
@@ -301,7 +300,7 @@ export default function UsageCard() {
                       <div key={d.name} className={styles.detailRow}>
                         <span className={styles.detailName}>{d.name}…</span>
                         <span className={styles.detailNum}>
-                          讀 {d.rows_read.toLocaleString()} ／ 寫 {d.rows_written.toLocaleString()}
+                          讀取 {d.rows_read.toLocaleString()} ／ 寫入 {d.rows_written.toLocaleString()}
                         </span>
                       </div>
                     ))}

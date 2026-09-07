@@ -60,8 +60,8 @@ export default function PresenceToasts() {
           <span>
             <span className={styles.name}>{t.name}</span>
             {t.kind === 'upload'
-              ? ` 傳了 ${uploadSummary(t.photos, t.videos)}${t.albumName ? `到「${t.albumName}」` : ''}`
-              : ' 上線囉'}
+              ? ` 上傳了 ${uploadSummary(t.photos, t.videos)}${t.albumName ? `至「${t.albumName}」` : ''}`
+              : ' 已上線'}
           </span>
         </div>
       ))}

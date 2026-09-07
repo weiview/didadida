@@ -24,7 +24,7 @@ const TIME_SOURCE_LABEL: Record<string, string> = {
   offset_tag: '相機寫入的時區',
   gps_utc: 'GPS 時間推算',
   file_time: '檔案時間',
-  assumed: `假設為 ${formatTzOffset(DEFAULT_TZ_OFFSET_MINUTES)}（未經確認）`,
+  assumed: `推定為 ${formatTzOffset(DEFAULT_TZ_OFFSET_MINUTES)}（未確認）`,
 };
 
 interface PhotoLightboxProps {
@@ -149,7 +149,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
       if (ok) onUpdate();
     }
     setIsSavingRestricted(false);
-    if (!ok) alert("設定失敗，請再試一次");
+    if (!ok) alert("設定失敗，請稍後再試");
   };
 
   useEffect(() => {
@@ -729,7 +729,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             */}
           {!isGif(photo) && !photo.drive_file_id && (
             <span className={styles.qualityNote}>
-              Drive 沒接上或缺這張備份，顯示的是 800px 縮圖
+              無法連線至 Google Drive 或缺少此備份，目前顯示 800px 縮圖
             </span>
           )}
           {/*
@@ -783,10 +783,10 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               className={styles.motionBtn}
               disabled={motionFailed}
               title={motionFailed
-                ? '這張的動畫讀不到（原始檔可能還沒備份到 Drive）'
+                ? '無法讀取動態片段（原始檔可能尚未備份至 Google Drive）'
                 : playMotion
-                  ? '停下這張照片的動態片段'
-                  : '播放這張照片的動態片段'}
+                  ? '停止播放動態片段'
+                  : '播放動態片段'}
               onClick={(e) => {
                 e.stopPropagation();
                 if (motionFailed) return;
@@ -798,7 +798,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               }}
             >
               <span aria-hidden>{motionFailed ? '⚠' : playMotion ? '■' : '▶'}</span>
-              <span>{motionFailed ? '動畫讀不到' : playMotion ? '停止' : '動態'}</span>
+              <span>{motionFailed ? '無法讀取' : playMotion ? '停止' : '動態'}</span>
             </button>
           )}
             </>
@@ -820,8 +820,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               disabled={isSavingRestricted}
               aria-pressed={photo.restricted === 1}
               title={photo.restricted === 1
-                ? `目前不開放：只有可管理全站內容的人看得到這${isVideo(photo) ? '支影片' : '張照片'}，其他人的相簿、搜尋與地圖上都沒有它。按一下改回開放`
-                : '按一下設成不開放：只有可管理全站內容的人看得到，其他人的相簿、搜尋與地圖上都不會有它'}
+                ? `目前為不開放，此${isVideo(photo) ? '影片' : '照片'}僅可管理全站內容的成員可見，不會出現在其他人的相簿、搜尋與地圖中。點擊改為開放`
+                : '點擊設為不開放，僅可管理全站內容的成員可見，不會出現在其他人的相簿、搜尋與地圖中'}
               onClick={(e) => { e.stopPropagation(); handleToggleRestricted(photo.restricted !== 1); }}
             >
               <span className={styles.restrictIcon} aria-hidden>{photo.restricted === 1 ? '🔒' : '🔓'}</span>
@@ -839,7 +839,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               onClick={(e) => { e.stopPropagation(); revealRestricted(photo.id); }}
             >
               <span>🔒 不開放</span>
-              <span className={styles.revealVeilHint}>點一下暫時顯示</span>
+              <span className={styles.revealVeilHint}>點擊暫時顯示</span>
             </button>
           )}
           {/* 掀開之後留一顆收回去的小鈕，位置接在左上角那顆鎖底下 */}
@@ -849,7 +849,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               className={styles.revealBack}
               onClick={(e) => { e.stopPropagation(); toggleRestrictedReveal(photo.id); }}
             >
-              暫時顯示中 · 收回
+              暫時顯示中 · 收合
             </button>
           )}
           {hasPrev && (
@@ -885,7 +885,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                   value={descValue} 
                   onChange={e => setDescValue(e.target.value)} 
                   className={styles.textarea}
-                  placeholder="輸入 Story (上限 200 字)..."
+                  placeholder="輸入 Story（上限 200 字）"
                   maxLength={200}
                 />
                 <button className={styles.btn} onClick={handleSaveDesc} disabled={isSavingDesc || descValue === (photo.description || "")}>
@@ -919,7 +919,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                     onChange={e => setNewTagName(e.target.value)} 
                     onBlur={() => { if(newTagName.trim()) handleAddTag() }}
                     onKeyDown={e => { if(e.key === 'Enter') handleAddTag() }}
-                    placeholder="新增標籤..."
+                    placeholder="新增標籤"
                     className={styles.framelessInput}
                     list="available-tags"
                   />
@@ -934,7 +934,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             {/* 管理員新增標籤時：快捷選取既有標籤膠囊按鈕 */}
             {isAdmin && (photo.tags?.length || 0) < 10 && availableTags.filter(t => !photo.tags?.some(pt => pt.name === t.name)).length > 0 && (
               <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px', alignItems: 'center' }}>
-                <span style={{ fontSize: '0.75rem', color: '#888' }}>快速加入既有標籤：</span>
+                <span style={{ fontSize: '0.75rem', color: '#888' }}>加入既有標籤：</span>
                 {availableTags
                   .filter(t => !photo.tags?.some(pt => pt.name === t.name))
                   .map(t => (
@@ -989,7 +989,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             */}
           <div className={styles.exifToggleRow}>
             <div className={styles.switchWrapper}>
-              <span>{isVideo(photo) ? '顯示影片的 Metadata' : '顯示照片資訊 (EXIF)'}</span>
+              <span>{isVideo(photo) ? '顯示影片資訊' : '顯示照片資訊（EXIF）'}</span>
               <label className={styles.switch}>
                 <input type="checkbox" checked={showExif} onChange={(e) => setExifExpanded(e.target.checked)} />
                 <span className={styles.slider}></span>
@@ -1010,8 +1010,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                   <span className={styles.exifLabel}>拍攝時間</span>
                   <span className={styles.exifValue}>
                     {displayDate
-                      || (isVideo(photo) ? '未指定（檔案裡沒有寫時間）'
-                        : isGif(photo) ? '未指定（GIF 沒有 EXIF）' : '未知')}
+                      || (isVideo(photo) ? '未指定（檔案未記錄時間）'
+                        : isGif(photo) ? '未指定（GIF 無 EXIF）' : '未知')}
                   </span>
                 </div>
 
@@ -1025,7 +1025,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                         type="button"
                         className={styles.exifEditBtn}
                         onClick={() => setShowFixTime(true)}
-                        title={displayDate ? '改掉手動填的時間' : '這一張沒有拍攝時間，指定一個'}
+                        title={displayDate ? '修改手動指定的時間' : '尚無拍攝時間，指定一個'}
                       >
                         {displayDate ? '修改' : '指定時間'}
                       </button>
@@ -1044,9 +1044,9 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                   <div className={styles.exifItem}>
                     <span className={styles.exifValue} style={{ color: '#888' }}>
                       {isVideo(photo)
-                        ? '還沒讀過這支影片的 metadata（站長可以到後台「影片的 Metadata」回讀一次）'
+                        ? '尚未讀取此影片的資訊（站長可於後台「影片資訊」執行回讀）'
                         : isGif(photo)
-                          ? 'GIF 沒有相機參數'
+                          ? 'GIF 無相機參數'
                           : '此照片無其他 EXIF 參數'}
                     </span>
                   </div>

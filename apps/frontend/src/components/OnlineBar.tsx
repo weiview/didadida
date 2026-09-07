@@ -28,7 +28,7 @@ const MAX_HEADS = 3;
 
 /** 「最後出現」寫成人看得懂的相對時間。null ＝ 這個帳號還沒回來過 */
 function lastSeenText(t: number | null): string {
-  if (t == null) return "還沒登入過";
+  if (t == null) return "尚未登入過";
   const m = Math.floor((Date.now() - t) / 60000);
   if (m < 1) return "剛剛";
   if (m < 60) return `${m} 分鐘前`;
@@ -88,7 +88,7 @@ export default function OnlineBar() {
           className={styles.pill}
           onClick={() => setOpen((v) => !v)}
           aria-expanded={open}
-          title={others.length > 0 ? `${others.length} 位家人在線上` : "只有你在線上"}
+          title={others.length > 0 ? `${others.length} 位成員在線上` : "目前僅有您在線上"}
         >
           {heads.length > 0 ? (
             <span className={styles.heads}>
@@ -105,21 +105,21 @@ export default function OnlineBar() {
             {/* 只有自己的時候寫「只有你在線上」比寫一個 0 誠實 */}
             {others.length > 0
               ? `${others.length} 人在線上`
-              : "只有你在線上"}
+              : "僅有您在線上"}
           </span>
         </button>
 
         {open && (
           <div className={styles.panel} role="dialog" aria-label="誰在線上">
             <div className={styles.title}>
-              {others.length > 0 ? `${others.length} 位家人在線上` : "目前只有你在線上"}
+              {others.length > 0 ? `${others.length} 位成員在線上` : "目前僅有您在線上"}
             </div>
             {online.map((p) => (
               <div key={p.id} className={styles.row}>
                 <Avatar src={p.avatar} name={p.name} color={p.color} size={28} presence="online" />
                 <span className={styles.name}>
                   {p.name}
-                  {p.id === snap.self && <span className={styles.me}>你自己</span>}
+                  {p.id === snap.self && <span className={styles.me}>您自己</span>}
                 </span>
                 <span className={`${styles.when} ${styles.online}`}>上線中</span>
               </div>

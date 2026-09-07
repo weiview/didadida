@@ -3506,7 +3506,7 @@ export default function FootprintMap({
       const ok = await onEditPoints(edits);
       // 失敗時保留選取，使用者才能直接重試而不用重選一次
       if (ok) clearSelection();
-      else setEditError('儲存失敗，請再試一次');
+      else setEditError('儲存失敗，請稍後再試');
     } finally {
       setEditBusy(false);
     }
@@ -3527,17 +3527,17 @@ export default function FootprintMap({
 
   const mergeSelected = useCallback(() => {
     if (selectedPoints.length < 2) {
-      setEditError('至少要選兩個點才能合併');
+      setEditError('至少需選取兩個點才能合併');
       return;
     }
     const { day_key: dayKey, seg } = selectedPoints[0];
     if (selectedPoints.some((p) => p.day_key !== dayKey || p.seg !== seg)) {
-      setEditError('合併的點必須在同一天的同一段軌跡內');
+      setEditError('合併的點必須位於同一天的同一段軌跡內');
       return;
     }
 
     const times = selectedPoints.map((p) => Date.parse(p.t_utc)).filter(Number.isFinite);
-    if (times.length === 0) { setEditError('選到的點沒有有效時間'); return; }
+    if (times.length === 0) { setEditError('選取的點沒有有效時間'); return; }
     const t0 = Math.min(...times);
     const t1 = Math.max(...times);
 
@@ -3550,14 +3550,14 @@ export default function FootprintMap({
         return Number.isFinite(t) && t >= t0 && t <= t1;
       })
       .sort((a, b) => Date.parse(a.t_utc) - Date.parse(b.t_utc));
-    if (absorbed.length < 2) { setEditError('沒有可以合併的點'); return; }
+    if (absorbed.length < 2) { setEditError('沒有可合併的點'); return; }
 
     const lat = absorbed.reduce((s, p) => s + p.lat, 0) / absorbed.length;
     const lng = absorbed.reduce((s, p) => s + p.lng, 0) / absorbed.length;
     const staySec = Math.max(1, Math.round((t1 - t0) / 1000));
 
     if (!window.confirm(
-      `把 ${absorbed.length} 個點合併成一處停留（${humanDuration(staySec)}）？`,
+      `確定將 ${absorbed.length} 個點合併為一處停留（${humanDuration(staySec)}）？`,
     )) return;
 
     void submitEdits([{
@@ -3591,7 +3591,7 @@ export default function FootprintMap({
     const { point, photo } = mergePair;
     const n = orderById.get(point.id);
     if (!window.confirm(
-      `把軌跡點${n ? ` #${n}` : ''} 移到「${photo.title}」的位置？`,
+      `確定將軌跡點${n ? ` #${n}` : ''} 移至「${photo.title}」的位置？`,
     )) return;
     void submitEdits([{
       dayKey: point.day_key,
@@ -3615,13 +3615,13 @@ export default function FootprintMap({
     const { point, photo } = mergePair;
     const n = orderById.get(point.id);
     if (!window.confirm(
-      `把「${photo.title}」移到軌跡點${n ? ` #${n}` : ''} 的位置？`,
+      `確定將「${photo.title}」移至軌跡點${n ? ` #${n}` : ''} 的位置？`,
     )) return;
     setEditBusy(true);
     setEditError(null);
     try {
       if (await onMovePhoto(photo.id, point.lat, point.lng)) clearSelection();
-      else setEditError('儲存失敗，請再試一次');
+      else setEditError('儲存失敗，請稍後再試');
     } finally {
       setEditBusy(false);
     }
@@ -3666,7 +3666,7 @@ export default function FootprintMap({
             {selectedPhotos.length > 0 && ` ・ ${selectedPhotos.length} 張照片`}
           </span>
           <span style={{ fontSize: 12, color: '#64748b', flex: '1 1 200px', minWidth: 0 }}>
-            點擊軌跡點或照片選取，按住 Shift 點第二個軌跡點可連選一段
+            點擊軌跡點或照片以選取；按住 Shift 點選第二個軌跡點可連選一段
           </span>
 
           {/* 選到照片時才長出來 —— 平常這排已經四顆按鈕，再多兩顆會擠成一團 */}
@@ -3675,7 +3675,7 @@ export default function FootprintMap({
               <button
                 onClick={movePointToPhoto}
                 disabled={editBusy || !mergePair}
-                title="軌跡點的座標改成這張照片的座標"
+                title="將軌跡點的座標改為這張照片的座標"
                 style={{
                   border: 'none', borderRadius: 8, padding: '6px 12px', fontSize: 13, flexShrink: 0,
                   background: mergePair ? '#0f766e' : '#e2e8f0',
@@ -3688,7 +3688,7 @@ export default function FootprintMap({
               <button
                 onClick={movePhotoToPoint}
                 disabled={editBusy || !mergePair || !onMovePhoto}
-                title="照片的座標改成這個軌跡點的座標，並標記為手動指定"
+                title="將照片的座標改為這個軌跡點的座標，並標記為手動指定"
                 style={{
                   border: 'none', borderRadius: 8, padding: '6px 12px', fontSize: 13, flexShrink: 0,
                   background: mergePair && onMovePhoto ? '#2563eb' : '#e2e8f0',

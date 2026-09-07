@@ -191,7 +191,7 @@ export default function FootprintDayPicker({
           padding: '7px 12px', borderRadius: 7, border: '1px solid #cbd5e1',
           background: '#fff', cursor: 'pointer', fontSize: 13, minWidth: 168, textAlign: 'left',
         }}
-        title={`只有留下${noun}的日子選得到。點一天＝就看那天，再點第二天＝框出一段範圍`}
+        title={`僅能選擇有${noun}的日期。點選一天檢視該日，再點第二天可框選範圍`}
       >
         {label} ▾
       </button>
@@ -241,7 +241,7 @@ export default function FootprintDayPicker({
                   type="button"
                   disabled={!ok}
                   onClick={() => pick(day)}
-                  title={ok ? day : `${day} 沒有任何${noun}`}
+                  title={ok ? day : `${day} 無${noun}`}
                   style={{
                     position: 'relative', padding: '6px 0', borderRadius: 6, fontSize: 12.5,
                     border: '1px solid transparent',
@@ -270,11 +270,11 @@ export default function FootprintDayPicker({
             <span style={{ fontSize: 11.5, color: anchor ? '#2563eb' : '#94a3b8', flex: 1 }}>
               {/* 等第二下的時候，這行字要蓋過月份統計 —— 那是此刻唯一需要知道的事，
                   而且它同時解釋了「為什麼面板還開著」 */}
-              {anchor ? '再點一天框出範圍，或按「完成」就看這一天'
-                : loading ? `讀取這個月的${noun}…`
-                : daysWithData === null ? `（尚未載入${noun}索引）`
-                : daysWithData.size === 0 ? `這個月沒有任何${noun}`
-                : `這個月有 ${daysWithData.size} 天有${noun}`}
+              {anchor ? '再點選一天可框選範圍，或按「完成」僅檢視這一天'
+                : loading ? `載入本月${noun}…`
+                : daysWithData === null ? `尚未載入${noun}索引`
+                : daysWithData.size === 0 ? `本月無${noun}`
+                : `本月有 ${daysWithData.size} 天有${noun}`}
             </span>
             {(from || to) && (
               <button

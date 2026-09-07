@@ -56,7 +56,7 @@ export async function captureVideoPoster(file: File): Promise<VideoPoster> {
   try {
     const meta = await withTimeout(
       once(video, 'loadedmetadata'),
-      `讀不到「${file.name}」的影片資訊`,
+      `無法讀取「${file.name}」的影片資訊`,
     ).then(() => ({
       // 串流式的 webm 有時候回 Infinity；當成沒有長度，格線就不畫時間角標
       durationMs: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : 0,
@@ -65,7 +65,7 @@ export async function captureVideoPoster(file: File): Promise<VideoPoster> {
     }));
 
     if (!meta.width || !meta.height) {
-      throw new Error(`「${file.name}」這個格式瀏覽器解不開，換 MP4 再試一次`);
+      throw new Error(`瀏覽器無法解析「${file.name}」的格式，請改用 MP4 上傳`);
     }
 
     // 有長度就取 1 秒或一成的位置（取小的），沒長度只好從頭拿
@@ -74,7 +74,7 @@ export async function captureVideoPoster(file: File): Promise<VideoPoster> {
       : 0;
     const painted = once(video, 'seeked');
     video.currentTime = seekTo;
-    await withTimeout(painted, `擷不到「${file.name}」的封面畫面`);
+    await withTimeout(painted, `無法擷取「${file.name}」的封面畫面`);
 
     /*
      * seeked 只保證「跳到了」，不保證那一格已經畫出來。有 requestVideoFrameCallback
@@ -88,14 +88,14 @@ export async function captureVideoPoster(file: File): Promise<VideoPoster> {
     canvas.width = Math.max(1, Math.round(meta.width * scale));
     canvas.height = Math.max(1, Math.round(meta.height * scale));
     const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('這個瀏覽器畫不出封面');
+    if (!ctx) throw new Error('此瀏覽器無法產生封面畫面');
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
     const blob = await new Promise<Blob | null>((resolve) => {
       // 不支援 WebP 編碼的瀏覽器會自己退回 PNG，後端兩種都收
       canvas.toBlob(resolve, 'image/webp', 0.85);
     });
-    if (!blob) throw new Error(`「${file.name}」的封面編不出來`);
+    if (!blob) throw new Error(`無法產生「${file.name}」的封面`);
 
     const base = file.name.replace(/\.[^/.]+$/, '') || 'video';
     return {

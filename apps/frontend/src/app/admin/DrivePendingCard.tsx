@@ -15,12 +15,12 @@ import { fetchDrivePending, type DrivePendingPhoto } from "@/lib/api";
  *    （R2 上只有封面），GIF 的動畫本體本來就在 R2，Drive 那份才是備份。
  */
 const missingLabel = (p: DrivePendingPhoto): string => {
-  if (p.media_type === "video") return "影片缺原始檔";
-  if (p.media_type === "gif") return "GIF 缺原始檔備份";
+  if (p.media_type === "video") return "缺原始檔";
+  if (p.media_type === "gif") return "缺原始檔備份";
   const need4k = !p.has_4k;
   const needOrig = !p.has_original;
-  if (need4k && needOrig) return "兩份都缺";
-  return need4k ? "只缺 4K" : "只缺原始檔";
+  if (need4k && needOrig) return "缺 4K 與原始檔";
+  return need4k ? "缺 4K" : "缺原始檔";
 };
 
 /**
@@ -61,7 +61,7 @@ export function DrivePendingList({ reloadToken = 0 }: { reloadToken?: number }) 
       let remaining = 0;
       for (let page = 0; page < 20; page++) {
         const res = await fetchDrivePending(cursor, 500);
-        if (!res) throw new Error("讀取清單失敗（要有「可管理全站內容」的權限）");
+        if (!res) throw new Error("載入清單失敗，需要「可管理全站內容」權限");
         all.push(...res.photos);
         remaining = res.remaining;
         cursor = res.next_cursor;
@@ -70,7 +70,7 @@ export function DrivePendingList({ reloadToken = 0 }: { reloadToken?: number }) 
       setRows(all);
       setTotal(remaining);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "讀取清單失敗");
+      setError(e instanceof Error ? e.message : "載入清單失敗");
     } finally {
       setBusy(false);
     }
@@ -91,7 +91,7 @@ export function DrivePendingList({ reloadToken = 0 }: { reloadToken?: number }) 
       setCopiedId(id);
       setTimeout(() => setCopiedId((cur) => (cur === id ? null : cur)), 1600);
     } catch {
-      window.prompt("複製不了，請自己選取這段文字：", name);
+      window.prompt("無法自動複製，請手動選取以下文字：", name);
     }
   };
 
@@ -109,33 +109,32 @@ export function DrivePendingList({ reloadToken = 0 }: { reloadToken?: number }) 
   return (
     <>
       <p className={styles.hint}>
-        上傳當下 Drive 那一步失敗的照片與影片會留在這裡（很舊的照片也是）。
-        <strong>要補的話：把同一個原始檔再拖進那本相簿一次就好</strong> ——
-        站上會認出是同一個檔，直接補上缺的那一份，相簿裡不會多一格，
-        原本的標籤、留言、Story、改過的時間與地點都留著。
-        影片沒有 4K 那一份，但 Drive 那份對影片<strong>不是備份是本體</strong>，
-        沒上去就等於沒有影片。GIF 同樣沒有 4K 那一份，不過它的動畫本體是存在
-        R2 的，Drive 這一份純粹是備份 —— 沒上去相簿裡那一格還是會動。
+        以下是上傳時 Drive 備份未完成的照片與影片。
+        <strong>補傳方式：將同一個原始檔重新上傳到該相簿</strong>，
+        系統會辨識為同一個檔案，只補上缺少的部分，不會新增一筆，
+        原有的標籤、留言、Story 與已修改的時間、地點都會保留。
+        影片沒有 4K 版本，且 Drive 上的原始檔就是影片本體，未上傳即無法播放。
+        GIF 同樣沒有 4K 版本，但動畫本體存放在站上，Drive 這份僅為備份。
       </p>
 
       <div className={styles.formRow}>
         <button className={styles.button} disabled={busy} onClick={load}>
-          {busy ? "讀取中…" : rows === null ? "看清單" : "重新讀取"}
+          {busy ? "載入中…" : rows === null ? "查看清單" : "重新載入"}
         </button>
       </div>
 
       {error && <p className={`${styles.message} ${styles.err}`}>{error}</p>}
 
       {rows !== null && rows.length === 0 && (
-        <p className={styles.hint}>全站的照片與影片都有完整的 Drive 備份，沒有要補的。</p>
+        <p className={styles.hint}>所有照片與影片的 Drive 備份都已完成。</p>
       )}
 
       {rows !== null && rows.length > 0 && (
         <>
           <p className={styles.hint}>
-            有 <strong>{total || rows.length}</strong> 個檔案還沒有完整的 Drive 備份
-            {rows.length < total && `（先列出前 ${rows.length} 個）`}
-            。點檔名複製那一個，點「看照片」在新分頁打開那一張。
+            有 <strong>{total || rows.length}</strong> 個檔案的 Drive 備份不完整
+            {rows.length < total && `（僅列出前 ${rows.length} 個）`}
+            。點檔名可複製，點「看照片」會在新分頁開啟。
           </p>
 
           <div
@@ -170,7 +169,7 @@ export function DrivePendingList({ reloadToken = 0 }: { reloadToken?: number }) 
                 >
                   <button
                     type="button"
-                    title={`${name}（點一下複製檔名）`}
+                    title={`${name}（點擊複製檔名）`}
                     onClick={() => copyName(p.id, name)}
                     style={{
                       flex: "1 1 200px",
@@ -201,8 +200,8 @@ export function DrivePendingList({ reloadToken = 0 }: { reloadToken?: number }) 
                     ) : (
                       [
                         missingLabel(p),
-                        p.uploader_name || "上傳者不明",
-                        p.album_name || "相簿不明",
+                        p.uploader_name || "上傳者未知",
+                        p.album_name || "相簿未知",
                       ].join("　·　")
                     )}
                   </span>
@@ -220,7 +219,7 @@ export function DrivePendingList({ reloadToken = 0 }: { reloadToken?: number }) 
                       href={`/album?id=${p.album_id}&photo=${p.id}`}
                       target="_blank"
                       rel="noopener noreferrer"
-                      title="在新分頁打開這一張"
+                      title="在新分頁開啟這張照片"
                       style={{ flex: "none", padding: "2px 6px", whiteSpace: "nowrap" }}
                     >
                       看照片 ↗

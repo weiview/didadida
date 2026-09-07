@@ -360,7 +360,7 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
     const text = serializeEditor(editorRef.current).trim();
     if (!text || sending) return;
     if (text.length > 1000) {
-      setError('留言太長了，上限 1000 字');
+      setError('留言長度上限為 1000 字');
       return;
     }
     setSending(true);
@@ -379,7 +379,7 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
   };
 
   const remove = async (c: PhotoComment) => {
-    if (!window.confirm('刪掉這則留言？底下的回覆會一起消失。')) return;
+    if (!window.confirm('確定刪除這則留言？其下的回覆將一併刪除。')) return;
     if (await deleteComment(c.id)) {
       // 回覆是後端 CASCADE 刪掉的，前端也要照著把它們拿掉
       setComments((prev) => prev.filter((x) => x.id !== c.id && x.parent_id !== c.id));
@@ -441,7 +441,7 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
       {loading ? (
         <span className={styles.commentHint}>載入中…</span>
       ) : threads.length === 0 ? (
-        <span className={styles.commentHint}>還沒有人留言</span>
+        <span className={styles.commentHint}>尚無留言</span>
       ) : (
         <div className={styles.commentList}>
           {threads.map(({ root, replies }) => (
@@ -475,7 +475,7 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
               role="textbox"
               aria-multiline="true"
               aria-label="留言"
-              data-placeholder="留個言…　打 @ 可以提到某個人"
+              data-placeholder="輸入留言…　輸入 @ 可提及成員"
               onInput={() => { syncDraft(); refreshMentionQuery(); }}
               onKeyDown={onEditorKeyDown}
               // 游標被鍵盤或滑鼠移走時，@ 選單也該跟著關掉／重算
@@ -522,7 +522,7 @@ export default function PhotoComments({ photoId }: { photoId: number }) {
         </div>
       ) : (
         <span className={styles.commentHint}>
-          {isAdmin ? '站長關閉了你的留言權限' : '訪客只能看留言。想留言請用 Google 登入'}
+          {isAdmin ? '目前無留言權限，請洽站長' : '訪客僅能瀏覽留言，如需留言請使用 Google 登入'}
         </span>
       )}
     </div>

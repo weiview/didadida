@@ -142,9 +142,9 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
 
   /** 還差什麼才套得下去。null＝可以套了 */
   const blockReason = !pin
-    ? '還沒選位置 —— 在地圖上點一下、或貼上座標'
+    ? '尚未選擇位置，請在地圖上點選或貼上座標'
     : !trimmedName
-      ? '還沒填打卡地點名稱'
+      ? '請填寫地點名稱'
       : null;
 
   /** 搜尋框裡打的是座標而不是地名時，就是這個值 */
@@ -212,7 +212,7 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
    */
   const removePlace = useCallback(async (pl: SavedPlace) => {
     const yes = window.confirm(
-      `把「${pl.name}」從地點簿移除？\n\n只是收掉這個捷徑，已經標好的照片座標與地名都不會動。`
+      `將「${pl.name}」從地點簿移除？\n\n僅移除此快捷選項，已標記照片的座標與地名不會變動。`
     );
     if (!yes) return;
     if (await deletePlace(pl.id)) {
@@ -324,11 +324,11 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
               {preview.startLocal && preview.endLocal ? (
                 <div>時間範圍：{preview.startLocal} ~ {preview.endLocal}</div>
               ) : (
-                <div style={{ color: '#b45309' }}>選取的照片沒有拍攝時間，無法建立時間區段</div>
+                <div style={{ color: '#b45309' }}>選取的照片皆無拍攝時間，無法建立時間區段</div>
               )}
               {preview.missingTimeCount > 0 && (
                 <div style={{ color: '#b45309' }}>
-                  其中 {preview.missingTimeCount} 張缺少拍攝時間，不會納入區段
+                  其中 {preview.missingTimeCount} 張無拍攝時間，不納入區段
                 </div>
               )}
               {preview.existingExifCount > 0 && (
@@ -346,10 +346,10 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
               padding: '12px 14px', fontSize: 13.5, lineHeight: 1.7, marginBottom: 14,
             }}>
               <div style={{ fontWeight: 600, marginBottom: 6 }}>
-                另有 {preview!.alsoInRange.length} 張照片也落在此時間範圍內，但未被選取
+                另有 {preview!.alsoInRange.length} 張照片落在此時間範圍內但未選取
               </div>
               <div style={{ color: '#78350f', marginBottom: 8 }}>
-                相簿的顯示順序不一定等於拍攝時間順序，若曾手動排序過就會出現這種情況。
+                相簿的顯示順序不一定等於拍攝時間順序，手動排序過即可能如此。
               </div>
               <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer' }}>
                 <input
@@ -368,9 +368,9 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
             padding: 12, marginBottom: 12,
           }}>
             <div style={{ fontSize: 12.5, color: '#64748b', marginBottom: 8, lineHeight: 1.6 }}>
-              在地圖上點一下就是打卡位置。地名搜尋用的是 OpenStreetMap，
-              小店家常常沒收錄，這時候自己點、或從 Google 地圖複製座標貼到底下
-              「搜尋地點或貼上座標」那一格最快。
+              在地圖上點選即可設定位置。地名搜尋來源為 OpenStreetMap，
+              小型店家可能未收錄，此時可直接在地圖上點選，
+              或將 Google 地圖的座標貼入下方「搜尋地點或貼上座標」欄位。
             </div>
 
             <PlacePickerMap
@@ -394,7 +394,7 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
             <div className={styles.fieldRow}>
               <div className={styles.field}>
                 <label className={styles.fieldLabel}>
-                  打卡地點名稱
+                  地點名稱
                   <span style={{ color: '#b91c1c', marginLeft: 4 }}>*</span>
                 </label>
 
@@ -425,14 +425,14 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
                       <button
                         type="button"
                         onClick={() => setPlaceMenuOpen((o) => !o)}
-                        title="從用過的地點挑一個"
+                        title="選擇曾使用的地點"
                         style={{
                           flex: 'none', padding: '9px 12px', borderRadius: 8,
                           border: '1px solid #cbd5e1', background: '#fff', color: '#334155',
                           cursor: 'pointer', fontSize: 13, whiteSpace: 'nowrap',
                         }}
                       >
-                        用過的 {placeMenuOpen ? '▲' : '▼'}
+                        常用地點 {placeMenuOpen ? '▲' : '▼'}
                       </button>
                     )}
                   </div>
@@ -445,7 +445,7 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
                     }}>
                       {placeHits.length === 0 ? (
                         <div style={{ padding: '10px 12px', fontSize: 13, color: '#94a3b8' }}>
-                          地點簿裡還沒有這個名字 —— 直接打完套用，它就會存進去。
+                          地點簿中尚無此名稱，套用後會自動加入。
                         </div>
                       ) : (
                         placeHits.map((pl, i) => (
@@ -477,7 +477,7 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
                             <button
                               type="button"
                               onClick={() => removePlace(pl)}
-                              title="從地點簿移除（不會動到已經標好的照片）"
+                              title="從地點簿移除（不影響已標記的照片）"
                               style={{
                                 flex: 'none', border: 'none', background: 'transparent',
                                 color: '#94a3b8', cursor: 'pointer', fontSize: 15, padding: '9px 12px',
@@ -494,7 +494,7 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
                           padding: '6px 12px', fontSize: 12, color: '#94a3b8',
                           borderTop: '1px solid #f1f5f9',
                         }}>
-                          只列出前 {PLACE_MENU_MAX} 個，打幾個字縮小範圍
+                          僅顯示前 {PLACE_MENU_MAX} 筆，可輸入文字縮小範圍
                         </div>
                       )}
                     </div>
@@ -502,7 +502,7 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
                 </div>
 
                 <p className={styles.fieldNote}>
-                  自己打，或從「用過的」挑一個 —— 座標會一起帶進來。套用之後就存進地點簿
+                  可直接輸入，或從「常用地點」選擇（會一併帶入座標）。套用後將存入地點簿
                 </p>
               </div>
 
@@ -556,11 +556,11 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
                   <p className={styles.fieldNote}>搜尋中…</p>
                 ) : typedCoords ? (
                   <p className={styles.fieldNote} style={{ color: '#2563eb' }}>
-                    認得是座標，已直接釘在地圖上
+                    已辨識為座標，並標記於地圖上
                   </p>
                 ) : (
                   <p className={styles.fieldNote}>
-                    找不到就在地圖上自己點一下，或貼 Google 地圖的座標
+                    查無結果時可直接在地圖上點選，或貼上 Google 地圖的座標
                   </p>
                 )}
               </div>
@@ -577,8 +577,8 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
               */}
             {movesPlace && (
               <div style={{ fontSize: 12.5, marginTop: 6, color: '#b45309', lineHeight: 1.6 }}>
-                「{trimmedName}」在地點簿裡本來是 {namedPlace!.lat.toFixed(5)}, {namedPlace!.lng.toFixed(5)}
-                　—— 套用之後會更新成現在這一點。想留著舊的請換一個名字。
+                「{trimmedName}」在地點簿中原為 {namedPlace!.lat.toFixed(5)}, {namedPlace!.lng.toFixed(5)}，
+                套用後將更新為目前位置。如需保留原座標，請使用其他名稱。
               </div>
             )}
           </div>
@@ -605,8 +605,8 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
               <span>
                 同時建立行程段
                 <span style={{ color: '#64748b', display: 'block', fontSize: 12.5 }}>
-                  只是把「這段時間我在這裡」記下來當規則。之後在「地點」視窗按
-                  「用行程段補位置」時，落在這個時間範圍又還沒有位置的照片才會套用同一地點
+                  將此時間範圍與地點記錄為規則。日後在「地點」視窗按「用行程段補位置」時，
+                  落在此範圍且尚無位置的照片會套用相同地點
                 </span>
               </span>
             </label>
@@ -622,7 +622,7 @@ export default function AssignPlaceModal({ isOpen, photoIds, albumId, onClose, o
                 <span>
                   覆蓋已有 GPS 的照片
                   <span style={{ color: '#64748b', display: 'block', fontSize: 12.5 }}>
-                    預設不覆蓋 —— 照片自帶的 GPS 比手動指定精確
+                    預設不覆蓋，照片自帶的 GPS 通常較手動指定精確
                   </span>
                 </span>
               </label>

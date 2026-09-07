@@ -657,7 +657,7 @@ export default function Home() {
       }));
       const success = await reorderAlbums(updates);
       if (!success) {
-        alert("儲存排序失敗");
+        alert("排序儲存失敗");
         loadData(); // 恢復原狀
       }
     }
@@ -674,7 +674,7 @@ export default function Home() {
           <h1 className={styles.title}>
             DidaDida
           </h1>
-          <p className={styles.subtitle}>紀錄每一個美好瞬間</p>
+          <p className={styles.subtitle}>記錄每一個美好瞬間</p>
           {/* 站長沒開放訪客看足跡的話，這個連結就不存在 —— 直接打網址也一樣進不去 */}
           {canViewMap && (
             <Link
@@ -693,7 +693,7 @@ export default function Home() {
             <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
               <input 
                 type="text" 
-                placeholder="搜尋相簿、Story 或檔名..." 
+                placeholder="搜尋相簿、Story 或檔名" 
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
                 className={styles.searchInput}
@@ -732,8 +732,8 @@ export default function Home() {
                 value={sortBy}
                 onChange={(val) => setSortBy(val as any)}
                 options={[
-                  { value: "custom", label: "自訂排序 (可拖曳)" },
-                  { value: "upload_date", label: "依建立日期 (新到舊)" }
+                  { value: "custom", label: "自訂排序（可拖曳）" },
+                  { value: "upload_date", label: "建立日期（新到舊）" }
                 ]}
               />
 
@@ -741,12 +741,12 @@ export default function Home() {
                 value={gridColumns || 0}
                 onChange={(val) => setGridColumns(Number(val))}
                 options={[
-                  { value: 0, label: "縮圖版面: 自動" },
-                  { value: 1, label: "縮圖版面: 1 欄 (大圖)" },
-                  { value: 2, label: "縮圖版面: 2 欄 (雙排)" },
-                  { value: 3, label: "縮圖版面: 3 欄 (精緻)" },
-                  { value: 4, label: "縮圖版面: 4 欄 (多張)" },
-                  { value: 5, label: "縮圖版面: 5 欄 (密集)" }
+                  { value: 0, label: "版面：自動" },
+                  { value: 1, label: "版面：1 欄" },
+                  { value: 2, label: "版面：2 欄" },
+                  { value: 3, label: "版面：3 欄" },
+                  { value: 4, label: "版面：4 欄" },
+                  { value: 5, label: "版面：5 欄" }
                 ]}
               />
             </div>
@@ -808,7 +808,7 @@ export default function Home() {
                   }}
                 >
                   <span>
-                    🏷️ {selectedTags.length === 0 ? '所有標籤' : selectedTags.length === availableTags.length ? '全選標籤 (所有)' : `已選取 ${selectedTags.length} 個標籤`}
+                    🏷️ {selectedTags.length === 0 ? '所有標籤' : selectedTags.length === availableTags.length ? '已選取全部標籤' : `已選取 ${selectedTags.length} 個標籤`}
                   </span>
                   <span style={{ fontSize: '0.8rem', color: '#888' }}>選擇 ❯</span>
                 </button>
@@ -821,7 +821,7 @@ export default function Home() {
                 <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}>
                   {[
                     { value: "custom", label: "自訂排序" },
-                    { value: "upload_date", label: "建立日期 (新到舊)" }
+                    { value: "upload_date", label: "建立日期（新到舊）" }
                   ].map(opt => {
                     const isSelected = sortBy === opt.value;
                     return (
@@ -855,11 +855,11 @@ export default function Home() {
                 <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}>
                   {[
                     { value: 0, label: "自動" },
-                    { value: 1, label: "1 欄 (大圖)" },
-                    { value: 2, label: "2 欄 (雙排)" },
-                    { value: 3, label: "3 欄 (精緻)" },
-                    { value: 4, label: "4 欄 (多張)" },
-                    { value: 5, label: "5 欄 (密集)" }
+                    { value: 1, label: "1 欄" },
+                    { value: 2, label: "2 欄" },
+                    { value: 3, label: "3 欄" },
+                    { value: 4, label: "4 欄" },
+                    { value: 5, label: "5 欄" }
                   ].map(opt => {
                     const isSelected = (gridColumns || 0) === opt.value;
                     return (
@@ -906,13 +906,13 @@ export default function Home() {
                     }}
                     style={{ background: 'none', border: 'none', color: 'var(--accent-color, #d1bfae)', fontWeight: 600, fontSize: '0.88rem', cursor: 'pointer' }}
                   >
-                    {selectedTags.length === availableTags.length ? '取消全選' : '全選所有標籤'}
+                    {selectedTags.length === availableTags.length ? '取消全選' : '全選'}
                   </button>
                 </div>
 
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', justifyContent: 'center', padding: '6px 4px 20px 4px' }}>
                   {availableTags.length === 0 ? (
-                    <div style={{ padding: '20px', color: '#888', fontSize: '0.9rem' }}>全站尚無相片標籤</div>
+                    <div style={{ padding: '20px', color: '#888', fontSize: '0.9rem' }}>尚未建立任何標籤</div>
                   ) : (
                     availableTags.map(t => {
                       const isSelected = selectedTags.includes(t.id);
@@ -955,7 +955,7 @@ export default function Home() {
       </header>
 
       {loading ? (
-        <div className={styles.loading}>載入中...</div>
+        <div className={styles.loading}>載入中…</div>
       ) : (searchQuery.trim() || selectedTags.length > 0) ? (
         /* 照片與相簿分層搜尋/標籤篩選結果模式 */
         <div>
@@ -968,8 +968,8 @@ export default function Home() {
                   <polyline points="21 15 16 10 5 21"></polyline>
                 </svg>
                 {selectedTags.length > 0 && !searchQuery.trim()
-                  ? `標籤篩選照片 (${displayPhotos.length} 張)`
-                  : `照片搜尋結果 (${displayPhotos.length} 張)`}
+                  ? `標籤篩選照片（${displayPhotos.length} 張）`
+                  : `照片搜尋結果（${displayPhotos.length} 張）`}
               </h2>
               <div className={albumStyles.photoGrid}>
                 {displayPhotos.map((photo, index) => (
@@ -1003,12 +1003,12 @@ export default function Home() {
                         disabled={restrictBusyId === photo.id}
                         aria-pressed={photo.restricted === 1}
                         title={photo.restricted === 1
-                          ? '目前不開放：只有可管理全站內容的人看得到。按一下改回開放'
-                          : '按一下設成不開放：只有可管理全站內容的人看得到'}
+                          ? '目前為不開放，僅可管理全站內容的成員可見。點擊改為開放'
+                          : '點擊設為不開放，僅可管理全站內容的成員可見'}
                         onClick={async (e) => {
                           e.stopPropagation();
                           const ok = await handleToggleRestricted(photo.id, photo.restricted !== 1);
-                          if (!ok) alert('設定失敗，請再試一次');
+                          if (!ok) alert('設定失敗，請稍後再試');
                         }}
                       >
                         {photo.restricted === 1 ? '🔒' : '🔓'}
@@ -1025,7 +1025,7 @@ export default function Home() {
                           className={`${albumStyles.restrictedBadge} ${albumStyles.restrictedBadgeBtn}`}
                           onClick={(e) => { e.stopPropagation(); toggleRestrictedReveal(photo.id); }}
                         >
-                          🔒 不開放 · {isBlurred(photo) ? '點一下顯示' : '收回'}
+                          🔒 不開放 · {isBlurred(photo) ? '點擊顯示' : '收合'}
                         </button>
                       ) : (
                         <span className={albumStyles.restrictedBadge}>🔒 不開放</span>
@@ -1057,8 +1057,8 @@ export default function Home() {
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
                 {selectedTags.length > 0 && !searchQuery.trim()
-                  ? `包含標籤的相簿 (${displayAlbums.length} 個)`
-                  : `相簿搜尋結果 (${displayAlbums.length} 個)`}
+                  ? `包含標籤的相簿（${displayAlbums.length} 個）`
+                  : `相簿搜尋結果（${displayAlbums.length} 個）`}
               </h2>
               <div 
                 className={styles.albumGrid}
@@ -1093,7 +1093,7 @@ export default function Home() {
           )}
 
           {displayPhotos.length === 0 && displayAlbums.length === 0 && (
-            <div className={styles.emptyState}>找不到符合條件的相簿或照片</div>
+            <div className={styles.emptyState}>沒有符合條件的相簿或照片</div>
           )}
         </div>
       ) : (
@@ -1223,7 +1223,7 @@ export default function Home() {
             disabled={selectedAlbums.length === 0 || isBatchDeleting}
             style={{ opacity: selectedAlbums.length === 0 ? 0.5 : 1 }}
           >
-            {isBatchDeleting ? '刪除中...' : `刪除 ${selectedAlbums.length} 個項目`}
+            {isBatchDeleting ? '刪除中…' : `刪除 ${selectedAlbums.length} 個項目`}
           </button>
 
           {/* 「編輯／完成」的切換鈕原本在頁首，編輯模式下 FAB 收起，出口就放在這排的尾端 */}
@@ -1248,7 +1248,7 @@ export default function Home() {
               <label>相簿名稱</label>
               <input 
                 type="text" 
-                placeholder="例如：2026 寶寶成長日記" 
+                placeholder="例如：2026 家庭旅遊" 
                 value={newAlbumName}
                 onChange={e => setNewAlbumName(e.target.value)}
                 autoFocus
@@ -1263,7 +1263,7 @@ export default function Home() {
                 onClick={handleCreateAlbum}
                 disabled={!newAlbumName.trim() || isSubmitting}
               >
-                {isSubmitting ? "建立中..." : "建立"}
+                {isSubmitting ? "建立中…" : "建立"}
               </button>
             </div>
           </div>
@@ -1273,7 +1273,7 @@ export default function Home() {
       <SlideConfirmModal 
         isOpen={showDeleteConfirm}
         title={`刪除 ${selectedAlbums.length} 個相簿`}
-        message={`確定要刪除這 ${selectedAlbums.length} 個相簿嗎？這個動作無法復原，裡面的所有照片都會被刪除。`}
+        message={`確定刪除這 ${selectedAlbums.length} 個相簿？此動作無法復原，相簿內的所有照片將一併刪除。`}
         onConfirm={handleBatchDeleteAlbums}
         onCancel={() => setShowDeleteConfirm(false)}
       />

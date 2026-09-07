@@ -41,7 +41,7 @@ export default function TrackColorPicker({
     const result = await setUserTrackColor(userId, hex);
     setSaving(null);
     if (result.success) onChange(result.track_color || hex);
-    else setError(result.message || "換色失敗");
+    else setError(result.message || "顏色設定失敗");
   };
 
   return (
@@ -56,7 +56,7 @@ export default function TrackColorPicker({
               type="button"
               onClick={() => pick(hex)}
               disabled={disabled || saving !== null}
-              title={taken ? `${name}（${taken.name || "另一位家人"}已經在用）` : name}
+              title={taken ? `${name}（${taken.name || "其他成員"}已使用）` : name}
               aria-label={name}
               aria-pressed={mine}
               style={{

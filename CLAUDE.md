@@ -1280,7 +1280,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - **讀到的東西整批存進 `Photo.exif` 的 `_video` 底下**（`videoMetaToExif()`／`videoMetaBlock()`，
   **不需要 migration**，那一欄本來就是 TEXT 而影片一直是空的）。`normalizeGeo()` 只認白名單
   裡那幾個鍵，所以 `_video` 對它是惰性的。燈箱那塊面板因此對影片端出
-  **「影片的 Metadata」**（欄位跟照片的 EXIF 一一對應，沒對照到的原始標籤照樣一條條列）。
+  **「影片資訊」**（欄位跟照片的 EXIF 一一對應，沒對照到的原始標籤照樣一條條列）。
   ⚠️ `uploadPhoto()` 的 exif 白名單**必須含 `'_video'`** —— 那個白名單是**丟掉沒列到的鍵**，
   漏了它新上傳的影片就跟存量的一樣是空的，而且錯得很安靜（時間與座標照樣進得去，
   因為那幾個鍵在白名單上）。
@@ -1321,7 +1321,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 ### 回寫既有影片：`POST /api/admin/video-meta`
 
 存量影片（2026-08-31 之前傳的）一律沒有時間、也沒有 `_video`，入口在
-**`/admin`「影片的 Metadata」**那一格（`app/admin/VideoMetaCard.tsx`，`AdminSection` 的
+**`/admin`「影片資訊」**那一格（`app/admin/VideoMetaCard.tsx`，`AdminSection` 的
 id 仍是 `video-meta`，換掉會弄丟 localStorage 那個開合狀態）。
 
 - 認 `canManageOthers`（它會改到全站每一個人的影片）。沒有 `GOOGLE_DRIVE_SA_KEY` 回 503。
@@ -1832,7 +1832,7 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
   **不是整列一顆 button** —— button 裡面不能再放 button／a。
 - ⚠️⚠️ **相簿頁是 `/album?id=<相簿>`，不是 `/album/<相簿>`。** 前端是 `output: "export"` 的
   純靜態站，`src/app/album/` 底下沒有 `[id]` 這一層 —— 多打一段路徑就是實實在在的 404。
-  三張後台卡片（補傳清單、影片的 Metadata、Android 動態照片）都各自踩過一次，
+  三張後台卡片（補傳清單、影片資訊、Android 動態照片）都各自踩過一次，
   **新增任何連到某一張照片的連結前先看一眼這一條**。
 - 清單刻意**不列縮圖**：一次幾百張就是幾百次 Workers 請求。要看是哪一張是
   使用者一次點一張的動作，不是一開頁就全部載進來。

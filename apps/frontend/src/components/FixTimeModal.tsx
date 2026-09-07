@@ -140,7 +140,7 @@ export default function FixTimeModal({
 
     setSubmitting(false);
     if (!res) {
-      setError('修正失敗，請確認登入狀態後再試一次');
+      setError('修改失敗，請確認登入狀態後再試一次');
       return;
     }
     onDone({
@@ -231,8 +231,8 @@ export default function FixTimeModal({
         {mode === 'shift' && (
           <>
             <p style={{ fontSize: 13, color: '#64748b', lineHeight: 1.7, margin: '0 0 12px' }}>
-              相機時鐘本身走差了（例如 D800 每年約慢一分鐘）。拍攝時間會整批往前或往後移動，
-              時區不變。要用多少可以拿手機時間對一下機身時鐘的差距。
+              適用於相機時鐘本身有誤差的情況。拍攝時間會整批往前或往後移動，時區維持不變。
+              可用手機時間與相機時鐘比對，得出需調整的分鐘數。
             </p>
             <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', marginBottom: 8 }}>
               <label style={{ fontSize: 13 }}>
@@ -255,12 +255,12 @@ export default function FixTimeModal({
               </label>
               <div style={{ fontSize: 13, color: '#64748b', paddingBottom: 9 }}>
                 {totalMinutes === 0
-                  ? '（填正數往後、負數往前）'
+                  ? '（正數往後、負數往前）'
                   : `共 ${totalMinutes > 0 ? '+' : ''}${totalMinutes} 分鐘`}
               </div>
             </div>
             <p style={{ fontSize: 12.5, color: '#b45309', margin: '0 0 18px', lineHeight: 1.6 }}>
-              這個操作會把時間標記為「使用者修正」，之後任何自動流程都不會再改動它。
+              修改後時間會標記為「手動修正」，後續自動流程不會再變更。
             </p>
           </>
         )}
@@ -268,8 +268,8 @@ export default function FixTimeModal({
         {mode === 'timezone' && (
           <>
             <p style={{ fontSize: 13, color: '#64748b', lineHeight: 1.7, margin: '0 0 12px' }}>
-              出國拍照但機身時區沒改的情況。相機記的時刻本身沒錯，錯的只是「該用哪個時區去讀它」，
-              所以照片的排序位置不會變，只有顯示出來的拍攝時間會換算成新時區。
+              適用於出國拍照但未調整相機時區的情況。相機記錄的時刻本身正確，
+              只是時區判讀有誤，因此照片排序不變，僅顯示的拍攝時間會換算為新時區。
             </p>
             <label style={{ fontSize: 13, display: 'block', marginBottom: 18 }}>
               <div style={{ marginBottom: 4, color: '#475569' }}>照片當時所在地的時區</div>
@@ -285,9 +285,8 @@ export default function FixTimeModal({
         {mode === 'set' && (
           <>
             <p style={{ fontSize: 13, color: '#64748b', lineHeight: 1.7, margin: '0 0 12px' }}>
-              本來就<strong>沒有</strong>拍攝時間的東西才用這個：影片（封面圖是網頁畫出來的，不帶 EXIF）、
-              掃描的老照片、被 App 洗掉 EXIF 的圖。上面兩個操作都需要一個原本的時間當基準，
-              對這些一律跳過。
+              適用於原本就沒有拍攝時間的項目：影片、掃描的舊照片，以及 EXIF 已被移除的圖片。
+              前兩項操作需要既有時間作為基準，因此無法處理這些項目。
             </p>
             {/*
               * 六個選單而不是一格 datetime-local：
@@ -313,28 +312,28 @@ export default function FixTimeModal({
               </select>
             </label>
             <p style={{ fontSize: 12.5, color: '#334155', margin: '0 0 10px', lineHeight: 1.6 }}>
-              會存成 <code>{toWallClockString(wall)}</code>
+              將儲存為 <code>{toWallClockString(wall)}</code>
               　{tzOptionLabel({ minutes: tz, hint: '' })}
             </p>
             {!initialWall && guessed && (
               <p style={{ fontSize: 12.5, color: '#15803d', margin: '0 0 10px', lineHeight: 1.6 }}>
-                已從檔名 <code>{titles?.[0]}</code> 預填，確認一下對不對再套用。
+                已依檔名 <code>{titles?.[0]}</code> 預先填入，請確認後再套用。
               </p>
             )}
             {guess === 'utc' && (
               <p style={{ fontSize: 12.5, color: '#b45309', margin: '0 0 10px', lineHeight: 1.6 }}>
-                檔名 <code>{titles?.[0]}</code> 裡的時間是 UTC（Pixel 相機的習慣），
-                直接拿來用會差一整個時區，所以沒有幫你預填。
+                檔名 <code>{titles?.[0]}</code> 中的時間為 UTC（Pixel 相機格式），
+                直接採用會相差一個時區，因此不預先填入。
               </p>
             )}
             {photoIds.length > 1 && (
               <p style={{ fontSize: 12.5, color: '#b45309', margin: '0 0 10px', lineHeight: 1.6 }}>
-                選取了 {photoIds.length} 個項目，<strong>全部都會被設成同一個時間</strong>。
-                每支影片各自的時間要一個一個來。
+                已選取 {photoIds.length} 個項目，將全部設為同一個時間。
+                若需分別設定，請逐一處理。
               </p>
             )}
             <p style={{ fontSize: 12.5, color: '#b45309', margin: '0 0 18px', lineHeight: 1.6 }}>
-              這個操作會把時間標記為「使用者指定」，之後任何自動流程都不會再改動它。
+              設定後時間會標記為「手動指定」，後續自動流程不會再變更。
             </p>
           </>
         )}

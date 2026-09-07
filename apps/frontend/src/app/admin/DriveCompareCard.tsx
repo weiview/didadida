@@ -70,7 +70,7 @@ export default function DriveCompareCard() {
       setAudit(await fetchDriveAudit());
       setPendingToken((t) => t + 1);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "讀取失敗");
+      setError(e instanceof Error ? e.message : "載入失敗");
     } finally {
       setBusy(null);
     }
@@ -105,8 +105,8 @@ export default function DriveCompareCard() {
       setPendingToken((t) => t + 1);
       setNote(
         state.finished_at
-          ? `對完了：${full.totals.albums} 本相簿、${full.totals.photos} 張。`
-          : `相簿太多，這一輪先對到第 ${state.albums_done} 本，再按一次會從頭重來。`,
+          ? `比對完成：${full.totals.albums} 本相簿、${full.totals.photos} 張照片。`
+          : `本輪比對至第 ${state.albums_done} 本相簿，再按一次會重新開始。`,
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "比對失敗");
@@ -135,7 +135,7 @@ export default function DriveCompareCard() {
     setBusy("trash"); setError(null); setNote(null);
     try {
       const state = await runDriveAudit({ retryTrash: true });
-      setNote(state.revived ? `救回 ${state.revived} 筆待搬，已經重新試過一次` : "沒有放棄的待搬項目");
+      setNote(state.revived ? `已將 ${state.revived} 筆重新排入待移動佇列。` : "目前沒有失敗的待移動項目。");
       // 救回來的是待搬佇列的事，報告本身沒變 —— 重抓一次才看得到新的數字
       setAudit(await fetchDriveAudit());
     } catch (e) {
@@ -155,10 +155,9 @@ export default function DriveCompareCard() {
       badge={audit ? (missing > 0 ? `缺 ${missing} 份備份` : "備份齊全") : undefined}
     >
       <p className={styles.hint}>
-        站上一張照片，Drive 上就該有<strong>一份 4K ＋ 一份原始檔</strong>
-        （影片與 GIF 沒有 4K，只有原始檔一份）。系統平常每十分鐘自己對一本，
-        這顆按鈕是<strong>現在就把全部相簿從頭對一遍</strong>，
-        對完底下會列出「缺備份的檔」與「被搬進 trash/ 的檔」兩份清單。
+        每張照片在 Google Drive 上應有一份 4K 與一份原始檔（影片與 GIF 只有原始檔）。
+        系統每十分鐘自動比對一本相簿，按下按鈕可立即重新比對全部相簿。
+        完成後會列出「缺少備份的檔案」與「已移入 trash/ 的檔案」兩份清單。
       </p>
 
       <div className={styles.formRow}>
@@ -170,7 +169,7 @@ export default function DriveCompareCard() {
           {busy === "all" ? "比對中…" : "比對全部相簿"}
         </button>
         <button className={styles.button} disabled={busy !== null} onClick={loadLatest}>
-          {busy === "load" ? "讀取中…" : "只看上次的結果"}
+          {busy === "load" ? "載入中…" : "查看上次結果"}
         </button>
       </div>
 
@@ -188,8 +187,8 @@ export default function DriveCompareCard() {
             />
           </div>
           <p className={styles.hint}>
-            對過 {progress.done}{progress.total > 0 ? ` / ${progress.total}` : ""} 本
-            —— 相簿多的話要幾分鐘，這段時間不要關掉這一頁。
+            已比對 {progress.done}{progress.total > 0 ? ` / ${progress.total}` : ""} 本，
+            需要數分鐘，請保持此頁開啟。
           </p>
         </>
       )}
@@ -201,19 +200,19 @@ export default function DriveCompareCard() {
         <>
           <p className={styles.hint}>
             {audit.finished_at
-              ? `上一輪對完於 ${new Date(audit.finished_at).toLocaleString("zh-TW")}`
+              ? `上次完成於 ${new Date(audit.finished_at).toLocaleString("zh-TW")}`
               : audit.cursor > 0
-                ? `對到一半（已經對過 ${audit.albums_done} 本）`
-                : "還沒對過"}
+                ? `進行中（已比對 ${audit.albums_done} 本）`
+                : "尚未比對"}
           </p>
 
           <div className={styles.detail}>
             <div className={styles.detailRow}>
-              <span className={styles.detailName}>對過的相簿 / 照片</span>
+              <span className={styles.detailName}>已比對相簿 / 照片</span>
               <span className={styles.detailNum}>{audit.totals.albums} / {audit.totals.photos}</span>
             </div>
             <div className={styles.detailRow}>
-              <span className={styles.detailName}>兩份都在（不用補）</span>
+              <span className={styles.detailName}>備份完整</span>
               <span className={styles.detailNum}>{audit.totals.ok ?? 0}</span>
             </div>
             <div className={styles.detailRow}>
@@ -223,23 +222,23 @@ export default function DriveCompareCard() {
               </span>
             </div>
             <div className={styles.detailRow}>
-              <span className={styles.detailName}>檔案在、記錄漏掉（已自動接回來）</span>
+              <span className={styles.detailName}>記錄遺漏，已自動修復</span>
               <span className={styles.detailNum}>{audit.totals.linked ?? 0}</span>
             </div>
             <div className={styles.detailRow}>
-              <span className={styles.detailName}>沒人指著的檔，已搬進 trash/</span>
+              <span className={styles.detailName}>無對應照片，已移入 trash/</span>
               <span className={styles.detailNum}>{audit.totals.orphans_queued}</span>
             </div>
           </div>
 
           {audit.last_error && (
-            <p className={`${styles.message} ${styles.err}`}>上次出錯：{audit.last_error}</p>
+            <p className={`${styles.message} ${styles.err}`}>上次錯誤：{audit.last_error}</p>
           )}
         </>
       )}
 
       {/* ── 清單一：缺 Drive 備份的檔 ─────────────────────────────────── */}
-      <div className={styles.detailHead}>缺 Drive 備份的檔</div>
+      <div className={styles.detailHead}>缺少 Drive 備份的檔案</div>
       <DrivePendingList reloadToken={pendingToken} />
 
       {/* ── 清單二：被搬進 trash/ 的檔 ────────────────────────────────
@@ -250,21 +249,20 @@ export default function DriveCompareCard() {
       {audit && (
         <>
           <div className={styles.detailHead}>
-            被搬進 trash/ 的檔（{trashed.length}{audit.trashed_more ? "＋" : ""}）
+            已移入 trash/ 的檔案（{trashed.length}{audit.trashed_more ? "＋" : ""}）
           </div>
           {trashed.length === 0 ? (
             <p className={styles.hint}>
-              這一輪沒有搬走任何檔。
-              {audit.totals.orphans_queued > 0 && "（上面那個數字是更早以前那幾輪搬的）"}
+              本輪沒有移動任何檔案。
+              {audit.totals.orphans_queued > 0 && "（上方數字為先前幾輪的累計）"}
             </p>
           ) : (
             <>
               <p className={styles.hint}>
-                這些是 Drive 上多出來、站上<strong>沒有任何一格指著</strong>的檔
-                （重複補傳留下的第二份、刪過照片留下的殘檔）。
-                <strong>搬進 <span className={styles.mono}>didadida/trash/</span> 不是刪除</strong>
-                —— 反悔的話進 Drive 自己搬回原本那本相簿的資料夾就好。
-                {audit.trashed_more ? `另外還有 ${audit.trashed_more} 筆沒列出來。` : ""}
+                以下是 Drive 上多出來、站上沒有任何照片對應的檔案（重複補傳的第二份、
+                刪除照片後的殘檔）。移入 <span className={styles.mono}>didadida/trash/</span>
+                並非刪除，可隨時在 Drive 中移回原相簿資料夾。
+                {audit.trashed_more ? `另有 ${audit.trashed_more} 筆未列出。` : ""}
               </p>
               <div
                 style={{
@@ -304,7 +302,7 @@ export default function DriveCompareCard() {
                       href={`https://drive.google.com/file/d/${t.drive_id}/view`}
                       target="_blank"
                       rel="noopener noreferrer"
-                      title="在 Drive 上打開這個檔"
+                      title="在 Drive 中開啟"
                       style={{ flex: "none", padding: "2px 6px", whiteSpace: "nowrap" }}
                     >
                       去 Drive 看 ↗
@@ -324,8 +322,8 @@ export default function DriveCompareCard() {
       {audit?.trash && audit.trash.gave_up > 0 && (
         <>
           <p className={styles.hint}>
-            有 <strong style={{ color: "#b91c1c" }}>{audit.trash.gave_up}</strong> 筆待搬的檔
-            試了三次都失敗，已經停在那裡（另外還有 {audit.trash.remaining} 筆排隊中）。
+            有 <strong style={{ color: "#b91c1c" }}>{audit.trash.gave_up}</strong> 筆待移動的檔案
+            連續三次失敗，已暫停處理（另有 {audit.trash.remaining} 筆排隊中）。
           </p>
           <div className={styles.formRow}>
             <button
@@ -333,17 +331,17 @@ export default function DriveCompareCard() {
               disabled={busy !== null}
               onClick={retryTrash}
             >
-              {busy === "trash" ? "重試中…" : `重試放棄的 ${audit.trash.gave_up} 筆`}
+              {busy === "trash" ? "重試中…" : `重試這 ${audit.trash.gave_up} 筆`}
             </button>
           </div>
           <details className={styles.guide}>
-            <summary className={styles.guideSummary}>看卡住的是哪幾筆</summary>
+            <summary className={styles.guideSummary}>查看失敗項目</summary>
             <div className={styles.guideBody}>
               {audit.trash.stuck.map((t) => (
                 <div key={t.id} className={styles.detailRow}>
                   <span className={styles.mono}>{t.drive_id}</span>
                   <span className={styles.detailNote}>
-                    試了 {t.attempts} 次{t.last_error ? `：${t.last_error}` : ""}
+                    已嘗試 {t.attempts} 次{t.last_error ? `：${t.last_error}` : ""}
                   </span>
                 </div>
               ))}
@@ -357,12 +355,12 @@ export default function DriveCompareCard() {
         兩格），那是站在某一本相簿前面才會問的問題，所以收起來放。
       */}
       <details className={styles.guide}>
-        <summary className={styles.guideSummary}>進階：單獨比對一本相簿（逐張明細）</summary>
+        <summary className={styles.guideSummary}>單獨比對一本相簿（含逐張明細）</summary>
         <div className={styles.guideBody}>
           {audit?.albums && audit.albums.length > 0 ? (
             <div className={styles.formRow}>
               <div className={styles.field}>
-                <label htmlFor="audit-album">選一本</label>
+                <label htmlFor="audit-album">選擇相簿</label>
                 <select
                   id="audit-album"
                   className={styles.select}
@@ -370,7 +368,7 @@ export default function DriveCompareCard() {
                   disabled={busy !== null}
                   onChange={(e) => setAlbumId(e.target.value === "" ? "" : Number(e.target.value))}
                 >
-                  <option value="">選一本相簿…</option>
+                  <option value="">請選擇相簿…</option>
                   {audit.albums.map((a) => (
                     <option key={a.id} value={a.id}>{a.name}</option>
                   ))}
@@ -381,36 +379,36 @@ export default function DriveCompareCard() {
                 disabled={busy !== null || albumId === ""}
                 onClick={runOneAlbum}
               >
-                {busy === "one" ? "比對中…" : "全面比對這一本"}
+                {busy === "one" ? "比對中…" : "比對這本相簿"}
               </button>
             </div>
           ) : (
-            <p className={styles.hint}>先按上面的「只看上次的結果」或「比對全部相簿」載入相簿清單。</p>
+            <p className={styles.hint}>請先按上方「查看上次結果」或「比對全部相簿」載入相簿清單。</p>
           )}
 
           {albumReport && <AlbumAuditReport report={albumReport} />}
 
           {audit && audit.reports.length > 0 && (
             <>
-              <div className={styles.detailHead}>逐本相簿的結果（{audit.reports.length}）</div>
+              <div className={styles.detailHead}>各相簿結果（{audit.reports.length}）</div>
               {audit.reports.map((r) => (
                 <div key={r.album_id} className={styles.detailRow}>
                   <span className={styles.detailName}>{r.name}</span>
                   <span className={styles.detailNote}>
                     {r.error
-                      ? `出錯：${r.error}`
+                      ? `錯誤：${r.error}`
                       : r.no_folder
-                        ? `${r.photos} 張，Drive 上還沒有這本的資料夾`
+                        ? `${r.photos} 張，Drive 上尚無對應資料夾`
                         : [
                             `${r.photos} 張`,
                             r.missing_4k > 0 ? `缺 4K ${r.missing_4k}` : "",
                             r.missing_original > 0 ? `缺原始檔 ${r.missing_original}` : "",
-                            r.linked > 0 ? `接回記錄 ${r.linked}` : "",
-                            r.cleared > 0 ? `Drive 上不見了 ${r.cleared}` : "",
-                            r.moved > 0 ? `被搬走 ${r.moved}` : "",
-                            r.orphans_queued > 0 ? `孤兒 ${r.orphans_queued}` : "",
-                            r.foreign > 0 ? `外來檔 ${r.foreign}` : "",
-                            r.truncated ? "（檔案太多沒列完，這本的判定不算數）" : "",
+                            r.linked > 0 ? `修復記錄 ${r.linked}` : "",
+                            r.cleared > 0 ? `Drive 上已遺失 ${r.cleared}` : "",
+                            r.moved > 0 ? `已移動 ${r.moved}` : "",
+                            r.orphans_queued > 0 ? `無對應照片 ${r.orphans_queued}` : "",
+                            r.foreign > 0 ? `非本站檔案 ${r.foreign}` : "",
+                            r.truncated ? "（檔案過多未列完，本次結果不計）" : "",
                           ].filter(Boolean).join("、")}
                   </span>
                 </div>
@@ -450,20 +448,20 @@ const mediaSuffix = (t?: string) => (t === "video" ? "（影片）" : t === "gif
 const NEEDS_ACTION = new Set(["missing", "cleared", "gone"]);
 
 const ITEM_STATE_LABEL: Record<string, string> = {
-  missing: "從來沒傳成功過",
-  cleared: "Drive 上確認沒了，記錄已清掉",
-  gone: "記錄有、Drive 清單裡沒有（還沒追問到）",
-  linked: "檔案在，記錄漏掉，已自動接回來",
-  linking: "檔案在，記錄下一輪才寫得回去（備份是好的）",
-  moved: "被搬到別的資料夾，備份是好的",
+  missing: "從未上傳成功",
+  cleared: "Drive 上已不存在，記錄已清除",
+  gone: "有記錄但未出現在 Drive 清單，尚未確認",
+  linked: "檔案存在，記錄已自動修復",
+  linking: "檔案存在，記錄將於下一輪修復",
+  moved: "已移至其他資料夾，備份正常",
 };
 
 const EXTRA_REASON_LABEL: Record<string, string> = {
-  foreign: "不是本站放的檔，一律不碰",
-  too_new: "建立不到 24 小時，可能是剛傳完還沒回報",
-  in_use: "那張照片還指著它",
-  queued_before: "早就在待搬佇列裡了",
-  over_limit: "這一輪額度用完，下一輪再處理",
+  foreign: "非本站上傳的檔案，不處理",
+  too_new: "建立未滿 24 小時，可能仍在上傳",
+  in_use: "仍有照片使用中",
+  queued_before: "已在待移動佇列中",
+  over_limit: "本輪已達處理上限，下一輪繼續",
 };
 
 function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
@@ -479,32 +477,32 @@ function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
     <div className={styles.detail}>
       <div className={styles.detailHead}>單獨比對：{r.name}</div>
 
-      {r.error && <p className={`${styles.message} ${styles.err}`}>出錯：{r.error}</p>}
+      {r.error && <p className={`${styles.message} ${styles.err}`}>錯誤：{r.error}</p>}
 
       {r.no_folder ? (
         <p className={styles.hint}>
-          這本相簿在 Drive 上<strong>還沒有資料夾</strong> —— {r.photos} 張全都沒有備份過。
-          把任何一個原始檔再拖進那本相簿一次就會建起來。
+          這本相簿在 Drive 上尚無資料夾，{r.photos} 張皆未備份。
+          重新上傳任一張原始檔即可建立。
         </p>
       ) : r.truncated ? (
         <p className={`${styles.message} ${styles.err}`}>
-          這本在 Drive 上的檔案太多，這次<strong>沒有列完</strong>。
-          「不見了」與「多出來的檔」整段跳過 —— 拿半份清單去判定會清掉好資料。
+          這本相簿在 Drive 上的檔案過多，本次未完整列出。
+          為避免依據不完整的清單誤判，「已遺失」與「多餘檔案」兩段已略過。
         </p>
       ) : null}
 
       <div className={styles.detailRow}>
         <span className={styles.detailName}>
-          <strong>{r.ok}</strong> / {r.photos} 張<strong>不用補</strong>（該有的備份都在）
+          <strong>{r.ok}</strong> / {r.photos} 張備份完整
         </span>
         <span className={styles.detailNum}>
-          {r.photos - r.ok > 0 ? `還有 ${r.photos - r.ok} 張要處理` : "全部齊了"}
+          {r.photos - r.ok > 0 ? `尚有 ${r.photos - r.ok} 張待處理` : "全部完成"}
         </span>
       </div>
 
       {todo.length > 0 && (
         <>
-          <div className={styles.detailHead}>還缺哪些（{todo.length}{r.items_more ? "＋" : ""}）</div>
+          <div className={styles.detailHead}>缺少備份（{todo.length}{r.items_more ? "＋" : ""}）</div>
           {todo.map((i) => (
             <div key={`${i.photo_id}-${i.slot}`} className={styles.detailRow}>
               <span className={styles.detailName}>
@@ -514,16 +512,15 @@ function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
             </div>
           ))}
           <p className={styles.hint}>
-            補的方法：把同一個原始檔再拖進那本相簿一次（站上會認出是同一個檔），
-            它只會補缺的那一份。⚠️ 真正的 4K 只編得出來一次 ——
-            R2 上那份 2000px 補不回 4K，一定要拿原始檔。
+            補傳方式：將同一個原始檔重新上傳到該相簿，系統會辨識為同一個檔案，
+            只補上缺少的部分。4K 版本必須由原始檔產生，無法從站上的縮圖還原。
           </p>
         </>
       )}
 
       {done.length > 0 && (
         <details className={styles.guide}>
-          <summary className={styles.guideSummary}>已經自動處理好的（{done.length}）</summary>
+          <summary className={styles.guideSummary}>已自動處理（{done.length}）</summary>
           <div className={styles.guideBody}>
             {done.map((i) => (
               <div key={`${i.photo_id}-${i.slot}`} className={styles.detailRow}>
@@ -538,54 +535,53 @@ function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
       )}
 
       {r.items_more ? (
-        <p className={styles.hint}>明細只列前面那些，另外還有 {r.items_more} 筆沒列出來。</p>
+        <p className={styles.hint}>另有 {r.items_more} 筆明細未列出。</p>
       ) : null}
 
       {(queued.length > 0 || kept.length > 0) && (
         <details className={styles.guide}>
           <summary className={styles.guideSummary}>
-            Drive 上多出來的檔（已排進 trash/ {queued.length}、這次不動 {kept.length}）
+            Drive 上的多餘檔案（已移入 trash/ {queued.length}、本次未處理 {kept.length}）
           </summary>
           <div className={styles.guideBody}>
             <p>
-              「排進 trash/」是<strong>搬進 <span className={styles.code}>didadida/trash/</span></strong>
-              不是刪除，反悔隨時去 Drive 搬回來。
+              移入 <span className={styles.code}>didadida/trash/</span> 並非刪除，
+              可隨時在 Drive 中還原。
             </p>
             {queued.map((e) => (
               <div key={e.drive_id} className={styles.detailRow}>
                 <span className={styles.detailName}>{e.name}</span>
-                <span className={styles.detailNote}>已排進 trash/</span>
+                <span className={styles.detailNote}>已移入 trash/</span>
               </div>
             ))}
             {kept.map((e) => (
               <div key={e.drive_id} className={styles.detailRow}>
                 <span className={styles.detailName}>{e.name}</span>
                 <span className={styles.detailNote}>
-                  {EXTRA_REASON_LABEL[e.reason ?? ""] ?? "不動它"}
+                  {EXTRA_REASON_LABEL[e.reason ?? ""] ?? "未處理"}
                 </span>
               </div>
             ))}
-            {r.extras_more ? <p>另外還有 {r.extras_more} 個沒列出來。</p> : null}
+            {r.extras_more ? <p>另有 {r.extras_more} 個未列出。</p> : null}
           </div>
         </details>
       )}
 
       {dups.length > 0 && (
         <details className={styles.guide}>
-          <summary className={styles.guideSummary}>站上重複的照片（{dups.length} 組，不會自動刪）</summary>
+          <summary className={styles.guideSummary}>站上重複的照片（{dups.length} 組，不會自動刪除）</summary>
           <div className={styles.guideBody}>
             <p>
-              這幾組是<strong>站上（相簿裡）有兩格以上</strong>指著同一張照片。
-              <strong>不會自動刪</strong> —— 刪一格連同它的標籤、留言、Story、
-              手動修過的座標與時間一起沒，哪一格該留只有你判斷得了。
-              到相簿裡進編輯模式選起來刪掉不要的那一格就好。
+              以下每組在相簿中有兩筆以上指向同一張照片。系統不會自動刪除：
+              刪除一筆會連同它的標籤、留言、Story 與手動設定的位置、時間一併移除。
+              請至相簿進入編輯模式，自行刪除多餘的那一筆。
             </p>
             {dups.map((d) => (
               <div key={`${d.kind}-${d.key}`}>
                 <div className={styles.detailHead}>
                   {d.kind === "same_hash"
-                    ? "同一個檔（位元組一模一樣）"
-                    : "檔名一樣（不一定是同一張，請自己看一眼）"}
+                    ? "同一個檔案（內容完全相同）"
+                    : "檔名相同（不一定是同一張，請自行確認）"}
                   ：{d.key}
                 </div>
                 {d.photos.map((p) => (
@@ -595,7 +591,7 @@ function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
                     </span>
                     <span className={styles.detailNote}>
                       {isOneSlotMedia(p.media_type)
-                        ? (p.has_original ? "Drive 有原始檔" : "Drive 沒有備份")
+                        ? (p.has_original ? "Drive 有原始檔" : "Drive 無備份")
                         : `${p.has_4k ? "有 4K" : "缺 4K"}、${p.has_original ? "有原始檔" : "缺原始檔"}`}
                       {p.created_at ? `　${p.created_at.slice(0, 10)} 加入` : ""}
                     </span>
@@ -603,14 +599,14 @@ function AlbumAuditReport({ report: r }: { report: DriveAuditAlbumReport }) {
                 ))}
               </div>
             ))}
-            {r.dups_more ? <p>另外還有 {r.dups_more} 組沒列出來。</p> : null}
+            {r.dups_more ? <p>另有 {r.dups_more} 組未列出。</p> : null}
           </div>
         </details>
       )}
 
       {todo.length === 0 && done.length === 0 && extras.length === 0 && dups.length === 0
         && !r.no_folder && !r.truncated && (
-        <p className={styles.hint}>這一本兩邊完全對得起來，沒有要補的、也沒有多餘的。</p>
+        <p className={styles.hint}>這本相簿兩邊完全一致，沒有缺少或多餘的檔案。</p>
       )}
     </div>
   );

@@ -43,7 +43,7 @@ export default function AccessGate({ children }: { children: React.ReactNode }) 
     // 攤開後路時輸入框的意思就變成「管理員密碼」，兩把鑰匙走的是不同端點
     const result = adminFallback ? await login(password) : await unlock(password);
     if (!result.success) {
-      setError(result.message || '密碼錯誤');
+      setError(result.message || '密碼不正確');
       setPassword('');
       setSubmitting(false);
       return;
@@ -71,14 +71,14 @@ export default function AccessGate({ children }: { children: React.ReactNode }) 
       <div className={styles.card}>
         <div className={styles.brand}>滴答生活</div>
         <p className={styles.subtitle}>
-          {adminFallback ? '管理員密碼' : '這是私人相簿，請輸入通行密碼'}
+          {adminFallback ? '請輸入管理員密碼' : '本站為私人相簿，請輸入通行密碼'}
         </p>
 
         <div className={styles.field}>
           <input
             type="password"
             inputMode="text"
-            placeholder={adminFallback ? '管理員密碼...' : '通行密碼...'}
+            placeholder={adminFallback ? '管理員密碼' : '通行密碼'}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && submit()}
@@ -93,7 +93,7 @@ export default function AccessGate({ children }: { children: React.ReactNode }) 
           onClick={submit}
           disabled={!password || submitting}
         >
-          {submitting ? '確認中...' : '進入'}
+          {submitting ? '驗證中…' : '進入'}
         </button>
 
         {error && <p className={styles.error}>{error}</p>}
@@ -103,7 +103,7 @@ export default function AccessGate({ children }: { children: React.ReactNode }) 
 
         {adminFallback ? (
           <button type="button" className={styles.adminLink} onClick={() => { setAdminFallback(false); setError(null); setPassword(''); }}>
-            ← 改用通行密碼進入
+            ← 改用通行密碼
           </button>
         ) : (
           <>

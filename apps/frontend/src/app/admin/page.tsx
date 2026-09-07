@@ -203,8 +203,8 @@ export default function AdminPage() {
     if (!result.success) return setError(result.message || "新增失敗");
     setError(null);
     setNotice(result.restored
-      ? `${email} 之前被停權過，已經重新啟用。`
-      : `${email} 已加入白名單，他用 Google 登入就進得來了。`);
+      ? `${email} 先前已停權，現已重新啟用。`
+      : `${email} 已加入白名單，可使用 Google 登入。`);
     setNewEmail("");
     setNewName("");
     setNewCanManage(false);
@@ -239,8 +239,8 @@ export default function AdminPage() {
       setError(null);
       const changed = data.results.filter((r) => r.status === "updated");
       setNotice(changed.length
-        ? `已自動綁定 ${changed.length} 人：${changed.map((r) => `${r.name}（${r.folder_name}）`).join("、")}。他們在地圖上按「從 Drive 同步」就讀得到自己的軌跡了。`
-        : "掃完了，沒有需要變更的綁定。");
+        ? `已自動綁定 ${changed.length} 人：${changed.map((r) => `${r.name}（${r.folder_name}）`).join("、")}。`
+        : "掃描完成，沒有需要變更的綁定。");
       // 綁定寫在 User 上，重讀白名單才不會讓下面那些列停在舊值
       load();
     } catch (e: any) {
@@ -258,8 +258,8 @@ export default function AdminPage() {
     setError(null);
     setGuestMap(result.settings!.guest_can_view_map === 1);
     setNotice(next
-      ? "訪客現在看得到足跡地圖了。"
-      : "訪客看不到足跡地圖了，首頁那個連結也會消失。");
+      ? "訪客現在可以檢視足跡地圖。"
+      : "訪客已無法檢視足跡地圖，首頁也不會顯示入口。");
   };
 
   /** 放手才送。值沒變就什麼都不做 —— 點一下拉桿不該產生一次寫入 */
@@ -279,7 +279,7 @@ export default function AdminPage() {
     const saved = result.settings!.convoy_overlap_pct;
     setConvoyPct(saved);
     setSavedConvoyPct(saved);
-    setNotice(`同遊門檻改成 ${saved}%。大家下次重整地圖就會用新的判定。`);
+    setNotice(`同行門檻已設為 ${saved}%，下次開啟地圖即生效。`);
   };
 
   const toggleGuestComments = async (next: boolean) => {
@@ -291,8 +291,8 @@ export default function AdminPage() {
     setError(null);
     setGuestComments(result.settings!.guest_can_view_comments === 1);
     setNotice(next
-      ? "訪客現在看得到照片底下的留言了（還是留不了言）。"
-      : "訪客看不到留言了，燈箱裡那一塊會整個消失。");
+      ? "訪客現在可以閱讀留言，但仍無法發表。"
+      : "訪客已無法看到留言。");
   };
 
   /** 換副駕駛。選「沒有人」就是送 null —— 那台車的後排照樣坐得滿，只是沒人被指名 */
@@ -308,8 +308,8 @@ export default function AdminPage() {
     setSeatPassenger(saved);
     const who = users.find((u) => u.id === saved);
     setNotice(who
-      ? `合體的時候 ${who.name || who.email} 會坐在副駕駛座。`
-      : "沒有人被指定成副駕駛了，大家照名單順序補位。");
+      ? `合體時由 ${who.name || who.email} 坐副駕駛座。`
+      : "未指定副駕駛，將依名單順序遞補。");
   };
 
   const toggleRestrictedBlur = async (next: boolean) => {
@@ -321,8 +321,8 @@ export default function AdminPage() {
     setError(null);
     setRestrictedBlur(result.settings!.restricted_blur === 1);
     setNotice(next
-      ? "不開放的照片現在會先蓋一層模糊，點一下才暫時看得到。重整之後又蓋回去。"
-      : "不開放的照片恢復正常顯示（其他人本來就看不到那幾張）。");
+      ? "不開放的照片已加上模糊，點一下可暫時顯示。"
+      : "不開放的照片已恢復正常顯示。");
   };
 
   const handleRemove = async () => {
@@ -336,11 +336,11 @@ export default function AdminPage() {
     if (!result.success) return setError(result.message || "移除失敗");
     setError(null);
     setNotice(
-      `${user.email} 已停權，登不進來了。`
+      `${user.email} 已停權，無法登入。`
       + (result.albumCount
-        ? `他名下的 ${result.albumCount} 本相簿原封不動留著。`
+        ? `名下的 ${result.albumCount} 本相簿仍會保留。`
         : "")
-      + "帳號留在名單上（標示為停權），要放他回來直接再加一次就好。",
+      + "帳號會留在名單上並標示為停權，日後可再次加入。",
     );
     load();
   };
@@ -375,12 +375,12 @@ export default function AdminPage() {
     setBusyId(null);
     if (!result.success) return setError(result.message || "刪除失敗");
     setError(null);
-    const parts = [`${user.email} 的帳號已經刪掉了。`];
-    if (result.deletedAlbums) parts.push(`一併刪掉 ${result.deletedAlbums} 本相簿。`);
-    if (result.deletedPhotos) parts.push(`一併刪掉 ${result.deletedPhotos} 張照片（Drive 上的備份會搬進 trash/）。`);
-    if (result.keptAlbums) parts.push(`保留下來的 ${result.keptAlbums} 本相簿已經改掛在你名下。`);
-    if (result.deletedTrackDays) parts.push(`一併刪掉 ${result.deletedTrackDays} 天的足跡。`);
-    if (result.keptTrackDays) parts.push(`保留下來的 ${result.keptTrackDays} 天足跡已經改掛在你名下。`);
+    const parts = [`${user.email} 的帳號已刪除。`];
+    if (result.deletedAlbums) parts.push(`已刪除 ${result.deletedAlbums} 本相簿。`);
+    if (result.deletedPhotos) parts.push(`已刪除 ${result.deletedPhotos} 張照片，Drive 備份移入 trash/。`);
+    if (result.keptAlbums) parts.push(`保留的 ${result.keptAlbums} 本相簿已轉移至您的帳號。`);
+    if (result.deletedTrackDays) parts.push(`已刪除 ${result.deletedTrackDays} 天的足跡。`);
+    if (result.keptTrackDays) parts.push(`保留的 ${result.keptTrackDays} 天足跡已轉移至您的帳號。`);
     setNotice(parts.join(""));
     load();
   };
@@ -412,7 +412,7 @@ export default function AdminPage() {
         <h1 className={styles.title}>找不到這一頁</h1>
         {isAdmin && (
           <p className={styles.hint}>
-            後台設定要「可管理全站內容」才看得到。你可以管理自己的相簿與照片，但全站設定與白名單不在你的權限範圍內。
+            後台設定需要「可管理全站內容」權限。您仍可管理自己的相簿與照片。
           </p>
         )}
       </div>
@@ -425,8 +425,8 @@ export default function AdminPage() {
         <Link href="/" className={styles.back}>← 回相簿</Link>
         <h1 className={styles.title}>後台設定</h1>
         <p className={styles.hint}>
-          只有白名單上的信箱能用「家庭成員登入」進來。預設每個人只動得了自己建的相簿與自己上傳的照片；
-          勾了「可管理全站內容」才動得了別人的東西，也才碰得到相簿排序、GPS 軌跡這類全站共用的設定。
+          只有白名單上的信箱能登入。成員預設只能管理自己建立的相簿與上傳的照片；
+          勾選「可管理全站內容」後，才能管理其他人的內容與全站設定。
         </p>
       </header>
 
@@ -435,8 +435,7 @@ export default function AdminPage() {
 
       <AdminSection id="guest" title="訪客能看到什麼">
         <p className={styles.hint}>
-          用通行密碼進站的訪客預設只看得到相簿。足跡地圖會把照片的實際位置畫在地圖上
-          （已經標成不公開的相簿與照片仍然不會出現），要不要給訪客看由你決定。
+          訪客以通行密碼進站，預設只能瀏覽相簿。足跡地圖會顯示照片的拍攝位置，不開放的照片仍不會出現。
         </p>
         <label className={styles.checkbox}>
           <input
@@ -458,16 +457,14 @@ export default function AdminPage() {
           讓訪客看照片底下的留言
         </label>
         <p className={styles.hint}>
-          訪客<strong>永遠留不了言</strong>，這格只管看不看得到。家人之間的對話會連名字一起被
-          訪客看見，開之前先想一下留言區裡都講了些什麼。
+          訪客無法留言，這裡只控制能否閱讀。開啟後，成員的留言與顯示名稱都會對訪客可見。
         </p>
       </AdminSection>
 
       <AdminSection id="restricted" title="不開放的照片">
         <p className={styles.hint}>
-          標成「不開放」的照片<strong>只有你跟可管理全站內容的人看得到</strong>，
-          其他成員與訪客的相簿、搜尋、地圖上那一格整個不存在 —— 那是權限，一直都在。
-          這裡這一格管的是<strong>你自己那一份畫面</strong>：捲到那幾張的時候要不要先糊著。
+          標成「不開放」的照片只有可管理全站內容的成員看得到，不會出現在其他成員與訪客的相簿、搜尋與地圖上。
+          以下選項僅影響您的畫面。
         </p>
         <label className={styles.checkbox}>
           <input
@@ -479,18 +476,14 @@ export default function AdminPage() {
           不開放的照片先蓋一層模糊（縮圖與燈箱都算）
         </label>
         <p className={styles.hint}>
-          點那一張一下就暫時掀開，再點角標上的「收回」蓋回去；
-          <strong>重整或關掉分頁就全部蓋回去</strong>，不會記住。
-          用途是旁邊剛好有人看著螢幕的時候，捲相簿不會整片跳出來。
+          點一下可暫時顯示，再點角標的「收回」蓋回去；重新整理後一律恢復模糊。
         </p>
       </AdminSection>
 
-      <AdminSection id="convoy" title="足跡地圖：一起出遊的判定">
+      <AdminSection id="convoy" title="足跡地圖：同行判定">
         <p className={styles.hint}>
-          播放足跡時，一起出遊的人會合體成同一台車。判定的方式是拿兩個人
-          <strong>貼路之後的移動路線</strong>逐趟比對：同一趟裡，走在對方那條路上
-          （相隔五分鐘以內經過）的比例超過這個門檻，整趟就算一起出遊，
-          動畫預設是合併的，只有中途真的分頭走一段才會拆開。
+          播放足跡時，同行的成員會合併成同一台車。系統比對兩人貼路後的移動路線，
+          重疊比例超過門檻即視為同行，中途分開的路段仍會拆開顯示。
         </p>
         <div className={styles.sliderRow}>
           <input
@@ -512,10 +505,8 @@ export default function AdminPage() {
           </span>
         </div>
         <p className={styles.hint}>
-          真的同車的兩份軌跡貼完路通常重疊九成以上，
-          <strong>預設 {CONVOY_PCT_DEFAULT}%</strong> 已經留了不少餘裕給停車場、路口岔開。
-          調低會讓「順路載一段」也算成一起出遊；調高則只有整趟幾乎一模一樣才合體。
-          改完不必重貼路，家人下次開地圖就是新的判定。
+          預設 {CONVOY_PCT_DEFAULT}%。調低會讓短程順路也算同行，調高則需要整趟幾乎一致。
+          修改後下次開啟地圖即生效，不需要重新貼路。
         </p>
       </AdminSection>
 
@@ -525,11 +516,8 @@ export default function AdminPage() {
       */}
       <AdminSection id="car" title="足跡地圖：車上的座位">
         <p className={styles.hint}>
-          合體成同一台車的時候，<strong>站長固定坐駕駛座</strong>（那是規則，沒得選）。
-          副駕駛在這裡指定，其他人依名單順序坐後座。
-          <strong>只要是合體的軌跡，後座就一定有寶寶</strong> ——
-          他沒有帳號也沒有自己的軌跡，所以他的頭像存在這一格而不是白名單裡，
-          沒傳就畫一隻小外星人。
+          合體時站長固定為駕駛，副駕駛在這裡指定，其餘成員依名單順序坐後座。
+          合體的軌跡一定會有寶寶；他沒有帳號，頭像設定在這一格，未設定時顯示預設圖示。
         </p>
         {/*
           ⚠️ 整格的說明**只講這一次**。以前是每顆 AvatarPicker 自己印一份，
@@ -537,20 +525,9 @@ export default function AdminPage() {
           推得老遠 —— 現在三顆都傳 `notes={false}`，話收在這裡講完。
         */}
         <p className={styles.hint}>
-          每個座位底下是那個人的<strong>頭像、頭像朝向</strong>與
-          <strong>地圖上的軌跡顏色</strong>（寶寶沒有自己的軌跡，所以他只有頭像）。
-          頭像<strong>建議用去背的 PNG</strong>，在地圖上才是一顆大頭而不是一塊圓照片；
-          GIF 動圖會動。
-        </p>
-        <p className={styles.hint}>
-          <strong>「頭像朝向」講的是這張圖裡的臉朝哪一邊</strong>：
-          車頭會跟著行進方向左右翻面，頭像不會 —— 一張側臉朝左的頭像，
-          在往東走的那半段路上就變成坐在車上看車尾。選對了系統會自己決定
-          什麼時候要把它鏡射過來。正臉的頭像兩個值都對，不必管。
-          <br />
-          這一格只端<strong>車上這三顆頭</strong>。
-          其他人的頭像、朝向與顏色在底下<strong>「白名單」</strong>那一格，
-          每一列的「▸ 頭像與顏色」點開就是。
+          每個座位可設定頭像、頭像朝向與軌跡顏色（寶寶沒有軌跡顏色）。頭像建議使用去背 PNG，支援 GIF 動圖。
+          「頭像朝向」指圖片中人臉朝向的一側，系統會依此決定車頭轉向時要不要鏡射；正面照兩種都適用。
+          其他成員的設定在下方「白名單」每一列的「頭像與顏色」。
         </p>
         <div className={styles.formRow}>
           <div className={styles.field}>
@@ -634,7 +611,7 @@ export default function AdminPage() {
             setBabyAvatarUrl(avatar);
             // 這一輪 session 裡走去 /map 就會用新的那張，不必重整
             setBabyAvatar(avatar);
-            setNotice(avatar ? "寶寶的頭像換好了。" : "寶寶的頭像移除了，後座會畫一隻小外星人。");
+            setNotice(avatar ? "已更新寶寶的頭像。" : "已移除寶寶的頭像，後座將顯示預設圖示。");
           }}
           facing={babyFacing}
           onFacingChange={(facing) => {
@@ -670,7 +647,7 @@ export default function AdminPage() {
               id="new-name"
               type="text"
               value={newName}
-              placeholder="他自己之後也改得動"
+              placeholder="日後可修改"
               maxLength={40}
               onChange={(e) => setNewName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
@@ -684,7 +661,7 @@ export default function AdminPage() {
             />
             可管理全站內容
           </label>
-          <label className={styles.checkbox} title="給了才動得了足跡：同步 Drive、上傳 GPX、匯入 Google 時間軸">
+          <label className={styles.checkbox} title="可同步 Drive、上傳 GPX、匯入 Google 時間軸">
             <input
               type="checkbox"
               checked={newCanUseTools}
@@ -698,15 +675,15 @@ export default function AdminPage() {
             onClick={handleAdd}
             disabled={!newEmail.trim() || adding}
           >
-            {adding ? "新增中..." : "加入"}
+            {adding ? "新增中…" : "加入"}
           </button>
         </div>
 
         <div className={styles.detailHead}>目前的名單（{users.length}）</div>
         {loading ? (
-          <p className={styles.hint}>讀取中...</p>
+          <p className={styles.hint}>載入中…</p>
         ) : users.length === 0 ? (
-          <p className={styles.hint}>目前只有你自己。</p>
+          <p className={styles.hint}>目前僅有您一位成員。</p>
         ) : (
           users.map((user) => {
             const owner = user.role === "owner";
@@ -741,7 +718,7 @@ export default function AdminPage() {
                   <div className={styles.userName}>
                     {user.name || "（未命名）"}
                     {owner && <span className={styles.tag}>站長</span>}
-                    {self && !owner && <span className={styles.tag}>你自己</span>}
+                    {self && !owner && <span className={styles.tag}>您自己</span>}
                     {!owner && user.active !== 1 && (
                       <span className={`${styles.tag} ${styles.tagOff}`}>已停權</span>
                     )}
@@ -771,7 +748,7 @@ export default function AdminPage() {
                       }
                       return user.last_login_at
                         ? `最後登入 ${fmtUtc(user.last_login_at)}`
-                        : "還沒登入過";
+                        : "尚未登入";
                     })()}
                     {(user.album_count > 0 || user.uploaded_count > 0) && (
                       <>
@@ -844,12 +821,12 @@ export default function AdminPage() {
                       {detailError[user.id] ? (
                         <p className={styles.hint}>{detailError[user.id]}</p>
                       ) : !details[user.id] ? (
-                        <p className={styles.hint}>讀取中...</p>
+                        <p className={styles.hint}>載入中…</p>
                       ) : (
                         <>
                           {details[user.id]!.own_albums.length > 0 && (
                             <>
-                              <div className={styles.detailHead}>他建立的相簿</div>
+                              <div className={styles.detailHead}>建立的相簿</div>
                               {details[user.id]!.own_albums.map((a) => (
                                 <div key={a.album_id} className={styles.detailRow}>
                                   <Link href={`/album?id=${a.album_id}`} className={styles.detailName}>
@@ -861,7 +838,7 @@ export default function AdminPage() {
                                         但他只傳了 1 張」看起來像算錯 */}
                                     {a.total > a.uploaded && (
                                       <span className={styles.detailNote}>
-                                        （另有 {a.total - a.uploaded} 張是別人傳的）
+                                        （另有 {a.total - a.uploaded} 張由他人上傳）
                                       </span>
                                     )}
                                     {a.total === 0 && <span className={styles.detailNote}>（空相簿）</span>}
@@ -873,7 +850,7 @@ export default function AdminPage() {
 
                           {details[user.id]!.elsewhere.length > 0 && (
                             <>
-                              <div className={styles.detailHead}>他傳進別人的相簿</div>
+                              <div className={styles.detailHead}>上傳到其他相簿</div>
                               {details[user.id]!.elsewhere.map((a) => (
                                 <div key={a.album_id} className={styles.detailRow}>
                                   <Link href={`/album?id=${a.album_id}`} className={styles.detailName}>
@@ -890,7 +867,7 @@ export default function AdminPage() {
 
                           {details[user.id]!.own_albums.length === 0
                             && details[user.id]!.elsewhere.length === 0 && (
-                            <p className={styles.hint}>還沒有建過相簿，也還沒傳過照片。</p>
+                            <p className={styles.hint}>尚未建立相簿或上傳照片。</p>
                           )}
                         </>
                       )}
@@ -901,7 +878,7 @@ export default function AdminPage() {
                 <div className={styles.actions}>
                   {/* 站長的權限不能在這裡改（後端也會擋）—— 唯一的站長把自己降權之後
                       就沒有人能改回來了 */}
-                  <label className={styles.checkbox} title={owner ? "站長本來就是全開" : self ? "不能改自己的權限" : undefined}>
+                  <label className={styles.checkbox} title={owner ? "站長權限固定為全部開啟" : self ? "無法變更自己的權限" : undefined}>
                     <input
                       type="checkbox"
                       checked={owner || user.can_manage_others === 1}
@@ -921,7 +898,7 @@ export default function AdminPage() {
                     */}
                   <label
                     className={styles.checkbox}
-                    title="可以把照片上傳／匯入到別人建的相簿。加進去的照片相簿主人隨時刪得掉"
+                    title="可將照片上傳或匯入到其他人建立的相簿"
                   >
                     <input
                       type="checkbox"
@@ -934,7 +911,7 @@ export default function AdminPage() {
 
                   <label
                     className={styles.checkbox}
-                    title="可以拖曳調整別人相簿裡的照片順序。原本的順序沒有留底，改了救不回來"
+                    title="可調整其他人相簿的照片順序，變更後無法復原"
                   >
                     <input
                       type="checkbox"
@@ -954,7 +931,7 @@ export default function AdminPage() {
                     */}
                   <label
                     className={styles.checkbox}
-                    title="關掉之後他在燈箱裡看不到留言區（連別人的留言也看不到）"
+                    title="關閉後將看不到任何留言"
                   >
                     <input
                       type="checkbox"
@@ -967,7 +944,7 @@ export default function AdminPage() {
 
                   <label
                     className={styles.checkbox}
-                    title="關掉之後他還是看得到留言，只是沒有輸入框"
+                    title="關閉後仍可閱讀留言，但無法發表"
                   >
                     <input
                       type="checkbox"
@@ -987,7 +964,7 @@ export default function AdminPage() {
                     */}
                   <label
                     className={styles.checkbox}
-                    title="關掉之後他看不到足跡地圖（連自己的軌跡也看不到），首頁不會出現地圖入口"
+                    title="關閉後將看不到足跡地圖，首頁也不會顯示入口"
                   >
                     <input
                       type="checkbox"
@@ -1009,7 +986,7 @@ export default function AdminPage() {
                     */}
                   <label
                     className={styles.checkbox}
-                    title="關掉之後他還是看得到地圖，只是不能同步 Drive、上傳 GPX、匯入 Google 時間軸"
+                    title="關閉後仍可檢視地圖，但無法同步 Drive、上傳 GPX 或匯入 Google 時間軸"
                   >
                     <input
                       type="checkbox"
@@ -1102,14 +1079,11 @@ export default function AdminPage() {
       */}
       <AdminSection id="tracks" title="GPS 軌跡資料夾">
         <p className={styles.hint}>
-          每個人的 GPSLogger 都是傳進他自己的 Google Drive（手機 App 只碰得到自己建的資料夾，
-          沒辦法直接傳到你這邊）。請他把那個資料夾<strong>分享</strong>給下面這個服務帳號，
-          你再按一次掃描 —— 對得上信箱的會自動綁好，之後他在地圖上按「從 Drive 同步」
-          就讀得到自己的軌跡。
+          GPSLogger 會把軌跡上傳到成員自己的 Google Drive。請成員將該資料夾分享給下方的服務帳號，
+          再執行掃描即可自動綁定，之後就能在地圖上使用「從 Drive 同步」。
         </p>
         <p className={styles.hint}>
-          配對只認一件事：<strong>分享過來的資料夾，擁有者要是他登入本站的那個 Google 帳號</strong>。
-          手機上如果是用另一個帳號設定 GPSLogger，這裡永遠對不到他。
+          自動配對依據資料夾擁有者的信箱，必須與該成員登入本站的 Google 帳號相同。
         </p>
 
         {/*
@@ -1119,106 +1093,84 @@ export default function AdminPage() {
         <details className={styles.guide}>
           <summary className={styles.guideSummary}>設定步驟與疑難排解</summary>
           <div className={styles.guideBody}>
-            <h3 className={styles.guideHead}>為什麼要一個人一個資料夾</h3>
+            <h3 className={styles.guideHead}>為什麼每個人各一個資料夾</h3>
             <p>
-              GPSLogger 只拿得到「自己建立的檔案」這種權限，看不到也寫不進別人的資料夾，
-              所以「全家都傳進站長的 Drive」做不到。每個人只能傳進自己的 Drive，
-              各自把那個資料夾分享給站上的服務帳號，再由你在這裡對上人。
+              GPSLogger 只能存取自己建立的檔案，無法寫入他人的 Drive，因此無法統一上傳到同一個帳號。
+              每位成員各自上傳到自己的 Drive，再把資料夾分享給本站的服務帳號。
             </p>
 
-            <h3 className={styles.guideHead}>請家人做的事（只做一次）</h3>
+            <h3 className={styles.guideHead}>成員需要做的設定（只需一次）</h3>
             <ol className={styles.guideList}>
               <li>
                 從 <strong>F-Droid</strong> 安裝 GPSLogger（mendhak 版，v122 以上）。
-                不要用 GitHub 下載的 APK —— 簽章對不上，Drive 授權會失敗；
-                Play 商店那個同名的 BasicAirData GPS Logger 是另一套軟體，沒有自動上傳，不能用。
+                GitHub 下載的 APK 簽章不符，Drive 授權會失敗；Play 商店的 BasicAirData GPS Logger 是另一套軟體，不支援自動上傳。
               </li>
               <li>
-                <span className={styles.code}>Auto send, email and upload</span> →
-                開啟 Allow auto sending → 目標選 Google Drive → 授權。
-                <strong>授權時要選他登入這個站的那個 Google 帳號</strong> ——
-                這裡選錯，後面就永遠自動對不上他。
-                資料夾填<strong>單層名稱</strong>（例如 <span className={styles.code}>GPSLogger</span>），不要填路徑。
+                <span className={styles.code}>Auto send, email and upload</span> → 開啟 Allow auto sending → 目標選 Google Drive → 完成授權。
+                授權時請選擇登入本站的同一個 Google 帳號，否則無法自動配對。
+                資料夾請填單層名稱（例如 <span className={styles.code}>GPSLogger</span>），不要填路徑。
               </li>
               <li>
-                三個一定要改：關掉 <span className={styles.code}>Send zip file</span>（預設是開的）、
-                關掉 <span className={styles.code}>Prefix unique string to the file name</span>、
-                <span className={styles.code}>New file creation</span> 選 <strong>Once a day</strong>。
+                關閉 <span className={styles.code}>Send zip file</span> 與 <span className={styles.code}>Prefix unique string to the file name</span>，
+                並將 <span className={styles.code}>New file creation</span> 設為 <strong>Once a day</strong>。
               </li>
               <li>
-                傳送頻率設 <strong>15 分鐘</strong>。auto-send 每次只送「當下那個檔」，
-                跨過午夜就換成新的一天了，間隔太長會讓前一天最後那段永遠傳不上來。
+                傳送頻率設為 <strong>15 分鐘</strong>。自動傳送每次只會送出當下的檔案，間隔過長會讓跨日前最後一段軌跡漏傳。
               </li>
+              <li>以 <span className={styles.code}>Test upload</span> 確認 Drive 上已建立該資料夾。</li>
               <li>
-                用設定頁裡的 <span className={styles.code}>Test upload</span> 按一下，確認 Drive 上真的長出那個資料夾。
-              </li>
-              <li>
-                到 Google Drive 對那個資料夾按「共用」，加入下面那個服務帳號信箱，
-                權限給<strong>檢視者</strong>就夠 —— 服務帳號只讀不寫，也刪不掉任何東西。
+                在 Google Drive 將該資料夾共用給下方的服務帳號信箱，權限選<strong>檢視者</strong>即可；服務帳號只會讀取，不會修改或刪除。
               </li>
             </ol>
 
-            <h3 className={styles.guideHead}>你在這裡做的事</h3>
+            <h3 className={styles.guideHead}>管理者需要做的事</h3>
             <ol className={styles.guideList}>
-              <li>按一次掃描，服務帳號信箱就會出現，可以複製給家人。</li>
-              <li>
-                家人分享完，再按一次。<strong>沒有東西要挑</strong> ——
-                資料夾的擁有者信箱等於誰的帳號，就自動綁給誰，下面每一列會寫清楚結果。
-              </li>
-              <li>
-                綁好立刻生效，不用重新部署。之後他在地圖上按「從 Drive 同步」就讀得到自己的軌跡。
-              </li>
+              <li>執行一次掃描，取得服務帳號信箱並提供給成員。</li>
+              <li>成員分享完成後再掃描一次，系統會依資料夾擁有者的信箱自動綁定，結果顯示於下方清單。</li>
+              <li>綁定後立即生效，成員即可在地圖上使用「從 Drive 同步」。</li>
             </ol>
             <p>
-              一個資料夾<strong>只會綁一個人</strong>：綁重了兩個人會同步到同一批檔案，
-              同一天會多出一份不是他的軌跡。信箱是唯一的，所以自動配對不可能配出這種狀況；
-              舊的人工綁定如果卡在別人身上，掃描時會直接拆掉換人。
+              一個資料夾只會綁定一位成員。若舊的綁定指向其他人，掃描時會自動更正。
             </p>
 
-            <h3 className={styles.guideHead}>狀況對照</h3>
+            <h3 className={styles.guideHead}>常見狀況</h3>
             <dl className={styles.guideFaq}>
-              <dt>某個人一直是「還沒設定共享資料夾」</dt>
+              <dt>成員一直顯示「尚未設定共享資料夾」</dt>
               <dd>
-                最常見的是他手機上授權 Drive 用的 Google 帳號，跟他登入這個站的帳號不是同一個 ——
-                那就要請他在 GPSLogger 裡改用正確的帳號重新授權。其次才是根本還沒分享：
-                Test upload 成功不代表已經分享，那是兩件事。
+                多半是手機上授權 Drive 的 Google 帳號與登入本站的帳號不同，請成員改用正確帳號重新授權。
+                其次是尚未分享資料夾；Test upload 成功並不代表已完成分享。
               </dd>
 
-              <dt>畫面說有資料夾對不到任何帳號</dt>
+              <dt>有資料夾對不到任何帳號</dt>
               <dd>
-                通常就是上一條那個帳號不對，訊息裡會寫出那個資料夾是哪個信箱分享的 ——
-                把它跟白名單上的信箱對一下就知道差在哪。也可能是 Drive 沒告訴我們擁有者是誰
-                （對方帳號設定不揭露），那種情況自動配對救不了，要跟我說一聲手動綁。
+                訊息會顯示該資料夾由哪個信箱分享，可與白名單上的信箱比對。
+                若對方帳號設定不揭露擁有者，則無法自動配對，需要人工處理。
               </dd>
 
-              <dt>顯示「分享了 2 個以上，請只留一個」</dt>
-              <dd>同一個帳號分享了不只一個資料夾，我們不猜哪個是 GPSLogger 的。請他在 Drive 上把多餘的取消共用，再掃一次。</dd>
+              <dt>顯示分享了兩個以上的資料夾</dt>
+              <dd>同一個帳號分享了多個資料夾，系統不會猜測，請成員取消多餘的共用後重新掃描。</dd>
 
-              <dt>本來綁好的人變成「還沒設定」</dt>
+              <dt>原本已綁定的成員變回未設定</dt>
+              <dd>對方已取消分享或刪除資料夾。原有綁定會保留，重新分享後再掃描即可恢復。</dd>
+
+              <dt>已綁定但同步不到資料</dt>
+              <dd>資料夾內沒有 .gpx 檔。系統只讀取 .gpx，Test upload 產生的 gpslogger_test.xml 會略過。</dd>
+
+              <dt>清單中沒有站長自己</dt>
               <dd>
-                對方取消分享或把資料夾丟進垃圾桶了，同步會失敗，要請他重新分享一次。
-                舊的綁定會刻意留著不清掉，所以重新分享後掃一次就恢復。
+                站長的軌跡來源是部署時設定的
+                <span className={styles.code}>GOOGLE_DRIVE_FOLDER_ID</span>，需在環境變數中變更。
               </dd>
 
-              <dt>綁好了，但同步是空的</dt>
-              <dd>資料夾裡沒有 .gpx。我們只認副檔名 .gpx，Test upload 產生的 gpslogger_test.xml 會被跳過，那是正常的。</dd>
-
-              <dt>清單裡沒有你自己</dt>
-              <dd>
-                站長不用在這裡綁。你的軌跡讀的是部署時設好的
-                <span className={styles.code}>GOOGLE_DRIVE_FOLDER_ID</span>，
-                要換資料夾是去改那顆環境變數，不是在這一頁。
-              </dd>
-
-              <dt>掃描回「尚未設定 GOOGLE_DRIVE_SA_KEY」</dt>
-              <dd>這個環境的 Worker 還沒灌那顆 secret，整段功能都不會動。</dd>
+              <dt>掃描回報「尚未設定 GOOGLE_DRIVE_SA_KEY」</dt>
+              <dd>此環境的 Worker 尚未設定該 secret，功能無法使用。</dd>
             </dl>
           </div>
         </details>
 
         {scan && (
           <p className={styles.hint}>
-            要分享給這個信箱（唯讀就夠了）：<br />
+            請分享給這個信箱（唯讀權限即可）：<br />
             <span className={styles.mono}>{scan.serviceAccount}</span>
           </p>
         )}
@@ -1230,7 +1182,7 @@ export default function AdminPage() {
             onClick={runScan}
             disabled={scanning}
           >
-            {scanning ? "掃描中..." : scan ? "重新掃描 Drive" : "掃描 Drive 並自動綁定"}
+            {scanning ? "掃描中…" : scan ? "重新掃描 Drive" : "掃描 Drive 並自動綁定"}
           </button>
         </div>
 
@@ -1240,14 +1192,14 @@ export default function AdminPage() {
         */}
         {scan && scan.unmatched.length > 0 && (
           <p className={styles.hint}>
-            另外有 {scan.unmatched.length} 個資料夾分享過來，但對不到任何帳號：
-            {scan.unmatched.map((f) => `${f.name}（${f.ownerEmail || "拿不到擁有者"}）`).join("、")}。
-            這些信箱不在白名單裡，或跟白名單上的寫法不一樣。
+            另有 {scan.unmatched.length} 個分享過來的資料夾對不到帳號：
+            {scan.unmatched.map((f) => `${f.name}（${f.ownerEmail || "無法取得擁有者"}）`).join("、")}。
+            這些信箱不在白名單中，或與白名單上的寫法不同。
           </p>
         )}
 
         {trackTargets.length === 0 && (
-          <p className={styles.hint}>白名單裡目前只有你自己，你的軌跡不用在這裡設定。</p>
+          <p className={styles.hint}>白名單目前僅有您，站長的軌跡不需在此設定。</p>
         )}
 
         {trackTargets.map((user) => {
@@ -1260,22 +1212,22 @@ export default function AdminPage() {
                   {/* 還沒掃過：只知道 D1 有沒有存 id，不知道那個資料夾叫什麼名字
                       （名字在 Drive 上，沒存進來），所以這裡只能講狀態不能講名字 */}
                   {!r && (user.track_drive_folder_id
-                    ? "已綁定資料夾。按上面掃描可以確認現在還通不通。"
-                    : "還沒設定共享資料夾。")}
+                    ? "已綁定資料夾，可執行掃描確認狀態。"
+                    : "尚未設定共享資料夾。")}
                   {r?.status === "bound" && `目前綁定：${r.folder_name}`}
                   {r?.status === "updated" && `已自動綁定：${r.folder_name}`}
                   {r?.status === "missing" && (
                     <>
-                      還沒設定共享資料夾 —— 找不到用 <span className={styles.code}>{r.email}</span>{" "}
-                      分享過來的資料夾。
-                      {r.still_bound && "（之前綁的還留著，沒有動它）"}
+                      尚未設定共享資料夾：找不到由 <span className={styles.code}>{r.email}</span>{" "}
+                      分享的資料夾。
+                      {r.still_bound && "（原有綁定保留未變更）"}
                     </>
                   )}
                   {r?.status === "ambiguous" && (
                     <>
                       {r.email} 分享了 {r.folder_names?.length} 個資料夾（
-                      {r.folder_names?.join("、")}），無法判斷哪一個是 GPSLogger 的，
-                      這次沒有綁。請他只留一個再掃一次。
+                      {r.folder_names?.join("、")}），無法判斷哪一個是 GPSLogger 的，因此未綁定。
+                      請保留其中一個後重新掃描。
                     </>
                   )}
                 </div>
@@ -1295,8 +1247,8 @@ export default function AdminPage() {
            * 用詞跟著改成「裡面共 X 張」，免得跟上面那行的「上傳 N 張」對不起來。
            */
           removing && removing.album_count > 0
-            ? `${removing.email} 名下有 ${removing.album_count} 本相簿、裡面共 ${removing.photo_count} 張照片。移出白名單只會讓他登不進來，相簿與照片會原封不動留著，之後想讓他回來再加一次就好。`
-            : `${removing?.email} 之後就登不進來了。帳號會留在名單上標示為停權，想讓他回來再加一次就好。`
+            ? `${removing.email} 名下有 ${removing.album_count} 本相簿、共 ${removing.photo_count} 張照片。移出白名單後將無法登入，相簿與照片仍會保留；日後可再次加入。`
+            : `${removing?.email} 移出後將無法登入。帳號會保留在名單上並標示為停權，日後可再次加入。`
         }
         onConfirm={handleRemove}
         onCancel={() => setRemoving(null)}
@@ -1308,10 +1260,10 @@ export default function AdminPage() {
         message={
           // 沒東西可勾的人不要講「由下面的選項決定」——下面根本沒有選項
           preview
-            ? `${preview.email} 會從白名單上消失，救不回來。`
+            ? `${preview.email} 將從白名單上永久移除，無法復原。`
               + (preview.albums > 0 || preview.photos_uploaded > 0 || preview.track_days > 0
-                ? "要不要順便清掉他的內容，由下面的選項決定。" : "")
-            : "正在算他名下有多少東西..."
+                ? "是否一併刪除其內容，請由下方選項決定。" : "")
+            : "正在統計名下內容…"
         }
         onConfirm={handlePurge}
         onCancel={() => setPurging(null)}
@@ -1328,8 +1280,7 @@ export default function AdminPage() {
                 <span>
                   一併刪除他建立的 {preview.albums} 本相簿
                   <span className={styles.purgeNote} style={{ display: "block" }}>
-                    連同裡面全部 {preview.photos_in_albums} 張照片。
-                    <strong>包含別人傳進去的</strong> —— 相簿沒了，照片沒有地方可以放。
+                    連同其中全部 {preview.photos_in_albums} 張照片，<strong>包含其他成員上傳的</strong>。
                   </span>
                 </span>
               </label>
@@ -1346,8 +1297,8 @@ export default function AdminPage() {
                   一併刪除他上傳的 {preview.photos_uploaded} 張照片
                   <span className={styles.purgeNote} style={{ display: "block" }}>
                     {preview.photos_elsewhere > 0
-                      ? <>其中 <strong>{preview.photos_elsewhere} 張放在別人的相簿裡</strong>，也會一起消失。</>
-                      : "都在他自己的相簿裡。"}
+                      ? <>其中 <strong>{preview.photos_elsewhere} 張位於其他人的相簿</strong>，也會一併刪除。</>
+                      : "全部位於他自己的相簿。"}
                   </span>
                 </span>
               </label>
@@ -1363,8 +1314,7 @@ export default function AdminPage() {
                 <span>
                   一併刪除他 {preview.track_days} 天的足跡
                   <span className={styles.purgeNote} style={{ display: "block" }}>
-                    連同原始 GPX 與貼過路的結果。
-                    <strong>這是刪他的移動紀錄，跟相簿無關</strong> —— 照片上的位置不受影響。
+                    連同原始 GPX 與貼路結果。此項只影響移動紀錄，照片上的位置不受影響。
                   </span>
                 </span>
               </label>
@@ -1372,17 +1322,17 @@ export default function AdminPage() {
 
             <p className={styles.purgeNote}>
               {!dropAlbums && preview.albums > 0
-                && `沒勾的話，他那 ${preview.albums} 本相簿會改掛在你（站長）名下，內容原封不動。`}
+                && `未勾選時，這 ${preview.albums} 本相簿將轉移至站長名下，內容不變。`}
               {!dropTracks && preview.track_days > 0
-                && `沒勾的話，他那 ${preview.track_days} 天足跡會改掛在你（站長）名下。`}
+                && `未勾選時，這 ${preview.track_days} 天的足跡將轉移至站長名下。`}
               {(dropAlbums || dropPhotos)
-                && "刪掉的照片會直接從 R2 移除；Google Drive 上的備份是搬進 trash/ 資料夾，不會真的刪檔。"}
+                && "刪除的照片會從儲存空間移除；Google Drive 上的備份會移入 trash/ 資料夾，不會直接刪除。"}
               {dropTracks
-                && "足跡刪掉之後救不回來 —— 原始 GPX 還在他自己的 Google Drive 裡，站上這份是唯一的副本。"}
+                && "足跡刪除後無法復原，站上這份是唯一的副本。"}
             </p>
           </>
         ) : (
-          <p className={styles.purgeNote}>他沒有建過相簿、沒有上傳過照片，也沒有足跡，刪掉不會動到任何內容。</p>
+          <p className={styles.purgeNote}>沒有相簿、照片或足跡，刪除不會影響任何內容。</p>
         ))}
       </SlideConfirmModal>
     </div>

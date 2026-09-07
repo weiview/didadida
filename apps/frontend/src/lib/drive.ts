@@ -237,16 +237,16 @@ async function requireFolderAccess(
     throw new DriveAccessError(
       scope, 'no_access', folderId,
       scope === 'root'
-        ? `Drive 寫入帳號看不到 didadida 根目錄（HTTP ${probe.status}）—— 資料夾被刪掉或搬走了，或現在連結的是另一個帳號`
-        : '這本相簿在 Drive 上的資料夾存取不到',
+        ? `無法存取 Google Drive 根目錄（HTTP ${probe.status}），資料夾可能已刪除或移動，或目前連結的是其他帳號`
+        : '無法存取此相簿在 Google Drive 上的資料夾',
     );
   }
   if (!probe.canAddChildren) {
     throw new DriveAccessError(
       scope, 'not_editor', folderId,
       scope === 'root'
-        ? 'Drive 寫入帳號在 didadida 根目錄上只有檢視權限，寫不進去'
-        : '這本相簿的資料夾只有檢視權限，寫不進去',
+        ? 'Google Drive 根目錄僅有檢視權限，無法寫入'
+        : '此相簿的資料夾僅有檢視權限，無法寫入',
     );
   }
   verifiedFolders.add(folderId);
@@ -341,8 +341,8 @@ export async function ensureAlbumFolder(
       throw new DriveAccessError(
         'album', probe.ok ? 'not_editor' : 'no_access', album.drive_folder_id,
         probe.ok
-          ? '這本相簿的資料夾只有檢視權限，寫不進去'
-          : `這本相簿在 Drive 上的資料夾存取不到（HTTP ${probe.status}）`,
+          ? '此相簿的資料夾僅有檢視權限，無法寫入'
+          : `無法存取此相簿在 Google Drive 上的資料夾（HTTP ${probe.status}）`,
       );
     }
     console.warn(`相簿 ${albumId} 的 Drive 資料夾是別的帳號建的，改在寫入帳號名下重建`);
@@ -434,7 +434,7 @@ export async function uploadToDrive(
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
-      throw new DriveHttpError(res.status, `Drive 上傳失敗 ${res.status}: ${detail.slice(0, 200)}`);
+      throw new DriveHttpError(res.status, `Google Drive 上傳失敗 ${res.status}: ${detail.slice(0, 200)}`);
     }
     const data = await res.json();
     if (!data?.id) throw new Error('Drive 上傳沒有回傳 file id');
@@ -623,7 +623,7 @@ export async function pushVideoToDrive(
    * 使用者看到的是「失敗」，而 Drive 上那個孤兒檔由背景對帳收尾。
    */
   if (!(await recordDriveIds(photoId, { driveFileId: null, driveOriginalId }))) {
-    throw new Error('影片傳上 Drive 了，但沒能記回網站（把同一個檔再拖進來上傳一次就會補上）');
+    throw new Error('影片已上傳至 Google Drive，但未能記錄至網站，請將同一個檔案再上傳一次以補齊');
   }
   return true;
 }
@@ -681,7 +681,7 @@ export async function pushPhotoToDrive(
         driveFileId = await uploadToDrive(token, webp4k, `${photoId}_${base}_4k.webp`, folderId);
         fourK = 'ok';
       } else {
-        reasons.push('這個格式編不出 4K WebP');
+        reasons.push('此格式無法產生 4K WebP');
       }
     } catch (err) {
       console.warn(`照片 ${photoId} 的 4K 沒送上 Drive`, err);
@@ -706,13 +706,13 @@ export async function pushPhotoToDrive(
       // 檔案上去了、網站不知道 —— 這是孤兒的來源，要講出來
       return {
         ok: false, fourK: 'failed', original: 'failed',
-        reason: '傳上 Drive 了，但沒能記回網站（可以稍後再補傳一次）',
+        reason: '已上傳至 Google Drive，但未能記錄至網站，請將同一個檔案再上傳一次以補齊',
       };
     }
   }
 
   const ok = fourK !== 'failed' && original !== 'failed';
-  return { ok, fourK, original, ...(ok ? {} : { reason: reasons.join('；') || 'Drive 上傳失敗' }) };
+  return { ok, fourK, original, ...(ok ? {} : { reason: reasons.join('；') || 'Google Drive 上傳失敗' }) };
 }
 
 /* ---- 診斷（已移除）----

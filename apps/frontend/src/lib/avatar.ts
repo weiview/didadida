@@ -66,7 +66,7 @@ async function decode(file: File): Promise<ImageBitmap | HTMLImageElement> {
     return await new Promise<HTMLImageElement>((resolve, reject) => {
       const img = new Image();
       img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error('讀不懂這個圖檔'));
+      img.onerror = () => reject(new Error('無法讀取此圖片檔案'));
       img.src = url;
     });
   } finally {
@@ -128,7 +128,7 @@ export async function prepareAvatar(file: File): Promise<PreparedAvatar> {
   const src = await decode(file);
   const sw = 'width' in src ? src.width : 0;
   const sh = 'height' in src ? src.height : 0;
-  if (!sw || !sh) throw new Error('讀不懂這個圖檔');
+  if (!sw || !sh) throw new Error('無法讀取此圖片檔案');
 
   /*
    * 先縮到一個夠掃描的尺寸再讀 ImageData。原尺寸掃一張 4000×3000 的圖是
@@ -143,7 +143,7 @@ export async function prepareAvatar(file: File): Promise<PreparedAvatar> {
   scan.width = scanW;
   scan.height = scanH;
   const sctx = scan.getContext('2d', { willReadFrequently: true });
-  if (!sctx) throw new Error('這個瀏覽器畫不出 canvas');
+  if (!sctx) throw new Error('此瀏覽器不支援 canvas 繪圖');
   sctx.drawImage(src as CanvasImageSource, 0, 0, scanW, scanH);
   const { hasAlpha, box } = scanAlpha(sctx.getImageData(0, 0, scanW, scanH).data, scanW, scanH);
 
@@ -151,7 +151,7 @@ export async function prepareAvatar(file: File): Promise<PreparedAvatar> {
   out.width = AVATAR_SIZE;
   out.height = AVATAR_SIZE;
   const ctx = out.getContext('2d');
-  if (!ctx) throw new Error('這個瀏覽器畫不出 canvas');
+  if (!ctx) throw new Error('此瀏覽器不支援 canvas 繪圖');
   ctx.imageSmoothingQuality = 'high';
 
   if (hasAlpha) {
@@ -191,7 +191,7 @@ export async function prepareAvatar(file: File): Promise<PreparedAvatar> {
   const type = canEncodeWebp() ? 'image/webp' : 'image/png';
   const blob = await new Promise<Blob | null>((resolve) =>
     out.toBlob((b) => resolve(b), type, 0.92));
-  if (!blob) throw new Error('產生頭像失敗');
+  if (!blob) throw new Error('頭像產生失敗');
 
   return { blob, type, hadAlpha: hasAlpha, animated: false, previewUrl: URL.createObjectURL(blob) };
 }

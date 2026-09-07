@@ -39,9 +39,9 @@ const MAX_GROUPS = 100;
 
 /** 幾個 bit 以內算「長得一樣」 */
 const LEVELS = [
-  { value: 0, label: "一模一樣（0）" },
-  { value: 4, label: "幾乎一樣（4 以內，推薦）" },
-  { value: 8, label: "有點像就算（8 以內）" },
+  { value: 0, label: "完全相同" },
+  { value: 4, label: "幾乎相同（建議）" },
+  { value: 8, label: "有點相似" },
 ];
 
 interface Group {
@@ -91,11 +91,11 @@ export default function PhashCard() {
         rounds++;
         all.push(...res.items);
         cursor = res.next_cursor;
-        setPhase("讀清單");
+        setPhase("讀取清單");
         setProgress({ done: all.length, total: total || all.length });
         if (res.done) break;
         if (rounds >= MAX_ROUNDS) {
-          setMessage({ text: `清單超過 ${MAX_ROUNDS * PAGE} 張，先比對前面這些。`, ok: false });
+          setMessage({ text: `照片超過 ${MAX_ROUNDS * PAGE} 張，本次僅比對前面部分。`, ok: false });
           break;
         }
       }
@@ -129,7 +129,7 @@ export default function PhashCard() {
             } else {
               failed++;
             }
-            setPhase("算特徵值");
+            setPhase("計算特徵值");
             setProgress({ done: computed + failed, total: todo.length });
           }
         }));
@@ -141,7 +141,7 @@ export default function PhashCard() {
           try {
             await savePhashes(out);
           } catch (e) {
-            saveError = e instanceof Error ? e.message : "寫回特徵值失敗";
+            saveError = e instanceof Error ? e.message : "特徵值儲存失敗";
           }
         }
       }
@@ -150,9 +150,9 @@ export default function PhashCard() {
       setPhase("");
       setProgress(null);
       setMessage({
-        text: `全站 ${all.length} 張，這一趟新算了 ${computed} 張`
-          + (todo.length === 0 ? "（都算過了）" : "")
-          + (failed ? `。${failed} 張讀不到縮圖，再按一次會重試` : "")
+        text: `全站 ${all.length} 張，本次新計算 ${computed} 張`
+          + (todo.length === 0 ? "（皆已計算過）" : "")
+          + (failed ? `。${failed} 張無法讀取縮圖，再按一次會重試` : "")
           + (saveError ? `。${saveError}` : "")
           + "。",
         ok: !failed && !saveError,
@@ -232,16 +232,16 @@ export default function PhashCard() {
   const remove = async (photo: PhashPhoto) => {
     const where = albums.get(photo.album_id) || `相簿 #${photo.album_id}`;
     const ok = window.confirm(
-      `刪掉「${photo.title || `#${photo.id}`}」（在「${where}」）？\n\n`
-      + "連同它的標籤、留言、Story、手動修過的座標與時間一起沒，"
-      + "Drive 上那一份會排進 trash/。這件事沒有辦法復原。",
+      `確定刪除「${photo.title || `#${photo.id}`}」（位於「${where}」）？\n\n`
+      + "將一併移除它的標籤、留言、Story 與手動設定的位置和時間，"
+      + "Drive 上的備份會移入 trash/。此操作無法復原。",
     );
     if (!ok) return;
     setDeleting(photo.id);
     try {
       const done = await deletePhoto(photo.id);
       if (!done) {
-        setMessage({ text: `刪不掉 #${photo.id}，請再試一次`, ok: false });
+        setMessage({ text: `無法刪除 #${photo.id}，請再試一次`, ok: false });
         return;
       }
       // 刪完不重抓（同「不開放」那顆快速鎖的理由）：整份清單重抓一次要好幾秒，
@@ -262,28 +262,25 @@ export default function PhashCard() {
   return (
     <AdminSection id="phash" title="相片的像素比對">
       <p className={styles.hint}>
-        找「明明是同一張、但<strong>特徵碼不一樣</strong>」的重複照片。
-        特徵碼比的是位元組，所以從 Google 相簿匯入（Google 自己轉過檔）、
-        或換一台電腦重傳的同一張照片一定對不上；這裡改比<strong>畫面本身</strong>。
+        比對畫面內容，找出重複的照片。經過轉檔或重新上傳的同一張照片，檔案內容會不同，
+        僅靠檔案比對無法辨識，這裡改以畫面本身比對。
       </p>
       <p className={styles.hint}>
-        比對<strong>全站</strong>一次做完，跨相簿的重複也找得到。算過的照片不會再算第二次，
-        新上傳的照片自己就帶著特徵值上來，所以這顆按鈕<strong>隨時都可以再按一次</strong>，
-        平常按一下很快 —— 之後又傳到同一張但特徵碼不同的照片，回來按「重新比對」就會出現。
-        <strong>連拍</strong>（同一秒連按好幾張）畫面幾乎一樣，也會被圈在一起 ——
-        所以下面每一張都要你自己看過再決定刪不刪。
+        比對範圍為全站，跨相簿的重複也找得到。已計算過的照片不會重複計算，
+        新上傳的照片會自動帶入特徵值，因此可隨時再次比對。
+        連拍的照片畫面相近，也會被歸為同一組，請逐張確認後再決定是否刪除。
       </p>
 
       <div className={styles.formRow}>
         <button className={`${styles.button} ${styles.primary}`} onClick={run} disabled={busy}>
-          {busy ? `${phase || "處理"}中...` : items ? "重新比對" : "開始比對"}
+          {busy ? `${phase || "處理"}中…` : items ? "重新比對" : "開始比對"}
         </button>
         <select
           className={styles.select}
           value={threshold}
           onChange={(e) => setThreshold(Number(e.target.value))}
           disabled={busy}
-          title="要多像才算重複"
+          title="相似程度門檻"
         >
           {LEVELS.map((l) => <option key={l.value} value={l.value}>{l.label}</option>)}
         </select>
@@ -305,17 +302,17 @@ export default function PhashCard() {
       {items && (
         <p className={styles.hint}>
           {groups.length === 0
-            ? "沒有找到長得一樣的照片。"
-            : `找到 ${groups.length} 組長得一樣的（多出來的共 ${dupCount} 張）`
-              + (groups.length > MAX_GROUPS ? `，先列前 ${MAX_GROUPS} 組。` : "。")}
+            ? "沒有找到重複的照片。"
+            : `找到 ${groups.length} 組重複照片（多出 ${dupCount} 張）`
+              + (groups.length > MAX_GROUPS ? `，僅列出前 ${MAX_GROUPS} 組。` : "。")}
         </p>
       )}
 
       {groups.slice(0, MAX_GROUPS).map((g) => (
         <div key={g.key} className={styles.dupGroup}>
           <div className={styles.detailHead}>
-            這 {g.photos.length} 張長得一樣
-            {g.photos.length - aliveIn(g) > 0 ? `（已刪 ${g.photos.length - aliveIn(g)} 張）` : ""}
+            這 {g.photos.length} 張畫面相同
+            {g.photos.length - aliveIn(g) > 0 ? `（已刪除 ${g.photos.length - aliveIn(g)} 張）` : ""}
           </div>
           {g.photos.map((p) => {
             const gone = deletedIds.has(p.id);
@@ -342,15 +339,15 @@ export default function PhashCard() {
                     href={`/album?id=${p.album_id}&photo=${p.id}`}
                     target="_blank"
                     rel="noreferrer"
-                    title="在新分頁看這張照片"
+                    title="在新分頁開啟這張照片"
                   >
                     {p.title || `#${p.id}`} ↗
                   </a>
                   <span className={styles.detailNote}>
                     {albums.get(p.album_id) || `相簿 #${p.album_id}`}
-                    {p.taken_at ? ` · ${p.taken_at.slice(0, 16).replace("T", " ")}` : " · 沒有拍攝時間"}
+                    {p.taken_at ? ` · ${p.taken_at.slice(0, 16).replace("T", " ")}` : " · 無拍攝時間"}
                     {p.media_type && p.media_type !== "photo" ? ` · ${p.media_type}` : ""}
-                    {sameBytes ? " · 特徵碼也一樣" : ""}
+                    {sameBytes ? " · 檔案內容相同" : ""}
                   </span>
                 </div>
                 {gone ? (
@@ -361,7 +358,7 @@ export default function PhashCard() {
                     onClick={() => remove(p)}
                     disabled={deleting !== null}
                   >
-                    {deleting === p.id ? "刪除中..." : "刪除"}
+                    {deleting === p.id ? "刪除中…" : "刪除"}
                   </button>
                 )}
               </div>

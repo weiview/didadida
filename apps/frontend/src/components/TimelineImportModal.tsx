@@ -87,7 +87,7 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
     // null 是「抓失敗」，空陣列才是「真的沒有待處理的照片」。抓失敗時留著舊快照
     // 並說清楚，不要讓畫面靜靜地變成一個假的「已完成」。
     if (fresh === null) {
-      setError('讀取照片清單失敗，畫面上的數字可能不是最新的。請確認仍在登入狀態。');
+      setError('讀取照片清單失敗，畫面數字可能不是最新的。請確認登入狀態後重試。');
       return;
     }
     setPhotos(fresh);
@@ -114,7 +114,7 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
       setTrack(extracted.points > 0 ? extracted : null);
 
       if (parsed.samples.length === 0) {
-        setError('這個檔案裡找不到任何位置資料。請確認匯出的是 Timeline.json（手機版）或舊版的 Records.json。');
+        setError('檔案中找不到位置資料。請確認匯出的是 Timeline.json（手機版）或舊版 Records.json。');
         setSamples([]);
       } else {
         setSamples(parsed.samples);
@@ -159,11 +159,11 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
     setUploading(false); setUploadProgress('');
 
     if (failed.length > 0) {
-      setError(`有 ${failed.length} 個月份上傳失敗（${failed.slice(0, 3).join('、')}${failed.length > 3 ? '…' : ''}），索引只收錄了成功的部分。請確認仍在登入狀態後重試。`);
+      setError(`${failed.length} 個月份上傳失敗（${failed.slice(0, 3).join('、')}${failed.length > 3 ? '…' : ''}），索引僅收錄成功的部分。請確認登入狀態後重試。`);
       return;
     }
     if (!indexOk) {
-      setError('月份都上傳完了，但索引寫入失敗 —— 地圖上還看不到。請確認仍在登入狀態後重試。');
+      setError('月份已全部上傳，但索引寫入失敗，地圖上尚無法顯示。請確認登入狀態後重試。');
       return;
     }
     setTrackResult(`已上傳 ${track.months.length} 個月、${track.points.toLocaleString()} 個位置點`);
@@ -202,8 +202,8 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
     if (res) {
       setResult(
         `已為 ${res.updated} 張照片寫入位置`
-        + (res.skipped > 0 ? `，${res.skipped} 張因已有更可信的位置而跳過` : '')
-        + (res.loose ? `（其中 ${res.loose} 筆差距超過 10 分鐘，只補了原本沒有座標的照片）` : ''),
+        + (res.skipped > 0 ? `，${res.skipped} 張已有更可信的位置，予以略過` : '')
+        + (res.loose ? `（其中 ${res.loose} 筆時間差超過 10 分鐘，僅填入原本無座標的照片）` : ''),
       );
       onDone(res.updated);
       // 寫完一定要重抓：candidates／matches 都是從這份 photos 算出來的，
@@ -211,7 +211,7 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
       // 上面卻還寫著「候選 30 張」、按鈕還邀請你再寫一次同樣的 30 張。
       await loadPhotos(onlyMissing);
     } else {
-      setError('寫入失敗，請確認仍在登入狀態。');
+      setError('寫入失敗，請確認登入狀態後重試。');
     }
     setSubmitting(false);
   }, [matches, onDone, loadPhotos, onlyMissing]);
@@ -240,12 +240,12 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
       >
         <h3 style={{ margin: '0 0 6px', fontSize: 18 }}>從 Google 時間軸匯入</h3>
         <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 16px', lineHeight: 1.7 }}>
-          手機的 Google Maps → 你的時間軸 → 設定 → 匯出時間軸資料，會得到 Timeline.json。
-          選一次檔可以做兩件獨立的事：<strong style={{ color: '#0f172a' }}>補照片位置</strong>，
-          以及<strong style={{ color: '#0f172a' }}>上傳足跡圖層</strong>。
+          於手機版 Google 地圖選擇「你的時間軸」→「設定」→「匯出時間軸資料」，可取得 Timeline.json。
+          選取檔案後可執行兩項獨立作業：<strong style={{ color: '#0f172a' }}>補照片位置</strong>
+          與<strong style={{ color: '#0f172a' }}>上傳足跡圖層</strong>。
           <br />
-          <strong style={{ color: '#0f172a' }}>原始檔永遠不會上傳</strong>，只在你的瀏覽器裡解析；
-          送出去的只有座標與時間，地點名稱、住家／公司標記、WiFi 掃描一概不讀。
+          <strong style={{ color: '#0f172a' }}>原始檔不會上傳</strong>，僅在瀏覽器中解析，
+          傳送的資料僅有座標與時間；地點名稱、住家與公司標記、WiFi 掃描紀錄皆不會讀取。
         </p>
 
         <label style={{
@@ -263,7 +263,7 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
           </span>
         </label>
 
-        {parsing && <p style={{ fontSize: 13.5, color: '#64748b' }}>解析中…（檔案較大時需要幾秒）</p>}
+        {parsing && <p style={{ fontSize: 13.5, color: '#64748b' }}>解析中…（檔案較大時需稍候）</p>}
 
         {error && (
           <div style={{
@@ -280,9 +280,9 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
           }}>
             <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>足跡圖層（紀念層）</div>
             <p style={{ fontSize: 12.5, color: '#64748b', margin: '0 0 10px', lineHeight: 1.7 }}>
-              十二年的移動軌跡畫成地圖上最底層的一條淡線。
-              <strong style={{ color: '#0f172a' }}>唯讀</strong> —— 不修正、不貼路、也不會拿來推算照片位置。
-              重新上傳是整包覆蓋，不用擔心重複。
+              將歷年的移動軌跡繪製為地圖最底層的淡色線條。
+              此圖層為<strong style={{ color: '#0f172a' }}>唯讀</strong>，不會修正、貼路，也不用於推算照片位置。
+              重新上傳將整批覆蓋，不會產生重複資料。
             </p>
             <div style={{ fontSize: 13, lineHeight: 1.9, marginBottom: 10 }}>
               <div>
@@ -324,7 +324,7 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
               background: '#f8fafc', borderRadius: 10, padding: '12px 14px',
               fontSize: 13.5, lineHeight: 1.8, marginBottom: 14,
             }}>
-              <div>格式：<strong>{format === 'phone' ? '手機版匯出' : format === 'records' ? '舊版 Records.json' : '舊版語意月檔'}</strong></div>
+              <div>格式：<strong>{format === 'phone' ? '手機版匯出' : format === 'records' ? '舊版 Records.json' : '舊版月份檔'}</strong></div>
               <div>位置取樣點：<strong>{samples.length.toLocaleString()}</strong> 筆</div>
               <div>時間範圍：{fmtRange(samples)}</div>
               {skipped.map((s, i) => (
@@ -362,7 +362,7 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
               </label>
             </div>
             <p style={{ fontSize: 12.5, color: '#64748b', margin: '-6px 0 14px', lineHeight: 1.6 }}>
-              預設時區只在時間軸記錄本身沒帶時區時才會用到；手機版匯出通常每筆都自帶，用不上。
+              僅在時間軸紀錄未附帶時區時才會採用預設時區；手機版匯出通常每筆皆自帶時區。
             </p>
 
             <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 13.5, marginBottom: 14, cursor: 'pointer' }}>
@@ -373,9 +373,9 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
                 style={{ marginTop: 3 }}
               />
               <span>
-                只處理還沒有座標的照片
+                僅處理尚無座標的照片
                 <span style={{ display: 'block', color: '#64748b', fontSize: 12.5 }}>
-                  取消勾選會連已用行程段或內插定位過的照片一起重算（照片自帶的 GPS 一律不覆蓋）
+                  取消勾選時，已由行程段或內插定位的照片也會重新計算；照片自帶的 GPS 一律不覆蓋
                 </span>
               </span>
             </label>
@@ -388,17 +388,17 @@ export default function TimelineImportModal({ isOpen, onClose, onDone, onTrackUp
               <div>
                 {loadingPhotos
                   // 切換上面那個勾選會回後端重撈，數字在那期間是上一次的，要講清楚
-                  ? '正在讀取照片清單…'
+                  ? '讀取照片清單…'
                   : <>候選照片 <strong>{candidates.length}</strong> 張，比對成功 <strong>{matches.length}</strong> 張</>}
               </div>
               {matches.length > 0 && (
                 <div style={{ color: '#475569', fontSize: 12.5 }}>
-                  時間差 2 分鐘內：{buckets.exact} ／ 10 分鐘內：{buckets.near} ／ 更久：{buckets.loose}
+                  時間差 2 分鐘內：{buckets.exact} ／ 10 分鐘內：{buckets.near} ／ 超過 10 分鐘：{buckets.loose}
                 </div>
               )}
               {matches.length === 0 && candidates.length > 0 && (
                 <div style={{ color: '#78350f', fontSize: 12.5 }}>
-                  照片的拍攝時間都不在時間軸的涵蓋範圍內。可以試著放寬容許時間差，或確認匯出的時間軸有涵蓋到這些照片的日期。
+                  照片的拍攝時間皆不在時間軸的涵蓋範圍內。可放寬容許時間差，或確認匯出的時間軸包含這些日期。
                 </div>
               )}
             </div>

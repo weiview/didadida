@@ -54,7 +54,7 @@ export default function VideoPlayer({ photo }: { photo: Photo }) {
       {state === "loading" && <PhotoSpinner />}
       {state === "error" && (
         <p className={styles.error}>
-          這支影片播不出來。可能是上傳還沒完成，或 Drive 暫時取不到 —— 稍後再試一次。
+          無法播放此影片。可能是上傳尚未完成，或暫時無法連線至 Google Drive，請稍後再試。
         </p>
       )}
     </div>

@@ -71,7 +71,7 @@ export default function RotatePhotosModal({ isOpen, photos, onClose, onDone }: P
     setBusy(false);
     if (rotated.length === 0 && failures.length > 0) {
       // 一張都沒成功就留在視窗裡講原因，關掉會讓人以為什麼都沒發生
-      setError(`全部都失敗了。${failures[0]}`);
+      setError(`全部處理失敗。${failures[0]}`);
       return;
     }
     onDone({ rotated, failures, skipped });
@@ -108,7 +108,7 @@ export default function RotatePhotosModal({ isOpen, photos, onClose, onDone }: P
       >
         <h3 style={{ margin: '0 0 4px', fontSize: 18 }}>旋轉照片</h3>
         <p style={{ margin: '0 0 14px', fontSize: 13, color: '#64748b' }}>
-          已選取 {photos.length} 張{targets.length !== photos.length && `，其中 ${targets.length} 張可以轉`}
+          已選取 {photos.length} 張{targets.length !== photos.length && `，其中 ${targets.length} 張可旋轉`}
         </p>
 
         {/*
@@ -135,7 +135,7 @@ export default function RotatePhotosModal({ isOpen, photos, onClose, onDone }: P
               }}
             />
           ) : (
-            <span style={{ color: '#94a3b8', fontSize: 13 }}>沒有可以旋轉的照片</span>
+            <span style={{ color: '#94a3b8', fontSize: 13 }}>沒有可旋轉的照片</span>
           )}
         </div>
 
@@ -145,17 +145,16 @@ export default function RotatePhotosModal({ isOpen, photos, onClose, onDone }: P
         </div>
 
         <p style={{ fontSize: 12.5, color: '#334155', margin: '0 0 10px', lineHeight: 1.6 }}>
-          目前 <strong>{deg === 0 ? '沒有旋轉' : `順時針 ${deg}°`}</strong>
-          {targets.length > 1 && '，選取的每一張都會轉同樣的角度。'}
+          目前 <strong>{deg === 0 ? '未旋轉' : `順時針 ${deg}°`}</strong>
+          {targets.length > 1 && '，選取的照片將套用相同角度。'}
         </p>
         <p style={{ fontSize: 12.5, color: '#64748b', margin: '0 0 10px', lineHeight: 1.6 }}>
-          轉的是<strong>網站上的縮圖</strong>（相簿格線、首頁、地圖）。
-          Google Drive 上那份原始檔與大圖不會被動到。
+          僅旋轉站上的縮圖（相簿、首頁、地圖），Google Drive 上的原始檔與大圖不受影響。
         </p>
         {skipped > 0 && (
           <p style={{ fontSize: 12.5, color: '#b45309', margin: '0 0 10px', lineHeight: 1.6 }}>
-            其中 {skipped} 個是影片或 GIF，<strong>不會處理</strong> ——
-            影片在網站上只有一張封面、GIF 是動畫本體，轉了會弄壞它們。
+            其中 {skipped} 個是影片或 GIF，不會處理：影片在站上只有一張封面，
+            GIF 為動畫本體，旋轉會造成顯示異常。
           </p>
         )}
 

@@ -8,19 +8,19 @@
 export function authErrorMessage(reason: string): string {
   switch (reason) {
     case 'not_admin':
-      return '這個 Google 帳號不在白名單裡，所以不能當管理員。請站長先把這個信箱加進白名單，再登入一次。';
+      return '此 Google 帳號不在白名單中，無法登入。請聯絡站長將此信箱加入白名單後再試。';
     case 'revoked':
-      return '這個 Google 帳號已經被停權了。要恢復請找站長。';
+      return '此 Google 帳號已停權，如需恢復請聯絡站長。';
     case 'not_configured':
-      return '後端還沒設定 Google 登入（GOOGLE_CLIENT_ID），暫時不能用。請先用密碼登入。';
+      return '尚未設定 Google 登入（GOOGLE_CLIENT_ID），請改用密碼登入。';
     case 'email_unverified':
-      return '這個 Google 帳號的信箱還沒驗證，不能用來登入管理員。';
+      return '此 Google 帳號的信箱尚未驗證，無法用於登入。';
     case 'wrong_audience':
-      return 'Google 給的憑證不是發給這個網站的，登入流程設定可能壞了。請用密碼登入。';
+      return 'Google 憑證的對象不是本站，登入設定可能有誤，請改用密碼登入。';
     case 'token_invalid':
-      return 'Google 憑證失效了，請再試一次。';
+      return 'Google 憑證已失效，請重新登入。';
     case 'token_exchange_failed':
-      return 'Google 那邊沒有換到憑證，請再登入一次。一直失敗的話請用密碼進來。';
+      return '無法向 Google 取得憑證，請重新登入；若持續失敗請改用密碼登入。';
     default:
       return `Google 登入失敗（${reason}）。`;
   }

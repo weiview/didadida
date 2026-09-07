@@ -116,8 +116,8 @@ export default function GoogleSyncConflictModal({
   const zoomButton = (p: PhotoData) => (
     <button
       type="button"
-      title="放大看"
-      aria-label="放大看"
+      title="放大檢視"
+      aria-label="放大檢視"
       onClick={(e) => { e.stopPropagation(); setZoom({ url: p.largeUrl || p.url, name: p.name }); }}
       style={{
         position: 'absolute', top: '5px', right: '5px', width: '28px', height: '28px',
@@ -144,8 +144,8 @@ export default function GoogleSyncConflictModal({
       }}>
         <h3 style={{ margin: '0 0 6px 0', fontSize: '1.15rem', color: 'var(--text-color)', lineHeight: '1.4' }}>
           {reason === 'same_file'
-            ? '這個檔跟相簿裡已經有的那張特徵碼一樣（確定是同一個檔）'
-            : '特徵碼對不上，但拍攝時間一樣 —— 可能是同一張'}
+            ? '這個檔案與相簿中已有的照片內容完全相同'
+            : '檔案內容不同，但拍攝時間相同，可能是同一張'}
           {counter && (
             <span style={{ marginLeft: 8, fontSize: '0.9rem', color: 'var(--text-light)', fontWeight: 400 }}>
               （第 {counter.current} / {counter.total} 張）
@@ -159,15 +159,15 @@ export default function GoogleSyncConflictModal({
         </h3>
         <p style={{ margin: '0 0 15px 0', fontSize: '0.85rem', color: 'var(--text-light)', lineHeight: '1.5' }}>
           {reason === 'same_file'
-            ? '要留兩份還是取代掉舊的？不要的話按「略過這張」。'
-            : '連拍很容易撞在同一秒，不一定是同一張。'}
-          {' '}縮圖右上角的 <strong>🔍</strong> 可以放大看，比對完再決定。
+            ? '請選擇保留兩份或取代既有照片，也可略過不處理。'
+            : '連拍照片的拍攝時間可能相同，不一定是同一張。'}
+          {' '}點縮圖右上角的 <strong>🔍</strong> 可放大比對。
         </p>
 
         <div style={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap', gap: '20px', marginBottom: '20px' }}>
           {/* 準備匯入的新照片 */}
           <div style={{ flex: '1 1 200px', minWidth: '150px' }}>
-            <h4 style={{ marginBottom: '10px', fontSize: '0.95rem' }}>準備匯入的新照片</h4>
+            <h4 style={{ marginBottom: '10px', fontSize: '0.95rem' }}>待上傳的照片</h4>
             <div style={{
               border: '2px solid var(--accent-color)', borderRadius: '10px',
               overflow: 'hidden', position: 'relative',
@@ -200,7 +200,7 @@ export default function GoogleSyncConflictModal({
           {/* 已存在的照片 */}
           <div style={{ flex: '2 1 280px', minWidth: '200px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '5px' }}>
-              <h4 style={{ margin: 0, fontSize: '0.95rem' }}>相簿中已存在的版本 (共 {existingPhotos.length} 張)</h4>
+              <h4 style={{ margin: 0, fontSize: '0.95rem' }}>相簿中已存在的版本（共 {existingPhotos.length} 張）</h4>
               {existingPhotos.length > 0 && (
                 <button
                   type="button"
@@ -260,8 +260,8 @@ export default function GoogleSyncConflictModal({
                     </div>
                     <div style={{ color: 'var(--text-light)' }}>
                       {decision === 'replace' && isSelected
-                        ? '準備被取代'
-                        : (p.sameFile ? '特徵碼一樣' : '時間一樣')}
+                        ? '將被取代'
+                        : (p.sameFile ? '內容相同' : '時間相同')}
                     </div>
                   </div>
                 </div>
@@ -281,7 +281,7 @@ export default function GoogleSyncConflictModal({
               cursor: 'pointer', fontSize: '0.95rem', fontWeight: 'bold'
             }}
           >
-            全部保留 (都存下來)
+            兩份都保留
           </button>
         </div>
 
@@ -296,7 +296,7 @@ export default function GoogleSyncConflictModal({
                 cursor: 'pointer', fontSize: '0.95rem',
               }}
             >
-              略過這張
+              略過
             </button>
           )}
           <button
@@ -335,7 +335,7 @@ export default function GoogleSyncConflictModal({
           />
           <div style={{ color: '#fff', fontSize: '0.85rem', textAlign: 'center', wordBreak: 'break-all' }}>
             {zoom.name}
-            <span style={{ opacity: 0.6, marginLeft: zoom.name ? 8 : 0 }}>點任何地方關閉</span>
+            <span style={{ opacity: 0.6, marginLeft: zoom.name ? 8 : 0 }}>點擊任意處關閉</span>
           </div>
         </div>
       )}
