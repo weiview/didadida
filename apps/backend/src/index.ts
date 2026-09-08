@@ -116,6 +116,26 @@ const SETTING_GUEST_MAP = "guest_can_view_map";
  */
 const SETTING_GUEST_COMMENTS = "guest_can_view_comments";
 /**
+ * 訪客看不看得到**影片**。**預設關**，理由同上面那兩個開關。
+ *
+ * ⚠️ 這一格**只管 media_type = 'video'**（2026-09-07 使用者拍板）。GIF 與
+ *    Android 動態照片在站上都算「照片」（media_type 是 'gif'／'photo'），
+ *    訪客照樣看得到 —— 使用者要擋的是「一段完整的影片」，不是「會動的東西」。
+ * ⚠️ 關著的時候要擋兩層：清單那幾支的 SQL 濾掉，以及 /api/photos/:id/video
+ *    那條位元組路由自己也要擋。只做前者的話訪客拿著 mt 從編號 1 數上去就抓得完。
+ */
+const SETTING_GUEST_VIDEOS = "guest_can_view_videos";
+/**
+ * 訪客能不能「複製照片」。**預設關**。
+ *
+ * ⚠️⚠️ **這是門檻不是牆，畫面上要照實講。** 位元組只要送到瀏覽器就攔不住
+ *    （截圖、開發者工具、直接記下網址）。關著的時候做兩件事：
+ *    ① 前端擋掉右鍵、拖曳與長按（`guest_can_copy_photos` 跟著 /api/auth/me 回去）；
+ *    ② **後端不發 Drive 上那份 4K** —— /api/photos/:id/full 對訪客直接 302 回
+ *    R2 那顆 800px 縮圖。②才是真的有代價的那一半：拿到手的最大只有 800px。
+ */
+const SETTING_GUEST_COPY = "guest_can_copy_photos";
+/**
  * 地圖上「兩個人這一趟算不算一起出遊」的重疊率門檻，單位是百分比。
  * 沒設過＝`CONVOY_PCT_DEFAULT`。
  *
@@ -310,15 +330,29 @@ const MEDIA_TOKEN_TTL_SEC = 86400 * 7;
  * 進站 token 本身沒有這個問題（每次都回頭查 D1），是這張刻意不查 D1 的票才有。
  * 要修得讓 /full 每次都 currentActor()，那就等於為了少數幾張照片，讓每一張大圖
  * 都多一次 D1 讀取 —— 不划算。
+ *
+ * 2026-09-07 起還有**第三種粒度：訪客票**。它證明的是「持票人是訪客」——
+ * 也就是「這個人**沒有**成員身分」。多這一格是因為 /full、/video、/motion 吃的是
+ * AUTOINCREMENT 的流水號，而訪客的三道限制（看不看得到這本相簿、看不看得到影片、
+ * 拿不拿得到 Drive 那份大圖）如果只寫在清單的 SQL 裡，訪客照樣可以從 1 數上去
+ * 直接抓位元組 —— 清單過濾管得到「列出來的東西」，管不到「按編號要位元組」。
+ *
+ * ⚠️ **一般票（basic）在這次部署之前就發給訪客了，效期七天。** 那些票驗回來
+ *    仍然是 basic，也就是**七天內舊的訪客票會被當成成員票**（拿得到影片與 4K）。
+ *    刻意不改一般票的格式讓舊票整批失效 —— 那會有一段「全站大圖都破」的空窗，
+ *    跟當初加升級票時同一個取捨。要立刻收乾淨就換掉 GUEST_PASSWORD。
  */
-type MediaScope = 'none' | 'basic' | 'admin';
+type MediaScope = 'none' | 'basic' | 'guest' | 'admin';
+
+/** 發得出來的三種粒度（'none' 只會從驗證那邊回來，不會拿去簽） */
+type MintableScope = 'basic' | 'guest' | 'admin';
 
 /**
  * 簽章的內容：到期時間 ＋ 粒度。
  * 粒度一定要進 payload，否則把升級票尾巴那個 `.a` 拔掉／加上就換了一個粒度。
  */
-const mediaTokenPayload = (exp: string, scope: 'basic' | 'admin') =>
-  scope === 'admin' ? `media:admin:${exp}` : `media:${exp}`;
+const mediaTokenPayload = (exp: string, scope: MintableScope) =>
+  scope === 'basic' ? `media:${exp}` : `media:${scope}:${exp}`;
 
 async function mediaHmacKey(env: Env, usage: "sign" | "verify"): Promise<CryptoKey> {
   return crypto.subtle.importKey(
@@ -330,17 +364,20 @@ async function mediaHmacKey(env: Env, usage: "sign" | "verify"): Promise<CryptoK
 /**
  * 發一張媒體 token。
  *
- * 格式 `<到期的 epoch 秒>.<base64url 的 HMAC>`，升級票在尾巴多一段 `.a`。
+ * 格式 `<到期的 epoch 秒>.<base64url 的 HMAC>`，升級票在尾巴多一段 `.a`、
+ * 訪客票多一段 `.g`。
  * **刻意讓一般票的格式一個字都沒變** —— 已經躺在家人瀏覽器 localStorage 裡的
  * 那些票在這次部署之後照樣驗得過，不會有一段「大圖全破」的空窗。
  */
-async function mintMediaToken(env: Env, scope: 'basic' | 'admin' = 'basic'): Promise<string> {
+const MEDIA_SCOPE_SUFFIX: Record<MintableScope, string> = { basic: '', guest: '.g', admin: '.a' };
+
+async function mintMediaToken(env: Env, scope: MintableScope = 'basic'): Promise<string> {
   const exp = String(Math.floor(Date.now() / 1000) + MEDIA_TOKEN_TTL_SEC);
   const key = await mediaHmacKey(env, "sign");
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(mediaTokenPayload(exp, scope)));
   const b64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  return scope === 'admin' ? `${exp}.${b64}.a` : `${exp}.${b64}`;
+  return `${exp}.${b64}${MEDIA_SCOPE_SUFFIX[scope]}`;
 }
 
 /**
@@ -352,10 +389,11 @@ async function mintMediaToken(env: Env, scope: 'basic' | 'admin' = 'basic'): Pro
 async function verifyMediaToken(raw: string | null, env: Env): Promise<MediaScope> {
   if (!raw) return 'none';
   const parts = raw.split(".");
-  if (parts.length !== 2 && !(parts.length === 3 && parts[2] === "a")) return 'none';
+  const suffix = parts.length === 3 ? parts[2] : "";
+  if (parts.length !== 2 && !(parts.length === 3 && (suffix === "a" || suffix === "g"))) return 'none';
   const [exp, sig] = parts;
   if (!exp || !sig) return 'none';
-  const scope: 'basic' | 'admin' = parts.length === 3 ? 'admin' : 'basic';
+  const scope: MintableScope = suffix === "a" ? 'admin' : suffix === "g" ? 'guest' : 'basic';
   // 先看到期再驗簽：過期的不必花 CPU 算 HMAC
   if (!/^\d+$/.test(exp) || Number(exp) < Math.floor(Date.now() / 1000)) return 'none';
   try {
@@ -386,6 +424,24 @@ function requestMediaScope(request: Request, url: URL, env: Env): Promise<MediaS
   const pending = verifyMediaToken(url.searchParams.get("mt"), env);
   mediaScopeCache.set(request, pending);
   return pending;
+}
+
+/**
+ * 這個請求是不是訪客發的（＝**沒有**成員身分）。位元組那三支路由專用。
+ *
+ * 票說了算的先算票（零成本，同一個請求只驗一次簽）；沒帶票的才回頭問
+ * `currentActor()` —— 那是帶 Authorization 進來的請求，而 currentActor 本來就有
+ * WeakMap 快取，不會多花讀取額度。
+ *
+ * ⚠️ **basic 一律當成員。** 這次部署之前發給訪客的票也是 basic，效期七天 ——
+ *    也就是七天內舊訪客票還吃得到影片與 4K。刻意不動一般票的格式（見 MediaScope
+ *    那段），要立刻收乾淨就換掉 GUEST_PASSWORD 讓所有訪客重新換票。
+ */
+async function requestIsGuest(request: Request, url: URL, env: Env): Promise<boolean> {
+  const scope = await requestMediaScope(request, url, env);
+  if (scope === 'guest') return true;
+  if (scope === 'basic' || scope === 'admin') return false;
+  return (await currentActor(request, env)) === null;
 }
 
 /**
@@ -692,6 +748,46 @@ const canSeeRestricted = (actor: Actor | null): boolean => !!actor?.canManageOth
 
 /** WHERE 片段。用到它的 SQL 必須把 Photo 別名為 `p`（跟 LOCAL_TIME_EXPR 同一個規矩） */
 const RESTRICTED_VISIBLE_COND = "p.restricted = 0";
+
+/*
+ * ── 訪客看得到哪幾本相簿（0027）─────────────────────────────────────────────
+ *
+ * `Album.guest_visible` 是**白名單**（DEFAULT 0，使用者 2026-09-07 拍板
+ * 「預設看不到，逐本開放」）。只管訪客 —— 成員（Google 登入、白名單內）永遠看
+ * 得到全部，這一欄跟 map_private／restricted 是三件互不相干的事。
+ *
+ * ⚠️ 同 restricted：過濾**一定要寫在 SQL 的 WHERE 裡**。撈回來再挑，那幾本的
+ *    名字、封面與預覽圖早就在回應裡了。
+ * ⚠️⚠️ **這收不回已經發出去的縮圖網址。** `/api/photos/view/*` 在進站閘門的
+ *    白名單上，唯一的護欄是「網址猜不到」，而那些網址在關掉之前早就隨相簿 JSON
+ *    發給每一個進得了站的人。要真的收乾淨就得把整本相簿的 R2 物件鍵全部換掉
+ *    （一本幾千張＝幾千次 R2 讀＋寫＋刪），**刻意不做**。能保證的是「從現在起
+ *    那本相簿不會再出現在任何清單上，大圖與影片的位元組也要不到」。
+ */
+
+/** WHERE 片段。用到它的 SQL 必須把 Album 別名為 `a`。 */
+const GUEST_ALBUM_COND = "a.guest_visible = 1";
+
+/**
+ * WHERE 片段：訪客看不到影片時濾掉。Photo 別名為 `p`。
+ * `media_type` 是 NOT NULL DEFAULT 'photo'（0019），所以 `!=` 不會踩到
+ * 「NULL 比較是 falsy」那個坑（見 CLAUDE.md 坑 4）。
+ */
+const GUEST_NO_VIDEO_COND = "p.media_type != 'video'";
+
+/**
+ * 這本相簿對訪客開著嗎。位元組那三支路由（/full、/video、/motion）專用。
+ *
+ * ⚠️ **刻意不把 Album JOIN 進那三支的主查詢** —— 那會讓每一次取大圖的 D1 讀取
+ *    列數從 1 變成 2，而且是**對每一個人**（成員占絕大多數）。改成只有確定是
+ *    訪客時才多問這一句，成員一列都不會多讀。
+ */
+async function albumVisibleToGuest(env: Env, albumId: any): Promise<boolean> {
+  if (albumId == null) return false;
+  const row = await env.DB.prepare("SELECT guest_visible FROM Album WHERE id = ?")
+    .bind(Number(albumId)).first<any>();
+  return Number(row?.guest_visible) === 1;
+}
 
 /**
  * GIF 動畫本體的大小上限（見 migrations/0021）。
@@ -1149,6 +1245,16 @@ async function guardTrackTools(
 
 async function guestCanViewComments(env: Env): Promise<boolean> {
   return (await getSettingCached(env, SETTING_GUEST_COMMENTS)) === "1";
+}
+
+/** 訪客看不看得到影片。沒設過＝關。 */
+async function guestCanViewVideos(env: Env): Promise<boolean> {
+  return (await getSettingCached(env, SETTING_GUEST_VIDEOS)) === "1";
+}
+
+/** 訪客能不能複製照片（＝拿不拿得到 Drive 那份 4K）。沒設過＝關。 */
+async function guestCanCopyPhotos(env: Env): Promise<boolean> {
+  return (await getSettingCached(env, SETTING_GUEST_COPY)) === "1";
 }
 
 /**
@@ -3416,8 +3522,27 @@ if (method === "POST" && pathname === "/api/verify-password") {
            * 圖片／影片的簽章網址要用的那張。**訪客也有** —— 燈箱大圖本來就給訪客看，
            * 這張 token 擋的是「完全沒進站的人」，不是訪客。
            * 同樣跟著這一條回來（零額外請求），效期與手上那張進站 token 一致。
+           *
+           * 三種粒度：可管理全站內容的人拿 admin（看得到不開放的照片）、訪客拿
+           * guest（位元組那三支路由要照訪客的三道限制擋他）、其餘成員拿 basic。
+           * ⚠️ 判斷訪客用的是 `actor === null` 不是 identity.role —— 白名單被撤掉
+           *    的人 token 還沒過期，他現在就是個訪客。
            */
-          media_token: await mintMediaToken(env, actor?.canManageOthers ? 'admin' : 'basic'),
+          media_token: await mintMediaToken(env, actor?.canManageOthers ? 'admin' : (actor === null ? 'guest' : 'basic')),
+          /*
+           * 訪客能不能複製照片。**只有訪客問得到這個設定**（成員永遠是 1）——
+           * 前端拿它決定要不要擋右鍵／拖曳／長按。同上，跟著這一條回來、
+           * 值走 getSettingCached（60 秒 memo），零額外請求。
+           * ⚠️ 這只是門檻不是牆，真正有代價的那一半在 /api/photos/:id/full
+           *    （關著的時候訪客拿不到 Drive 那份 4K，只給 800px）。
+           */
+          guest_can_copy_photos: actor !== null || (await guestCanCopyPhotos(env)) ? 1 : 0,
+          /*
+           * 訪客看不看得到影片。成員永遠是 1。前端拿它決定要不要在畫面上把
+           * 「站長沒有開放影片」講出來 —— 清單那幾支的 SQL 早就濾掉了，
+           * 這個旗標只是讓前端不必猜「為什麼相簿裡少了東西」。
+           */
+          guest_can_view_videos: actor !== null || (await guestCanViewVideos(env)) ? 1 : 0,
           /*
            * 合體那台車後座那個寶寶的頭像。**只發給看得到地圖的人** ——
            * 其他人拿它沒有任何用途，而每一個訪客的 /auth/me 都要多讀一列
@@ -3853,9 +3978,22 @@ if (method === "POST" && pathname === "/api/verify-password") {
         }
 
         if (method === "GET") {
+          /*
+           * 訪客看得到哪幾本相簿的那份清單**搭這一支的順風車**（0027）。
+           * `Album` 是幾十列的小表，而後台那個「選相簿」的視窗要的就是
+           * 「全部相簿 ＋ 哪幾本已經勾了」。為它另開一支路由等於進後台多一次請求。
+           */
+          const { results: guestAlbums } = await env.DB.prepare(
+            "SELECT id, name, guest_visible FROM Album ORDER BY name COLLATE NOCASE ASC"
+          ).all<any>();
           return new Response(JSON.stringify({
             guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
             guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
+            guest_can_view_videos: (await getSetting(env, SETTING_GUEST_VIDEOS)) === "1" ? 1 : 0,
+            guest_can_copy_photos: (await getSetting(env, SETTING_GUEST_COPY)) === "1" ? 1 : 0,
+            guest_albums: (guestAlbums ?? []).map((a: any) => ({
+              id: Number(a.id), name: a.name, guest_visible: Number(a.guest_visible) === 1 ? 1 : 0,
+            })),
             convoy_overlap_pct: await convoyOverlapPct(env),
             restricted_blur: (await getSetting(env, SETTING_RESTRICTED_BLUR)) === "1" ? 1 : 0,
             // 地圖上合體那台車：副駕是誰、後座那個寶寶長什麼樣
@@ -3869,12 +4007,28 @@ if (method === "POST" && pathname === "/api/verify-password") {
           const body: {
             guest_can_view_map?: any; guest_can_view_comments?: any; convoy_overlap_pct?: any;
             restricted_blur?: any; seat_passenger_uid?: any;
+            guest_can_view_videos?: any; guest_can_copy_photos?: any;
           } = await request.json();
           if (body.guest_can_view_map !== undefined) {
             await setSetting(env, SETTING_GUEST_MAP, body.guest_can_view_map ? "1" : "0");
           }
           if (body.guest_can_view_comments !== undefined) {
             await setSetting(env, SETTING_GUEST_COMMENTS, body.guest_can_view_comments ? "1" : "0");
+          }
+          /*
+           * ⚠️⚠️ 這兩格改完**一定要 bumpContentEpoch()**。它們決定訪客那份**共用
+           *    邊緣快取**的內容（影片在不在清單裡、大圖給不給 4K），而 Cache API
+           *    清不掉（cache.delete 只作用在當下那一個機房）—— 不換一把 key 的話
+           *    站長把開關關掉之後，訪客照樣從快取拿到舊的那一份，看起來就是
+           *    「開關沒有作用」。(同 PUT /api/photos/restricted 兩個方向都要推)
+           */
+          if (body.guest_can_view_videos !== undefined) {
+            await setSetting(env, SETTING_GUEST_VIDEOS, body.guest_can_view_videos ? "1" : "0");
+            await bumpContentEpoch(env);
+          }
+          if (body.guest_can_copy_photos !== undefined) {
+            await setSetting(env, SETTING_GUEST_COPY, body.guest_can_copy_photos ? "1" : "0");
+            await bumpContentEpoch(env);
           }
           if (body.convoy_overlap_pct !== undefined) {
             // 這一格是數字不是開關，壞值要當場報錯而不是靜靜地存進去 ——
@@ -3901,10 +4055,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
             await setSetting(env, SETTING_SEAT_PASSENGER,
               Number.isInteger(uid) && uid > 0 ? String(uid) : "");
           }
+          // ⚠️ 這裡刻意**不回相簿清單**（GET 才給）—— 拉桿放手那一下也會打這一支，
+          //    為它多掃一次 Album 是白花的。前端自己留著手上那份。
           return new Response(JSON.stringify({
             success: true,
             guest_can_view_map: (await getSetting(env, SETTING_GUEST_MAP)) === "1" ? 1 : 0,
             guest_can_view_comments: (await getSetting(env, SETTING_GUEST_COMMENTS)) === "1" ? 1 : 0,
+            guest_can_view_videos: (await getSetting(env, SETTING_GUEST_VIDEOS)) === "1" ? 1 : 0,
+            guest_can_copy_photos: (await getSetting(env, SETTING_GUEST_COPY)) === "1" ? 1 : 0,
             convoy_overlap_pct: await convoyOverlapPct(env),
             restricted_blur: (await getSetting(env, SETTING_RESTRICTED_BLUR)) === "1" ? 1 : 0,
             seat_passenger_uid: Number(await getSetting(env, SETTING_SEAT_PASSENGER)) || null,
@@ -3912,6 +4070,51 @@ if (method === "POST" && pathname === "/api/verify-password") {
             baby_avatar_facing: normFacing(await getSetting(env, SETTING_BABY_FACING)),
           }), { headers });
         }
+      }
+
+      /* ── 後台：訪客看得到哪幾本相簿（0027）──────────────────────────────
+       *
+       * 整份覆蓋（`album_ids` 就是「勾起來的那幾本」），不是逐本 toggle ——
+       * 後台那個視窗的操作就是「勾一勾、按確定」，一次一支路由對得上使用者的動作。
+       *
+       * ⚠️ 寫入切成 `env.DB.batch`：先把現在開著的全部關掉，再把選中的打開，
+       *    兩邊都帶著「原本是什麼」（`WHERE guest_visible = 0/1`）—— 沒變的那幾列
+       *    連 UPDATE 都不會下，D1 的寫入列數才不會每按一次確定就等於相簿總數。
+       * ⚠️ `IN (?,?,…)` 一定要先 chunkIds() 切塊（D1 綁定參數上限 100）。
+       * ⚠️⚠️ 改完**一定要 bumpContentEpoch()** —— 訪客那份共用邊緣快取裡躺著
+       *    舊的相簿清單，不換 key 的話站長關掉一本之後訪客照樣看得到。
+       */
+      if (method === "PUT" && pathname === "/api/admin/guest-albums") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        if (!actor.canManageOthers) {
+          return forbidden(headers, "只有站長或可管理全站內容的人可以改訪客看得到哪些相簿");
+        }
+        const body: { album_ids?: any } = await request.json();
+        const ids = Array.isArray(body.album_ids)
+          ? [...new Set(body.album_ids.map((n: any) => Math.round(Number(n))).filter((n: number) => Number.isInteger(n) && n > 0))]
+          : [];
+        const stmts: D1PreparedStatement[] = [
+          env.DB.prepare("UPDATE Album SET guest_visible = 0 WHERE guest_visible = 1"),
+        ];
+        for (const chunk of chunkIds(ids)) {
+          stmts.push(env.DB.prepare(
+            `UPDATE Album SET guest_visible = 1 WHERE guest_visible = 0 AND id IN (${placeholdersFor(chunk)})`
+          ).bind(...chunk));
+        }
+        await env.DB.batch(stmts);
+        await bumpContentEpoch(env);
+        const { results: rows } = await env.DB.prepare(
+          "SELECT id, name, guest_visible FROM Album ORDER BY name COLLATE NOCASE ASC"
+        ).all<any>();
+        return new Response(JSON.stringify({
+          success: true,
+          guest_albums: (rows ?? []).map((a: any) => ({
+            id: Number(a.id), name: a.name, guest_visible: Number(a.guest_visible) === 1 ? 1 : 0,
+          })),
+        }), { headers });
       }
 
       /*
@@ -4996,6 +5199,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
         * 這行不會比原本的 isAuthorized 多花任何讀取。
         */
        const albumsActor = await currentActor(request, env);
+       /*
+        * 訪客只看得到被勾起來的那幾本（Album.guest_visible，0027）。
+        * 過濾寫在 SQL 的 WHERE 裡，不是撈回來再 filter —— 後者會讓分頁的
+        * LIMIT/OFFSET 對不上（一頁 20 本濾掉一半就變 10 本，而 has_more
+        * 還是照 20 算）。影片同理：訪客不能看影片時連預覽圖都不該抽到它。
+        */
+       const albumsIsGuest = albumsActor === null;
+       const albumsGuestNoVideo = albumsIsGuest && !(await guestCanViewVideos(env));
        // 快取 60 秒，剛好對齊下面預覽圖的分鐘種子 —— 種子換人時快取也正好過期，
        // 不會出現「快取裡的舊種子」與「新算出來的種子」互相打架的空窗
        // 預覽圖會濾掉不開放的照片，所以這份清單要跟著版本號走（見 bumpContentEpoch）
@@ -5031,6 +5242,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           }
           where.push(`(${clauses.join(" OR ")})`);
         }
+        if (albumsIsGuest) where.push(GUEST_ALBUM_COND);
         if (tagIds.length > 0) {
           where.push(`a.id IN (SELECT p.album_id FROM Photo p
                                 WHERE p.id IN (SELECT photo_id FROM PhotoTag WHERE tag_id IN (${placeholdersFor(tagIds)})))`);
@@ -5089,9 +5301,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * 順帶一個好處：這句 SQL 不再隨身分改變，同一本相簿的預覽圖全站只有一種答案。
          */
         const previewRestricted = " AND restricted = 0";
+        // ⚠️ 這一段的 Photo 沒有別名，所以不能直接用 GUEST_NO_VIDEO_COND（它寫的是 p.）
+        const previewNoVideo = albumsGuestNoVideo ? " AND media_type != 'video'" : "";
         const previewSelect = (op: string) =>
           `SELECT COALESCE(thumb_sm_url, thumb_url, url) AS url
-             FROM Photo WHERE album_id = ? AND shuffle_key ${op} ?${previewRestricted}
+             FROM Photo WHERE album_id = ? AND shuffle_key ${op} ?${previewRestricted}${previewNoVideo}
             ORDER BY shuffle_key LIMIT 5`;
         const statements = (albums as any[]).flatMap((a) => {
           const seed = seedFor(Number(a.id));
@@ -5183,7 +5397,9 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const photo = await env.DB.prepare(
           // url 現在跟 thumb_url 是同一顆物件，但舊照片（Google 同步進來的那批）
           // 只有 url，所以還是照 COALESCE 的順序逐級退
-          "SELECT COALESCE(thumb_url, thumb_sm_url, url) AS fallback_url, drive_file_id, gif_key, restricted FROM Photo WHERE id = ?"
+          // album_id／media_type 是給訪客那三道閘用的。⚠️ 多帶兩欄不多花任何讀取
+          // 額度（D1 算的是讀了幾列不是幾欄），所以不必為此多打一次查詢
+          "SELECT COALESCE(thumb_url, thumb_sm_url, url) AS fallback_url, drive_file_id, gif_key, restricted, album_id, media_type FROM Photo WHERE id = ?"
         ).bind(photoId).first<any>();
         if (!photo) {
           return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
@@ -5215,14 +5431,6 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * 擋掉了，這純粹是多一層保險）。⚠️ adm 一定要**先 delete 再由伺服器自己
          * set** —— 照抄請求裡的 `?adm=1` 等於讓任何人自己指定要讀哪一份快取。
          */
-        const keyUrl = new URL(request.url);
-        keyUrl.searchParams.delete("mt");
-        keyUrl.searchParams.delete("adm");
-        if (isRestricted) keyUrl.searchParams.set("adm", "1");
-        const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
-        const hit = await cache.match(cacheKey);
-        if (hit) return hit;
-
         const fallback = () => new Response(null, {
           status: 302,
           headers: {
@@ -5231,6 +5439,49 @@ if (method === "POST" && pathname === "/api/verify-password") {
             "Cache-Control": "public, max-age=300",
           },
         });
+
+        /*
+         * 訪客的三道閘，**整段一定要擋在 cache.match 前面**：進到那一行就可能
+         * 直接命中家人先前存下的那份 4K，底下的判斷根本沒機會跑（同「不開放」
+         * 那一段把 D1 查詢挪到快取前面的理由）。回去的那個 302 自己也不寫快取。
+         *
+         * requestIsGuest 讀的是票的粒度（mt 的 .g，見 mintMediaToken）——
+         * <img src> 帶不了 Authorization，而 mt 不是身分、只證明「這個網址是站上
+         * 發出來的」，所以票上必須自己帶著粒度，否則訪客拿著票從 1 數上去就能
+         * 把整站的 Drive 4K 抓完（跟 2026-08-24 把這條路由移出白名單同一個坑）。
+         *
+         * ⚠️ 一般成員與管理員在這裡**一次 D1 都不會多讀** —— requestMediaScope
+         * 只算 HMAC，albumVisibleToGuest 只有訪客才會走到。
+         */
+        if (await requestIsGuest(request, url, env)) {
+          // ① 相簿沒被勾起來 → 這張照片對他不存在（404 不是 403）
+          if (!(await albumVisibleToGuest(env, photo.album_id))) {
+            return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+          }
+          // ② 影片開關關著時，連影片那一列的大圖入口也一起關（它拿到的會是封面圖）
+          if (photo.media_type === "video" && !(await guestCanViewVideos(env))) {
+            return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+          }
+          /*
+           * ③ 不給複製時只給 800px：**退回 R2 那顆縮圖，不是拒絕**。
+           * 燈箱照樣打得開，只是另存下來的那一份不是 Drive 上的 4K。
+           * 這是門檻不是牆（畫面上的東西一定拷得走），配的是前端那層
+           * 擋右鍵／拖曳／長按，兩層都只是讓「順手存一張」不再順手。
+           *
+           * ⚠️ GIF 不走這條：它的動畫本體整份在 R2（0021），退回縮圖等於
+           * 端出一張不會動的第一格 —— 那是把功能弄壞，不是防拷貝。
+           */
+          const isGifBytes = typeof photo.gif_key === "string" && photo.gif_key;
+          if (!isGifBytes && !(await guestCanCopyPhotos(env))) return fallback();
+        }
+
+        const keyUrl = new URL(request.url);
+        keyUrl.searchParams.delete("mt");
+        keyUrl.searchParams.delete("adm");
+        if (isRestricted) keyUrl.searchParams.set("adm", "1");
+        const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
+        const hit = await cache.match(cacheKey);
+        if (hit) return hit;
 
         /*
          * GIF：位元組就在 R2（0021），不必問 Drive。
@@ -5300,7 +5551,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           && pathname.endsWith("/video") && pathname.split("/").length === 5) {
         const photoId = pathname.split("/")[3];
         const photo = await env.DB.prepare(
-          "SELECT drive_original_id, media_type, restricted FROM Photo WHERE id = ?"
+          "SELECT drive_original_id, media_type, restricted, album_id FROM Photo WHERE id = ?"
         ).bind(photoId).first<any>();
 
         // 對著一張照片要影片是前端弄錯了，不要真的去代理一張圖片的位元組
@@ -5316,6 +5567,18 @@ if (method === "POST" && pathname === "/api/verify-password") {
             && (await requestMediaScope(request, url, env)) !== 'admin'
             && !canSeeRestricted(await currentActor(request, env))) {
           return new Response(JSON.stringify({ error: "Video not found" }), { status: 404, headers });
+        }
+        /*
+         * 訪客兩道閘，一樣回 404。這裡是**位元組**那一層 —— 清單那邊的 SQL
+         * 過濾只讓它從畫面上消失，而 /api/photos/:id/video 吃的是 AUTOINCREMENT
+         * 的流水號，不擋的話拿著票從 1 數上去就能把全站的影片抓完。
+         */
+        if (await requestIsGuest(request, url, env)) {
+          const guestOk = (await guestCanViewVideos(env))
+            && (await albumVisibleToGuest(env, photo.album_id));
+          if (!guestOk) {
+            return new Response(JSON.stringify({ error: "Video not found" }), { status: 404, headers });
+          }
         }
         // 上傳到一半斷掉會留下這種列：封面已經在 R2，影片還沒送上 Drive
         if (!photo.drive_original_id) {
@@ -5382,7 +5645,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           && pathname.endsWith("/motion") && pathname.split("/").length === 5) {
         const photoId = pathname.split("/")[3];
         const photo = await env.DB.prepare(
-          "SELECT drive_original_id, motion_offset, restricted FROM Photo WHERE id = ?"
+          "SELECT drive_original_id, motion_offset, restricted, album_id FROM Photo WHERE id = ?"
         ).bind(photoId).first<any>();
 
         // 「這張沒有動畫」跟「查無此照片」對前端是同一件事：沒有東西可以播
@@ -5394,6 +5657,15 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (Number(photo.restricted) === 1
             && (await requestMediaScope(request, url, env)) !== 'admin'
             && !canSeeRestricted(await currentActor(request, env))) {
+          return new Response(JSON.stringify({ error: "Motion photo not found" }), { status: 404, headers });
+        }
+        /*
+         * 訪客：只看相簿有沒有被勾起來。**動態照片不吃影片那個開關** ——
+         * 使用者拍板那一格「只有影片」（media_type = video），而動態照片在站上
+         * 是一張照片，它的動畫是照片的一部分（同 GIF）。
+         */
+        if (await requestIsGuest(request, url, env)
+            && !(await albumVisibleToGuest(env, photo.album_id))) {
           return new Response(JSON.stringify({ error: "Motion photo not found" }), { status: 404, headers });
         }
         if (!photo.drive_original_id) {
@@ -5473,6 +5745,14 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (!album) {
           return new Response(JSON.stringify({ error: "Album not found" }), { status: 404, headers });
         }
+        /*
+         * 沒被勾起來的相簿對訪客一律 404，不是 403 —— 403 等於承認「這裡有一本
+         * 你不能看的相簿」（同不開放的照片那條規矩）。SELECT * 本來就把
+         * guest_visible 帶回來了，這個判斷不多花任何一次讀取。
+         */
+        if ((await currentActor(request, env)) === null && Number((album as any).guest_visible) !== 1) {
+          return new Response(JSON.stringify({ error: "Album not found" }), { status: 404, headers });
+        }
         return new Response(JSON.stringify(album), { headers });
       }
 
@@ -5481,6 +5761,16 @@ if (method === "POST" && pathname === "/api/verify-password") {
         // 同樣有座標差異，管理員跳過快取
         const albumActor = await currentActor(request, env);
         const albumIsAdmin = albumActor !== null;
+        /*
+         * 訪客的兩道過濾一律折進下面那句 SQL 的 WHERE 裡（Album 已經是 `a`、
+         * Photo 已經是 `p`，不必多 JOIN 一張表）：相簿沒被勾起來就整本沒有照片，
+         * 影片開關關著就連影片那幾列都不端出去。撈回來再 filter 的話，那幾張的
+         * R2 縮圖網址早就跟著 JSON 送出去了 —— 而 /api/photos/view/* 在進站閘門
+         * 的白名單上，唯一的護欄就是「網址猜不到」。
+         */
+        const albumGuestCond = albumActor === null
+          ? ` AND ${GUEST_ALBUM_COND}` + ((await guestCanViewVideos(env)) ? "" : ` AND ${GUEST_NO_VIDEO_COND}`)
+          : "";
         const albumEpoch = albumIsAdmin ? null : await contentEpoch(env);
         return withEdgeCache(request, ctx,
           { browserMaxAge: 10, edgeMaxAge: 300, skip: albumIsAdmin, epoch: albumEpoch },
@@ -5495,7 +5785,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           SELECT p.*, a.user_id AS user_id, a.map_private
           FROM Photo p
           LEFT JOIN Album a ON a.id = p.album_id
-          WHERE p.album_id = ?${canSeeRestricted(albumActor) ? "" : ` AND ${RESTRICTED_VISIBLE_COND}`}
+          WHERE p.album_id = ?${canSeeRestricted(albumActor) ? "" : ` AND ${RESTRICTED_VISIBLE_COND}`}${albumGuestCond}
           ORDER BY p.sort_order ASC, p.created_at DESC
         `).bind(albumId).all();
         const photos = applyGeoPrivacy(rawPhotos as any[], albumIsAdmin);
@@ -5598,6 +5888,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
         const binds: any[] = [];
         // 不開放的那幾張連搜尋都搜不到（FTS 索引照樣建著，過濾在外層）
         if (!canSeeRestricted(searchActor)) where.push(RESTRICTED_VISIBLE_COND);
+        // 訪客只搜得到被勾起來的相簿；影片開關關著時連檔名都搜不到那幾支
+        if (searchActor === null) {
+          where.push(GUEST_ALBUM_COND);
+          if (!(await guestCanViewVideos(env))) where.push(GUEST_NO_VIDEO_COND);
+        }
         if (matchExpr) {
           where.push(`p.id IN (SELECT rowid FROM PhotoFts WHERE PhotoFts MATCH ?)`);
           binds.push(matchExpr);
@@ -7946,6 +8241,11 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         if (!isAdmin) conds.push("a.map_private = 0", "p.geo_private = 0");
         // 不開放的那幾張連點都不該出現（跟座標隱私是兩件事，見 canSeeRestricted）
         if (!canSeeRestricted(actor)) conds.push(RESTRICTED_VISIBLE_COND);
+        // 訪客看不到的相簿，它的照片座標也不該出現在地圖上
+        if (actor === null) {
+          conds.push(GUEST_ALBUM_COND);
+          if (!(await guestCanViewVideos(env))) conds.push(GUEST_NO_VIDEO_COND);
+        }
 
         const qAlbum = url.searchParams.get("album_id");
         if (qAlbum) { conds.push("p.album_id = ?"); binds.push(qAlbum); }

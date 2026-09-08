@@ -77,11 +77,18 @@ Authorization，而 R2 的物件鍵要先拿到（鎖著的）相簿 JSON 才知
   前端存在 `localStorage.media_token`，由 `photoFullSrc()`／`photoVideoSrc()` 掛上網址。
 - **`mt` 不是身分**，只證明「這個網址是站上發出來的」。拿它打 `/api/albums` 一樣 401；
   要知道「是誰」的路由照樣得走 `currentActor()`。
-- **票有兩種粒度**（0020）：一般票 `<exp>.<HMAC>`，可管理全站內容的人拿到的是
-  尾巴多一段 `.a` 的升級票。差別只在「不開放」那幾張（見「不開放的照片」）。
-  粒度有進 HMAC 的 payload，所以自己加／拔 `.a` 驗不過。
-  ⚠️ 升級票**七天內不會因為權限被撤而失效**（它刻意不查 D1）—— 已知，要修的話
-  等於每一張大圖都多一次 D1 讀取。
+- **票有三種粒度**：一般票（成員）`<exp>.<HMAC>`、**訪客票**尾巴多一段 `.g`
+  （0027 加的）、可管理全站內容的人拿到的是尾巴多一段 `.a` 的**升級票**（0020）。
+  粒度有進 HMAC 的 payload，所以自己加／拔 `.g`／`.a` 驗不過。
+  `.a` 的差別只在「不開放」那幾張（見「不開放的照片」）；`.g` 的差別是那三支
+  位元組路由（`/full`／`/video`／`/motion`）要另外過訪客那幾道閘（見「訪客能看到什麼」）。
+  ⚠️⚠️ **粒度是刻在票上的，而票有七天效期** —— 所以「權限改了、票還沒過期」這段
+  空窗對三種粒度都成立：升級票七天內不會因為權限被撤而失效，訪客票也一樣
+  （它刻意不查 D1）。要修等於每一張大圖都多一次 D1 讀取。
+  ⚠️ 換句話說，**部署完那一刻手上還握著舊 `basic` 票的訪客**（0027 之前登入的）
+  在票過期或重新登入之前仍然吃得到 4K 與影片。要立刻收乾淨只有一條路：
+  換掉 `GUEST_PASSWORD`。刻意**不動一般票的格式**去強制作廢 —— 那會讓全站
+  每一個人的大圖同時破圖，代價比這段空窗大得多。
 - **不是每張照片各簽一組**：相簿內容那支路由不分頁，5000 張的相簿逐張簽等於一次請求
   跑 5000 趟 `crypto.subtle.sign`，遠超單次 10ms CPU。`/full` 回的是圖片位元組、
   內容不隨身分變化，所以「證明你進得了站」就是剛好的粒度。
@@ -376,6 +383,84 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   前端連 Google 時間軸紀念層也一起收（`/map` 不抓 index、開關不出現）——
   那是他自己的另一半足跡，留著就是一條沒有名字的線。
   **資料完全不動，權限開回來下一次進頁就全部復原。**
+
+## 訪客能看到什麼：影片、相簿、複製
+
+2026-09-07 加的三格（`/admin`「訪客能看到什麼」那一格）。**三格都只管訪客** ——
+成員（Google 登入、白名單內）永遠看得到全部，這三件事跟 `restricted`、
+`can_view_map` 是互不相干的東西。
+
+| 開關 | 存在哪 | 預設 |
+|---|---|---|
+| 訪客看不看得到影片 | `AppSetting.guest_can_view_videos`（k/v，**不需要 migration**） | 關 |
+| 訪客能不能複製照片 | `AppSetting.guest_can_copy_photos`（k/v，**不需要 migration**） | 關 |
+| 訪客看得到哪幾本相簿 | **`Album.guest_visible`（0027，欄位）** | 0（看不到） |
+
+- ⚠️⚠️ **相簿是欄位不是一份 id 清單**（不是塞進 `AppSetting`）。過濾一定要寫進
+  SQL 的 WHERE（`GUEST_ALBUM_COND` ＝ `a.guest_visible = 1`，Album 要別名為 `a`）——
+  撈回來再挑的話那幾本的名字、封面與預覽圖早就在回應裡了；而存成 id 清單就得寫成
+  `IN (?,?,…)`，一撞上 **D1 綁定參數上限 100** 就 500。
+- ⚠️ **`DEFAULT 0` ＝白名單，使用者拍板「預設看不到，逐本開放」。** 兩個已知的
+  後果他都接受了：① 0027 一上線訪客眼中是一片空的，直到站長去勾；
+  ② **之後每一本新建的相簿預設都是關的**。
+- 蓋住的地方（訪客身分才加條件）：`/api/albums`（含**首頁那排預覽圖**那一句）、
+  `/api/albums/:id`（不開放的那本直接 **404**）、`/api/albums/:id/photos`、
+  `/api/search`、`/api/footprint`，以及**位元組那三支**。
+- ⚠️⚠️ **清單那層的 SQL 過濾只讓東西從畫面上消失，位元組那三支要自己再擋一次。**
+  `/full`／`/video`／`/motion` 吃的是 AUTOINCREMENT 的流水號，不擋的話訪客拿著
+  自己那張票從 1 數上去就抓得完全站（同 2026-08-24 把 `/full` 移出白名單那個坑）。
+  身分從 **`mt` 的 `.g` 粒度**認（`requestIsGuest()`）—— `<img src>`／`<video src>`
+  帶不了 Authorization，所以粒度必須刻在票上。
+  ⚠️ 那三支拿不到一律回 **404 不是 403**（同「不開放」：403 等於承認那個編號上有東西）。
+  ⚠️ **成員與管理員在這幾道閘上一次 D1 都不會多讀** —— `requestMediaScope()` 只算
+  HMAC，`albumVisibleToGuest()` 只有確定是訪客時才走到。也因此**刻意不把 Album
+  JOIN 進那三支的主查詢**（那會讓每一次取大圖對**每一個人**都從讀 1 列變成 2 列）。
+- ⚠️ 影片那一格**只管 `media_type = 'video'`**（使用者拍板）。GIF 與 Android 動態
+  照片在站上都算「照片」，訪客照樣看得到 —— 要擋的是「一段完整的影片」，不是
+  「會動的東西」。`GUEST_NO_VIDEO_COND` ＝ `p.media_type != 'video'`（`media_type`
+  是 NOT NULL DEFAULT 'photo'，所以不會踩到坑 4 那個 NULL 比較）。
+- **「不給複製」是門檻不是牆，畫面上要照實講。** 位元組只要送到瀏覽器就攔不住
+  （截圖、開發者工具、直接記下網址）。做的是兩層：
+  - **後端不發 Drive 上那份 4K** —— `/api/photos/:id/full` 對訪客直接退回 R2 那顆
+    800px 縮圖（`fallback()`，**不是拒絕**：燈箱照樣打得開，只是另存下來的那份
+    最大 800px）。這才是真的有代價的那一半。
+    ⚠️ **GIF 不走這條**：它的動畫本體整份在 R2（0021），退回縮圖等於端出一張
+    不會動的第一格 —— 那是把功能弄壞，不是防拷貝。
+  - **前端擋右鍵／拖曳／長按**：`components/CopyGuard.tsx`，**只掛在 `layout.tsx`
+    一個地方**（`<PresenceToasts />` 後面）。⚠️ 刻意**不做成每個元件的 prop** ——
+    照片出現在格線、燈箱、地圖、留言頭像、首頁封面好幾條路上，漏掉一條就破功。
+    它是一支 document 層的監聽器（`contextmenu`／`dragstart`，只擋 `closest('img, video')`
+    命中的，所以連結與文字照樣選得動）＋ 一個 `body.no-copy-media` class
+    （手機長按沒有可取消的事件，只能靠 `-webkit-touch-callout: none` 那組 CSS，
+    在 `globals.css`）。⚠️ **不要加停用開發者工具那種花招。**
+  - ⚠️ 前端那顆旗標 `canCopyPhotos` 跟著 `GET /api/auth/me` 回來（零額外請求），
+    **成員一律 1**；前端解析時**預設 true** —— 邊快取裡躺著舊版後端的回應時
+    那一欄是 `undefined`，當成 false 會讓全站的人突然按不了右鍵。
+
+### 後台那一格與 `PUT /api/admin/guest-albums`
+
+- 兩個開關是 `GET/PUT /api/admin/settings` 上的兩個欄位（同 `guest_can_view_map`
+  那一套）。**相簿清單也搭 GET 那一趟回來**（`guest_albums: [{id, name, guest_visible}]`，
+  一句 `SELECT id, name, guest_visible FROM Album`）—— 不另外開一支 GET。
+  ⚠️ 但它**刻意不進 `SiteSettings` 型別**：`PUT /admin/settings` 的回應裡沒有這一段，
+  混在一起會讓存一次開關就把挑相簿那份 state 清空。
+- 選相簿是 `app/admin/GuestAlbumsModal.tsx`（跳出來的勾選視窗，使用者指定的形式），
+  ⚠️ **清單在視窗打開時才抓**，不在進 `/admin` 時抓（同 Drive 比對、用量條那條規矩）。
+- ⚠️⚠️ **`PUT /api/admin/guest-albums` 是整份覆寫，不是 diff** ——
+  送 `{album_ids: [...]}`，沒列到的一律關掉。呼叫端**永遠要送完整清單**。
+  一趟 `env.DB.batch`：先 `UPDATE … SET guest_visible = 0 WHERE guest_visible = 1`，
+  再照 100 個一塊切開 `UPDATE … SET guest_visible = 1 WHERE guest_visible = 0 AND id IN (…)`
+  —— 兩句都帶著「原本是什麼」，**沒變的那幾列一列都不寫**。
+- ⚠️ 寫完一定要 `bumpContentEpoch()`：訪客那份共用邊緣快取（`/api/albums`、
+  `/api/albums/:id/photos`、`/api/search`、`/api/footprint`）不換 key 的話，
+  剛關掉的那本要等快取過期才會消失，站長會以為開關壞了。
+- ⚠️⚠️ **關掉一本相簿收不回已經發出去的縮圖網址。** `/api/photos/view/*` 在進站
+  閘門的白名單上，唯一的護欄是「網址猜不到」，而那些網址在關掉之前早就隨相簿
+  JSON 發給每一個進得了站的人了。要真的收乾淨得把整本的 R2 物件鍵全部換掉
+  （一本幾千張＝幾千次 R2 讀＋寫＋刪），**刻意不做**。能保證的是「從現在起那本
+  不會再出現在任何清單上，大圖、影片與動態照片的位元組也要不到」。
+  已經開著的分頁也一樣 —— 他手上那份清單是關掉之前拿的。
+
 
 ## 誰在線上：綠燈與「XXX 上線囉」
 

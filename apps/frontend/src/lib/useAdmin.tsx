@@ -135,6 +135,15 @@ interface AuthValue {
   babyAvatarFacing: 'left' | 'right';
   /** 站長在 /admin 換掉寶寶的朝向之後，就地把手上這份改掉（同 setBabyAvatar） */
   setBabyAvatarFacing: (facing: 'left' | 'right') => void;
+  /**
+   * 照片能不能被複製（右鍵存圖、拖曳、手機長按）。**成員永遠 true**，
+   * 訪客要站長在後台開了才有（預設關）。
+   *
+   * ⚠️ 這**不是權限，是門檻** —— 位元組已經在他的瀏覽器裡了，截圖擋不掉。
+   * 真正有份量的那一半在後端：關著的時候訪客拿不到 Drive 那份 4K，只有 800px。
+   * 所以這裡放行不代表資料是安全的，這裡擋掉也不代表他就拿不到。
+   */
+  canCopyPhotos: boolean;
   /** 換完自己的頭像朝向之後同步這裡的 user（同 setMyAvatar） */
   setMyAvatarFacing: (facing: 'left' | 'right') => void;
   /** 登出：清掉站上與 Google 的 token，回到進站畫面 */
@@ -148,7 +157,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     admin: false, guest: false, canViewMap: false,
     canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
     convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false,
-    babyAvatar: null, babyAvatarFacing: 'left', user: null,
+    babyAvatar: null, babyAvatarFacing: 'left', canCopyPhotos: true, user: null,
   });
   const [checking, setChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -174,7 +183,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // 遮罩也不樂觀關掉：真正的值等 checkAuth() 回來。猜錯的方向要是
         // 「先攤開來再糊回去」，那一下就白做了
         convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: true,
-        babyAvatar: null, babyAvatarFacing: 'left', user: null,
+        babyAvatar: null, babyAvatarFacing: 'left', canCopyPhotos: true, user: null,
       });
       checkAuth().then((next) => {
         if (!alive) return;
@@ -250,7 +259,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       admin: false, guest: false, canViewMap: false,
       canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
       convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false,
-      babyAvatar: null, babyAvatarFacing: 'left', user: null,
+      babyAvatar: null, babyAvatarFacing: 'left', canCopyPhotos: true, user: null,
     });
     setAuthError(null);
   }, []);
@@ -309,6 +318,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     restrictedBlur: state.restrictedBlur,
     babyAvatar: state.babyAvatar,
     babyAvatarFacing: state.babyAvatarFacing,
+    canCopyPhotos: state.canCopyPhotos,
     markNotificationsRead,
     canEdit,
     canAddTo,

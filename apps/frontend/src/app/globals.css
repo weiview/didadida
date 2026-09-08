@@ -163,3 +163,15 @@ body.is-scrolling .floating-control * {
     transform: var(--glass-transform);
   }
 }
+
+/* 訪客不能複製照片時由 components/CopyGuard.tsx 掛上。
+   右鍵與拖曳是 JS 擋的，這裡負責**手機的長按選單**（-webkit-touch-callout）——
+   那個選單不發任何可以 preventDefault 的事件，只有 CSS 關得掉。
+   ⚠️ 只作用在 img/video 上，整頁停用選取會讓訪客連文字都複製不了 */
+body.no-copy-media img,
+body.no-copy-media video {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}

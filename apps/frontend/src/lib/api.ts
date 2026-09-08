@@ -523,6 +523,15 @@ export interface AuthState {
   babyAvatar: string | null;
   /** 寶寶那張頭像朝哪一邊（同 CurrentUser.avatar_facing，站長在 /admin 設） */
   babyAvatarFacing: 'left' | 'right';
+  /**
+   * 照片能不能被複製（右鍵存圖、拖曳、手機長按）。**成員永遠 true**，
+   * 訪客要站長在後台開了才有（預設關）。
+   *
+   * ⚠️ 這**不是權限，是門檻**：位元組已經在他的瀏覽器裡，截圖與開發者工具永遠擋不掉。
+   * 有份量的那一半在後端 —— 關著的時候訪客的 /api/photos/:id/full 只給 R2 那顆
+   * 800px 縮圖，Drive 上那份 4K 一律不發。
+   */
+  canCopyPhotos: boolean;
   user: CurrentUser | null;
 }
 
@@ -647,7 +656,7 @@ export async function checkAuth(): Promise<AuthState> {
     admin: false, guest: false, canViewMap: false,
     canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
     convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false,
-    babyAvatar: null, babyAvatarFacing: 'left', user: null,
+    babyAvatar: null, babyAvatarFacing: 'left', canCopyPhotos: true, user: null,
   };
   if (typeof window === 'undefined') return locked;
   // 舊版把明文密碼存在這個 key。清掉已經留在使用者瀏覽器裡的那一份，
@@ -685,6 +694,9 @@ export async function checkAuth(): Promise<AuthState> {
         babyAvatar: data.baby_avatar ?? null,
         // 舊後端不回這個欄位 —— 當 'left'（多數去背頭像是側臉朝左）
         babyAvatarFacing: data.baby_avatar_facing === 'right' ? 'right' : 'left',
+        // 舊後端不回這個欄位 —— 當成「可以」。少擋一次右鍵不痛不癢，
+        // 而擋錯了是每個成員在自己的相簿裡都按不出右鍵選單
+        canCopyPhotos: data.guest_can_copy_photos != null ? !!data.guest_can_copy_photos : true,
         user: data.user ?? null,
       };
     }
@@ -1549,6 +1561,17 @@ export interface SiteSettings {
    */
   guest_can_view_comments: number;
   /**
+   * 訪客能不能看影片，預設 0。**只管 media_type = 'video'** ——
+   * GIF 與 Android 動態照片在站上是照片，不吃這一格（使用者 2026-09-07 拍板）。
+   * 關著的時候影片連相簿清單、搜尋與地圖座標都不會出現，不是端出來再擋播放。
+   */
+  guest_can_view_videos: number;
+  /**
+   * 訪客能不能複製照片，預設 0。關著時前端擋右鍵／拖曳／長按，
+   * 後端也只發 800px 縮圖（見 AuthState.canCopyPhotos 那段的取捨）。
+   */
+  guest_can_copy_photos: number;
+  /**
    * 地圖上「這一趟算不算一起出遊」的貼路重疊率門檻（%），預設 70。
    *
    * 放在站台設定而不是每個人各自調：它是判定規則的靈敏度，不是誰的偏好 ——
@@ -1580,6 +1603,8 @@ export interface SiteSettings {
 export interface SiteSettingsPatch {
   guest_can_view_map?: boolean;
   guest_can_view_comments?: boolean;
+  guest_can_view_videos?: boolean;
+  guest_can_copy_photos?: boolean;
   convoy_overlap_pct?: number;
   restricted_blur?: boolean;
   /** 送 0 或 null 就是「沒有人是副駕駛」 */
@@ -1593,6 +1618,8 @@ export async function fetchSiteSettings(): Promise<SiteSettings> {
   return {
     guest_can_view_map: data.guest_can_view_map ?? 0,
     guest_can_view_comments: data.guest_can_view_comments ?? 0,
+    guest_can_view_videos: data.guest_can_view_videos ?? 0,
+    guest_can_copy_photos: data.guest_can_copy_photos ?? 0,
     convoy_overlap_pct: clampConvoyPct(data.convoy_overlap_pct),
     restricted_blur: data.restricted_blur ?? 0,
     seat_passenger_uid: data.seat_passenger_uid ?? null,
@@ -1616,6 +1643,8 @@ export async function updateSiteSettings(
       settings: {
         guest_can_view_map: data.guest_can_view_map ?? 0,
         guest_can_view_comments: data.guest_can_view_comments ?? 0,
+        guest_can_view_videos: data.guest_can_view_videos ?? 0,
+        guest_can_copy_photos: data.guest_can_copy_photos ?? 0,
         convoy_overlap_pct: clampConvoyPct(data.convoy_overlap_pct),
         restricted_blur: data.restricted_blur ?? 0,
         seat_passenger_uid: data.seat_passenger_uid ?? null,
@@ -1623,6 +1652,48 @@ export async function updateSiteSettings(
         baby_avatar_facing: data.baby_avatar_facing === 'right' ? 'right' : 'left',
       },
     };
+  }
+  return { success: false, message: data.error || '修改失敗' };
+}
+
+/**
+ * 後台那張「訪客看得到哪幾本」清單裡的一列。
+ * `guest_visible` 是**目前存在 D1 的值**（Album.guest_visible，0027），
+ * 不是畫面上勾了什麼 —— 勾選狀態由呼叫端自己拿一個 Set 管。
+ */
+export interface GuestAlbumOption {
+  id: number;
+  name: string;
+  guest_visible: number;
+}
+
+/**
+ * 訪客看得到哪幾本相簿。**搭 GET /api/admin/settings 的順風車，不另開一支路由** ——
+ * 那一支本來就要為了後台的其他開關打一次，多帶一張幾十列的小表不多花往返。
+ */
+export async function fetchGuestAlbums(): Promise<GuestAlbumOption[]> {
+  const res = await fetch(`${API_BASE_URL}/admin/settings`, { headers: getAuthHeaders() });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '讀取相簿清單失敗');
+  const data = await res.json();
+  // 舊後端不回這個欄位 —— 回空陣列，那一格會說「沒有相簿」而不是整頁壞掉
+  return Array.isArray(data.guest_albums) ? data.guest_albums : [];
+}
+
+/**
+ * 覆寫「訪客看得到哪幾本」。⚠️ 送的是**完整清單**不是差異：沒列在裡面的一律關掉，
+ * 所以呼叫端一定要把畫面上所有勾起來的 id 都送出來。
+ */
+export async function updateGuestAlbums(
+  ids: number[],
+): Promise<{ success: boolean; albums?: GuestAlbumOption[]; message?: string }> {
+  const res = await fetch(`${API_BASE_URL}/admin/guest-albums`, {
+    method: 'PUT',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ album_ids: ids }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.success) {
+    return { success: true, albums: Array.isArray(data.guest_albums) ? data.guest_albums : [] };
   }
   return { success: false, message: data.error || '修改失敗' };
 }

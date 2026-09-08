@@ -18,6 +18,7 @@ import VideoMetaCard from "./VideoMetaCard";
 import MotionScanCard from "./MotionScanCard";
 import PhashCard from "./PhashCard";
 import UsageCard from "./UsageCard";
+import GuestAlbumsModal from "./GuestAlbumsModal";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import Avatar from "@/components/Avatar";
 import AvatarPicker from "@/components/AvatarPicker";
@@ -128,6 +129,23 @@ export default function AdminPage() {
   const [guestComments, setGuestComments] = useState<boolean | null>(null);
   const [savingGuestComments, setSavingGuestComments] = useState(false);
   /**
+   * 站台開關：訪客看不看得到影片。**預設關**，而且**只管 `media_type = 'video'`**
+   * （使用者 2026-09-07 拍板）—— GIF 與 Android 動態照片是照片，不受影響。
+   */
+  const [guestVideos, setGuestVideos] = useState<boolean | null>(null);
+  const [savingGuestVideos, setSavingGuestVideos] = useState(false);
+  /**
+   * 站台開關：訪客能不能複製照片。**預設關**。
+   *
+   * ⚠️ 這**不是權限，是門檻** —— 位元組已經在他的瀏覽器裡，截圖與開發者工具永遠
+   * 擋不掉。有份量的那一半在後端：關著的時候訪客的大圖只給 R2 那顆 800px 縮圖，
+   * Drive 上那份 4K 一律不發。
+   */
+  const [guestCopy, setGuestCopy] = useState<boolean | null>(null);
+  const [savingGuestCopy, setSavingGuestCopy] = useState(false);
+  /** 訪客看得到哪幾本相簿的選擇視窗。清單在**打開的當下**才抓，不是進頁就抓 */
+  const [pickingAlbums, setPickingAlbums] = useState(false);
+  /**
    * 站台開關：不開放的照片要不要連「看得到的人」也先蓋一層模糊。**預設關**。
    *
    * ⚠️ 這一格**不是權限**。沒權限的人手上根本沒有那幾張（後端 SQL 就濾掉了），
@@ -175,6 +193,8 @@ export default function AdminPage() {
       setUsers(list);
       setGuestMap(settings.guest_can_view_map === 1);
       setGuestComments(settings.guest_can_view_comments === 1);
+      setGuestVideos(settings.guest_can_view_videos === 1);
+      setGuestCopy(settings.guest_can_copy_photos === 1);
       setConvoyPct(settings.convoy_overlap_pct);
       setSavedConvoyPct(settings.convoy_overlap_pct);
       setRestrictedBlur(settings.restricted_blur === 1);
@@ -293,6 +313,32 @@ export default function AdminPage() {
     setNotice(next
       ? "訪客現在可以閱讀留言，但仍無法發表。"
       : "訪客已無法看到留言。");
+  };
+
+  const toggleGuestVideos = async (next: boolean) => {
+    setSavingGuestVideos(true);
+    setNotice(null);
+    const result = await updateSiteSettings({ guest_can_view_videos: next });
+    setSavingGuestVideos(false);
+    if (!result.success) return setError(result.message || "修改失敗");
+    setError(null);
+    setGuestVideos(result.settings!.guest_can_view_videos === 1);
+    setNotice(next
+      ? "訪客現在可以看影片。"
+      : "訪客的相簿與搜尋結果不會再出現影片，連結也放不出來。");
+  };
+
+  const toggleGuestCopy = async (next: boolean) => {
+    setSavingGuestCopy(true);
+    setNotice(null);
+    const result = await updateSiteSettings({ guest_can_copy_photos: next });
+    setSavingGuestCopy(false);
+    if (!result.success) return setError(result.message || "修改失敗");
+    setError(null);
+    setGuestCopy(result.settings!.guest_can_copy_photos === 1);
+    setNotice(next
+      ? "訪客現在可以右鍵存圖，大圖也會給 Drive 上那份 4K。"
+      : "訪客的右鍵、拖曳與長按已擋掉，大圖只給 800px 縮圖。");
   };
 
   /** 換副駕駛。選「沒有人」就是送 null —— 那台車的後排照樣坐得滿，只是沒人被指名 */
@@ -459,7 +505,57 @@ export default function AdminPage() {
         <p className={styles.hint}>
           訪客無法留言，這裡只控制能否閱讀。開啟後，成員的留言與顯示名稱都會對訪客可見。
         </p>
+
+        <label className={styles.checkbox}>
+          <input
+            type="checkbox"
+            checked={guestVideos === true}
+            disabled={guestVideos === null || savingGuestVideos}
+            onChange={(e) => toggleGuestVideos(e.target.checked)}
+          />
+          讓訪客看影片
+        </label>
+        <p className={styles.hint}>
+          關著的時候，影片在訪客眼中整格不存在（相簿、搜尋與地圖都不會出現），直接開網址也放不出來。
+          只影響影片：GIF 與 Android 動態照片算照片，不受這一格控制。
+        </p>
+
+        <label className={styles.checkbox}>
+          <input
+            type="checkbox"
+            checked={guestCopy === true}
+            disabled={guestCopy === null || savingGuestCopy}
+            onChange={(e) => toggleGuestCopy(e.target.checked)}
+          />
+          讓訪客複製照片
+        </label>
+        <p className={styles.hint}>
+          關著的時候，訪客的右鍵、拖曳與手機長按都會被擋掉，燈箱的大圖也只給 800px 縮圖，
+          不會發 Google Drive 上那份 4K。這是門檻不是防護 —— 螢幕截圖擋不掉。
+        </p>
+
+        <div className={styles.detailHead}>訪客看得到哪幾本相簿</div>
+        <p className={styles.hint}>
+          預設每一本都不開放，要逐本勾選。沒開放的相簿在訪客眼中整本不存在，新建的相簿也一樣是關的。
+        </p>
+        <button
+          className={styles.button}
+          onClick={() => setPickingAlbums(true)}
+        >
+          選擇相簿…
+        </button>
       </AdminSection>
+
+      <GuestAlbumsModal
+        isOpen={pickingAlbums}
+        onClose={() => setPickingAlbums(false)}
+        onSaved={(count) => {
+          setError(null);
+          setNotice(count === 0
+            ? "訪客目前看不到任何相簿。"
+            : `訪客現在看得到 ${count} 本相簿。`);
+        }}
+      />
 
       <AdminSection id="restricted" title="不開放的照片">
         <p className={styles.hint}>
