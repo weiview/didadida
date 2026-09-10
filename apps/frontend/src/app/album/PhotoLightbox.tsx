@@ -4,7 +4,7 @@ import PhotoComments from "./PhotoComments";
 import PhotoImage from "@/components/PhotoImage";
 import VideoPlayer from "@/components/VideoPlayer";
 import FixTimeModal from "@/components/FixTimeModal";
-import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, photoMotionSrc, hasMotion, isVideo, isGif, setPhotosRestricted } from "@/lib/api";
+import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, photoMotionSrc, hasMotion, isVideo, isGif, isNewMedia, setPhotosRestricted } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import { setExifExpanded, useExifExpanded } from "@/lib/exifPref";
@@ -652,7 +652,17 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
      *    被蓋在後面的格線也跟著改欄數。
      */
     <div className={styles.overlay} data-lightbox onClick={onClose}>
-      <button className={styles.closeBtn} onClick={(e) => { e.stopPropagation(); onClose(); }} title="關閉">×</button>
+      {/*
+        * ⚠️ 一週內新增的那幾張，照片那格的右上角被 45 度的 NEW 角標蓋住，
+        *   而手機上 `.content` 是 100vw/100vh —— 那個角就是這顆 × 站的地方。
+        *   `closeBtnShifted` 只在手機把它往下讓到角標底下（桌機是兩欄，
+        *   角標在左欄的右上方，離這顆很遠，那條規則本來就不生效）。
+        */}
+      <button
+        className={`${styles.closeBtn} ${isNewMedia(photo) ? styles.closeBtnShifted : ''}`}
+        onClick={(e) => { e.stopPropagation(); onClose(); }}
+        title="關閉"
+      >×</button>
       
       <div className={styles.content} onClick={e => e.stopPropagation()}>
 
@@ -861,6 +871,19 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             <button className={`${styles.navButton} ${styles.nextButton}`} onClick={(e) => { e.stopPropagation(); onNext?.(); }}>
               &#10095;
             </button>
+          )}
+
+          {/*
+            * 一週內新增的照片／影片，右上角蓋一塊 45 度的 NEW（同格線那顆）。
+            * ⚠️ 掛在 `.imageContainer` 這一層而不是 `.zoomLayer` 裡面 ——
+            *   放進去的話捏合放大 5 倍時它會跟著變五倍大。
+            * ⚠️ 它 `pointer-events: none` 且 z-index 低於關閉鈕、換頁箭頭與
+            *   那顆鎖，只高過掀開遮罩（見 lightbox.module.css 那段）。
+            */}
+          {isNewMedia(photo) && (
+            <span className={styles.newBadge} aria-label="最近新增">
+              <span className={styles.newBadgeText}>NEW</span>
+            </span>
           )}
         </div>
         

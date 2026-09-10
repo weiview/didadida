@@ -104,6 +104,18 @@ export interface Album {
   drive_folder_id?: string | null;
   /** 建立這本相簿的人。搭配 useAdmin 的 canEdit() 決定要不要端出編輯與刪除 */
   user_id?: number | null;
+  /**
+   * 這本相簿裡最新那張照片的 created_at（UTC，同 Photo.created_at 的格式）。
+   * 給首頁卡片的 NEW 角標用，`isNewAlbum()` 判斷。
+   * ⚠️ 選填：邊快取裡躺著舊版後端的回應時它是 undefined，那時候一律當成不新。
+   */
+  latest_photo_at?: string | null;
+}
+
+/** 這本相簿裡有一週內新增的照片嗎（首頁卡片右上角那顆 NEW） */
+export function isNewAlbum(album: { latest_photo_at?: string | null }, now = Date.now()): boolean {
+  const t = parseSqlUtc(album.latest_photo_at);
+  return t !== null && now - t < NEW_MEDIA_WINDOW_MS;
 }
 
 export interface Tag {

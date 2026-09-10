@@ -2622,11 +2622,14 @@ function AlbumContent() {
                 * 一週內新增的那幾格右上角掛一顆會動的「NEW」（`isNewMedia`，見 lib/api.ts）。
                 * ⚠️ 判定在瀏覽器算 `created_at`，所以它會自己隨時間過期 ——
                 * 後端一個位元組都沒改，訪客那份共用邊緣快取照舊。
-                * ⚠️ 右上角本來是影片／GIF／動態那顆角標的位置，被佔走的時候
-                * 那一顆要靠 `videoBadgeStacked` 往下讓一排。
+                * ⚠️ 它是一塊 45 度的實心角標，**整個右上角都被蓋掉** —— 影片／GIF／
+                * 動態那顆因此要靠 `videoBadgeShifted` 往**左**讓開（不是往下讓一排，
+                * 使用者明確要求不要影響到影片的時間標示）。
                 */}
               {isNewMedia(photo) && (
-                <span className={styles.newBadge} aria-label="最近新增">NEW</span>
+                <span className={styles.newBadge} aria-label="最近新增">
+                  <span className={styles.newBadgeText}>NEW</span>
+                </span>
               )}
               {/*
                 * 影片在格線上就是它的封面圖，跟照片長得一模一樣 —— 沒有這個角標
@@ -2634,7 +2637,7 @@ function AlbumContent() {
                 * 回 null，那就只剩一個播放三角形。
                 */}
               {photo.media_type === 'video' && (
-                <span className={`${styles.videoBadge} ${isNewMedia(photo) ? styles.videoBadgeStacked : ""}`}>
+                <span className={`${styles.videoBadge} ${isNewMedia(photo) ? styles.videoBadgeShifted : ""}`}>
                   <span className={styles.videoBadgeIcon} aria-hidden="true">▶</span>
                   {formatDuration(photo.duration_ms)}
                 </span>
@@ -2645,7 +2648,7 @@ function AlbumContent() {
                 * 沒有理由做出第二種長相。
                 */}
               {photo.media_type === 'gif' && (
-                <span className={`${styles.videoBadge} ${isNewMedia(photo) ? styles.videoBadgeStacked : ""}`}>GIF</span>
+                <span className={`${styles.videoBadge} ${isNewMedia(photo) ? styles.videoBadgeShifted : ""}`}>GIF</span>
               )}
               {/*
                 * Android 的動態照片：格線上就是那張靜態的照片本身，動畫藏在原始檔
@@ -2654,7 +2657,7 @@ function AlbumContent() {
                 * media_type 仍然是 'photo'，所以跟上面那兩個不是同一組判斷。
                 */}
               {photo.media_type === 'photo' && hasMotion(photo) && (
-                <span className={`${styles.videoBadge} ${isNewMedia(photo) ? styles.videoBadgeStacked : ""}`}>
+                <span className={`${styles.videoBadge} ${isNewMedia(photo) ? styles.videoBadgeShifted : ""}`}>
                   <span className={styles.videoBadgeIcon} aria-hidden="true">▶</span>
                   動態
                 </span>

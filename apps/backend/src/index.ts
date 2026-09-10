@@ -5307,19 +5307,40 @@ if (method === "POST" && pathname === "/api/verify-password") {
           `SELECT COALESCE(thumb_sm_url, thumb_url, url) AS url
              FROM Photo WHERE album_id = ? AND shuffle_key ${op} ?${previewRestricted}${previewNoVideo}
             ORDER BY shuffle_key LIMIT 5`;
+        /*
+         * 首頁那排卡片要知道「這本裡面有沒有一週內新增的照片」（NEW 角標）。
+         *
+         * ⚙️ 邊界跟預覽圖那兩句一模一樣（不開放的不算、訪客看不到影片時影片也不算）
+         *   —— 否則卡片上會挂著一顆 NEW，點進去卻一張新的都沒有。
+         * ⚙️ 靠的是 0028 那支 `idx_photo_album_created(album_id, created_at DESC)`：
+         *   沒有它的話這一句只能拿 `idx_photo_album_sort` 排（created_at 在第三欄），
+         *   等於把那本相簿的索引項目全走一遍——一本幾千張、一次問十幾本，
+         *   每開一次首頁就是上萬列讀取。有索引就是一本一列。
+         */
+        const latestSelect =
+          `SELECT created_at FROM Photo
+             WHERE album_id = ?${previewRestricted}${previewNoVideo}
+            ORDER BY created_at DESC LIMIT 1`;
         const statements = (albums as any[]).flatMap((a) => {
           const seed = seedFor(Number(a.id));
           return [
             env.DB.prepare(previewSelect(">=")).bind(a.id, seed),
             env.DB.prepare(previewSelect("<")).bind(a.id, seed),
+            env.DB.prepare(latestSelect).bind(a.id),
           ];
         });
         const batched = await env.DB.batch<any>(statements);
 
         const albumsWithPhotos = (albums as any[]).map((album, i) => {
           // 同一張照片不可能同時滿足 >= 與 <，直接串接不會重複
-          const rows = [...batched[i * 2].results, ...batched[i * 2 + 1].results];
-          return { ...album, preview_photos: rows.slice(0, 5).map((p: any) => p.url) };
+          const rows = [...batched[i * 3].results, ...batched[i * 3 + 1].results];
+          return {
+            ...album,
+            preview_photos: rows.slice(0, 5).map((p: any) => p.url),
+            // 「一週內」由前端自己算（isNewAlbum）—— 這裡只負責把時間送出去，
+            // 不把「新不新」烘進回應：那是時間的函數，烘進共用邊緣快取會定格。
+            latest_photo_at: (batched[i * 3 + 2].results[0]?.created_at as string) ?? null,
+          };
         });
 
         return new Response(JSON.stringify({

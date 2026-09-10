@@ -209,6 +209,111 @@
   background: rgba(180, 83, 9, 0.95);
 }
 
+/* ── 一週內新增：右上角那塊 45 度的 NEW ────────────────────────────────────
+ *
+ * 跟格線那顆是同一個造型（album.module.css 的 `.newBadge`），但 CSS module
+ * 不能跨檔共用，所以這裡是一份刻意的複本 —— 改造型要兩邊一起改。
+ *
+ * ⚠️ 它掛在 `.imageContainer` 裡（跟那顆鎖、換頁箭頭同一層），**不在
+ *    `.zoomLayer` 裡面** —— 放進去的話捏合放大 5 倍時角標會跟著變五倍大。
+ * ⚠️ `z-index: 3160` 是排出來的：要**高於 `.revealVeil`（3150）**（不開放又
+ *    糊著的那幾張，角標照樣要看得見），但**低於 `.closeBtn`／`.navButton`
+ *    （3200）與 `.restrictBtn`（3250）** —— 那三顆是按得下去的東西，
+ *    絕不能被一塊 `pointer-events: none` 的裝飾蓋住。
+ * ⚠️ 手機上 `.content` 是 100vw/100vh，這個角剛好就是畫面的右上角，
+ *    也就是關閉鈕的位置 —— 那時候關閉鈕要靠 `.closeBtnShifted` 往下讓開
+ *    （見底下那個 max-width: 768px）。桌機是兩欄，這個角在左欄的右上方，
+ *    離固定在畫面右上角的關閉鈕很遠，不必讓。
+ */
+.newBadge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 78px;
+  height: 78px;
+  z-index: 3160;
+  /* 直角三角形：左上 → 右上 → 右下，斜邊就是那條 45 度線 */
+  clip-path: polygon(0 0, 100% 0, 100% 100%);
+  background: linear-gradient(135deg, #ff5f6d 0%, #ffc371 45%, #ff5f6d 100%);
+  background-size: 200% 200%;
+  pointer-events: none;
+  animation: newBadgeFlow 3.2s ease-in-out infinite;
+}
+
+/* 沿著斜邊的一條細褶線，看起來像折過來的緞帶而不是一塊色塊 */
+.newBadge::before {
+  content: '';
+  position: absolute;
+  left: -26px;
+  top: 33px;
+  width: 140px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.55);
+  transform: rotate(45deg);
+}
+
+/* 斜掃過去的一道光，方向與斜邊垂直 */
+.newBadge::after {
+  content: '';
+  position: absolute;
+  inset: -30%;
+  background: linear-gradient(
+    45deg,
+    transparent 38%,
+    rgba(255, 255, 255, 0.8) 50%,
+    transparent 62%
+  );
+  transform: translate(-70%, 70%);
+  animation: newBadgeShine 3.2s ease-in-out infinite;
+}
+
+/* 轉 45 度與斜邊平行，擺在三角形的重心（(0,0)/(78,0)/(78,78) 的重心 ≈ (52, 26)） */
+.newBadgeText {
+  position: absolute;
+  top: 19px;
+  right: -29px;
+  width: 110px;
+  text-align: center;
+  transform: rotate(45deg);
+  color: #fff;
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.18em;
+  line-height: 14px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+@keyframes newBadgeFlow {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+@keyframes newBadgeShine {
+  0% {
+    transform: translate(-70%, 70%);
+  }
+  55%,
+  100% {
+    transform: translate(70%, -70%);
+  }
+}
+
+/* 會動的東西一律讓開這個偏好（同足跡那條流動彩虹線） */
+@media (prefers-reduced-motion: reduce) {
+  .newBadge,
+  .newBadge::after {
+    animation: none;
+  }
+  .newBadge::after {
+    opacity: 0;
+  }
+}
+
 /* 鎖本身比字再大一點：它是這顆鈕上唯一一眼認得出來的東西 */
 .restrictIcon {
   font-size: 1.15rem;
@@ -644,6 +749,17 @@ input:checked + .slider:before {
     width: 40px;
     height: 40px;
     font-size: 2rem;
+  }
+  /*
+   * 手機上 `.content` 是 100vw/100vh，照片那格的右上角就是畫面的右上角 ——
+   * 也就是這顆 × 原本站的位置。一週內新增的那幾張會被那塊 78px 的 NEW 蓋掉，
+   * 所以整顆往下讓到角標底下。
+   *
+   * ⚠️ 只在手機讓。桌機是兩欄、角標在左欄的右上方，離這顆很遠。
+   * ⚠️ 同樣是單一 class 的權重，靠**順序**決勝 —— 必須留在上面那條後面。
+   */
+  .closeBtnShifted {
+    top: 86px;
   }
   .imageContainer {
     height: 60vh;

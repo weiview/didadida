@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useMemo, useCallback } from "react";
 import styles from "./page.module.css";
 import albumStyles from "./album/album.module.css";
 import Link from "next/link";
-import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc, setPhotosRestricted, applyRestrictedPatch, isNewMedia } from "@/lib/api";
+import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc, setPhotosRestricted, applyRestrictedPatch, isNewMedia, isNewAlbum } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
@@ -155,6 +155,23 @@ function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, dr
           )}
 
           {!coverLoaded && <PhotoSpinner />}
+
+          {/*
+            * 這本相簿裡有一週內新增的照片時，封面右上角蓋一塊 45 度的「NEW」
+            * （跟格線那顆同一個樣式，album.module.css 的 .newBadge）。
+            *
+            * ⚠️ 掛在 `.coverPlaceholder` 裡面不是掛在整張卡上：那一層才是
+            *   `position: relative; overflow: hidden; border-radius: 12px`，
+            *   而 `.albumCard` 有 1.5rem 的 padding —— 掛在外面會浮在留白上，
+            *   而且會跟編輯模式的勾選框、刪除鈕（都在卡片右上角外緣）打架。
+            * ⚠️ 判定用 `latest_photo_at`（後端每本多回一列），一樣是瀏覽器算的，
+            *   所以它會自己隨時間過期。
+            */}
+          {isNewAlbum(album) && (
+            <span className={albumStyles.newBadge} aria-label="最近有新增">
+              <span className={albumStyles.newBadgeText}>NEW</span>
+            </span>
+          )}
         </div>
         <h2 className={styles.albumTitle}>{album.name}</h2>
         <p className={styles.albumMeta}>
@@ -998,7 +1015,9 @@ export default function Home() {
                       * （搜尋結果沒有影片／GIF 角標），所以不必讓位。
                       */}
                     {isNewMedia(photo) && (
-                      <span className={albumStyles.newBadge} aria-label="最近新增">NEW</span>
+                      <span className={albumStyles.newBadge} aria-label="最近新增">
+                        <span className={albumStyles.newBadgeText}>NEW</span>
+                      </span>
                     )}
                     {/*
                       * 快速鎖：搜尋結果上也能直接標成／取消不開放，不必先點進燈箱。
