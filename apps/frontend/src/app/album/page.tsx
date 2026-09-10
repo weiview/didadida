@@ -2622,9 +2622,9 @@ function AlbumContent() {
                 * 一週內新增的那幾格右上角掛一顆會動的「NEW」（`isNewMedia`，見 lib/api.ts）。
                 * ⚠️ 判定在瀏覽器算 `created_at`，所以它會自己隨時間過期 ——
                 * 後端一個位元組都沒改，訪客那份共用邊緣快取照舊。
-                * ⚠️ 它是一塊 45 度的實心角標，**整個右上角都被蓋掉** —— 影片／GIF／
-                * 動態那顆因此要靠 `videoBadgeShifted` 往**左**讓開（不是往下讓一排，
-                * 使用者明確要求不要影響到影片的時間標示）。
+                * ⚠️ 它是一塊 45 度的實心角標，**整個右上角都被蓋掉** —— 所以影片／
+                * GIF／動態那顆時間標示 2026-09-10 整批搬到**右下角**（使用者指定），
+                * 兩顆從此對角線分開，不必再互相讓位。
                 */}
               {isNewMedia(photo) && (
                 <span className={styles.newBadge} aria-label="最近新增">
@@ -2635,9 +2635,10 @@ function AlbumContent() {
                 * 影片在格線上就是它的封面圖，跟照片長得一模一樣 —— 沒有這個角標
                 * 使用者根本看不出哪幾格點下去會動。長度抓不到時 formatDuration
                 * 回 null，那就只剩一個播放三角形。
+                * ⚠️ 位置是**右下角**（`.videoBadge`），不是右上 —— 右上整塊留給 NEW。
                 */}
               {photo.media_type === 'video' && (
-                <span className={`${styles.videoBadge} ${isNewMedia(photo) ? styles.videoBadgeShifted : ""}`}>
+                <span className={styles.videoBadge}>
                   <span className={styles.videoBadgeIcon} aria-hidden="true">▶</span>
                   {formatDuration(photo.duration_ms)}
                 </span>
@@ -2648,7 +2649,7 @@ function AlbumContent() {
                 * 沒有理由做出第二種長相。
                 */}
               {photo.media_type === 'gif' && (
-                <span className={`${styles.videoBadge} ${isNewMedia(photo) ? styles.videoBadgeShifted : ""}`}>GIF</span>
+                <span className={styles.videoBadge}>GIF</span>
               )}
               {/*
                 * Android 的動態照片：格線上就是那張靜態的照片本身，動畫藏在原始檔
@@ -2657,7 +2658,7 @@ function AlbumContent() {
                 * media_type 仍然是 'photo'，所以跟上面那兩個不是同一組判斷。
                 */}
               {photo.media_type === 'photo' && hasMotion(photo) && (
-                <span className={`${styles.videoBadge} ${isNewMedia(photo) ? styles.videoBadgeShifted : ""}`}>
+                <span className={styles.videoBadge}>
                   <span className={styles.videoBadgeIcon} aria-hidden="true">▶</span>
                   動態
                 </span>
