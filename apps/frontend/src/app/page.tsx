@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useMemo, useCallback } from "react";
 import styles from "./page.module.css";
 import albumStyles from "./album/album.module.css";
 import Link from "next/link";
-import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc, setPhotosRestricted, applyRestrictedPatch } from "@/lib/api";
+import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc, setPhotosRestricted, applyRestrictedPatch, isNewMedia } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
@@ -992,6 +992,14 @@ export default function Home() {
                       className={albumStyles.photoImage}
                       lazy
                     />
+                    {/*
+                      * 一週內新增的那幾格右上角掛一顆會動的「NEW」（跟相簿格線同一顆，
+                      * album.module.css 的 .newBadge）。⚠️ 這裡的右上角本來是空的
+                      * （搜尋結果沒有影片／GIF 角標），所以不必讓位。
+                      */}
+                    {isNewMedia(photo) && (
+                      <span className={albumStyles.newBadge} aria-label="最近新增">NEW</span>
+                    )}
                     {/*
                       * 快速鎖：搜尋結果上也能直接標成／取消不開放，不必先點進燈箱。
                       * 跟相簿格線同一顆（album.module.css 的 .restrictLock）。

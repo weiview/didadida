@@ -185,6 +185,9 @@
 /*
  * 影片角標。放**右上**：左上是編輯模式的勾選框、右下是「設為封面」那顆，
  * 三個擠在一起會互相蓋掉。
+ *
+ * ⚠️ 右上角現在是「NEW」先來後到 —— 一週內新增的那幾格會多一顆 `.newBadge`
+ * 佔住這個位置，這一顆得靠 `.videoBadgeStacked` 往下讓一排。
  */
 .videoBadge {
   position: absolute;
@@ -207,6 +210,91 @@
   -webkit-backdrop-filter: blur(8px);
   /* 整張卡片都是「點開燈箱」，角標不該把那個點擊吃掉 */
   pointer-events: none;
+}
+
+/*
+ * 一週內新增的照片／影片，右上角那顆會動的「NEW」（見 lib/api.ts 的 `isNewMedia`）。
+ *
+ * ⚠️ 判定完全在瀏覽器算（`created_at` 比 `Date.now()`），所以**回應內容一個位元組
+ * 都沒變** —— 不必動 `bumpContentEpoch()`，也不會讓訪客那份共用邊緣快取失效。
+ * ⚠️ `z-index` 要比 `.videoBadge`（5）高，兩顆萬一疊在一起時 NEW 在上面。
+ */
+.newBadge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #ff6b6b, #ffa94d);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.6;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  /* 那道掃光是絕對定位的 ::after，超出去的要切掉 */
+  overflow: hidden;
+  /* 整張卡片都是「點開燈箱」，角標不該把那個點擊吃掉 */
+  pointer-events: none;
+  animation: newBadgePulse 2.4s ease-in-out infinite;
+}
+
+/* 斜掃過去的一道光。跟 pulse 同一個週期，兩個動作才不會互相打架 */
+.newBadge::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    115deg,
+    transparent 25%,
+    rgba(255, 255, 255, 0.75) 50%,
+    transparent 75%
+  );
+  transform: translateX(-120%);
+  animation: newBadgeShine 2.4s ease-in-out infinite;
+}
+
+/*
+ * NEW 佔走右上角時，影片／GIF／動態那顆往下讓一排。
+ * ⚠️ 兩個都是單一 class 的權重，靠**順序**決勝 —— 這一條必須留在 `.videoBadge` 後面。
+ */
+.videoBadgeStacked {
+  top: 46px;
+}
+
+@keyframes newBadgePulse {
+  0%,
+  100% {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25), 0 0 0 0 rgba(255, 107, 107, 0.55);
+  }
+  50% {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25), 0 0 0 6px rgba(255, 107, 107, 0);
+  }
+}
+
+@keyframes newBadgeShine {
+  0% {
+    transform: translateX(-120%);
+  }
+  60%,
+  100% {
+    transform: translateX(120%);
+  }
+}
+
+/* 會動的東西一律讓開這個偏好（同足跡那條流動彩虹線） */
+@media (prefers-reduced-motion: reduce) {
+  .newBadge,
+  .newBadge::after {
+    animation: none;
+  }
+  .newBadge::after {
+    opacity: 0;
+  }
 }
 
 /*

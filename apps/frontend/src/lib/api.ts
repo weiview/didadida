@@ -203,6 +203,37 @@ export function isGif(photo: { media_type?: string | null }): boolean {
   return photo.media_type === 'gif';
 }
 
+/** 「新增」角標的時間範圍：一週。 */
+export const NEW_MEDIA_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * 解 D1 的 `created_at`（SQLite `CURRENT_TIMESTAMP`）。
+ *
+ * ⚠️ 它給的是 `'YYYY-MM-DD HH:MM:SS'` 而且**沒有任何時區標記** —— 直接丟給
+ * `Date.parse` 會被當成瀏覽器所在時區的牆上時間（台灣就整整差 8 小時），
+ * 在「一週」這種邊界判斷上就是差一個時區的誤差。所以自己補上 `T…Z`。
+ */
+export function parseSqlUtc(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  const naive = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(s);
+  const t = Date.parse(naive ? `${s.replace(' ', 'T')}Z` : s);
+  return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * 這一格是不是「最近新增的」（上傳進站台的時間在一週內）。
+ *
+ * ⚠️ 看的是 `created_at`（傳進來的時間）不是 `taken_at`（拍攝時間）——
+ * 使用者要的是「有新增的檔案」，掃描的老照片今天傳進來一樣是新的。
+ * 判斷完全在瀏覽器算，所以**不影響訪客那份共用邊緣快取**（回應內容沒變，
+ * 不需要 `bumpContentEpoch()`）。
+ */
+export function isNewMedia(photo: { created_at?: string | null }, now = Date.now()): boolean {
+  const t = parseSqlUtc(photo.created_at);
+  return t !== null && now - t < NEW_MEDIA_WINDOW_MS;
+}
+
 export interface Photo {
   id: number;
   title: string;
