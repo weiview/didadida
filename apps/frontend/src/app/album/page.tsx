@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef, Suspense, useMemo, useCallback } from "react";
 import styles from "./album.module.css";
+import TimelineRail from "./TimelineRail";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
 import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, setPhotosRestricted, applyRestrictedPatch, hasMotion, isNewMedia, announceUpload, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
@@ -825,14 +826,22 @@ function AlbumContent() {
     };
   }, [displayPhotos, sortBy]);
 
-  const handleScrollToTimelineIndex = (photoIdx: number) => {
+  /*
+   * instant：時間軸長按拖曳選完的那一跳（見 TimelineRail）。瞬間跳、而且把那個月的
+   * 第一張放在畫面上緣（留出右上角那排藥丸的高度）—— 選的是「那個月」，置中的話
+   * 上半個畫面還是上一個月。輕點節點照舊是平滑捲到中間。
+   */
+  const handleScrollToTimelineIndex = (photoIdx: number, instant = false) => {
     // 若目標超過目前載入量，自動提升可見張數
     if (photoIdx >= visibleCount) {
       setVisibleCount(photoIdx + 24);
     }
     setTimeout(() => {
       const el = photoCardRefs.current.get(photoIdx);
-      if (el) {
+      if (!el) return;
+      if (instant) {
+        window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 72, behavior: 'auto' });
+      } else {
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     }, 50);
@@ -2759,26 +2768,12 @@ function AlbumContent() {
 
       {/* 右側懸浮照片時間軸滾動條 */}
       {timelineGroup.length > 0 && (
-        <div className={`${styles.timelineTrack} ${isScrolling ? styles.timelineActive : ""}`}>
-          {currentTimelineDate && (
-            <div className={styles.timelineBubble}>
-              {currentTimelineDate}
-            </div>
-          )}
-          <div className={styles.timelineMarks}>
-            {timelineGroup.map((item) => (
-              <div 
-                key={item.label} 
-                className={styles.timelineNode}
-                onClick={() => handleScrollToTimelineIndex(item.index)}
-                title={`前往 ${item.label}`}
-              >
-                <span className={styles.timelineNodeDot} />
-                <span className={styles.timelineNodeText}>{item.label}</span>
-              </div>
-            ))}
-          </div>
-        </div>
+        <TimelineRail
+          groups={timelineGroup}
+          active={isScrolling}
+          bubble={currentTimelineDate}
+          onJump={handleScrollToTimelineIndex}
+        />
       )}
       
 
