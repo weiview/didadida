@@ -1,0 +1,22 @@
+-- 0029：本次精選
+--
+-- ## 是什麼
+-- 可管理全站內容的人在燈箱裡按一顆 ★，把那張照片（或影片）放進「本次精選」。
+-- 全站只有一份清單，右上角帳號牌旁邊那顆「★ 精選 n」點開就是它。
+--
+-- ## 為什麼是一個欄位不是一張表
+-- 清單就是「哪幾列 featured_at 不是 NULL」。沒有逐人的版本、也沒有「第幾期」，
+-- 累積到有人按「清空精選」為止 —— 多一張表只是多一次 JOIN。
+-- 刪照片時這一格跟著那一列一起消失，不必另外收。
+--
+-- ## 為什麼是時間不是 0/1
+-- 清單要照「什麼時候被選進來」排，最新的在前面。NULL ＝不是精選。
+--
+-- ## 不 backfill
+-- 預設 NULL，既有的每一列都不是精選，一列都不寫。
+--
+-- ## 部分索引
+-- 只有精選的那幾列進索引，所以 `WHERE featured_at IS NOT NULL` 讀到的列數
+-- 就是精選的張數，不會掃過整張 Photo。
+ALTER TABLE Photo ADD COLUMN featured_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_photo_featured ON Photo(featured_at) WHERE featured_at IS NOT NULL;

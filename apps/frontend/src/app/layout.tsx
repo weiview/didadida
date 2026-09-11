@@ -6,7 +6,7 @@ import AccessGate from "@/components/AccessGate";
 import AccountBadge from "@/components/AccountBadge";
 import PresenceToasts from "@/components/PresenceToasts";
 import CopyGuard from "@/components/CopyGuard";
-import OnlineBar from "@/components/OnlineBar";
+import TopRightBar from "@/components/TopRightBar";
 import { AuthProvider } from "@/lib/useAdmin";
 
 export const metadata: Metadata = {
@@ -46,9 +46,9 @@ export default function RootLayout({
             {/* 訪客不能複製照片時擋掉右鍵／拖曳／長按。**這是門檻不是防護**，
                 有份量的那一半在後端（大圖只給 800px），見 CopyGuard 的說明 */}
             <CopyGuard />
-            {/* 「現在誰在線上」。跟帳號牌並排在右上角那條帶子上，
-                **不自己開輪詢**，只是看 PresenceToasts 開的那一份快照 */}
-            <OnlineBar />
+            {/* 帳號牌左邊那一排：「★ 精選」＋「誰在線上」。
+                線上那條**不自己開輪詢**，只是看 PresenceToasts 開的那一份快照 */}
+            <TopRightBar />
             <main>{children}</main>
             <ScrollToTopButton />
           </AccessGate>

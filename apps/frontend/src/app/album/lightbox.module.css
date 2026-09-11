@@ -167,12 +167,19 @@
  * 關著的時候很淡 —— 它是每幾百張才動一次的管理動作，不該跟照片搶注意力。
  * 開著就換成暖褐色的實心藥丸並且把字寫出來，因為它決定的是「誰看得到」。
  */
-.restrictBtn {
+/* 左上角那排：不開放的鎖 ＋ 本次精選的 ★。位置與疊放層由這一排負責 */
+.cornerBtns {
   position: absolute;
   left: 12px;
   top: 12px;
   /* 要壓在遮罩（.revealVeil, 3150）上面 —— 糊著的時候照樣要能取消不開放 */
   z-index: 3250;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.restrictBtn {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -207,6 +214,17 @@
 
 .restrictBtnOn:hover {
   background: rgba(180, 83, 9, 0.95);
+}
+
+/* ★ 開著：金色，跟「不開放」那顆的琥珀色分得開 */
+.featureBtnOn {
+  opacity: 1;
+  background: rgba(202, 138, 4, 0.9);
+  color: #fff;
+}
+
+.featureBtnOn:hover {
+  background: rgba(202, 138, 4, 1);
 }
 
 /* ── 一週內新增：右上角那塊 45 度的 NEW ────────────────────────────────────

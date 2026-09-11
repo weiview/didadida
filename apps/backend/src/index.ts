@@ -790,6 +790,32 @@ async function albumVisibleToGuest(env: Env, albumId: any): Promise<boolean> {
 }
 
 /**
+ * 本次精選（0029）：全站一份，`Photo.featured_at` 不是 NULL 的那幾列。
+ *
+ * ⚠️ 看得到哪幾張跟相簿格線**同一套條件**，寫在 SQL 的 WHERE 裡：
+ *    不開放的只給看得到的人、訪客只看得到開放的相簿、訪客不能看影片時連影片也濾掉。
+ *    不然右上角那顆會把一張他在相簿裡根本找不到的照片端給他，點下去什麼都沒有。
+ * 讀取成本就是精選的張數（部分索引 idx_photo_featured），不會掃整張 Photo。
+ */
+async function listFeatured(env: Env, actor: Actor | null): Promise<any[]> {
+  let cond = "";
+  if (!canSeeRestricted(actor)) cond += ` AND ${RESTRICTED_VISIBLE_COND}`;
+  if (actor === null) {
+    cond += ` AND ${GUEST_ALBUM_COND}`;
+    if (!(await guestCanViewVideos(env))) cond += ` AND ${GUEST_NO_VIDEO_COND}`;
+  }
+  const { results } = await env.DB.prepare(
+    `SELECT p.id, p.album_id, p.title, p.media_type, p.url, p.thumb_url, p.thumb_sm_url,
+            p.restricted, p.featured_at, a.name AS album_name
+       FROM Photo p JOIN Album a ON a.id = p.album_id
+      WHERE p.featured_at IS NOT NULL${cond}
+      ORDER BY p.featured_at DESC, p.id DESC
+      LIMIT 100`
+  ).all();
+  return results as any[];
+}
+
+/**
  * GIF 動畫本體的大小上限（見 migrations/0021）。
  *
  * GIF 是站上**唯一一種位元組本身住在 R2 的媒體** —— 照片在 R2 只有兩顆縮圖
@@ -5192,6 +5218,18 @@ if (method === "POST" && pathname === "/api/verify-password") {
        * 改成每本相簿各送索引 seek，成本從「總照片數」變成「這一頁的相簿數 × 5」，
        * 不再隨照片數量成長。
        */
+      /*
+       * 路由：本次精選清單（右上角那顆「★ 精選」）。訪客也看得到，條件見 listFeatured。
+       * 每一頁都會打一次，所以訪客那份走共用邊緣快取、跟著版本號作廢（改精選會推 epoch）。
+       */
+      if (method === "GET" && pathname === "/api/featured") {
+        const featuredActor = await currentActor(request, env);
+        const featuredEpoch = featuredActor !== null ? null : await contentEpoch(env);
+        return withEdgeCache(request, ctx,
+          { browserMaxAge: 10, edgeMaxAge: 300, skip: featuredActor !== null, epoch: featuredEpoch },
+          async () => new Response(JSON.stringify({ items: await listFeatured(env, featuredActor) }), { headers }));
+      }
+
       if (method === "GET" && pathname === "/api/albums") {
        /*
         * 預覽圖要不要含不開放的那幾張，取決於是誰在看 —— 所以這裡要的是 actor
@@ -6526,6 +6564,45 @@ if (method === "POST" && pathname === "/api/verify-password") {
 
         const updated = res.reduce((n, r) => n + ((r.meta as any)?.changes ?? 0), 0);
         return new Response(JSON.stringify({ success: true, updated, rotated, restricted: value, photos: fresh }), { headers });
+      }
+
+      /*
+       * 路由：放進／拿出本次精選（0029）。跟不開放同一個理由只認 canManageOthers ——
+       * 精選是全站一份，「放什麼上去給大家看」是全站層級的決定。
+       * ⚠️ 要排在 PUT /api/photos/:id 前面（同 restricted／reorder）。
+       * 兩句都帶著「原本是什麼」：已經是精選的再按一次不會把時間刷新（排序不跳），
+       * 沒變的列一列都不寫。回應帶回整份新清單，前端直接換掉不必再打一次 GET。
+       */
+      if (method === "PUT" && pathname === "/api/photos/featured") {
+        if (!me.canManageOthers) {
+          return forbidden(headers, "只有可管理全站內容的人能設定精選");
+        }
+        const body: any = await request.json();
+        const ids = sanitizePhotoIds(body?.photoIds, 100);
+        if (ids.length === 0) {
+          return new Response(JSON.stringify({ error: "photoIds is required" }), { status: 400, headers });
+        }
+        const on = !(body?.featured === 0 || body?.featured === false);
+        await env.DB.batch(
+          chunkIds(ids).map((c) => env.DB.prepare(on
+            ? `UPDATE Photo SET featured_at = datetime('now') WHERE featured_at IS NULL AND id IN (${placeholdersFor(c)})`
+            : `UPDATE Photo SET featured_at = NULL WHERE featured_at IS NOT NULL AND id IN (${placeholdersFor(c)})`
+          ).bind(...c)),
+        );
+        await bumpContentEpoch(env);
+        return new Response(JSON.stringify({ success: true, items: await listFeatured(env, me) }), { headers });
+      }
+
+      /*
+       * 路由：清空本次精選。沒有「第幾期」，換一批就是整份清掉重選（使用者拍板）。
+       */
+      if (method === "DELETE" && pathname === "/api/featured") {
+        if (!me.canManageOthers) {
+          return forbidden(headers, "只有可管理全站內容的人能清空精選");
+        }
+        await env.DB.prepare("UPDATE Photo SET featured_at = NULL WHERE featured_at IS NOT NULL").run();
+        await bumpContentEpoch(env);
+        return new Response(JSON.stringify({ success: true, items: [] }), { headers });
       }
 
       /*

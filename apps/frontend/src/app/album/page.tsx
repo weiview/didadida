@@ -495,7 +495,15 @@ function AlbumContent() {
       // 一定是 401，主控台就多一行紅字。備份是管理員的功能，訪客連按都按不到
       if (isAdmin) prewarmDrive();
     }
-  }, [id, searchParams, isAdmin]);
+    /*
+     * ⚠️ 相依**不可以放 `searchParams`**。關燈箱時 `closeLightbox` 用 replaceState
+     *    把 `?photo=` 拿掉，Next 14 會讓 useSearchParams 跟著換一份 —— 放著的話
+     *    每關一次燈箱就是一次非 silent 的 `loadData()`：格線整片 unmount、
+     *    捲軸回頂端（「在燈箱裡改完資料，關掉之後要停在那張照片上」那一套全部白做）。
+     *    換相簿看的是 `id`，那才是真的要重抓的時候。
+     */
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, isAdmin]);
 
   /*
    * 日曆要的兩份資料。**整本相簿的照片本來就全在手上**（相簿內容那支路由不分頁），
@@ -598,11 +606,14 @@ function AlbumContent() {
   }, [photos, searchQuery, selectedTags, sortBy, dateFrom, dateTo]);
 
   /**
-   * `?photo=<id>` 直接開燈箱。通知列表點過來的就是這種網址。
+   * `?photo=<id>` 直接開燈箱。通知列表、右上角「★ 精選」點過來的就是這種網址。
    *
-   * 只認一次（`deepLinkDone`）：這串要等照片載完才有得找，而 displayPhotos
-   * 會隨篩選與排序一直變 —— 不記一筆的話，使用者關掉燈箱、改個排序，
-   * 它就會自己再跳出來。
+   * 同一個「相簿:照片」只認一次（`deepLinkKey`）：這串要等照片載完才有得找，
+   * 而 displayPhotos 會隨篩選與排序一直變 —— 不記一筆的話，使用者關掉燈箱、
+   * 改個排序，它就會自己再跳出來。
+   * ⚠️ 記的是**那一組 key 不是一個布林**：人已經在相簿頁上、再從精選那格點
+   *    另一張（同一本或別本）時，Next 只換網址不重新掛載這一頁，
+   *    布林早就是 true，第二次點下去就什麼都不會發生。
    *
    * 找不到（照片被刪了、或不在這本相簿裡）就什麼都不做，不要跳錯誤 ——
    * 通知本來就可能比內容活得久。
@@ -640,8 +651,9 @@ function AlbumContent() {
 
   /**
    * 關燈箱。**順手把網址上的 `?photo=` 拿掉** —— 那是通知點進來留下的深連結，
-   * 留著的話重新整理又會被上面那段效果重新開一次燈箱（`deepLinkDone` 只擋得住
-   * 同一次載入之內的重開，擋不住重整）。
+   * 留著的話重新整理又會被上面那段效果重新開一次燈箱（`deepLinkKey` 只擋得住
+   * 同一次載入之內的重開，擋不住重整）。拿掉之後 key 也跟著歸零，
+   * 所以同一張精選關掉再點一次照樣打得開。
    *
    * 用 `history.replaceState` 不用 router.replace：這裡只是要改網址列，不需要
    * 讓 Next 重跑一輪路由（會捲回頂端、也會讓整頁重畫）。
@@ -685,20 +697,28 @@ function AlbumContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [displayPhotos]);
 
-  const deepLinkDone = useRef(false);
+  const deepLinkKey = useRef<string | null>(null);
   useEffect(() => {
-    if (deepLinkDone.current || loading || displayPhotos.length === 0) return;
-    const want = Number(searchParams.get("photo"));
-    if (!Number.isFinite(want) || want <= 0) return;
-    deepLinkDone.current = true;
-    const index = displayPhotos.findIndex((p) => p.id === want);
-    if (index >= 0) {
-      // 燈箱吃的是 displayPhotos 的索引，所以那一張也得在「已載入」的範圍內，
-      // 否則往前翻幾張就撞到還沒 render 的區段
-      setVisibleCount((prev) => Math.max(prev, index + 12));
-      setSelectedPhotoIndex(index);
+    if (loading || displayPhotos.length === 0) return;
+    const raw = searchParams.get("photo");
+    const want = Number(raw);
+    if (!raw || !Number.isFinite(want) || want <= 0) {
+      // 網址上沒有 ?photo= 了（關燈箱時拿掉的）：下一次同一張也要認得
+      deepLinkKey.current = null;
+      return;
     }
-  }, [loading, displayPhotos, searchParams]);
+    const key = `${id}:${raw}`;
+    if (deepLinkKey.current === key) return;
+    const index = displayPhotos.findIndex((p) => p.id === want);
+    // ⚠️ 找不到**不記 key**：從別本相簿點過來的那一瞬間，手上還是上一本的清單，
+    //    記下去的話新相簿載完就不會再找一次了
+    if (index < 0) return;
+    deepLinkKey.current = key;
+    // 燈箱吃的是 displayPhotos 的索引，所以那一張也得在「已載入」的範圍內，
+    // 否則往前翻幾張就撞到還沒 render 的區段
+    setVisibleCount((prev) => Math.max(prev, index + 12));
+    setSelectedPhotoIndex(index);
+  }, [loading, displayPhotos, searchParams, id]);
 
   /*
    * 右側時間軸那條軌 —— 它就是**格線順序的縮影**：把 displayPhotos 由上往下走一遍，

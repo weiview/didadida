@@ -273,7 +273,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0026）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0029）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
@@ -318,7 +318,8 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   2026-08-31 修，prod 上被清掉的那一列已照 EXIF 補回來。
 - `Photo` 除了基本欄位還有：`drive_file_id`／`drive_original_id`（Drive 上的 4K 與原始檔）、
   `thumb_url`／`thumb_sm_url`（R2 的 800／400 WebP）、`uploaded_by`（誰傳的，見「身分與權限」）、
-  `file_hash`／`phash`（去重）、`shuffle_key`（隨機排序用的固定亂數）。
+  `file_hash`／`phash`（去重）、`shuffle_key`（隨機排序用的固定亂數）、
+  `featured_at`（本次精選，0029，見「本次精選」）。
 - `LOCAL_TIME_EXPR` = `COALESCE(p.taken_at_local, …)`，用到它的 SQL **必須把 Photo 別名為 `p`**。
 - `geo_source` 權威由高而低：`manual` > `exif` > `track` > `timeline` > `segment` > `interpolated`。
 - `TrackDay.day_key` 是**不透明字串**（多身分之後還帶使用者前綴），**不要拿去解析日期**。
@@ -510,15 +511,16 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   自己不開任何計時器。**停權的人不畫燈** —— 他登不進來永遠是灰的，
   而那一列旁邊已經有「已停權」的標籤了。
 - ⚠️ 登出要 `resetPresence()`。不清的話下一個登入的人會先看到上一個人的名單。
-- **畫面上那條「誰在線上」是 `components/OnlineBar.tsx`**（掛在 `layout.tsx`，
-  帳號牌左邊那 48px 的縫）。收起來是最多 3 顆別人的頭像 ＋「n 人在線上」，
+- **畫面上那條「誰在線上」是 `components/OnlineBar.tsx`**（掛在 `TopRightBar`
+  那一排裡、跟「★ 精選」並排，帳號牌左邊那 48px 的縫；見「本次精選」）。收起來是最多 3 顆別人的頭像 ＋「n 人在線上」，
   點開才是完整名單（在線上的在前、離線的寫最後出現是多久以前）。
   ⚠️ **它不開輪詢**，只是 `usePresence()` 看 `<PresenceToasts />` 開的那一份 ——
   多掛這一條在每一頁**不會多打任何一次 API**。
   ⚠️ 收起來那排**刻意不畫自己**（自己就在旁邊那顆帳號牌上），沒有別人時畫一顆
   灰點 ＋「只有你在線上」—— 空著一條會讓人以為壞了。訪客與 `!ready` 一律不畫。
-  ⚠️ `z-index: 925` **比帳號牌那層低**（它的點擊攔截層是 930）：那張卡打開時
-  這條就不該還能按。
+  ⚠️ 那一排（`TopRightBar`）是 `z-index: 925`，**比帳號牌那層低**（它的點擊攔截層
+  是 930）：那張卡打開時這條就不該還能按。OnlineBar 自己的 z-index 現在只是
+  **那一排裡面的相對值**（見「本次精選」）。
 - `GET /api/presence` 除了 `last_seen_at` 也回 **`track_color` 與 `avatar`**
   （那條橫幅要拿它們畫圓頭像，共用 `components/Avatar.tsx`）。
   ⚠️ 多帶兩欄**不多花任何讀取額度**（D1 算的是讀了幾列不是幾欄）；前端那兩欄
@@ -594,6 +596,51 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   分兩句就是每個人每次進站多一趟往返。
 - ⚠️ 訪客整個不參與：他沒有 `User` 那一列（同留言、同 presence），
   `/api/notifications` 對他是 401，presence 對他零 D1 動作。
+
+## 本次精選：右上角那顆「★ 精選」
+
+2026-09-11 加的（使用者：「可選取本次精選, 被選為本次精選的照片或影片 應該會有個
+常駐小視窗, 點開後可以點擊裡面的精選轉導過去觀看」）。使用者拍板四件事：
+**全站一份**、**只有可管理全站內容的人能挑**、**累積到手動清空**（沒有「第幾期」、
+不會自己過期）、**位置在右上角帳號牌旁邊**。
+
+- **是欄位不是表**：`Photo.featured_at TEXT`（0029）。NULL ＝不是精選，時間＝什麼時候
+  被選進來（清單照它新到舊排）。部分索引 `idx_photo_featured` 只收精選的那幾列，
+  所以讀取成本就是精選的張數。刪照片時跟著那一列一起消失，不必另外收。
+- 路由三支：
+  - `GET /api/featured`（`listFeatured()`）—— **訪客也看得到**。可見條件跟相簿格線
+    **同一套、寫在 SQL 裡**（`RESTRICTED_VISIBLE_COND`／`GUEST_ALBUM_COND`／
+    `GUEST_NO_VIDEO_COND`），不然右上角會端出一張他在相簿裡找不到的照片，
+    點下去什麼都沒有。上限 100。訪客走共用邊緣快取 ＋ `content_epoch`，成員 skip。
+  - `PUT /api/photos/featured` `{photoIds, featured}` —— 只認 `canManageOthers`
+    （同「不開放」的理由：放什麼給全站看是全站層級的決定）。⚠️ **要排在
+    `PUT /api/photos/:id` 前面**（同 restricted／reorder）。兩句 UPDATE 都帶著
+    「原本是什麼」：已經是精選的再按一次**不刷新時間**（排序不跳）。
+    回應帶整份新清單，前端直接換掉、不再打一次 GET。
+  - `DELETE /api/featured` —— 清空，同樣只認 `canManageOthers`。
+  - ⚠️ 寫入那兩支都要 `bumpContentEpoch()`，不然訪客那份邊緣快取要等過期才跟上。
+- 前端狀態在 `lib/featured.ts`（module 層 store ＋ `useSyncExternalStore`，同
+  presence／restrictedReveal；換值一定要換複本）。`loadFeatured()` 失敗**保留上一份**；
+  登出要 `resetFeatured()`（同 `resetPresence()`）。**不開輪詢**：身分確定時抓一次、
+  每次點開再抓一次 —— 精選是幾天才動一次的東西。
+- **挑的入口是燈箱左上角那一排**（`.cornerBtns`：🔒 不開放 ＋ ☆／★ 精選），跟那顆鎖
+  同權限、同規矩（關著淡、開著亮成金色並寫出「精選」）。狀態看的是全站那份清單
+  （`useFeatured()`）不是 Photo 上的欄位 —— 按完右上角的數字當場跟著變，相簿 JSON
+  不必重抓。⚠️ 位置與 `z-index: 3250` 現在由 `.cornerBtns` 負責，`.restrictBtn`
+  只剩長相（兩顆共用它）。
+- **看的入口是 `components/FeaturedBar.tsx`**：收著是「★ 精選 n」（手機只剩「★ n」），
+  點開是三欄縮圖，點一張走 `/album?id=<相簿>&photo=<id>` 深連結。管理者多一顆逐張的 ×
+  與「清空精選」（`confirm`）。**一張都沒有、或還沒抓回來時整顆不畫**。
+  不開放又開著遮罩的照 `restrictedBlur` 糊（共用 `restrictedReveal`）。
+  ⚠️ 面板**對齊畫面右緣、不對齊藥丸** —— 它在一排的最左邊，往左長會凸出手機畫面。
+- **右上角那一排是 `components/TopRightBar.tsx`**（`position: fixed`、`z-index: 925`、
+  帳號牌左邊 48px），裡面是 `FeaturedBar` ＋ `OnlineBar`。
+  ⚠️⚠️ 那一排**不可以有 `transform`／`filter`／`backdrop-filter`** —— 有的話裡面那些
+  `position: fixed` 的面板與點擊攔截層會改以這一排為基準，面板跑位、攔截層只剩一小塊。
+  兩顆的 z-index 是**這一排裡面的相對值**：攔截層 3、收著的 2、打開的 4 ——
+  打開的那顆壓在自己的攔截層上面，另一顆被攔截層蓋住（點它＝先收起來）。
+- ⚠️ 從這裡點進去時人可能**已經在 `/album` 上**（同一本或另一本），見「相簿格線」
+  那條 `deepLinkKey`。
 
 ## 手勢：捏合改欄數、燈箱裡放大照片
 

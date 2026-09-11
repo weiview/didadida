@@ -1,0 +1,28 @@
+/*
+ * 帳號牌左邊那一排（「★ 精選」＋「誰在線上」）。
+ *
+ * 位置緊貼右上角帳號牌的左邊：那顆是 40px、停在 right: max(12px, safe-area)，
+ * 所以這裡讓開 48px 就有 8px 的縫。上方那條 12～52px 的帶子在每一頁都是空的
+ * （相簿頁的時間軸從 top: 88px 才開始長，FAB 那疊在右下角），見 AccountBadge。
+ *
+ * z-index 刻意**比帳號牌那層低**（它的點擊攔截層是 930）—— 帳號面板打開時
+ * 這一排就不該還能按，點下去只會先把那張卡收起來。
+ *
+ * ⚠️ 這一排**不可以加 `transform`／`filter`／`backdrop-filter`** ——
+ *    那會讓它變成底下 `position: fixed` 的定位基準，
+ *    兩顆各自的點擊攔截層（inset: 0）就只剩這一排那麼大，點空白處收不起來。
+ */
+
+.row {
+  position: fixed;
+  top: max(12px, env(safe-area-inset-top));
+  right: calc(max(12px, env(safe-area-inset-right)) + 48px);
+  z-index: 925;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+@media (max-width: 480px) {
+  .row { gap: 6px; }
+}

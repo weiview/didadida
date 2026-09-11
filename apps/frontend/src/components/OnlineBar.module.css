@@ -1,20 +1,18 @@
 /*
  * 「現在誰在線上」那條。
  *
- * 位置緊貼右上角帳號牌的左邊：那顆是 40px、停在 right: max(12px, safe-area)，
- * 所以這裡讓開 48px 就有 8px 的縫。上方那條 12～52px 的帶子在每一頁都是空的
- * （相簿頁的時間軸從 top: 88px 才開始長，FAB 那疊在右下角），見 AccountBadge。
- *
- * z-index 刻意**比帳號牌那層低**（它的點擊攔截層是 930）—— 帳號面板打開時
- * 這條就不該還能按，點下去只會先把那張卡收起來。
+ * **位置不在這裡定** —— 它跟「★ 精選」一起排在 TopRightBar 那一排裡
+ * （帳號牌左邊，見 TopRightBar.module.css）。那一排是 fixed ＋ z-index 925，
+ * 自成一個疊放層，所以底下的 z-index 都是**那一排裡面的相對值**：
+ * 攔截層 3、收著的 2、打開的那顆 4（壓在自己的攔截層上面，
+ * 另一顆則被攔截層蓋住 —— 點它只會先把這張收起來）。
  */
 
 .wrap {
-  position: fixed;
-  top: max(12px, env(safe-area-inset-top));
-  right: calc(max(12px, env(safe-area-inset-right)) + 48px);
-  z-index: 925;
+  position: relative;
+  z-index: 2;
 }
+.wrapOpen { z-index: 4; }
 
 .pill {
   display: flex;
@@ -61,7 +59,7 @@
 .catcher {
   position: fixed;
   inset: 0;
-  z-index: 924; /* 就在 .wrap 底下：點空白處收起來 */
+  z-index: 3; /* 在收著的 .wrap 上面、打開的 .wrapOpen 底下：點空白處收起來 */
 }
 
 .panel {

@@ -7,6 +7,7 @@ import {
   verifyGuest, verifyLogin,
 } from './api';
 import { resetPresence } from './presence';
+import { resetFeatured } from './featured';
 
 /**
  * 全站共用的身分狀態。
@@ -255,6 +256,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // 上線名單也要清。留著的話下一個登入的人會先看到上一個人的名單，
     // 而且第一次抓回來會把所有人都當成「剛上線」跳一排提示
     resetPresence();
+    // 精選清單同理：下一個登入的人看得到的可能比較少（訪客、不開放的那幾張）
+    resetFeatured();
     setState({
       admin: false, guest: false, canViewMap: false,
       canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,

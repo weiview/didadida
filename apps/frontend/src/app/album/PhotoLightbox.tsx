@@ -7,6 +7,7 @@ import FixTimeModal from "@/components/FixTimeModal";
 import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, photoMotionSrc, hasMotion, isVideo, isGif, isNewMedia, setPhotosRestricted } from "@/lib/api";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
+import { toggleFeatured, useFeatured } from "@/lib/featured";
 import { setExifExpanded, useExifExpanded } from "@/lib/exifPref";
 import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
@@ -149,6 +150,21 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
       if (ok) onUpdate();
     }
     setIsSavingRestricted(false);
+    if (!ok) alert("設定失敗，請稍後再試");
+  };
+
+  /*
+   * 本次精選（0029）。跟那顆鎖同一個權限、同一個角落。
+   * 狀態看的是全站那一份清單（lib/featured），**不是 Photo 上的欄位** ——
+   * 按完右上角那顆「★ 精選」的數字要當場跟著變，而相簿 JSON 不必為此重抓。
+   */
+  const featured = useFeatured();
+  const isFeatured = featured.items.some((i) => i.id === photo.id);
+  const [isSavingFeatured, setIsSavingFeatured] = useState(false);
+  const handleToggleFeatured = async () => {
+    setIsSavingFeatured(true);
+    const ok = await toggleFeatured(photo.id, !isFeatured);
+    setIsSavingFeatured(false);
     if (!ok) alert("設定失敗，請稍後再試");
   };
 
@@ -823,20 +839,39 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             * 關著的時候刻意很淡；開著就整顆亮起來並且把「不開放」三個字寫出來。
             * 這顆開關決定的是「誰看得到」，狀態絕對不能靠猜。
             */}
+          {/*
+            * 旁邊那顆 ★ 是「本次精選」，同一個權限、同一個規矩：
+            * 關著很淡，開著亮起來並寫出「精選」兩個字。
+            */}
           {canManageOthers && (
-            <button
-              type="button"
-              className={`${styles.restrictBtn} ${photo.restricted === 1 ? styles.restrictBtnOn : ''}`}
-              disabled={isSavingRestricted}
-              aria-pressed={photo.restricted === 1}
-              title={photo.restricted === 1
-                ? `目前為不開放，此${isVideo(photo) ? '影片' : '照片'}僅可管理全站內容的成員可見，不會出現在其他人的相簿、搜尋與地圖中。點擊改為開放`
-                : '點擊設為不開放，僅可管理全站內容的成員可見，不會出現在其他人的相簿、搜尋與地圖中'}
-              onClick={(e) => { e.stopPropagation(); handleToggleRestricted(photo.restricted !== 1); }}
-            >
-              <span className={styles.restrictIcon} aria-hidden>{photo.restricted === 1 ? '🔒' : '🔓'}</span>
-              {photo.restricted === 1 && <span>不開放</span>}
-            </button>
+            <div className={styles.cornerBtns}>
+              <button
+                type="button"
+                className={`${styles.restrictBtn} ${photo.restricted === 1 ? styles.restrictBtnOn : ''}`}
+                disabled={isSavingRestricted}
+                aria-pressed={photo.restricted === 1}
+                title={photo.restricted === 1
+                  ? `目前為不開放，此${isVideo(photo) ? '影片' : '照片'}僅可管理全站內容的成員可見，不會出現在其他人的相簿、搜尋與地圖中。點擊改為開放`
+                  : '點擊設為不開放，僅可管理全站內容的成員可見，不會出現在其他人的相簿、搜尋與地圖中'}
+                onClick={(e) => { e.stopPropagation(); handleToggleRestricted(photo.restricted !== 1); }}
+              >
+                <span className={styles.restrictIcon} aria-hidden>{photo.restricted === 1 ? '🔒' : '🔓'}</span>
+                {photo.restricted === 1 && <span>不開放</span>}
+              </button>
+              <button
+                type="button"
+                className={`${styles.restrictBtn} ${isFeatured ? styles.featureBtnOn : ''}`}
+                disabled={isSavingFeatured}
+                aria-pressed={isFeatured}
+                title={isFeatured
+                  ? '已加入本次精選，點擊移出'
+                  : `點擊將此${isVideo(photo) ? '影片' : '照片'}加入本次精選（右上角「★ 精選」可以直接點過來看）`}
+                onClick={(e) => { e.stopPropagation(); handleToggleFeatured(); }}
+              >
+                <span className={styles.restrictIcon} aria-hidden>{isFeatured ? '★' : '☆'}</span>
+                {isFeatured && <span>精選</span>}
+              </button>
+            </div>
           )}
           {/*
             * 蓋著的時候整塊都是「點一下掀開」。這一層一定要蓋在影片上面 ——

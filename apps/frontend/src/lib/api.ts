@@ -3277,6 +3277,76 @@ export function applyRestrictedPatch(
   });
 }
 
+/**
+ * 本次精選的一項（0029）。全站只有一份清單，最新選進來的在前面。
+ *
+ * 帶的欄位剛好夠畫一格縮圖（`photoThumbSrc()` 吃 url／thumb_url／thumb_sm_url）
+ * 並組出 `/album?id=<album_id>&photo=<id>` 那條連結。
+ * 誰看得到哪幾項是後端 SQL 過濾過的（不開放、訪客看不到的相簿與影片）。
+ */
+export interface FeaturedItem {
+  id: number;
+  album_id: number;
+  title: string;
+  media_type: string;
+  url: string;
+  thumb_url?: string | null;
+  thumb_sm_url?: string | null;
+  restricted: number;
+  featured_at: string;
+  album_name: string;
+}
+
+function featuredItemsOf(data: any): FeaturedItem[] {
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
+/** 讀精選清單。失敗回 null（呼叫端保留手上那份，不要當成「清單是空的」） */
+export async function fetchFeatured(): Promise<FeaturedItem[] | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/featured`, { headers: getAuthHeaders() });
+    if (!res.ok) return null;
+    return featuredItemsOf(await res.json().catch(() => null));
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/**
+ * 把照片放進／移出精選。回的是寫完之後的**整份清單**（省一次重抓），失敗回 null。
+ * ⚠️ 後端只讓可管理全站內容的人動 —— 那顆 ★ 要先看 canManageOthers 再端出來。
+ */
+export async function setPhotosFeatured(photoIds: number[], featured: boolean): Promise<FeaturedItem[] | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/photos/featured`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ photoIds, featured: featured ? 1 : 0 }),
+    });
+    if (!res.ok) return null;
+    return featuredItemsOf(await res.json().catch(() => null));
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+/** 清空整份精選。成功回空陣列，失敗回 null */
+export async function clearFeatured(): Promise<FeaturedItem[] | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/featured`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return null;
+    return featuredItemsOf(await res.json().catch(() => null));
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
 export async function setAlbumMapPrivacy(albumId: number, mapPrivate: boolean): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE_URL}/albums/${albumId}/map-privacy`, {

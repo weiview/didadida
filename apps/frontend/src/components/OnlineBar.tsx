@@ -82,7 +82,7 @@ export default function OnlineBar() {
   return (
     <>
       {open && <div className={styles.catcher} onClick={() => setOpen(false)} />}
-      <div className={styles.wrap}>
+      <div className={`${styles.wrap} ${open ? styles.wrapOpen : ''}`}>
         <button
           type="button"
           className={styles.pill}
