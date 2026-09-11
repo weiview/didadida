@@ -118,8 +118,11 @@ body.is-scrolling .floating-control * {
     0 3px 8px -2px rgba(87, 72, 58, 0.22);
 }
 
-/* 按下去縮一點：觸控沒有 hover，這是手機上唯一的回饋 */
-.glass-control:active:not(:disabled) {
+/* 按下去縮一點：觸控沒有 hover，這是手機上唯一的回饋
+   ⚠️⚠️ 裝著按鈕的「一整張卡」要加 .glass-panel 排除掉。`:active` 會套在被按那顆的
+   **每一層祖先**上 —— 卡片自己一縮，底下那幾顆按鈕就從指尖底下滑走，mouseup／touchend
+   落在按鈕外面，瀏覽器根本不發 click（帳號牌的「後台設定」「登出」要按好幾下才有反應）。 */
+.glass-control:not(.glass-panel):active:not(:disabled) {
   transform: var(--glass-transform) scale(0.93);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.6),

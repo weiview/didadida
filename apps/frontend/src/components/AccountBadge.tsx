@@ -222,7 +222,9 @@ export default function AccountBadge() {
         </button>
 
         <div
-          className={`glass-control${open ? " floating-control" : ""}`}
+          // glass-panel：這是一張裝著按鈕的卡，不是一顆按鈕 —— 不能吃 .glass-control 的按壓縮放，
+          // 不然按底下那幾顆時整張卡一縮，按鈕從指尖底下滑走、click 不會發（見 globals.css）
+          className={`glass-control glass-panel${open ? " floating-control" : ""}`}
           role="dialog"
           aria-label="帳號"
           style={{
