@@ -669,13 +669,12 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
      */
     <div className={styles.overlay} data-lightbox onClick={onClose}>
       {/*
-        * ⚠️ 一週內新增的那幾張，照片那格的右上角被 45 度的 NEW 角標蓋住，
-        *   而手機上 `.content` 是 100vw/100vh —— 那個角就是這顆 × 站的地方。
-        *   `closeBtnShifted` 只在手機把它往下讓到角標底下（桌機是兩欄，
-        *   角標在左欄的右上方，離這顆很遠，那條規則本來就不生效）。
+        * ⚠️ 這顆 × 在每一段、每一張都站在同一個位置，**不為 NEW 角標讓位**。
+        *   手機上照片那格的右上角就是這裡，所以是角標自己縮成一顆藥丸貼到
+        *   × 的左邊（見 lightbox.module.css 的 max-width: 768px）。
         */}
       <button
-        className={`${styles.closeBtn} ${isNewMedia(photo) ? styles.closeBtnShifted : ''}`}
+        className={styles.closeBtn}
         onClick={(e) => { e.stopPropagation(); onClose(); }}
         title="關閉"
       >×</button>
@@ -909,7 +908,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           )}
 
           {/*
-            * 一週內新增的照片／影片，右上角蓋一塊 45 度的 NEW（同格線那顆）。
+            * 一週內新增的照片／影片，右上角蓋一塊 45 度的 NEW（同格線那顆）；
+            * 手機上縮成關閉鈕左邊的一顆藥丸，不跟 × 搶那個角。
             * ⚠️ 掛在 `.imageContainer` 這一層而不是 `.zoomLayer` 裡面 ——
             *   放進去的話捏合放大 5 倍時它會跟著變五倍大。
             * ⚠️ 它 `pointer-events: none` 且 z-index 低於關閉鈕、換頁箭頭與

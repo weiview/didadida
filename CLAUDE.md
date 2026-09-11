@@ -724,6 +724,14 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   退回 auto，照片高度變成「內容有多高」，而它的內容 `.zoomLayer` 與 PhotoImage 的
   外框**又都是 height: 100%**，整條鏈一路塌成 0。症狀是**點進燈箱一片全黑、
   只剩關閉鈕**，而且只在手機上。
+- ⚠️⚠️ **右上角那顆 × 永遠不讓位給 NEW 角標**（2026-09-11 使用者：「不管是不是
+  全畫面 右上的x 關閉按鈕看起來是被 new 往下擠 這樣不 OK」）。以前是 ×
+  在有 NEW 時換一個 `.closeBtnShifted` 往下挪 —— 關閉鈕是**唯一的出口**，
+  被一個純裝飾的角標推走完全反了。**那顆 class 已經刪掉，不要再加回來**：
+  現在手機上改成 **NEW 縮成一顆藥丸擺在 × 左邊**（`.newBadge` 在
+  `max-width: 768px` 那段改寫成 `right: 63px` ＋ `clip-path: none`
+  ＋ `border-radius: 999px`，`.newBadge::before` 那塊 45 度的三角整個
+  `display: none`，`.newBadgeText` 從絕對定位轉正）。桌機那個 45 度角標不動。
 
 ## 不開放的照片
 

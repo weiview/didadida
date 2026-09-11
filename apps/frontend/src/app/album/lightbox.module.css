@@ -236,12 +236,12 @@
  *    `.zoomLayer` 裡面** —— 放進去的話捏合放大 5 倍時角標會跟著變五倍大。
  * ⚠️ `z-index: 3160` 是排出來的：要**高於 `.revealVeil`（3150）**（不開放又
  *    糊著的那幾張，角標照樣要看得見），但**低於 `.closeBtn`／`.navButton`
- *    （3200）與 `.restrictBtn`（3250）** —— 那三顆是按得下去的東西，
+ *    （3200）與左上角那排 `.cornerBtns`（3250）** —— 那幾顆是按得下去的東西，
  *    絕不能被一塊 `pointer-events: none` 的裝飾蓋住。
  * ⚠️ 手機上 `.content` 是 100vw/100vh，這個角剛好就是畫面的右上角，
- *    也就是關閉鈕的位置 —— 那時候關閉鈕要靠 `.closeBtnShifted` 往下讓開
- *    （見底下那個 max-width: 768px）。桌機是兩欄，這個角在左欄的右上方，
- *    離固定在畫面右上角的關閉鈕很遠，不必讓。
+ *    也就是關閉鈕的位置 —— 那時候**角標自己改成 × 左邊的一顆藥丸**
+ *    （見底下那個 max-width: 768px），關閉鈕絕不讓位。桌機是兩欄，
+ *    這個角在左欄的右上方，離固定在畫面右上角的關閉鈕很遠，維持三角緞帶。
  */
 .newBadge {
   position: absolute;
@@ -769,15 +769,34 @@ input:checked + .slider:before {
     font-size: 2rem;
   }
   /*
-   * 手機上 `.content` 是 100vw/100vh，照片那格的右上角就是畫面的右上角 ——
-   * 也就是這顆 × 原本站的位置。一週內新增的那幾張會被那塊 78px 的 NEW 蓋掉，
-   * 所以整顆往下讓到角標底下。
-   *
-   * ⚠️ 只在手機讓。桌機是兩欄、角標在左欄的右上方，離這顆很遠。
-   * ⚠️ 同樣是單一 class 的權重，靠**順序**決勝 —— 必須留在上面那條後面。
+   * 手機上照片那格的右上角就是畫面的右上角，也就是這顆 × 站的位置。
+   * 讓位的是角標不是 ×：縮成一顆藥丸，貼在 × 的左邊、垂直置中對齊它
+   * （× 佔 15～55px，中線 35px → 22px 高的藥丸 top 24px；
+   *  right 63px ＝ × 的左緣 55px 再空 8px）。
+   * ⚠️ 不要再把 × 往下推（曾經有 `.closeBtnShifted { top: 86px }`）——
+   *   關閉鈕在每一張、每一段都要在同一個位置，手指才找得到。
    */
-  .closeBtnShifted {
-    top: 86px;
+  .newBadge {
+    top: 24px;
+    right: 63px;
+    width: auto;
+    height: 22px;
+    padding: 0 10px;
+    display: flex;
+    align-items: center;
+    clip-path: none;
+    border-radius: 999px;
+    overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  }
+  .newBadge::before {
+    display: none;
+  }
+  .newBadgeText {
+    position: static;
+    width: auto;
+    transform: none;
+    line-height: 22px;
   }
   .imageContainer {
     height: 60vh;
