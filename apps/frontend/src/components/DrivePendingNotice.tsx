@@ -4,8 +4,14 @@
  * 進站跳出來的「你傳的照片還有幾張要補傳」小窗。
  *
  * 使用者拍板：**誰傳的就跳給誰**（管理全站的人在 /admin「Drive 比對」看整份），
- * **每次登入都跳**。「每次」是以瀏覽器分頁的 session 算（sessionStorage）——
- * 同一個分頁裡換頁不會一直跳，重開網站／重新登入才會再跳一次。
+ * **每上線一次就跳一次**（2026-09-22 使用者更正：不是「每次登入」——
+ * 進站 token 有效 7 天，照登入算的話一週才跳一次）。
+ * 「上線」跟「XXX 上線囉」同一個定義：**離開超過 150 秒再回來**
+ * （`OFFLINE_AFTER_MS`，＝後端 PRESENCE_ONLINE_MS）。所以：
+ *   - 打開網站、隔一陣子重開分頁、手機切回來、螢幕關掉再打開 → 跳；
+ *   - 站內換頁、重新整理、同時開第二個分頁 → 不跳（人一直都在線上）。
+ * 最後在線上的時間記在 localStorage（`ACTIVE_KEY + uid`，分頁之間共用），
+ * 看得見的時候每 60 秒推一次、切到背景那一刻也推一次。
  *
  * - 張數跟著 `/api/auth/me` 回來（`drivePendingMine`，零額外請求）；
  *   零張就什麼都不做，**連清單都不抓**。清單在跳出來那一刻才打 `/me/drive-pending`。
@@ -24,7 +30,17 @@ import { useAdmin } from '@/lib/useAdmin';
 import { DrivePendingPhoto, fetchMyDrivePending } from '@/lib/api';
 import styles from './DrivePendingNotice.module.css';
 
-const SEEN_KEY = 'drive_pending_notice_shown:';
+const ACTIVE_KEY = 'drive_pending_notice_active:';
+/** 離開多久算「下線了」。跟後端 PRESENCE_ONLINE_MS 同一個數字 */
+const OFFLINE_AFTER_MS = 150 * 1000;
+const TOUCH_MS = 60 * 1000;
+
+function readActive(uid: number): number {
+  try { return Number(localStorage.getItem(ACTIVE_KEY + uid)) || 0; } catch { return 0; }
+}
+function touchActive(uid: number) {
+  try { localStorage.setItem(ACTIVE_KEY + uid, String(Date.now())); } catch { /* 存不了就每次都跳 */ }
+}
 
 function missingLabel(p: DrivePendingPhoto): string {
   if (p.media_type === 'video') return '影片缺原始檔';
@@ -43,37 +59,58 @@ export default function DrivePendingNotice() {
   // 不然每次重新整理都會把記號清掉、再跳一次。
   const prevUid = useRef<number | null>(null);
 
+  // 張數只在 /me 那一趟更新（跟 user 同一次 setState 回來，所以效果跑的時候已經是新的）；
+  // 回到前景時拿它判斷「值不值得打一次清單」
+  const pendingRef = useRef(drivePendingMine);
+  pendingRef.current = drivePendingMine;
+
   useEffect(() => {
     const wasUid = prevUid.current;
     prevUid.current = uid;
     if (uid == null) {
       if (wasUid == null) return;
       // 登出了：下一次登入（哪怕是同一個人、同一個分頁）要再跳一次
-      try {
-        for (let i = sessionStorage.length - 1; i >= 0; i--) {
-          const k = sessionStorage.key(i);
-          if (k?.startsWith(SEEN_KEY)) sessionStorage.removeItem(k);
-        }
-      } catch { /* 無痕模式之類的，當成沒記過 */ }
+      try { localStorage.removeItem(ACTIVE_KEY + wasUid); } catch { /* 無痕模式之類的 */ }
       setMode('hidden');
       setItems(null);
       return;
     }
-    if (drivePendingMine <= 0) return;
-    try {
-      if (sessionStorage.getItem(SEEN_KEY + uid)) return;
-      sessionStorage.setItem(SEEN_KEY + uid, '1');
-    } catch { /* 存不了就每次都跳，也還可以接受 */ }
-    setMode('open');
+
     let alive = true;
-    fetchMyDrivePending().then((list) => {
-      if (!alive) return;
-      if (list === null) setFailed(true);
-      else if (list.length === 0) setMode('hidden'); // 在這中間補完了
-      else setItems(list);
-    });
-    return () => { alive = false; };
-  }, [uid, drivePendingMine]);
+    const show = () => {
+      if (pendingRef.current <= 0) return;
+      setMode('open');
+      setFailed(false);
+      setItems(null);
+      fetchMyDrivePending().then((list) => {
+        if (!alive) return;
+        if (list === null) setFailed(true);
+        else if (list.length === 0) setMode('hidden'); // 在這中間補完了
+        else setItems(list);
+      });
+    };
+    // 「剛上線」＝上一次在線上是 150 秒以前（或從來沒有）
+    const cameOnline = () => {
+      const was = readActive(uid);
+      touchActive(uid);
+      if (Date.now() - was > OFFLINE_AFTER_MS) show();
+    };
+
+    if (document.visibilityState === 'visible') cameOnline();
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') touchActive(uid);
+    }, TOUCH_MS);
+    const onVis = () => {
+      if (document.visibilityState === 'visible') cameOnline();
+      else touchActive(uid); // 切走那一刻記下來，回來才算得出離開多久
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [uid]);
 
   if (mode === 'hidden') return null;
   const count = items?.length ?? drivePendingMine;

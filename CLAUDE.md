@@ -2063,7 +2063,7 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
 ## 「你傳的檔案還沒備份完整」小窗
 
 2026-09-22 加的（`components/DrivePendingNotice.tsx`，掛在 `layout.tsx` 的 `<TopRightBar />` 後面）。
-使用者拍板：**誰傳的就跳給誰**（管理全站的人看 `/admin`「Drive 比對」那份就好）、**每次登入都跳**。
+使用者拍板：**誰傳的就跳給誰**（管理全站的人看 `/admin`「Drive 比對」那份就好）、**每上線一次就跳一次**（不是每次登入 —— token 七天才換一次）。
 
 - 張數搭 `/api/auth/me` 的順風車（`drive_pending_mine`，**併進未讀數那一句 SQL**，零額外往返）；
   零張就什麼都不做。清單在跳出來那一刻才打 **`GET /api/me/drive-pending`**
@@ -2073,9 +2073,11 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
   `idx_photo_drive_pending_uploader` 的 WHERE **跟它一字一句一樣** —— 改其中一邊不改另一邊，
   SQLite 就用不到那顆索引，每個人每次進站變成全表掃 Photo。
   ⚠️ 不開放的照片（看不到的人）要另外加 `AND restricted = 0`，不然會叫人補一張他自己看不到的。
-- 「每次登入」＝ **sessionStorage 記號** `drive_pending_notice_shown:<uid>`：同一個分頁換頁不再跳；
-  **登出（uid 從有變成 null）才清掉**。⚠️ `/me` 回來之前 user 也是 null，只看「現在是 null」
-  的話每次重新整理都會清記號再跳一次。
+- 「上線」跟「XXX 上線囉」同一個定義：**離開超過 150 秒再回來**。最後在線上的時間記在
+  **localStorage** `drive_pending_notice_active:<uid>`（分頁之間共用），看得見時每 60 秒推一次、
+  切到背景那一刻也推一次；進站或 `visibilitychange` 回前景時比一下。於是開站、手機切回來、
+  螢幕關掉再打開會跳；站內換頁、重新整理、開第二個分頁不跳。**登出（uid 從有變成 null）清掉記號。**
+  ⚠️ 回前景時的張數是進站那次 `/me` 的（不另外打），真的跳之前清單那一趟會拿到最新的，零張就收掉。
 - 點「看照片 ↗」收成一顆藥丸（不是關掉），看完回來點藥丸再打開。連結是
   `/album?id=<相簿>&photo=<id>`（靜態匯出沒有 `[id]` 那一層）。
 - 補的方法寫在窗裡：**把同一個原始檔再拖進那本相簿一次**（`incompleteTwin()` 只補缺的那一半）。
