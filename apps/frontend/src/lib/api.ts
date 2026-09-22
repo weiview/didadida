@@ -546,6 +546,11 @@ export interface AuthState {
   /** 通知紅點上的數字。跟著 /auth/me 一起回，不另外打一支 */
   unreadNotifications: number;
   /**
+   * 我自己傳的、Drive 還缺一半備份的張數（訪客永遠 0）。
+   * 大於 0 時進站跳一個小窗（DrivePendingNotice），清單另外打 /me/drive-pending。
+   */
+  drivePendingMine: number;
+  /**
    * 地圖上「兩個人這一趟算不算一起出遊」的貼路重疊率門檻（%）。站長在後台調。
    * 跟著 /auth/me 一起回來（後端那邊有 60 秒 memo，不會每次都讀 D1）。
    */
@@ -697,7 +702,7 @@ export async function announceUpload(
 export async function checkAuth(): Promise<AuthState> {
   const locked: AuthState = {
     admin: false, guest: false, canViewMap: false,
-    canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
+    canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0, drivePendingMine: 0,
     convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false,
     babyAvatar: null, babyAvatarFacing: 'left', canCopyPhotos: true, user: null,
   };
@@ -729,6 +734,8 @@ export async function checkAuth(): Promise<AuthState> {
         // 舊後端不回這個欄位 —— 管理員照樣用得了工具，成員則保守地當成沒開
         canUseTools: data.can_use_tools != null ? !!data.can_use_tools : !!data.admin,
         unreadNotifications: Number(data.unread_notifications ?? 0),
+        // 舊後端不回這個欄位 —— 當 0（小窗不跳）
+        drivePendingMine: Number(data.drive_pending_mine ?? 0),
         // 舊後端不回這個欄位 —— 用預設值，地圖照樣判得出同遊
         convoyOverlapPct: clampConvoyPct(data.convoy_overlap_pct),
         // 舊後端不回這個欄位 —— 當成關的（維持這個開關出現之前的樣子）
@@ -2701,6 +2708,19 @@ export async function fetchDrivePending(
     );
     if (!res.ok) return null;
     return await res.json();
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
+/** 我自己傳的、Drive 還缺一半的（進站那個小窗用）。任何成員都打得到，只回自己的 */
+export async function fetchMyDrivePending(): Promise<DrivePendingPhoto[] | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/me/drive-pending`, { headers: getAuthHeaders() });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Array.isArray(data.photos) ? data.photos : [];
   } catch (error) {
     console.error(error);
     return null;

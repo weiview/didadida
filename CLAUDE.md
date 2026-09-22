@@ -273,7 +273,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0029）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0030）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
@@ -1421,6 +1421,14 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   存成「這個網址的答案」會餵給下一個人錯誤的位元組。回應是 `Cache-Control: private`；
   ③ **沒有退路** —— 照片拿不到 Drive 還能 302 回 R2 的 800px，影片在 R2 只有封面。
   位元組是**串流**出去的（回傳上游的 `body`），不落地、不進 Worker 記憶體。
+- ⚠️⚠️ **`/video` 與 `/motion` 自己發強驗證器（`mediaValidators()`）＋回 304**（2026-09-22）。
+  Drive 的 `alt=media` 不給 ETag，而 **Chrome 的媒體快取只肯存「帶強驗證器」的 206** ——
+  於是每播完一次重播就整段重新緩衝（每次都是 Worker → Drive 一整趟）。
+  ETag 是 `"v-<drive_original_id>"`（動態照片 `"m-<id>-<起點>"`）、Last-Modified 寫死一個日期：
+  Drive 檔一旦上傳內容就不變，id 本身就是版本。`If-None-Match` 對上就**在打 Drive 之前**
+  回 304（`notModifiedResponse()`，RFC 9110：先比 If-None-Match 再看 Range，所以帶著 Range 也回 304）。
+  ⚠️ 304 **一定要排在權限檢查（不開放、訪客那幾道閘）後面**，不然 304 等於承認那個編號上有東西。
+  ⚠️ 上游那顆 `ETag` 表頭**不再照抄**（它本來就沒有，抄了也是弱的）。
 - ⚠️⚠️ **`VideoPlayer` 的 `<video>` 要 `width/height: 100%` ＋ `object-fit: contain`，
   不可以寫 `width/height: auto`**（2026-09-01 修）。auto 的意思是「照固有尺寸長」，
   而 metadata 還沒回來之前 `<video>` 的固有尺寸來自 **poster**（R2 那張 800px 縮圖）
@@ -2051,6 +2059,29 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
 - 影片 `pushVideoToDrive` 記不回 D1 **要往外丟**（不是回 false）：呼叫端才會把剛建的那一列收掉。
   ⚠️ 那個回滾 `deletePhoto()` **自己也會失敗，要驗回傳值** —— 沒收掉就是相簿裡留下一格
   點開只有靜止畫面的東西，而使用者以為「跳過了」。
+
+## 「你傳的檔案還沒備份完整」小窗
+
+2026-09-22 加的（`components/DrivePendingNotice.tsx`，掛在 `layout.tsx` 的 `<TopRightBar />` 後面）。
+使用者拍板：**誰傳的就跳給誰**（管理全站的人看 `/admin`「Drive 比對」那份就好）、**每次登入都跳**。
+
+- 張數搭 `/api/auth/me` 的順風車（`drive_pending_mine`，**併進未讀數那一句 SQL**，零額外往返）；
+  零張就什麼都不做。清單在跳出來那一刻才打 **`GET /api/me/drive-pending`**
+  （只看 `uploaded_by = 自己`，上限 200，`no-store`，相簿名字另外整張撈 Album 在 JS 對）。
+- ⚠️⚠️ 條件字串是 **`DRIVE_PENDING_COND`**（`index.ts`），`/api/photos/drive-pending`、
+  `/me` 的張數、`/me/drive-pending` **三處共用同一個**。0030 的部分索引
+  `idx_photo_drive_pending_uploader` 的 WHERE **跟它一字一句一樣** —— 改其中一邊不改另一邊，
+  SQLite 就用不到那顆索引，每個人每次進站變成全表掃 Photo。
+  ⚠️ 不開放的照片（看不到的人）要另外加 `AND restricted = 0`，不然會叫人補一張他自己看不到的。
+- 「每次登入」＝ **sessionStorage 記號** `drive_pending_notice_shown:<uid>`：同一個分頁換頁不再跳；
+  **登出（uid 從有變成 null）才清掉**。⚠️ `/me` 回來之前 user 也是 null，只看「現在是 null」
+  的話每次重新整理都會清記號再跳一次。
+- 點「看照片 ↗」收成一顆藥丸（不是關掉），看完回來點藥丸再打開。連結是
+  `/album?id=<相簿>&photo=<id>`（靜態匯出沒有 `[id]` 那一層）。
+- 補的方法寫在窗裡：**把同一個原始檔再拖進那本相簿一次**（`incompleteTwin()` 只補缺的那一半）。
+  ⚠️ 列得出來的只有「站上有這一格、Drive 缺一半」的。整張沒傳上去的、Drive 失敗被回滾的影片，
+  站上沒有那一列 —— 那些在上傳當下已經逐檔 alert 過了。
+- 位置在**下方置中**、`z-index: 950`（左下是提示那一疊、右下是 FAB 與回頂端鈕；在燈箱底下）。
 
 ## `/admin` 的版面
 

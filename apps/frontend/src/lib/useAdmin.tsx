@@ -59,6 +59,8 @@ interface AuthValue {
   canUseTools: boolean;
   /** 右上角紅點上的數字。跟著 /auth/me 一起回來，不另外打一支 */
   unreadNotifications: number;
+  /** 我傳的還缺 Drive 備份的張數（見 DrivePendingNotice）。跟著 /auth/me 回來 */
+  drivePendingMine: number;
   /**
    * 地圖上「兩個人這一趟算不算一起出遊」的貼路重疊率門檻（%）。站長在 /admin 用拉桿調。
    * 只有 `/map` 用得到，但走 /auth/me 就是零額外請求，所以放在這裡而不是另開一支。
@@ -156,7 +158,7 @@ const AuthContext = createContext<AuthValue | null>(null);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AuthState>({
     admin: false, guest: false, canViewMap: false,
-    canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
+    canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0, drivePendingMine: 0,
     convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false,
     babyAvatar: null, babyAvatarFacing: 'left', canCopyPhotos: true, user: null,
   });
@@ -180,7 +182,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // 送出必定 403 的輸入框。等 checkAuth() 回來再說
       setState({
         admin: true, guest: false, canViewMap: true,
-        canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
+        canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0, drivePendingMine: 0,
         // 遮罩也不樂觀關掉：真正的值等 checkAuth() 回來。猜錯的方向要是
         // 「先攤開來再糊回去」，那一下就白做了
         convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: true,
@@ -260,7 +262,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     resetFeatured();
     setState({
       admin: false, guest: false, canViewMap: false,
-      canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0,
+      canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0, drivePendingMine: 0,
       convoyOverlapPct: CONVOY_PCT_DEFAULT, restrictedBlur: false,
       babyAvatar: null, babyAvatarFacing: 'left', canCopyPhotos: true, user: null,
     });
@@ -317,6 +319,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     canComment: state.canComment,
     canUseTools: state.canUseTools,
     unreadNotifications: state.unreadNotifications,
+    drivePendingMine: state.drivePendingMine,
     convoyOverlapPct: state.convoyOverlapPct,
     restrictedBlur: state.restrictedBlur,
     babyAvatar: state.babyAvatar,

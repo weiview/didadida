@@ -1,0 +1,117 @@
+/*
+ * 「你傳的檔案還沒備份完整」小窗（DrivePendingNotice）。
+ *
+ * 位置：畫面下方置中。左下角是上線／上傳提示那一疊、右下角是回到頂端鈕與相簿的 FAB。
+ * z-index 950：壓在右上角那一排（925／帳號牌 930）上面，但在燈箱底下 ——
+ * 點「看照片」之後它已經收成藥丸，不該擋住正在看的那張。
+ */
+
+.panel {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 950;
+  width: min(440px, calc(100vw - 32px));
+  max-height: min(70vh, 520px);
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  color: #222;
+  border-radius: 14px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.28);
+  border-top: 4px solid #e0a100;
+  padding: 12px 14px;
+  font-size: 14px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.close {
+  border: none;
+  background: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: #666;
+  padding: 2px 6px;
+}
+
+.note {
+  margin: 6px 0;
+  color: #555;
+  line-height: 1.45;
+  font-size: 13px;
+}
+
+.error {
+  margin: 6px 0;
+  color: #c62828;
+  font-size: 13px;
+}
+
+.list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid #eee;
+}
+
+.rowText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta {
+  font-size: 12px;
+  color: #777;
+}
+
+.link {
+  flex-shrink: 0;
+  font-size: 13px;
+  color: #1565c0;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.pill {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 950;
+  border: none;
+  border-radius: 999px;
+  padding: 9px 16px;
+  background: #e0a100;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  white-space: nowrap;
+}

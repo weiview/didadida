@@ -460,6 +460,48 @@ function isSignedMediaPath(pathname: string): boolean {
 }
 
 /**
+ * `/video` 與 `/motion` 的強驗證器。
+ *
+ * ⚠️ Chrome 的媒體快取**只在回應帶著強驗證器時才存 206 的片段**（非 weak 的 ETag，
+ * 或比 Date 早 60 秒以上的 Last-Modified）。Drive 的 `alt=media` 兩樣都不給，
+ * 於是每播完一次再按播放就整支重新經 Worker → Drive 取一遍 —— 看起來就是
+ * 「每次播放結束又要重新緩衝」，而且每一次都是一趟 Workers 請求＋ Drive 取檔。
+ *
+ * ETag 用 Drive file id 就夠：影片的位元組綁在那個 id 上，換檔就是換 id。
+ * Last-Modified 是一個固定的過去時間，只為了讓它「夠舊」。
+ */
+function mediaValidators(tag: string): Record<string, string> {
+  return {
+    ETag: `"${tag}"`,
+    "Last-Modified": "Thu, 01 Jan 2026 00:00:00 GMT",
+  };
+}
+
+/**
+ * If-None-Match 對得上就直接 304，不碰 Drive。
+ * ⚠️ 一定要排在權限（不開放、訪客）那幾道閘**後面** —— 304 等於承認「這個編號上有東西」。
+ * 帶 Range 也照回 304：RFC 9110 規定 If-None-Match 先於 Range 判斷。
+ */
+function notModifiedResponse(request: Request, validators: Record<string, string>): Response | null {
+  const inm = request.headers.get("If-None-Match");
+  if (!inm) return null;
+  const etag = validators.ETag;
+  const hit = inm.split(",").some((t) => {
+    const v = t.trim().replace(/^W\//, "");
+    return v === etag || v === "*";
+  });
+  if (!hit) return null;
+  return new Response(null, {
+    status: 304,
+    headers: {
+      ...validators,
+      "Cache-Control": "private, max-age=31536000, immutable",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
+
+/**
  * 地圖上每個人的軌跡顏色。固定調色盤，家人自己從裡面挑一個（見 PUT /api/me）。
  *
  * 為什麼是固定清單而不是自由取色：這幾個顏色是挑過的 —— 在 OpenFreeMap positron
@@ -748,6 +790,17 @@ const canSeeRestricted = (actor: Actor | null): boolean => !!actor?.canManageOth
 
 /** WHERE 片段。用到它的 SQL 必須把 Photo 別名為 `p`（跟 LOCAL_TIME_EXPR 同一個規矩） */
 const RESTRICTED_VISIBLE_COND = "p.restricted = 0";
+
+/**
+ * 「Drive 上還缺一半」的條件（照片要 4K ＋原始檔兩份，影片與 GIF 只有原始檔一份）。
+ * 理由見 `/api/photos/drive-pending` 那一段。Photo **不帶別名**。
+ *
+ * ⚠️ 0030 的部分索引 idx_photo_drive_pending_uploader 的 WHERE 就是這一句，
+ *    **改這裡要另加一支 migration 重建那個索引**，不然 `/api/auth/me` 的
+ *    「我還缺幾張」會安靜地退回讀過他傳過的每一張。
+ */
+const DRIVE_PENDING_COND = `((media_type IN ('video','gif') AND drive_original_id IS NULL)
+      OR (media_type NOT IN ('video','gif') AND (drive_file_id IS NULL OR drive_original_id IS NULL)))`;
 
 /*
  * ── 訪客看得到哪幾本相簿（0027）─────────────────────────────────────────────
@@ -3488,6 +3541,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
          */
         const canViewComments = actor !== null ? actor.canViewComments : await guestCanViewComments(env);
         let unread = 0;
+        let drivePendingMine = 0;
         if (actor?.uid != null) {
           /*
            * ⚠️⚠️ 未讀數要跟 /api/notifications 那支**用同一套條件**，不然紅點會
@@ -3514,9 +3568,20 @@ if (method === "POST" && pathname === "/api/verify-password") {
           parts.push(`(SELECT COUNT(*) FROM UploadEvent
                         WHERE user_id != ? AND created_at > ${seenExpr})`);
           unreadBinds.push(actor.uid, actor.uid);
-          const row = await env.DB.prepare(`SELECT ${parts.join(" + ")} AS n`)
-            .bind(...unreadBinds).first<any>();
+          /*
+           * 「我自己傳的、Drive 還缺一半的」有幾張 —— 前端那個紅字小窗靠它決定跳不跳
+           * （DrivePendingNotice）。**併在同一句**，理由同上：零次額外往返。
+           * 走 0030 的部分索引，讀到的列數就是缺件的張數。
+           * ⚠️ 只算 `uploaded_by = 我`：NULL 那些是 0009 之前的舊列＝站長的，
+           *    而站長本來就在 /admin 看得到整份清單。
+           * ⚠️ 看不到不開放照片的人不算那幾張 —— 連結點過去是一格不存在的照片。
+           */
+          const pendingRestricted = canSeeRestricted(actor) ? "" : " AND restricted = 0";
+          const row = await env.DB.prepare(`SELECT ${parts.join(" + ")} AS n,
+              (SELECT COUNT(*) FROM Photo WHERE uploaded_by = ? AND ${DRIVE_PENDING_COND}${pendingRestricted}) AS pending`)
+            .bind(...unreadBinds, actor.uid).first<any>();
           unread = Number(row?.n ?? 0);
+          drivePendingMine = Number(row?.pending ?? 0);
         }
         return new Response(JSON.stringify({
           // 白名單被撤掉的人 token 還沒過期 —— 這裡就要說 admin:false，
@@ -3530,6 +3595,8 @@ if (method === "POST" && pathname === "/api/verify-password") {
           // 訪客也永遠是 0：工具區整塊只給成員（見 migrations/0016）
           can_use_tools: actor?.canUseTools ? 1 : 0,
           unread_notifications: unread,
+          // 我傳的還缺 Drive 備份的張數（訪客永遠是 0），見 GET /api/me/drive-pending
+          drive_pending_mine: drivePendingMine,
           /*
            * 同遊判定的門檻。**刻意跟著這一條回來**，理由跟未讀數一樣：
            * 這是每次進站都會打的路由，而且值走 getSettingCached（60 秒 memo），
@@ -5647,6 +5714,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
           return new Response(JSON.stringify({ error: "Drive 未設定" }), { status: 503, headers });
         }
 
+        // 瀏覽器手上已經有這一份（見 mediaValidators）就不必再去 Drive 拿
+        const videoValidators = mediaValidators(`v-${photo.drive_original_id}`);
+        const videoNotModified = notModifiedResponse(request, videoValidators);
+        if (videoNotModified) return videoNotModified;
+
         try {
           const upstream = await fetchDriveMediaRange(
             env.GOOGLE_DRIVE_SA_KEY, photo.drive_original_id, request.headers.get("Range"),
@@ -5657,7 +5729,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
            * 不要自己算 —— 算錯的話瀏覽器會在影片中間卡住不動。
            */
           const videoHeaders = new Headers();
-          for (const h of ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag"]) {
+          for (const h of ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]) {
             const v = upstream.headers.get(h);
             if (v) videoHeaders.set(h, v);
           }
@@ -5671,6 +5743,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
            * 這裡的回應是「某個範圍」，共用快取存下來一定會餵錯給別人。
            */
           videoHeaders.set("Cache-Control", "private, max-age=31536000, immutable");
+          for (const [k, v] of Object.entries(videoValidators)) videoHeaders.set(k, v);
           return new Response(upstream.body, { status: upstream.status, headers: videoHeaders });
         } catch (e) {
           console.error("Drive 影片取檔失敗", e);
@@ -5734,6 +5807,11 @@ if (method === "POST" && pathname === "/api/verify-password") {
           return new Response(JSON.stringify({ error: "Drive 未設定" }), { status: 503, headers });
         }
 
+        // 起點也進 ETag：motion_offset 被重掃改掉的話，舊的那份就不是同一支影片了
+        const motionValidators = mediaValidators(`m-${photo.drive_original_id}-${start}`);
+        const motionNotModified = notModifiedResponse(request, motionValidators);
+        if (motionNotModified) return motionNotModified;
+
         const clientRange = request.headers.get("Range");
         let upstreamRange = `bytes=${start}-`;
         let wantPartial = false;
@@ -5785,6 +5863,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           mh.set("Access-Control-Allow-Origin", "*");
           // 同 /video：這是「某一段」，共用快取存下來一定會餵錯給別人
           mh.set("Cache-Control", "private, max-age=31536000, immutable");
+          for (const [k, v] of Object.entries(motionValidators)) mh.set(k, v);
           return new Response(upstream.body, { status: wantPartial ? 206 : 200, headers: mh });
         } catch (e) {
           console.error("Drive 動態照片取檔失敗", e);
@@ -6110,6 +6189,39 @@ if (method === "POST" && pathname === "/api/verify-password") {
        *
        * album_id 是選填的：帶了就只看那一本。
        */
+      /*
+       * 路由：我自己傳的、Drive 還缺一半的 —— 進站跳出來的那個小窗（DrivePendingNotice）。
+       *
+       * 跟 `/api/photos/drive-pending` 是同一個條件（DRIVE_PENDING_COND），差別只在
+       * **只看自己傳的**（誰傳的就讓誰知道，使用者拍板），所以任何成員都打得到。
+       * 小窗打開時才抓（`/api/auth/me` 已經帶了張數，零張就不會打這一支）。
+       * ⚠️ 不包 `withEdgeCache`，回 no-store —— 補完一張下一次就該少一列。
+       */
+      if (method === "GET" && pathname === "/api/me/drive-pending") {
+        const actor = await currentActor(request, env);
+        if (!actor?.uid) return forbidden(headers);
+        const pendingRestricted = canSeeRestricted(actor) ? "" : " AND restricted = 0";
+        const { results } = await env.DB.prepare(`
+          SELECT id, album_id, title, file_name, media_type, created_at,
+                 drive_file_id IS NOT NULL AS has_4k,
+                 drive_original_id IS NOT NULL AS has_original
+            FROM Photo
+           WHERE uploaded_by = ? AND ${DRIVE_PENDING_COND}${pendingRestricted}
+           ORDER BY id DESC LIMIT 200
+        `).bind(actor.uid).all<any>();
+        // 相簿名：整張小表撈回來在記憶體裡對（同 drive-pending，不 JOIN）
+        const { results: albumRows } = await env.DB.prepare("SELECT id, name FROM Album").all<any>();
+        const albumName = new Map<number, string>();
+        for (const a of albumRows ?? []) albumName.set(Number(a.id), String(a.name ?? ""));
+        const photos = (results ?? []).map((p: any) => ({
+          ...p,
+          album_name: albumName.get(Number(p.album_id)) ?? null,
+        }));
+        return new Response(JSON.stringify({ photos }), {
+          headers: { ...headers, "Cache-Control": "no-store" },
+        });
+      }
+
       if (method === "GET" && pathname === "/api/photos/drive-pending") {
         const drivePendingActor = await currentActor(request, env);
         if (!drivePendingActor) {
@@ -6150,10 +6262,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
          * ⚠️ 列表與 COUNT **必須用同一個條件**，不然「剩幾張」永遠歸不了零。
          *    共用底下這個字串就是為了讓它們沒辦法不一致。
          */
-        const drivePendingCond = `(
-             (media_type IN ('video','gif') AND drive_original_id IS NULL)
-          OR (media_type NOT IN ('video','gif') AND (drive_file_id IS NULL OR drive_original_id IS NULL))
-        )`;
+        const drivePendingCond = DRIVE_PENDING_COND;
 
         const { results: photos } = await env.DB.prepare(`
           SELECT id, album_id, uploaded_by, url, file_name, title, media_type, thumb_url,

@@ -7,6 +7,7 @@ import AccountBadge from "@/components/AccountBadge";
 import PresenceToasts from "@/components/PresenceToasts";
 import CopyGuard from "@/components/CopyGuard";
 import TopRightBar from "@/components/TopRightBar";
+import DrivePendingNotice from "@/components/DrivePendingNotice";
 import { AuthProvider } from "@/lib/useAdmin";
 
 export const metadata: Metadata = {
@@ -49,6 +50,8 @@ export default function RootLayout({
             {/* 帳號牌左邊那一排：「★ 精選」＋「誰在線上」。
                 線上那條**不自己開輪詢**，只是看 PresenceToasts 開的那一份快照 */}
             <TopRightBar />
+            {/* 「你傳的檔案還沒備份完整」—— 只跳給上傳的那個人，每次登入一次 */}
+            <DrivePendingNotice />
             <main>{children}</main>
             <ScrollToTopButton />
           </AccessGate>
