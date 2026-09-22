@@ -2116,6 +2116,66 @@ OR (media_type != 'video' AND (drive_file_id IS NULL OR drive_original_id IS NUL
   - 「單獨比對一本」＋逐張明細＋逐本結果收進一個 `<details>`。使用者要的是
     「內容簡化」，不是把功能砍掉。
 
+## Android App（`apps/android`）
+
+2026-09-22 加的。**一層 WebView 包著這個站，只有「上傳」是原生的**：前景服務
+`UploadService` 在背景把整批傳完（關掉畫面、切去別的 App 都照樣傳）。
+APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 商店，App 自己檢查更新。
+
+| | dev | prod |
+|---|---|---|
+| applicationId | `tw.didadida.app.dev` | `tw.didadida.app` |
+| 站台／API | dev 那組 | prod 那組 |
+| 登入回呼 scheme | `didadida-dev://auth` | `didadida://auth` |
+| 更新清單 | `/app/version-dev.json` | `/app/version-prod.json` |
+
+兩支 APK 可以同時裝在同一台手機上。
+
+- **網頁與 App 的接點只有兩個**（`apps/frontend/src/lib/nativeApp.ts`）：
+  `window.DidadidaApp.pickAndUpload(albumId, token)`（相簿頁的「上傳照片」在 App 裡改叫它），
+  以及原生傳完一批之後丟的 `didadida:native-upload-done`（相簿頁接到就 `loadData({silent:true})`）。
+  一般瀏覽器裡 `window.DidadidaApp` 不存在，走原本那條。
+- ⚠️⚠️ **上傳管線有兩份實作：網頁的 TS 與 App 的 Kotlin**（`app/src/main/java/tw/didadida/app/upload/`：
+  `Ingest`／`Media`（縮圖）／`Phash`／`MotionPhoto`／`VideoMeta`／`Geo`／`Drive`／`Api`）。
+  **改了 `ingestSources`、`uploadPhoto`、`lib/drive.ts`、縮圖、phash、動態照片、影片 metadata、
+  重複偵測，App 那一份要跟著改並發一版**（`version.properties` 的 `versionCode` +1）。
+  不改的話 App 傳上來的東西會跟網頁傳的長得不一樣，而且錯得很安靜。
+  ⚠️ 特別是 **phash 要算同一顆 400px 縮圖**、`file_hash` 要算同一份 800px 位元組 ——
+  不一樣的話 App 傳的跟網頁傳的永遠比不到一起。
+- **重複的那幾張**由 `DuplicateActivity` 一張一張問（網頁 `GoogleSyncConflictModal` 的原生版，
+  跳過／兩張都留／取代所選）。`DupStore.close()` 要在排 `finishDups` **之前**叫 ——
+  不然 `MainActivity.onResume` 會在背景還沒收完時又把同一批叫出來。
+- **Google 登入走 Custom Tab，不是 WebView**（Google 擋 WebView 的 OAuth）。
+  App 攔下 `/api/auth/google/login`，補一個一次性亂數 `&app=<nonce>`；後端回呼時看到
+  `app` 就導回 `<scheme>://auth?n=<nonce>#token=…`，App 驗過 nonce 才把 token 交給 WebView。
+  ⚠️ nonce 對不上一律丟掉 —— 那是別的 App 也能註冊的 scheme。
+- **Google 相簿匯入仍走網頁那條 JS**（Picker popup 在 WebView 裡以 `onCreateWindow` 開），
+  沒有原生版。
+- **更新**：`Updater` 最多 6 小時問一次 `version-<flavor>.json`，有新版跳一個對話框、
+  下載到 App 自己的目錄、交給系統安裝器。⚠️ 檔名一定要帶 flavor：dev 與 prod 兩個 Pages
+  部署吃的是**同一份 `public/`**，只放一份會叫 dev 的 App 去裝 prod 的 APK。
+- ⚠️⚠️ **簽章金鑰 `apps/android/keystore.jks` ＋ `keystore.properties`（gitignore，不在 repo）
+  一定要另外備份。** 弄丟了就再也發不出「裝得上去的更新」—— Android 只接受同一把金鑰簽的新版，
+  每一台手機都得先解除安裝（連同 App 裡的資料）再重裝。**永遠不要讀出或印出 `keystore.properties`。**
+
+### 建置與發版
+
+工具鏈：JDK 17 在 `%LOCALAPPDATA%\Android\jdk\`、SDK 在 `%LOCALAPPDATA%\Android\Sdk`
+（`apps/android/local.properties`，gitignore）。Gradle wrapper 8.11.1。
+
+```bash
+# 1. version.properties 的 versionCode +1（versionName 照需要改）
+# 2. 編兩支 release、放進 apps/frontend/public/app/、寫 version-<flavor>.json
+powershell -ExecutionPolicy Bypass -File apps/android/publish-apk.ps1
+# 3. 照「部署」那一節部署前端（dev 與 prod 兩邊）
+```
+
+- ⚠️ **`public/app/*.apk` 在 .gitignore 裡**，而 Pages 是 direct upload（整站覆寫）——
+  換一台電腦部署前端前**先跑一次 `publish-apk.ps1`**，不然那一次部署會把線上的 APK 整個拿掉，
+  App 的更新檢查拿到新版號卻下載 404。
+- ⚠️ `publish-apk.ps1` 要存成 **UTF-8 含 BOM**（Windows PowerShell 5.1 讀沒 BOM 的檔會當 ANSI，中文整支解析失敗）。
+- `version-*.json` 一定**不帶 BOM**（`JSONObject` 解不開）。
+
 ## 一進來就該知道的坑
 
 1. **`geo.ts` 與 `videoMeta.ts` 各有兩份副本**（`apps/backend/src/` 與 `apps/frontend/src/lib/`），

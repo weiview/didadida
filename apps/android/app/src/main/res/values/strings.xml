@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">滴答滴答</string>
+    <string name="dup_title">可能重複的照片</string>
+    <string name="channel_upload">上傳</string>
+    <string name="channel_notice">通知</string>
+</resources>

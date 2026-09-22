@@ -2891,7 +2891,7 @@ const GOOGLE_LOGIN_SCOPES = [
  */
 function googleAuthUrl(
   env: Env, origin: string,
-  opts: { albumId: string; redirectHost: string; consent: boolean; retried: boolean },
+  opts: { albumId: string; redirectHost: string; consent: boolean; retried: boolean; app?: string },
 ): string {
   const params = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID || "",
@@ -2902,6 +2902,7 @@ function googleAuthUrl(
     prompt: opts.consent ? "consent select_account" : "select_account",
     state: JSON.stringify({
       albumId: opts.albumId, redirectHost: opts.redirectHost, retried: opts.retried,
+      ...(opts.app ? { app: opts.app } : {}),
     }),
   });
   if (opts.consent) params.set("include_granted_scopes", "true");
@@ -2915,6 +2916,12 @@ function googleAuthUrl(
  * 而導回的目標原本是直接取 Referer／Origin —— 那是攻擊者的網頁決定得了的東西，
  * 等於任何網站都能把你騙去登入然後收走 token。只能從這張表裡挑。
  */
+/** App 登入的一次性亂數：只收 16–64 個網址安全字元，其他一律當沒有 */
+function appAuthNonce(v: unknown): string {
+  const s = typeof v === "string" ? v : "";
+  return /^[A-Za-z0-9_-]{16,64}$/.test(s) ? s : "";
+}
+
 const ALLOWED_ORIGINS = [
   "https://didadida-frontend.pages.dev",
   "https://dev.didadida-frontend.pages.dev",
@@ -8131,8 +8138,14 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
          * token 都沒有」才補跳一次（見下面「收下這個人自己的授權」）。
          * 精準到人，也不必為了站長的 Drive 讓全家人多按一次同意。
          */
+        /*
+         * Android App（apps/android）走 Custom Tab 登入：WebView 裡 Google 不給登入。
+         * `app` 是 App 自己產的一次性亂數，回呼時整段導回 `didadida://auth`，
+         * App 只收它自己發出去的那一個（見 appAuthNonce 與 apps/android 的 MainActivity）。
+         */
+        const app = appAuthNonce(urlObj.searchParams.get("app"));
         return Response.redirect(googleAuthUrl(env, new URL(request.url).origin, {
-          albumId, redirectHost, consent: false, retried: false,
+          albumId, redirectHost, consent: false, retried: false, app,
         }), 302);
       }
 
@@ -8145,6 +8158,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         let redirectHost = "";
         // 補跳同意畫面那一次會把 retried 帶進來。見下面「收下這個人自己的授權」
         let retried = false;
+        let app = "";
         try {
           const parsed = JSON.parse(decodeURIComponent(rawState));
           if (parsed && typeof parsed === "object") {
@@ -8157,6 +8171,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
             const candidate = String(parsed.redirectHost || "");
             if (ALLOWED_ORIGINS.includes(candidate)) redirectHost = candidate;
             retried = parsed.retried === true;
+            app = appAuthNonce(parsed.app);
           }
         } catch (e) {}
 
@@ -8178,7 +8193,17 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
             ? "https://dev.didadida-frontend.pages.dev"
             : "https://didadida-frontend.pages.dev";
         const baseFrontEndUrl = redirectHost || fallbackFrontEnd;
-        const target = albumId ? `${baseFrontEndUrl}/album?id=${albumId}` : `${baseFrontEndUrl}/`;
+        /*
+         * App 那一條導回自訂 scheme：fragment 一樣帶 token／authError，
+         * App 把它原封不動接到站台網址後面丟給 WebView，由 consumeAuthHash 收。
+         * ⚠️ dev worker 導的是 `didadida-dev://`：兩支 APK（prod 與 dev）可以同時
+         * 裝在同一台手機上，共用一個 scheme 的話登入回來會跳出「要用哪個 App 開」。
+         */
+        const appScheme = (isLocalWorker || selfHost.startsWith("didadida-api-dev"))
+          ? "didadida-dev" : "didadida";
+        const target = app
+          ? `${appScheme}://auth?n=${app}${albumId ? `&album=${encodeURIComponent(albumId)}` : ""}`
+          : albumId ? `${baseFrontEndUrl}/album?id=${albumId}` : `${baseFrontEndUrl}/`;
 
         const clientId = env.GOOGLE_CLIENT_ID || "";
         const clientSecret = env.GOOGLE_CLIENT_SECRET || "";
@@ -8249,7 +8274,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           ).bind(admitted.user.id).first<any>();
           if (!String(stored?.t || "").trim()) {
             return Response.redirect(googleAuthUrl(env, new URL(request.url).origin, {
-              albumId, redirectHost, consent: true, retried: true,
+              albumId, redirectHost, consent: true, retried: true, app,
             }), 302);
           }
         }

@@ -66,3 +66,7 @@ git_diff.txt
 modify_backend*.py
 diff_match_patch.py
 test-upload.js
+
+# Android 安裝檔：由 apps/android/publish-apk.ps1 產生，部署前端時跟著上 Pages。
+# 幾 MB 的二進位不進 repo；version-*.json 很小，可以進
+apps/frontend/public/app/*.apk

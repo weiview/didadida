@@ -1,5 +1,6 @@
 "use client";
 
+import { nativeApp, NATIVE_UPLOAD_DONE } from "@/lib/nativeApp";
 import { useEffect, useState, useRef, Suspense, useMemo, useCallback } from "react";
 import styles from "./album.module.css";
 import TimelineRail from "./TimelineRail";
@@ -848,8 +849,28 @@ function AlbumContent() {
   };
 
   const handleUploadClick = () => {
+    // 在 Android App 裡：交給原生的前景服務傳（背景也不會斷），見 lib/nativeApp.ts
+    const app = nativeApp();
+    let token: string | null = null;
+    try { token = localStorage.getItem('admin_token'); } catch { /* 無痕模式之類的 */ }
+    if (app && id && token) {
+      app.pickAndUpload(id, token);
+      return;
+    }
     fileInputRef.current?.click();
   };
+
+  // 原生那邊傳完一批：安靜地重抓（不清空格線，捲軸留在原地）
+  const loadDataRef = useRef(loadData);
+  loadDataRef.current = loadData;
+  useEffect(() => {
+    const onDone = (e: Event) => {
+      const detail = (e as CustomEvent<{ albumId?: string }>).detail;
+      if (!detail?.albumId || String(detail.albumId) === String(id)) void loadDataRef.current({ silent: true });
+    };
+    window.addEventListener(NATIVE_UPLOAD_DONE, onDone);
+    return () => window.removeEventListener(NATIVE_UPLOAD_DONE, onDone);
+  }, [id]);
 
   /**
    * 右下角浮動鈕展開後的那串動作。`actions[0]` 貼著 FAB，所以最常用的「上傳照片」擺第一。
