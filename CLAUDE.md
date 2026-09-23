@@ -2221,6 +2221,11 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   `App.kt` 手動 `FirebaseApp.initializeApp` —— **刻意不用 google-services plugin**（那要一份進 repo 的 json）。
   **檔案不在或 `appId` 是空的 → 推播整段跳過，App 其餘照常**。換一台電腦建置前要先補這個檔，
   不然發出去的那一版推播就安靜地沒了。
+  值抄自 Firebase 主控台下載的 `google-services.prod.json`／`.dev.json`（放在 `apps/android/`，同樣 gitignore）。
+- **Firebase 專案就是 `didadida-photos`**（跟 Drive SA 同一個 GCP 專案，兩支 App 都註冊在裡面）。
+  後端送推播用的是 `GOOGLE_DRIVE_SA_KEY` 那把 `didadida-gps-reader@…`，它在 IAM 上有
+  「Firebase Cloud Messaging API 管理員」角色，FCM API 已啟用 —— 所以 `FCM_SA_KEY`／`FCM_PROJECT_ID` **沒灌**。
+  ⚠️ Firebase 自己建的 `firebase-adminsdk-fbsvc@…` **沒有用到**（我們沒有它的金鑰）。推播從 **1.0.4** 起生效。
 - **桌面小工具 `FeaturedWidget.kt`**（「本次精選」）：輪播 `GET /api/featured`，系統每 30 分鐘換一張、
   右上 ⟳ 手動換，點圖開那張照片。清單在 prefs 快取 3 小時（精選幾天才動一次），
   **不開放的一律跳過**（桌面是誰都看得到的地方），沒登入時寫「打開 App 登入後…」。
