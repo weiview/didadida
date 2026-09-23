@@ -168,16 +168,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let alive = true;
 
-    // 先收登入回呼。這一步是同步的，而且會把 token 寫進 localStorage，
-    // 一定要排在 checkAuth() 前面，不然剛登入回來的那一次會被判成沒登入
-    const back = consumeAuthHash();
-    if (back.error) setAuthError(back.error);
-    /*
-     * 剛從 Google 回來。token 已經在 localStorage 裡了，但**還是要打一次
-     * /auth/me** —— 「我是誰、能不能管別人」只有後端知道，fragment 裡沒有。
-     * 先樂觀把 admin 設成 true 讓畫面立刻可用，帳號資料隨後補上。
+    /**
+     * 收一次登入回呼：把 fragment 裡的 token 收進 localStorage，再回後端問「我是誰」。
+     * 回傳「這一次真的帶著 token 回來了」。
      */
-    if (back.admin) {
+    const adoptAuthHash = () => {
+      const back = consumeAuthHash();
+      if (back.error) setAuthError(back.error);
+      /*
+       * 剛從 Google 回來。token 已經在 localStorage 裡了，但**還是要打一次
+       * /auth/me** —— 「我是誰、能不能管別人」只有後端知道，fragment 裡沒有。
+       * 先樂觀把 admin 設成 true 讓畫面立刻可用，帳號資料隨後補上。
+       */
+      if (!back.admin) return false;
       // 留言那兩項不跟著樂觀開放：它們是每人一欄的權限，猜錯會端出一個
       // 送出必定 403 的輸入框。等 checkAuth() 回來再說
       setState({
@@ -193,15 +196,35 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setState(next);
         setChecking(false);
       });
-      return () => { alive = false; };
-    }
+      return true;
+    };
+
+    // 先收登入回呼。這一步是同步的，而且會把 token 寫進 localStorage，
+    // 一定要排在 checkAuth() 前面，不然剛登入回來的那一次會被判成沒登入
+    if (adoptAuthHash()) return () => { alive = false; };
+
+    /*
+     * ⚠️⚠️ **Android App 那條路回來時，網址只差一個 fragment。**
+     * `MainActivity.handleAuthIntent` 叫的是 `web.loadUrl("<站台>/#token=…")`，
+     * 而 WebView 本來就停在 `<站台>/`（登入那一下被 `shouldOverrideUrlLoading`
+     * 攔去開 Custom Tab，這一頁根本沒動過）—— 同一份文件只換 hash 是
+     * **same-document navigation：整頁不會重載、JS 不會重跑**，上面那一次
+     * `consumeAuthHash()` 早就跑完了。沒有這支監聽器的話 token 進不了
+     * localStorage，畫面就停在進站閘門上，看起來像「選完帳號又跳回一開始的畫面」。
+     * 瀏覽器那條是整頁導轉（走的是上面那一次），掛著這支不影響它。
+     */
+    const onHashChange = () => { adoptAuthHash(); };
+    window.addEventListener('hashchange', onHashChange);
 
     checkAuth().then((next) => {
       if (!alive) return;
       setState(next);
       setChecking(false);
     });
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+      window.removeEventListener('hashchange', onHashChange);
+    };
   }, []);
 
   /** 整頁跳去 Google。`albumId` 只是為了登入後回到原本那本相簿 */

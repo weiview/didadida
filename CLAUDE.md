@@ -2149,6 +2149,14 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   App 攔下 `/api/auth/google/login`，補一個一次性亂數 `&app=<nonce>`；後端回呼時看到
   `app` 就導回 `<scheme>://auth?n=<nonce>#token=…`，App 驗過 nonce 才把 token 交給 WebView。
   ⚠️ nonce 對不上一律丟掉 —— 那是別的 App 也能註冊的 scheme。
+  ⚠️⚠️ **交回 WebView 那一下，網址只差一個 fragment，整頁不會重載。**
+  `handleAuthIntent` 叫的是 `web.loadUrl("<站台>/#token=…")`，而 WebView 本來就停在
+  `<站台>/`（按登入那一下被 `shouldOverrideUrlLoading` 攔去開 Custom Tab，這一頁根本
+  沒動過）—— 同一份文件只換 hash 是 same-document navigation，**JS 不會重跑**。
+  所以 `AuthProvider` 除了掛載時那一次，還要掛一支 **`hashchange`** 再收一次
+  `consumeAuthHash()`。少了它 token 進不了 localStorage，畫面停在進站閘門上，
+  看起來就是「選完 Google 帳號又跳回一開始的畫面」（2026-09-23 修）。
+  ⚠️ `?album=` 那條是另一個網址所以會整頁載入，**症狀只在從首頁登入時出現**。
 - **Google 相簿匯入仍走網頁那條 JS**（Picker popup 在 WebView 裡以 `onCreateWindow` 開），
   沒有原生版。
 - **更新**：`Updater` 最多 6 小時問一次 `version-<flavor>.json`，有新版跳一個對話框、
