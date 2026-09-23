@@ -7,4 +7,8 @@
     <string name="channel_push_upload">有人上傳</string>
     <string name="widget_featured_label">本次精選</string>
     <string name="widget_featured_desc">輪播站上的本次精選，點一下開那張照片</string>
+    <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
+    <string name="whats_new">• 手機最上面的狀態列（時間、電量）不再蓋住「精選」、「誰在線上」、帳號與燈箱左上角的鎖，按得到了
+• 打字時鍵盤不會再蓋住留言輸入框
+• 以後每次更新，都會像這樣跳出這一版改了哪些地方</string>
 </resources>

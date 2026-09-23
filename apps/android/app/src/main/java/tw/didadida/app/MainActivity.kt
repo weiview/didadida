@@ -24,6 +24,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import tw.didadida.app.push.Push
 import tw.didadida.app.upload.UploadEvents
 import tw.didadida.app.upload.UploadService
@@ -98,6 +102,7 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
         web = WebView(this)
         root.addView(web, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         setContentView(root)
+        SystemBars.apply(this, root) { customView != null }
 
         with(web.settings) {
             javaScriptEnabled = true
@@ -135,6 +140,7 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
                 web.loadUrl(Config.SITE + "/")
             }
         }
+        WhatsNew.maybeShow(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -314,12 +320,20 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
             customCallback = callback
             view.setBackgroundColor(Color.BLACK)
             root.addView(view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            // 全螢幕影片吃滿整個畫面：不墊狀態列、把系統列藏起來（從邊緣滑一下叫得回來）
+            ViewCompat.requestApplyInsets(root)
+            WindowCompat.getInsetsController(window, root).apply {
+                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                hide(WindowInsetsCompat.Type.systemBars())
+            }
         }
 
         override fun onHideCustomView() {
             customView?.let { root.removeView(it) }
             customView = null
             customCallback = null
+            WindowCompat.getInsetsController(window, root).show(WindowInsetsCompat.Type.systemBars())
+            ViewCompat.requestApplyInsets(root)
         }
     }
 

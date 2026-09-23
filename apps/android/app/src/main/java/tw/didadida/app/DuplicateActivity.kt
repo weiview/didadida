@@ -58,6 +58,7 @@ class DuplicateActivity : AppCompatActivity() {
         }
         scroll.addView(content)
         setContentView(scroll)
+        SystemBars.apply(this, scroll)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             // 返回鍵＝這一張跳過（不做任何事），繼續問下一張；要全部跳過用底下那顆

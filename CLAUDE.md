@@ -2231,13 +2231,24 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   **不開放的一律跳過**（桌面是誰都看得到的地方），沒登入時寫「打開 App 登入後…」。
   ⚠️ KDoc 裡不要寫 `/api/photos/view/*` —— Kotlin 的註解會巢狀，`/*` 會開一個永遠關不掉的註解。
 
+### 狀態列與「這一版改了什麼」（1.0.5）
+
+- ⚠️⚠️ **targetSdk 35 在 Android 15 上強制 edge-to-edge**：WebView 畫到狀態列底下，
+  右上角那一排（精選、誰在線上、帳號牌）與燈箱左上角的鎖整個被蓋住；`adjustResize` 也跟著失效。
+  `SystemBars.apply()` 把 systemBars＋displayCutout＋**ime** 的 inset 墊成 padding（不墊 ime 鍵盤會蓋住留言框），
+  狀態列圖示設成深色。MainActivity 與 DuplicateActivity 都要掛；**全螢幕影片時不墊**（`customView != null`），
+  進出全螢幕要 `requestApplyInsets(root)`。
+- 更新後第一次打開跳一次公告：`WhatsNew.maybeShow()`，文字是 `R.string.whats_new`
+  （**每發一版就改寫那一段，只寫這一版的**）。看過的版號記在 prefs `whats_new_seen`；
+  全新安裝（`firstInstallTime == lastUpdateTime`）不跳。靜默更新的「已更新」通知（`UpdatedReceiver`）也顯示同一段。
+
 ### 建置與發版
 
 工具鏈：JDK 17 在 `%LOCALAPPDATA%\Android\jdk\`、SDK 在 `%LOCALAPPDATA%\Android\Sdk`
 （`apps/android/local.properties`，gitignore）。Gradle wrapper 8.11.1。
 
 ```bash
-# 1. version.properties 的 versionCode +1（versionName 照需要改）
+# 1. version.properties 的 versionCode +1（versionName 照需要改），並改寫 strings.xml 的 whats_new
 # 2. 編兩支 release、放進 apps/frontend/public/app/、寫 version-<flavor>.json
 powershell -ExecutionPolicy Bypass -File apps/android/publish-apk.ps1
 # 3. 照「部署」那一節部署前端（dev 與 prod 兩邊）
