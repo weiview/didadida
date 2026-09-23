@@ -152,6 +152,18 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
         Updater.check(this)
     }
 
+    override fun onStart() {
+        super.onStart()
+        visible = true
+    }
+
+    override fun onStop() {
+        visible = false
+        // 離開 App 才裝新版：安裝會把行程殺掉，開著的時候裝等於 App 當場消失
+        Updater.installIfReady(this)
+        super.onStop()
+    }
+
     override fun onPause() {
         if (UploadEvents.listener === this) UploadEvents.listener = null
         super.onPause()
@@ -318,6 +330,8 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
     }
 
     companion object {
+        /** 畫面在不在前景（onStart～onStop）。`Updater`／`InstallReceiver` 用它決定裝不裝、怎麼問 */
+        @Volatile var visible = false
         private const val KEY_NONCE = "auth_nonce"
     }
 }

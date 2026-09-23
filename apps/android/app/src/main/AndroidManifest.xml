@@ -57,5 +57,14 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+        <!-- 自我更新：PackageInstaller 的安裝結果，只收自己發的 PendingIntent -->
+        <receiver android:name=".InstallReceiver" android:exported="false" />
+
+        <!-- 更新裝好之後系統送給新版的那一則，發「已更新」通知並清掉安裝檔 -->
+        <receiver android:name=".UpdatedReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

@@ -44,6 +44,7 @@ class UploadService : Service() {
         super.onCreate()
         nm = getSystemService(NotificationManager::class.java)
         ensureChannels(this)
+        running = true
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -82,6 +83,9 @@ class UploadService : Service() {
 
     override fun onDestroy() {
         worker.shutdown()
+        running = false
+        // 更新等在上傳後面：App 已經不在前景的話，收工這一刻就是裝新版的時機
+        tw.didadida.app.Updater.installIfReady(applicationContext)
         super.onDestroy()
     }
 
@@ -247,6 +251,8 @@ class UploadService : Service() {
     }
 
     companion object {
+        /** 服務活著＝有東西在傳。`Updater` 看它決定能不能裝新版（安裝會殺掉行程） */
+        @Volatile var running = false
         const val ACTION_UPLOAD = "tw.didadida.app.UPLOAD"
         const val ACTION_DUP = "tw.didadida.app.DUP"
         const val ACTION_DUP_FINISH = "tw.didadida.app.DUP_FINISH"

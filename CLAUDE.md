@@ -2177,8 +2177,18 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   ⚠️ `?album=` 那條是另一個網址所以會整頁載入，**症狀只在從首頁登入時出現**。
 - **Google 相簿匯入仍走網頁那條 JS**（Picker popup 在 WebView 裡以 `onCreateWindow` 開），
   沒有原生版。
-- **更新**：`Updater` 最多 6 小時問一次 `version-<flavor>.json`，有新版跳一個對話框、
-  下載到 App 自己的目錄、交給系統安裝器。⚠️ 檔名一定要帶 flavor：dev 與 prod 兩個 Pages
+- **更新**：`Updater` 最多 **1 小時**問一次 `version-<flavor>.json`（`onResume`），有新版就在背景
+  下載到 App 自己的目錄，驗過套件名與版號（`getPackageArchiveInfo`）才算數。
+  **Android 12+ 是靜默更新**（1.0.2 起）：等使用者**離開 App**（`MainActivity.onStop`）才用
+  `PackageInstaller` ＋ `USER_ACTION_NOT_REQUIRED` 裝，裝完由新版的 `UpdatedReceiver`
+  （`MY_PACKAGE_REPLACED`）發一則「已更新到 x.y.z」並清掉 APK。Android 11 以下照舊前景問一次。
+  ⚠️⚠️ **不可以在 App 開著時裝**（安裝會殺行程、不會自己重開），**上傳中或還有重複照片沒問完時
+  也不裝**（`busy()`）—— `UploadService.onDestroy` 收工時會再叫一次 `installIfReady()`。
+  ⚠️ 系統有權照樣要確認（`STATUS_PENDING_USER_ACTION`，`InstallReceiver` 接）：在前景直接端出
+  確認畫面，在背景改發「點這裡安裝」通知（Android 14 不准背景啟動 Activity）。
+  ⚠️ 前提是「允許安裝未知的應用程式」已經開著；沒開就跳一次請他去開。
+  「稍後」只是這一次不裝，**不會永久跳過那一版**。
+  ⚠️ 檔名一定要帶 flavor：dev 與 prod 兩個 Pages
   部署吃的是**同一份 `public/`**，只放一份會叫 dev 的 App 去裝 prod 的 APK。
 - ⚠️⚠️ **簽章金鑰 `apps/android/keystore.jks` ＋ `keystore.properties`（gitignore，不在 repo）
   一定要另外備份。** 弄丟了就再也發不出「裝得上去的更新」—— Android 只接受同一把金鑰簽的新版，
