@@ -3,4 +3,8 @@
     <string name="dup_title">可能重複的照片</string>
     <string name="channel_upload">上傳</string>
     <string name="channel_notice">通知</string>
+    <string name="channel_push_online">有人上線</string>
+    <string name="channel_push_upload">有人上傳</string>
+    <string name="widget_featured_label">本次精選</string>
+    <string name="widget_featured_desc">輪播站上的本次精選，點一下開那張照片</string>
 </resources>

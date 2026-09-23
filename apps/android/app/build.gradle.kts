@@ -19,6 +19,23 @@ val keystoreProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 
+/**
+ * Firebase（推播）的四個識別值，照 flavor 分開：`prod.appId=…`、`dev.appId=…`。
+ * ⚠️ 刻意**不用 google-services 外掛**：它要一份 google-services.json 進 repo，
+ *    而我們只需要四個字串，`Push.init()` 自己拿它們 `FirebaseApp.initializeApp`。
+ * 檔案不在（或某個 flavor 沒填）時值是空字串 → App 照常運作，只是沒有推播。
+ */
+val firebaseProps = Properties().apply {
+    val f = rootProject.file("firebase.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun com.android.build.api.dsl.ProductFlavor.firebaseFields(flavor: String) {
+    for ((field, key) in listOf("FCM_API_KEY" to "apiKey", "FCM_APP_ID" to "appId",
+                                "FCM_PROJECT_ID" to "projectId", "FCM_SENDER_ID" to "senderId")) {
+        buildConfigField("String", field, "\"" + firebaseProps.getProperty("$flavor.$key", "") + "\"")
+    }
+}
+
 android {
     namespace = "tw.didadida.app"
     compileSdk = 35
@@ -60,6 +77,7 @@ android {
             manifestPlaceholders["authScheme"] = "didadida"
             buildConfigField("String", "SITE_URL", "\"https://didadida-frontend.pages.dev\"")
             buildConfigField("String", "API_URL", "\"https://didadida-api.didadida.workers.dev/api\"")
+            firebaseFields("prod")
         }
         create("dev") {
             dimension = "env"
@@ -69,6 +87,7 @@ android {
             manifestPlaceholders["authScheme"] = "didadida-dev"
             buildConfigField("String", "SITE_URL", "\"https://dev.didadida-frontend.pages.dev\"")
             buildConfigField("String", "API_URL", "\"https://didadida-api-dev.didadida.workers.dev/api\"")
+            firebaseFields("dev")
         }
     }
 
@@ -95,4 +114,5 @@ dependencies {
     implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("com.google.firebase:firebase-messaging:24.1.0")
 }

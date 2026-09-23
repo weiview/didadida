@@ -13,6 +13,7 @@ import {
   type RangeReader,
 } from './videoMeta';
 import { readMotionOffset, MOTION_HEAD_CHUNK } from './motionPhoto';
+import { sendPush } from './fcm';
 
 export interface Env {
   DB: D1Database;
@@ -90,6 +91,14 @@ export interface Env {
    *    `viewer { accounts }` 會回 not authorized（2026-09-01 實測）。
    */
   CF_ACCOUNT_ID?: string;
+  /**
+   * Android App 推播（FCM HTTP v1）用的 service account 金鑰 JSON 全文。
+   * 沒設就退回 GOOGLE_DRIVE_SA_KEY（同一個 GCP 專案時那把 SA 加上
+   * 「Firebase Cloud Messaging API 管理員」角色就能用）。兩個都沒有就不推。見 fcm.ts
+   */
+  FCM_SA_KEY?: string;
+  /** Firebase 專案 id。沒設就用金鑰裡的 project_id */
+  FCM_PROJECT_ID?: string;
 }
 
 /** AppSetting 的 key。放這麼前面是因為路由與底下的 helper 都會用到 */
@@ -3747,6 +3756,24 @@ if (method === "POST" && pathname === "/api/verify-password") {
         if (actor.uid == null) {
           return new Response(JSON.stringify({ users: [], online_ms: PRESENCE_ONLINE_MS, self: null }),
             { headers: presenceHeaders });
+        }
+
+        /*
+         * 「XXX 上線囉」的手機推播（0032）。判定跟網頁那則提示同一套：上一次心跳
+         * 在 150 秒以前＝他離開過、現在回來了。**要排在心跳那句前面**（心跳一寫，
+         * last_seen_at 就是現在了）。條件都寫在 WHERE 裡、看 `changes`，不先讀舊值。
+         * ⚠️ last_seen_at 是 NULL（第一次進站）不推 —— 同網頁的規則：那不是「回來了」。
+         * ⚠️ 同一個人 30 分鐘內最多推一次：推播會把別人的手機叫起來。
+         */
+        const cameOnline = await env.DB.prepare(
+          `UPDATE User SET online_pushed_at = datetime('now')
+            WHERE id = ?
+              AND last_seen_at IS NOT NULL
+              AND last_seen_at < datetime('now', '-${Math.round(PRESENCE_ONLINE_MS / 1000)} seconds')
+              AND (online_pushed_at IS NULL OR online_pushed_at < datetime('now', '-30 minutes'))`
+        ).bind(actor.uid).run().catch(() => null);
+        if (cameOnline?.meta?.changes === 1) {
+          ctx.waitUntil(sendPush(env, actor.uid, { kind: "online", actor_name: actor.name ?? "" }));
         }
 
         // 心跳。40 秒內剛寫過就跳過（多分頁），見 PRESENCE_WRITE_THROTTLE_S
@@ -8153,7 +8180,55 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           console.error("upload announce failed", e);
           return new Response(JSON.stringify({ success: false }), { headers });
         }
+        // 手機推播（0032）。相簿名字在這裡查一次 —— 通知上要寫，而 App 點下去要開那一本
+        ctx.waitUntil((async () => {
+          const al = album
+            ? await env.DB.prepare("SELECT name FROM Album WHERE id = ?").bind(album).first<{ name: string }>().catch(() => null)
+            : null;
+          await sendPush(env, actor.uid!, {
+            kind: "upload",
+            actor_name: actor.name ?? "",
+            album_id: album ? String(album) : "",
+            album_name: al?.name ?? "",
+            photos: String(photos),
+            videos: String(videos),
+          });
+        })());
         return new Response(JSON.stringify({ success: true }), { headers });
+      }
+
+      /*
+       * 路由：Android App 註冊／取消推播裝置（0032）。成員限定（訪客沒有 User 那一列）。
+       * 註冊是 upsert：同一支手機換人登入時 token 不變，**擁有者跟著最後登入的人走**。
+       */
+      if ((method === "POST" || method === "DELETE") && pathname === "/api/push/register") {
+        const actor = await currentActor(request, env);
+        if (!actor) {
+          return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
+        }
+        const noStore = { ...headers, "Cache-Control": "no-store" };
+        const body = await request.json().catch(() => ({})) as { token?: unknown };
+        const token = typeof body.token === "string" ? body.token.trim() : "";
+        if (!token || token.length > 4096) {
+          return new Response(JSON.stringify({ error: "bad_token" }), { status: 400, headers: noStore });
+        }
+        if (method === "DELETE") {
+          // 只收得掉自己的：不然拿到別人 token 的人可以讓他收不到通知
+          if (actor.uid != null) {
+            await env.DB.prepare("DELETE FROM PushDevice WHERE token = ? AND user_id = ?").bind(token, actor.uid).run();
+          }
+          return new Response(JSON.stringify({ success: true }), { headers: noStore });
+        }
+        if (actor.uid == null) {
+          return new Response(JSON.stringify({ error: "no_account" }), { status: 409, headers: noStore });
+        }
+        // 同一個人、一天內註冊過的不再寫（App 每次開都會叫一次）
+        await env.DB.prepare(
+          `INSERT INTO PushDevice (token, user_id) VALUES (?, ?)
+           ON CONFLICT(token) DO UPDATE SET user_id = excluded.user_id, updated_at = datetime('now')
+            WHERE PushDevice.user_id != excluded.user_id OR PushDevice.updated_at < datetime('now', '-1 day')`
+        ).bind(token, actor.uid).run();
+        return new Response(JSON.stringify({ success: true }), { headers: noStore });
       }
 
       /*

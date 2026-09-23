@@ -8,6 +8,7 @@ import {
 } from './api';
 import { resetPresence } from './presence';
 import { resetFeatured } from './featured';
+import { nativeApp } from './nativeApp';
 
 /**
  * 全站共用的身分狀態。
@@ -276,7 +277,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setState((prev) => (prev.user ? { ...prev, user: { ...prev.user, avatar_facing: facing } } : prev));
   }, []);
 
+  // Android App：成員身分確定了就把票交給原生（推播登記、桌面小工具）。
+  // 只看 user.id —— 訪客沒有 User 那一列，推播與通知本來就沒有他的份
+  const myUid = state.user?.id;
+  useEffect(() => {
+    if (myUid == null) return;
+    const token = localStorage.getItem('admin_token');
+    if (token) nativeApp()?.setSession?.(token);
+  }, [myUid]);
+
   const logout = useCallback(() => {
+    // 要排在 clearTokens() 前面：App 撤推播用的是 App 自己存的那張舊票，但順序對了比較好懂
+    nativeApp()?.clearSession?.();
     clearTokens();
     // 上線名單也要清。留著的話下一個登入的人會先看到上一個人的名單，
     // 而且第一次抓回來會把所有人都當成「剛上線」跳一排提示

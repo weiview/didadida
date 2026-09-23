@@ -264,6 +264,7 @@ npx wrangler pages deploy out --project-name didadida-frontend --branch main --c
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google 登入整條掛掉 |
 | `GOOGLE_DRIVE_SA_KEY` | 燈箱取大圖、搬 trash、讀 GPSLogger 全掛 |
 | `CF_API_TOKEN` ＋ `CF_ACCOUNT_ID` | **只影響 `/admin` 用量條的四條 analytics**（今日 Workers 請求、R2 操作次數、D1 讀寫列數）顯示「未設定」，其餘照常。兩個是一組的，見「免費額度用量條」 |
+| `FCM_SA_KEY` ／ `FCM_PROJECT_ID`（選填） | 沒設就退回 `GOOGLE_DRIVE_SA_KEY` 與它的 `project_id`。那把 SA 沒有 FCM 權限的話 App 推播**安靜地不送**（log 有），其餘照常。見「App 推播」 |
 
 ⚠️ **`$v | wrangler secret put` 會多存一個換行**（管線加的，wrangler 不 trim），
 曾經害 Google 回 `invalid_grant`。灌任何一個 secret 都一樣，值裡不要有尾巴。
@@ -273,14 +274,14 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0031）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0032）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
 現有表：`User`／`Album`／`Photo`／`PhotoFts`(FTS5, bigram)／`Tag`／`PhotoTag`／`Favorite`／
 `TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`／`Comment`／`CommentNotify`／
 `Place`（打卡地點簿，0023，見「指定地點」）／`UploadEvent`（有人上傳的全站通知，0026，
-見「有人上傳了：全站通知」）。
+見「有人上傳了：全站通知」）／`PushDevice`（App 的 FCM token，0032，見「App 推播」）。
 **沒有多餘的表**—— `ShareLink`（從沒實作的分享連結）與 `TrackSegment`（拿掉的逐段交通工具）
 已由 0012 刪除，`database/schema.sql` 裡那兩塊 `CREATE TABLE` 也一併移除了。
 
@@ -326,7 +327,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - `Comment`／`CommentNotify` 見「留言」一節；`Place` 見「指定地點」一節；
   `UploadEvent` 見「有人上傳了：全站通知」一節。
 - **DROP TABLE 要由子表往父表**：`CommentNotify→Comment→Favorite→PhotoTag→TripSegment→
-  UploadEvent→Photo→Album→TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→User`
+  UploadEvent→Photo→Album→TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→PushDevice→User`
   （`UploadEvent` 指著 `User` 與 `Album`，要排在那兩張前面；`Place` 沒有外鍵，
   排哪裡都行）。開著外鍵時照字母序刪
   會 FK failed，而且是**跑到一半才炸**（`d1 execute --file` 是單一交易，會整包回滾）。
@@ -2193,6 +2194,37 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
 - ⚠️⚠️ **簽章金鑰 `apps/android/keystore.jks` ＋ `keystore.properties`（gitignore，不在 repo）
   一定要另外備份。** 弄丟了就再也發不出「裝得上去的更新」—— Android 只接受同一把金鑰簽的新版，
   每一台手機都得先解除安裝（連同 App 裡的資料）再重裝。**永遠不要讀出或印出 `keystore.properties`。**
+
+### App 推播（FCM）與桌面小工具
+
+2026-09-23 加的（使用者：「上傳跟上線通知都改用 FCM」）。網頁那套左下角提示照舊，
+**推播只給裝了 App、而且 App 此刻不在前景的人**（前景時 `PushService` 看 `MainActivity.visible` 直接丟掉 —— 網頁那則已經跳了）。
+
+- **後端 `src/fcm.ts` 的 `sendPush(env, excludeUid, data)`**：FCM HTTP v1，**data-only**（通知由 App 自己畫，
+  標題文字與點下去開哪一頁都在 `PushService`）、HIGH、TTL 1 小時。一個 token 一次請求、上限 40，
+  一律丟進 `ctx.waitUntil`（不擋回應）。404／`UNREGISTERED` 就地刪掉那一列。
+  ⚠️ FCM 本身免費，成本是 subrequest：一次推播 ＝ 1 次換 OAuth token（isolate 快取）＋ N 支手機。
+- 兩個觸發點：
+  - **上傳**：`POST /api/uploads/announce` 寫完 `UploadEvent` 就推 `{kind:"upload", actor_name, album_id, album_name, photos, videos}`（自己不推自己）。
+  - **上線**：`GET /api/presence` 心跳時一句**條件式 UPDATE** `User.online_pushed_at`（0032）——
+    上一次心跳超過 150 秒前（＝剛上線，跟「XXX 上線囉」同一個定義）**而且**上一次推播超過 30 分鐘前，
+    寫得進去（`changes = 1`）才推。⚠️ 30 分鐘那道是為了手機：螢幕一關一開就是一次「上線」，
+    沒有它全家的手機會被同一個人叮個不停。判斷寫在 WHERE 裡，不是先讀再寫。
+- **`PushDevice(token PK, user_id → User CASCADE)`**（0032）。`POST /api/push/register {token}` 登記、
+  `DELETE` 撤銷，**成員限定**（訪客沒有 User 那一列，同留言／presence）。token 換人登入時 upsert 改掛。
+- **App 端**：`push/Push.kt`（登記，24 小時節流）＋ `push/PushService.kt`（收訊、兩個通知頻道
+  `CHANNEL_PUSH_ONLINE`／`CHANNEL_PUSH_UPLOAD`，上傳那則點下去 `EXTRA_OPEN_PATH=/album?id=…`）。
+  票是網頁交給 App 的：`useAdmin` 成員身分確定時叫 `window.DidadidaApp.setSession(admin_token)`，
+  `logout()` 叫 `clearSession()`（App 先撤推播再清票）。兩支都是**選填的** —— 1.0.2 以前的 App 沒有。
+- ⚠️⚠️ **Firebase 設定不在 repo 裡**：`apps/android/firebase.properties`（gitignore）放
+  `prod.apiKey`／`prod.appId`／`prod.projectId`／`prod.senderId` 與同樣四個 `dev.*`，建置時烤進 BuildConfig，
+  `App.kt` 手動 `FirebaseApp.initializeApp` —— **刻意不用 google-services plugin**（那要一份進 repo 的 json）。
+  **檔案不在或 `appId` 是空的 → 推播整段跳過，App 其餘照常**。換一台電腦建置前要先補這個檔，
+  不然發出去的那一版推播就安靜地沒了。
+- **桌面小工具 `FeaturedWidget.kt`**（「本次精選」）：輪播 `GET /api/featured`，系統每 30 分鐘換一張、
+  右上 ⟳ 手動換，點圖開那張照片。清單在 prefs 快取 3 小時（精選幾天才動一次），
+  **不開放的一律跳過**（桌面是誰都看得到的地方），沒登入時寫「打開 App 登入後…」。
+  ⚠️ KDoc 裡不要寫 `/api/photos/view/*` —— Kotlin 的註解會巢狀，`/*` 會開一個永遠關不掉的註解。
 
 ### 建置與發版
 

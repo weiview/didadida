@@ -14,6 +14,14 @@ interface DidadidaAppBridge {
   pickAndUpload(albumId: string, token: string): void;
   /** App 的版本名稱（versionName），網頁用不到，除錯時看得出是哪一版 */
   version?(): string;
+  /**
+   * 成員登入確定之後交出進站票：App 拿它向 `/api/push/register` 登記推播，
+   * 桌面小工具也用它抓精選。每次開頁都會叫，節流在 App 那一頭。
+   * 選填 —— 1.0.3 之前的 App 沒有這一支。
+   */
+  setSession?(token: string): void;
+  /** 登出：App 先用舊票把這支手機的推播撤掉，再清掉 */
+  clearSession?(): void;
 }
 
 declare global {

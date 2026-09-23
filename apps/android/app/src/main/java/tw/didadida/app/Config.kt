@@ -15,6 +15,9 @@ object Config {
 
     const val CHANNEL_UPLOAD = "upload"
     const val CHANNEL_NOTICE = "notice"
+    /** 推播（FCM）的兩種：分開兩個頻道，使用者可以在系統設定裡只關掉其中一種 */
+    const val CHANNEL_PUSH_ONLINE = "push_online"
+    const val CHANNEL_PUSH_UPLOAD = "push_upload"
 
     /** 上傳完成後丟回 WebView 的事件名（前端 lib/nativeApp.ts 同一個字串） */
     const val JS_UPLOAD_DONE = "didadida:native-upload-done"

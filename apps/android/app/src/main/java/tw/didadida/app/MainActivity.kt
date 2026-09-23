@@ -24,6 +24,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.content.ContextCompat
+import tw.didadida.app.push.Push
 import tw.didadida.app.upload.UploadEvents
 import tw.didadida.app.upload.UploadService
 import java.security.SecureRandom
@@ -128,7 +129,9 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
         }
 
         if (!handleAuthIntent(intent)) {
-            if (savedInstanceState == null || web.restoreState(savedInstanceState) == null) {
+            val open = openPath(intent)
+            if (open != null) web.loadUrl(Config.SITE + open)
+            else if (savedInstanceState == null || web.restoreState(savedInstanceState) == null) {
                 web.loadUrl(Config.SITE + "/")
             }
         }
@@ -136,7 +139,18 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleAuthIntent(intent)
+        if (!handleAuthIntent(intent)) openPath(intent)?.let { web.loadUrl(Config.SITE + it) }
+    }
+
+    /**
+     * 通知與桌面小工具點下去要開的站內路徑（`EXTRA_OPEN_PATH`，例如 `/album?id=3`）。
+     * ⚠️ 只收「/ 開頭、不是 // 開頭」的 —— 拼在 `Config.SITE` 後面，`//evil.com` 會變成別的主機。
+     *    讀完就拿掉，不然轉個螢幕（Activity 重建）又跳一次。
+     */
+    private fun openPath(intent: Intent?): String? {
+        val p = intent?.getStringExtra(EXTRA_OPEN_PATH) ?: return null
+        intent.removeExtra(EXTRA_OPEN_PATH)
+        return p.takeIf { it.startsWith("/") && !it.startsWith("//") }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -327,11 +341,20 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
 
         @JavascriptInterface
         fun version(): String = BuildConfig.VERSION_NAME
+
+        /** 網頁確定有人登入時叫（每次開頁都叫）：推播登記與桌面小工具都要這張票 */
+        @JavascriptInterface
+        fun setSession(token: String) = Push.setSession(this@MainActivity, token)
+
+        /** 登出：把這支手機從站上的推播名單撤掉 */
+        @JavascriptInterface
+        fun clearSession() = Push.clearSession(this@MainActivity)
     }
 
     companion object {
         /** 畫面在不在前景（onStart～onStop）。`Updater`／`InstallReceiver` 用它決定裝不裝、怎麼問 */
         @Volatile var visible = false
         private const val KEY_NONCE = "auth_nonce"
+        const val EXTRA_OPEN_PATH = "open_path"
     }
 }
