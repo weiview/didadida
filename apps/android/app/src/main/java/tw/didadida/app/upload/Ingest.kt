@@ -126,7 +126,7 @@ class Ingest(
 
         val result = api.upload(
             albumId, source.name, thumbs.md, thumbs.sm, vmeta.exif?.toString(), takenAt,
-            null, "video", durationMs, 0L, null, false,
+            null, "video", durationMs, 0L, null, source.size, false,
         )
         when (result) {
             is Api.UploadResult.Duplicate -> {
@@ -210,7 +210,7 @@ class Ingest(
 
         val result = api.upload(
             albumId, source.name, thumbs.md, thumbs.sm, exif?.toString(), takenAt,
-            phash, kind, null, motionOffset, gifBytes, false,
+            phash, kind, null, motionOffset, gifBytes, source.size, false,
         )
         when (result) {
             is Api.UploadResult.Created -> {
@@ -342,7 +342,7 @@ class Ingest(
             val gifBytes = if (dup.mediaType == "gif") source.readAll() else null
             val result = api.upload(
                 albumId, dup.name, dup.thumbMd, dup.thumbSm, dup.exifJson, dup.takenAt,
-                dup.phash, dup.mediaType, dup.durationMs, dup.motionOffset, gifBytes, true,
+                dup.phash, dup.mediaType, dup.durationMs, dup.motionOffset, gifBytes, dup.size, true,
             )
             val id = when (result) {
                 is Api.UploadResult.Created -> result.id
@@ -361,6 +361,50 @@ class Ingest(
             }
         } catch (e: Exception) {
             failures.add("${dup.name}：${errText(e)}")
+        }
+    }
+
+    /**
+     * 使用者在重複視窗按了「就是同一張：只補缺的備份」（網頁的 `runBackfillJob`）。
+     * ⚠️ 自動補（`incompleteTwin`）只認 `same_file`；`same_image`／`same_time` 只有人
+     *    看過之後才可以走這條 —— 拿 A 的原始檔填 B 的欄位是安靜的錯。
+     * 不新增任何一列、不寫 R2，標籤／留言／Story 全都留著。
+     */
+    fun backfillDuplicate(dup: PendingDup, twinId: Long, onSent: (Long, Long) -> Unit) {
+        val twin = dup.existing.firstOrNull { it.id == twinId } ?: return
+        if (twin.mediaType != dup.mediaType) { failures.add("${dup.name}：媒體種類不同，無法補備份"); return }
+        val source = MediaSource(context, dup.uri, dup.name, dup.mime, dup.size)
+        try {
+            if (dup.mediaType == "video") {
+                if (twin.hasOriginal) return
+                if (folder() == null) {
+                    failures.add("${dup.name}：無法連線至 Google Drive，影片原始檔無法補齊（${driveError ?: "無法連線"}）")
+                    return
+                }
+                pushVideo(twin.id, source, onSent)
+                backfilled.add("${dup.name}：已補上 Google Drive 的影片原始檔")
+                return
+            }
+            val need4k = !twin.has4k && dup.mediaType != "gif"
+            val needOrig = !twin.hasOriginal
+            if (!need4k && !needOrig) return
+            val label = needLabel(need4k, needOrig)
+            if (folder() == null) {
+                driveMissing.add("${dup.name}：Google Drive 缺少 $label（${driveError ?: "無法連線"}）")
+                return
+            }
+            val res = pushPhoto(twin.id, source, need4k, needOrig)
+            if (res.ok) {
+                backfilled.add("${dup.name}：已補上 Google Drive 的 $label")
+            } else {
+                driveMissing.add(
+                    "${dup.name}：Google Drive 缺少 " +
+                        needLabel(res.fourK == "failed", res.original == "failed").ifEmpty { label }
+                )
+                failures.add("${dup.name}：補齊 Google Drive 備份失敗（${res.reason ?: "Drive 上傳失敗"}）")
+            }
+        } catch (e: Exception) {
+            failures.add("${dup.name}：補齊 Google Drive 備份失敗（${errText(e)}）")
         }
     }
 

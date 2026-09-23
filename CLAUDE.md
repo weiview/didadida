@@ -273,7 +273,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0030）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0031）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
@@ -1962,8 +1962,25 @@ id 仍是 `video-meta`，換掉會弄丟 localStorage 那個開合狀態）。
   補不起來。實作是撈回來再 `filter`（hash 有命中就只留那幾列），
   ⚠️ 配套要加 **`ORDER BY (file_hash = ?) DESC`** —— `LIMIT 5` 不能讓一串
   同秒的連拍把真正對得上的那一列擠掉。`reason` 跟著只看 hash 有沒有命中。
-- **視窗只在兩種情況下跳**：① 特徵碼一樣、而且 Drive 兩份都齊（真的重複）；
-  ② 特徵碼對不上、只有拍攝時間一樣（疑似）。缺備份的那些走上面那段直接補。
+- **第三個依據：畫面雜湊（`phash` 完全相等 → `same_image`）**。強度排在中間：
+  `same_file` > `same_image` > `same_time`，**只端出最強的那一種**，SQL 是
+  `ORDER BY (file_hash = ?) DESC, (phash = ?) DESC LIMIT 5`。
+  ⚠️ 為什麼需要它：**App 與網頁的縮圖編碼器不同**（Kotlin vs canvas），同一個原始檔
+  從兩邊傳，800px 那份位元組必定不同 —— `file_hash` 永遠對不上。phash 是 dHash，
+  對編碼差異不敏感。只比**完全相等**（吃得到 `idx_photo_phash`），距離比對留給
+  `/admin`「相片的像素比對」。⚠️ 整片同色（全 0／全 f）不拿來比，同 `isFlatPhash`。
+  ⚠️⚠️ **`same_image` 不觸發自動補**：`incompleteTwin()` 照舊只認 `same_file`。
+  畫面一樣不等於同一個檔（同一張照片的編修版、裁切版），拿錯的原始檔去填是安靜的錯。
+- **`Photo.file_size`（0031）＝原始檔大小**，上傳時送 `file_size`，視窗上兩邊並排顯示
+  給人比對。**NULL 就是不知道**（0031 之前的列，刻意不 backfill），畫面上不寫，
+  不要寫成 0。
+- **視窗上多一顆「就是同一張：只補缺的備份（4K／原始檔）」**（手動版的 `incompleteTwin`，
+  網頁 `backfillTarget()`／App `Ingest.backfillDuplicate()`）。條件：剛好命中一列、
+  媒體種類一致、那一列真的缺東西（影片只看原始檔，GIF 不需要 4K）。按下去補**既有那一列**
+  的 Drive，不新增、不寫 R2。這是給 `same_image`／`same_time` 那種「程式不敢斷定、人看得出來」
+  的情況用的 —— 判斷交給人，動作跟自動補是同一條。
+- **視窗只在這些情況下跳**：① 特徵碼一樣、而且 Drive 兩份都齊（真的重複）；
+  ② 特徵碼對不上、畫面或拍攝時間一樣（疑似）。缺備份又 `same_file` 的走上面那段直接補。
 - 視窗（`GoogleSyncConflictModal`，本機上傳與 Google 匯入共用）三件事：
   - **一定要顯示檔名**（新的那張用 `File.name`，舊的用 `Photo.title`）——
     縮到 100px 的兩張縮圖長得幾乎一樣，檔名才是使用者當場判斷得了的線索。
@@ -1976,7 +1993,7 @@ id 仍是 `video-meta`，換掉會弄丟 localStorage 那個開合狀態）。
     也刻意不接既有的 `PhotoLightbox`：那支要的是一列真的 `Photo`（留言、EXIF、
     上下一張都掛在上面），而左邊那張新照片在站上根本還不存在。
 - 標題那句話**跟著 `reason` 換**：`same_file` 寫「確定是同一個檔」、
-  `same_time` 寫「可能是同一張」並提醒連拍會撞在同一秒。確定與疑似要使用者
+  `same_image` 寫「畫面一模一樣、檔案不同」、`same_time` 寫「可能是同一張」並提醒連拍會撞在同一秒。確定與疑似要使用者
   做的事完全不同，寫成同一句「找到多個可能重複的版本」等於沒講。
 
 ### 補傳清單（`/api/photos/drive-pending`）
@@ -2143,7 +2160,8 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   ⚠️ 特別是 **phash 要算同一顆 400px 縮圖**、`file_hash` 要算同一份 800px 位元組 ——
   不一樣的話 App 傳的跟網頁傳的永遠比不到一起。
 - **重複的那幾張**由 `DuplicateActivity` 一張一張問（網頁 `GoogleSyncConflictModal` 的原生版，
-  跳過／兩張都留／取代所選）。`DupStore.close()` 要在排 `finishDups` **之前**叫 ——
+  跳過／兩張都留／取代所選／只補缺的備份 —— 最後那顆走 `UploadService` 的 `EXTRA_BACKFILL`
+  → `Ingest.backfillDuplicate()`）。`DupStore.close()` 要在排 `finishDups` **之前**叫 ——
   不然 `MainActivity.onResume` 會在背景還沒收完時又把同一批叫出來。
 - **Google 登入走 Custom Tab，不是 WebView**（Google 擋 WebView 的 OAuth）。
   App 攔下 `/api/auth/google/login`，補一個一次性亂數 `&app=<nonce>`；後端回呼時看到

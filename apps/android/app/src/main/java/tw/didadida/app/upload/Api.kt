@@ -33,6 +33,18 @@ class Api(private val base: String, private val token: String) {
         val takenAt: String?,
         val mediaType: String,
         val sameFile: Boolean,
+        /**
+         * 這一列的**像素**跟手上這個檔一樣（phash 相同），但不是同一個檔。
+         * 跨平台（App 傳的 vs 網頁傳的）唯一對得上的訊號 —— 編碼器不同，
+         * `file_hash` 必定不一樣。⚠️ **連拍也會長得一模一樣**，所以這是
+         * 「請人看一眼」的訊號，絕對不可以拿來自動補備份。
+         */
+        val sameImage: Boolean,
+        /**
+         * 原始檔大小（位元組）。0031 之前上傳的那些是 NULL ——
+         * ⚠️ **拿不到就是 null，畫面上整格不畫，不可以印成 0**。
+         */
+        val fileSize: Long?,
         val has4k: Boolean,
         val hasOriginal: Boolean,
     )
@@ -49,6 +61,9 @@ class Api(private val base: String, private val token: String) {
      * ⚠️ `thumb` 與 `album_id` 缺一個就是 400；`thumb` 的 MIME 只收 jpeg／webp。
      * ⚠️ `motion_offset` **一定要送，0 也要送** —— 不送的話那一列留在 NULL，
      *    後端會當成「還沒掃過」。（它只在 media_type 是 photo 時被採用。）
+     * ⚠️ `originalSize` 是**使用者手上那個檔**的大小，不是 `thumbMd` 的長度 ——
+     *    縮圖是我們自己產的，兩台裝置產出來的大小本來就不一樣，拿它給人比對等於
+     *    給一個假的線索。拿不到就送 null（那一列的 `file_size` 留在 NULL）。
      */
     fun upload(
         albumId: Long,
@@ -62,6 +77,7 @@ class Api(private val base: String, private val token: String) {
         durationMs: Long?,
         motionOffset: Long,
         gifBytes: ByteArray?,
+        originalSize: Long?,
         allowDuplicate: Boolean,
     ): UploadResult {
         val webp = "image/webp".toMediaType()
@@ -75,6 +91,9 @@ class Api(private val base: String, private val token: String) {
         if (exifJson != null) body.addFormDataPart("exif", exifJson)
         if (takenAtIso != null) body.addFormDataPart("taken_at", takenAtIso)
         if (phash != null) body.addFormDataPart("phash", phash)
+        if (originalSize != null && originalSize > 0) {
+            body.addFormDataPart("file_size", originalSize.toString())
+        }
         if (mediaType != "photo") body.addFormDataPart("media_type", mediaType)
         if (durationMs != null && durationMs > 0) {
             body.addFormDataPart("duration_ms", durationMs.toString())
@@ -106,8 +125,13 @@ class Api(private val base: String, private val token: String) {
                             takenAt = e.optStringOrNull("taken_at"),
                             mediaType = e.optString("media_type", "photo"),
                             // ⚠️ 邊快取裡躺著舊版後端的回應時這幾欄是 undefined，
-                            //    預設值要跟 api.ts 同一套：same_file 當 false、兩份當已經有
+                            //    預設值要跟 api.ts 同一套：same_file／same_image 當 false、
+                            //    兩份當已經有
                             sameFile = e.optBoolean("same_file", false),
+                            sameImage = e.optBoolean("same_image", false),
+                            // ⚠️ `optLong` 對 null 會回 0，而 0 跟「不知道」是兩件事
+                            fileSize = if (e.isNull("file_size")) null
+                                else e.optLong("file_size").takeIf { it > 0 },
                             has4k = e.optBoolean("has_4k", true),
                             hasOriginal = e.optBoolean("has_original", true),
                         )

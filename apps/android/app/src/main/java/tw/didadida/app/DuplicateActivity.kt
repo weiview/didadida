@@ -94,8 +94,8 @@ class DuplicateActivity : AppCompatActivity() {
 
     private fun current(): PendingDup? = ingest?.dupes?.getOrNull(index)
 
-    private fun decide(skip: Boolean, replace: LongArray = LongArray(0)) {
-        UploadService.decideDup(this, session, index, skip, replace)
+    private fun decide(skip: Boolean, replace: LongArray = LongArray(0), backfill: Long = 0L) {
+        UploadService.decideDup(this, session, index, skip, replace, backfill)
         advance()
     }
 
@@ -128,8 +128,12 @@ class DuplicateActivity : AppCompatActivity() {
         content.addView(text("可能重複的照片（${index + 1} / $total）", 20f, bold = true))
         content.addView(
             text(
-                if (dup.reason == "same_file") "確定是同一個檔：位元組跟站上那一張一模一樣。"
-                else "可能是同一張：拍攝時間一樣，但檔案不同。連拍會撞在同一秒，請自己看一眼。",
+                when (dup.reason) {
+                    "same_file" -> "確定是同一個檔：位元組跟站上那一張一模一樣。"
+                    "same_image" -> "畫面一模一樣，但檔案不同（手機與電腦各自縮圖，位元組本來就對不上）。" +
+                        "多半是同一張，請比一下檔名與大小。"
+                    else -> "可能是同一張：拍攝時間一樣，但檔案不同。連拍會撞在同一秒，請自己看一眼。"
+                },
                 14f,
             ).also { it.setPadding(0, dp(6), 0, dp(14)) },
         )
@@ -142,7 +146,10 @@ class DuplicateActivity : AppCompatActivity() {
         }
         BitmapFactory.decodeByteArray(dup.thumbMd, 0, dup.thumbMd.size)?.let { newImg.setImageBitmap(it) }
         content.addView(newImg, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(220)))
-        content.addView(text(dup.name, 13f).also { it.setPadding(0, dp(4), 0, dp(16)) })
+        content.addView(
+            text(listOfNotNull(dup.name, sizeText(dup.size)).joinToString(" · "), 13f)
+                .also { it.setPadding(0, dp(4), 0, dp(16)) },
+        )
 
         content.addView(text("站上已經有的（點選要被取代的）", 13f, bold = true))
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -158,6 +165,17 @@ class DuplicateActivity : AppCompatActivity() {
             cell.addView(
                 text(ex.title, 12f).apply {
                     maxLines = 2; ellipsize = TextUtils.TruncateAt.MIDDLE
+                    layoutParams = LinearLayout.LayoutParams(dp(140), LinearLayout.LayoutParams.WRAP_CONTENT)
+                },
+            )
+            val tag = when {
+                ex.sameFile -> "內容相同"
+                ex.sameImage -> "畫面相同"
+                else -> "時間相同"
+            }
+            cell.addView(
+                text(listOfNotNull(tag, sizeText(ex.fileSize)).joinToString(" · "), 11f).apply {
+                    setTextColor(Color.parseColor("#777777"))
                     layoutParams = LinearLayout.LayoutParams(dp(140), LinearLayout.LayoutParams.WRAP_CONTENT)
                 },
             )
@@ -191,6 +209,21 @@ class DuplicateActivity : AppCompatActivity() {
         }
         replaceBtn = button("") { decide(skip = false, replace = selected.toLongArray()) }
         buttons.addView(replaceBtn)
+        // 「就是同一張：只補缺的備份」（網頁的 backfillTarget）：剛好一列、種類一致、缺一半
+        val twin = dup.existing.singleOrNull()
+        if (twin != null && twin.mediaType == dup.mediaType) {
+            val need4k = !twin.has4k && dup.mediaType == "photo"
+            val needOrig = !twin.hasOriginal
+            if (need4k || needOrig) {
+                val need = listOfNotNull(if (need4k) "4K" else null, if (needOrig) "原始檔" else null)
+                    .joinToString(" ＋ ")
+                buttons.addView(button("就是同一張：只補缺的備份（$need）") { decide(skip = false, backfill = twin.id) })
+                buttons.addView(
+                    text("站上那一張的 Google Drive 缺 $need。不新增照片，標籤、留言、Story 都留著。", 12f)
+                        .also { it.setPadding(dp(4), 0, dp(4), dp(10)) },
+                )
+            }
+        }
         buttons.addView(button("兩張都留") { decide(skip = false) })
         buttons.addView(button("跳過這一張") { decide(skip = true) })
         if (total - index > 1) buttons.addView(button("剩下的全部跳過") { skipAll() })
@@ -204,6 +237,13 @@ class DuplicateActivity : AppCompatActivity() {
         val b = replaceBtn ?: return
         b.isEnabled = selected.isNotEmpty()
         b.text = if (selected.isEmpty()) "取代所選（先點上面的照片）" else "取代所選的 ${selected.size} 張"
+    }
+
+    /** 原始檔大小；不知道（舊的列是 NULL）就不寫，不要寫成 0 */
+    private fun sizeText(n: Long?): String? {
+        if (n == null || n <= 0) return null
+        return if (n >= 1024L * 1024) String.format("%.1f MB", n / 1024.0 / 1024.0)
+        else "${Math.max(1L, Math.round(n / 1024.0))} KB"
     }
 
     private fun absolute(u: String?): String? {

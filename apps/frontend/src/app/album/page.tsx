@@ -45,7 +45,7 @@ type PendingDuplicate = {
   previewUrl: string;
   exifData: any;
   takenAt?: string;
-  reason: 'same_file' | 'same_time';
+  reason: 'same_file' | 'same_image' | 'same_time';
   existing: DuplicateMatch[];
   /**
    * 有值就代表這一格是影片：`resized` 是封面圖、`file` 是原始影片檔。
@@ -1141,7 +1141,7 @@ function AlbumContent() {
     try {
       const result = await uploadPhoto(
         id as string, item.resized, item.exifData, item.takenAt, true, item.video, item.gif,
-        item.motionOffset,
+        item.motionOffset, item.file.size,
       );
       if (result.status !== 'ok') {
         dupFailuresRef.current.push(`${name}：${result.status === 'error' ? result.reason : '上傳失敗'}`);
@@ -1227,6 +1227,106 @@ function AlbumContent() {
       // 一張出錯不能把整條鏈斷掉，後面排隊的還要做（runDuplicateJob 自己也有
       // catch，這裡是最後一道保險）
       .catch((err) => { console.error('背景處理重複的照片時出錯', err); })
+      .then(() => { setDupJobs((prev) => ({ ...prev, done: prev.done + 1 })); });
+
+    advanceDuplicate();
+  };
+
+  /**
+   * 重複視窗上那顆「只補缺的備份」要補的是哪一列。
+   *
+   * 跟自動那條（`ingestSources` 裡的 `incompleteTwin`）**只差一個閂：不要求 same_file**
+   * —— 自動補是程式自己判斷的，補錯了沒有人知道，所以只敢在位元組完全一樣時動手；
+   * 這顆按鈕是使用者**親眼看過兩張縮圖、檔名與檔案大小**才按的，所以 `same_image`
+   *（畫面一樣、特徵碼不同）也算數。那正是它存在的理由：**同一個檔從 App 傳、從電腦
+   * 傳，`file_hash` 永遠對不上**（兩邊的編碼器不同，見 0031 那支 migration 的說明），
+   * 只有 phash 對得起來，而 phash 只證明「看起來一樣」（連拍也會一樣）—— 所以這件事
+   * 一定要人來按，不能自動做。
+   *
+   * 其餘的閂跟自動那條完全一樣：剛好命中一列、媒體種類一致、那一列真的缺了一半。
+   * 不成立就回 null，視窗整顆按鈕不端出來。
+   */
+  const backfillTarget = (item: PendingDuplicate): { twin: DuplicateMatch; need: string } | null => {
+    if (item.existing.length !== 1) return null;
+    const twin = item.existing[0];
+    const kind = item.video ? 'video' : item.gif ? 'gif' : 'photo';
+    if (twin.media_type !== kind) return null;
+    if (twin.has_4k && twin.has_original) return null;
+    // ⚠️ 影片與 GIF 的 `has_4k` 後端一律回 true（它們沒有 4K 那一份），所以這兩種
+    // 走到這裡缺的一定是原始檔 —— 也因此 `need.fourK` 對它們永遠是 false，
+    // `pushPhotoToDrive` 不會拿 GIF 去跑 `encode4kWebp`。
+    const need = item.video
+      ? '影片原始檔'
+      : [twin.has_4k ? '' : '4K', twin.has_original ? '' : '原始檔'].filter(Boolean).join(' ＋ ');
+    return { twin, need };
+  };
+
+  /**
+   * 「只補缺的備份」真正做的事：補**既有那一列**缺的那一半，站上不會多一格，
+   * 那一列的標籤、留言、Story、手動修過的座標與時間全都留著。
+   *
+   * 跟 `ingestSources` 裡那兩段自動補（影片一段、照片／GIF 一段）是同一件事，
+   * 但**刻意各寫一份**：那兩段跑在上傳迴圈裡，要回報逐檔進度並把結果累進當次的
+   * `backfilled`／`failures`；這一支跑在背景那條鏈上，錯誤一律沉進 `dupFailuresRef`
+   * 收工一次講完（⚠️ 背景裡不可以 alert，會蓋在使用者正在挑的下一張上面）。
+   * **改其中一邊記得看一眼另一邊。**
+   */
+  const runBackfillJob = async (item: PendingDuplicate, twin: DuplicateMatch) => {
+    const name = item.file.name;
+    const isVideoItem = !!item.video;
+    const need = { fourK: !twin.has_4k, original: !twin.has_original };
+    const label = isVideoItem
+      ? '影片原始檔'
+      : [need.fourK ? '4K' : '', need.original ? '原始檔' : ''].filter(Boolean).join(' ＋ ');
+    /**
+     * ⚠️ **影片不可以進 `pendingDriveBatch`** —— 那條佇列會對它跑
+     * `pushPhotoToDrive` → `encode4kWebp`。影片補不起來就只能當場講失敗。
+     */
+    const queueMissed = (n: { fourK?: boolean; original?: boolean }) => {
+      if (isVideoItem) return false;
+      setPendingDriveBatch((prev) => [...prev, { photoId: twin.id, file: item.file, need: n }]);
+      return true;
+    };
+
+    const drive = driveRef.current;
+    if (!drive) {
+      dupFailuresRef.current.push(queueMissed(need)
+        ? `${name}：無法連線至 Google Drive，${label} 已加入待補清單`
+        : `${name}：無法連線至 Google Drive，影片原始檔無法補齊`);
+      return;
+    }
+    try {
+      if (isVideoItem) {
+        await pushVideoToDrive(drive, twin.id, item.file);
+        return;
+      }
+      const res = await pushPhotoToDrive(drive, twin.id, item.file, need);
+      if (res.ok) return;
+      // 半套照樣進待補清單，`need` 只留這次還是沒成功的那一半
+      queueMissed({
+        fourK: need.fourK && res.fourK !== 'ok',
+        original: need.original && res.original !== 'ok',
+      });
+      dupFailuresRef.current.push(`${name}：補齊 Google Drive 的 ${label} 失敗（${res.reason || 'Drive 上傳失敗'}）`);
+    } catch (err) {
+      queueMissed(need);
+      dupFailuresRef.current.push(`${name}：補齊 Google Drive 備份失敗（${errText(err)}）`);
+    }
+  };
+
+  /**
+   * 視窗上那顆「只補缺的備份」：排進背景那條鏈，然後立刻跳下一張（同 `resolveDuplicate`）。
+   * ⚠️ 補備份**不算「站上多了新東西」**，所以不碰 `dupUploadedRef` —— 收工不會通知全家，
+   * 相簿裡也確實一格都沒多出來（同 `IngestResult.backfilled` 那條規矩）。
+   */
+  const backfillDuplicate = (twin: DuplicateMatch) => {
+    const item = duplicateItems[duplicateIndex];
+    if (!item) return;
+
+    setDupJobs((prev) => ({ ...prev, queued: prev.queued + 1 }));
+    dupJobsRef.current = dupJobsRef.current
+      .then(() => runBackfillJob(item, twin))
+      .catch((err) => { console.error('背景補齊 Drive 備份時出錯', err); })
       .then(() => { setDupJobs((prev) => ({ ...prev, done: prev.done + 1 })); });
 
     advanceDuplicate();
@@ -1368,6 +1468,8 @@ function AlbumContent() {
           const result = await uploadPhoto(
             id as string, poster, vmeta.exif ?? undefined,
             vmeta.fallbackIso ?? undefined, false, meta,
+            // gif／motionOffset 影片用不到，但最後那個原始檔大小要送（重複視窗拿它給人判斷）
+            undefined, undefined, rawFile.size,
           );
           if (result.status === 'duplicate') {
             /*
@@ -1456,7 +1558,7 @@ function AlbumContent() {
         const motionOffset = gifSource ? undefined : await readMotionOffsetFromFile(rawFile);
         const result = await uploadPhoto(
           id as string, file, exifData, takenAt || undefined, false, undefined,
-          gifSource ? { file: rawFile } : undefined, motionOffset,
+          gifSource ? { file: rawFile } : undefined, motionOffset, rawFile.size,
         );
         if (result.status === 'ok') {
           uploaded.push(result.photo);
@@ -2925,24 +3027,35 @@ function AlbumContent() {
         本機上傳撞到重複：一張一張問，跟 Google 匯入用同一個視窗、同一套選項
         （全部保留／勾選要被取代的舊照片，可複選）。疊在補件視窗上面，先處理這個。
       */}
-      {duplicateItems[duplicateIndex] && (
+      {duplicateItems[duplicateIndex] && (() => {
+        const item = duplicateItems[duplicateIndex];
+        // 「只補缺的備份」成不成立算一次就好（視窗那顆按鈕與它的 onClick 共用同一個 twin）
+        const bf = backfillTarget(item);
+        return (
         <GoogleSyncConflictModal
           isOpen={true}
-          reason={duplicateItems[duplicateIndex].reason}
+          reason={item.reason}
           tempPhoto={{
-            url: duplicateItems[duplicateIndex].previewUrl,
-            // 檔名一定要給：兩張縮圖長得幾乎一樣，這是使用者唯一分辨得出來的線索
-            name: duplicateItems[duplicateIndex].file.name,
+            // 檔名與檔案大小一定要給：兩張縮圖長得幾乎一樣，這兩格才是使用者
+            // 當場判斷得了的線索（跨平台的同一張照片 file_hash 永遠對不上，
+            // 只剩 phash 認得出來，而 phash 只證明「看起來一樣」）
+            url: item.previewUrl,
+            name: item.file.name,
+            size: item.file.size,
           }}
-          existingPhotos={duplicateItems[duplicateIndex].existing.map((e) => ({
+          existingPhotos={item.existing.map((e) => ({
             id: e.id,
             url: e.thumb_url || '',
             // 放大看用 800px 那顆；舊版後端沒有這個欄位時退回縮圖
             largeUrl: e.thumb_lg || e.thumb_url || '',
             name: e.title || undefined,
             sameFile: e.same_file,
+            sameImage: e.same_image,
+            // ⚠️ 舊的列沒有這一欄（0031 之前傳的），是 null 就整格不畫、不可以印成 0
+            size: e.file_size,
             taken_at: e.taken_at || undefined,
           }))}
+          {...(bf ? { backfill: { need: bf.need, onClick: () => backfillDuplicate(bf.twin) } } : {})}
           onResolve={(decision, replaceIds) => { resolveDuplicate(decision, replaceIds); }}
           onSkip={() => advanceDuplicate()}
           counter={{ current: duplicateIndex + 1, total: duplicateItems.length }}
@@ -2950,7 +3063,8 @@ function AlbumContent() {
             ? `背景處理中 ${dupJobs.queued - dupJobs.done} 張`
             : undefined}
         />
-      )}
+        );
+      })()}
 
 
       {/* 相簿層級的打卡補件。同樣不自己寫座標，挑完照片交給下面的 AssignPlaceModal */}

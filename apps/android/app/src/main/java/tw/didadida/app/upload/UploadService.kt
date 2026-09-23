@@ -68,7 +68,8 @@ class UploadService : Service() {
                 val index = intent.getIntExtra(EXTRA_INDEX, -1)
                 val replace = intent.getLongArrayExtra(EXTRA_REPLACE)?.toList().orEmpty()
                 val skip = intent.getBooleanExtra(EXTRA_SKIP, false)
-                if (!skip) enqueue { runDup(key, index, replace) }
+                val backfill = intent.getLongExtra(EXTRA_BACKFILL, 0L)
+                if (!skip) enqueue { runDup(key, index, replace, backfill) }
             }
             ACTION_DUP_FINISH -> {
                 val key = intent.getIntExtra(EXTRA_SESSION, 0)
@@ -143,14 +144,16 @@ class UploadService : Service() {
         }
     }
 
-    private fun runDup(key: Int, index: Int, replace: List<Long>) {
+    private fun runDup(key: Int, index: Int, replace: List<Long>, backfill: Long) {
         val ingest = DupStore.sessions[key] ?: return
         val dup = ingest.dupes.getOrNull(index) ?: return
         showProgress("處理重複的照片", dup.name, 0, 0)
-        ingest.runDuplicate(dup, replace) { sent, size ->
+        val onSent: (Long, Long) -> Unit = { sent, size ->
             val pct = if (size > 0) (sent * 100 / size).toInt().coerceIn(0, 100) else 0
             showProgress("處理重複的照片", "${dup.name}（$pct%）", 100, pct)
         }
+        if (backfill > 0) ingest.backfillDuplicate(dup, backfill, onSent)
+        else ingest.runDuplicate(dup, replace, onSent)
     }
 
     private fun finishDup(key: Int) {
@@ -253,6 +256,7 @@ class UploadService : Service() {
         const val EXTRA_SESSION = "session"
         const val EXTRA_INDEX = "index"
         const val EXTRA_REPLACE = "replace"
+        const val EXTRA_BACKFILL = "backfill"
         const val EXTRA_SKIP = "skip"
 
         private const val NOTIFY_PROGRESS = 1
@@ -279,13 +283,15 @@ class UploadService : Service() {
         }
 
         /** 一張重複照片的決定：skip＝跳過；replace 空＝兩張都留；否則取代那幾列 */
-        fun decideDup(context: Context, session: Int, index: Int, skip: Boolean, replace: LongArray) {
+        /** backfill > 0＝「就是同一張：只補缺的備份」，補的是那一列（不新增、不取代） */
+        fun decideDup(context: Context, session: Int, index: Int, skip: Boolean, replace: LongArray, backfill: Long = 0L) {
             if (skip) return   // 跳過什麼都不必做，也就不必叫醒服務
             context.startForegroundService(
                 Intent(context, UploadService::class.java).setAction(ACTION_DUP)
                     .putExtra(EXTRA_SESSION, session)
                     .putExtra(EXTRA_INDEX, index)
-                    .putExtra(EXTRA_REPLACE, replace),
+                    .putExtra(EXTRA_REPLACE, replace)
+                    .putExtra(EXTRA_BACKFILL, backfill),
             )
         }
 

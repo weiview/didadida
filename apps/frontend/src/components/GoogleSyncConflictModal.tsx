@@ -19,6 +19,33 @@ interface PhotoData {
   largeUrl?: string;
   /** 這一列跟手上這個檔是**位元組層級**的同一份（特徵碼一樣） */
   sameFile?: boolean;
+  /**
+   * 這一列的**像素**跟手上這個檔一樣（phash 相同），但不是同一個檔。
+   *
+   * 同一張照片從手機 App 傳與從電腦網頁傳，縮圖是兩個不同的編碼器產的，
+   * 位元組永遠對不上（`file_hash` 因此比不到），但畫面是同一個 —— 這就是那個訊號。
+   * ⚠️ 它只證明「看起來一樣」：連拍、同一個場景也會這樣，所以一律交給人看，
+   *    絕不拿它自動動手。
+   */
+  sameImage?: boolean;
+  /**
+   * 原始檔大小（位元組）。跟檔名一起當人工判斷的線索。
+   *
+   * ⚠️ **拿不到就是 null，畫面上整格不畫，不可以印成 0** —— 0031 之前傳上來的
+   *    那幾列 `file_size` 是 NULL＝「不知道」，印成 0 B 是一句假話。
+   */
+  size?: number | null;
+}
+
+/** 檔案大小寫給人看。null／0／壞值一律回 null（呼叫端整格不畫）。 */
+function sizeText(bytes?: number | null): string | null {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return null;
+  if (bytes < 1024) return bytes + ' B';
+  const units = ['KB', 'MB', 'GB'];
+  let v = bytes / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+  return (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10) + ' ' + units[i];
 }
 
 interface GoogleSyncConflictModalProps {
@@ -27,13 +54,32 @@ interface GoogleSyncConflictModalProps {
   existingPhotos: PhotoData[];
   onResolve: (decision: "keep_both" | "replace", replacePhotoIds?: number[]) => void;
   /**
-   * 為什麼判定重複。`same_file` ＝ 特徵碼一樣（**確定**是同一個檔）、
-   * `same_time` ＝ 特徵碼對不上、只有拍攝時間一樣（**疑似**）。
+   * 為什麼判定重複，**三種，強度由強到弱**：
+   * `same_file` ＝ 特徵碼一樣（**確定**是同一個檔）、
+   * `same_image` ＝ 特徵碼對不上但像素雜湊一樣（**很可能**是同一張 ——
+   * 同一個檔從手機 App 與從電腦網頁傳就會落在這裡）、
+   * `same_time` ＝ 只有拍攝時間一樣（**疑似**）。
    *
-   * 兩者要使用者做的事完全不同，所以標題那句話跟著它換：確定的直接處理掉，
-   * 疑似的要他放大看一眼再決定（連拍很容易撞在同一秒）。
+   * 三種要使用者做的事完全不同，所以標題、說明與每一格底下那句話都跟著它換：
+   * 確定的直接處理掉，後兩種要他看檔名、檔案大小、放大比對一眼再決定
+   * （連拍很容易撞在同一秒，也很容易長得一模一樣）。
+   *
+   * ⚠️ 認不得的值一律退到**最弱**的那一檔，不要猜成 `same_file` ——
+   *    講成「確定是同一個檔」而其實不是，使用者會直接按取代。
    */
-  reason?: 'same_file' | 'same_time';
+  reason?: 'same_file' | 'same_image' | 'same_time';
+  /**
+   * 「只補缺的備份」。**給了才端出來** —— 呼叫端要自己確認：剛好命中一列、
+   * 媒體種類一致，而且那一列在 Drive 上真的缺了一半。
+   *
+   * ⚠️ 補的是**既有那一列**：標籤、留言、Story、手動修過的座標與時間全都留著，
+   *    站上不會多出一格。另外兩條路都做不到這件事 ——「兩份都保留」會多一列
+   *    ＋兩顆 R2 物件而缺的照樣缺，「取代」補得起來但換了新 id，上面那些全沒了。
+   * ⚠️ `same_file` 走不到這個視窗（前端 `incompleteTwin()` 自己就補掉了）。
+   *    這顆按鈕是為 `same_image`／`same_time` 存在的：像素或時間一樣不足以
+   *    自動動手（補到別張照片是無聲的錯），所以由人按下去確認。
+   */
+  backfill?: { need: string; onClick: () => void };
   /**
    * 本機上傳走這條路時多一顆「略過這張」。
    *
@@ -55,7 +101,7 @@ interface GoogleSyncConflictModalProps {
 }
 
 export default function GoogleSyncConflictModal({
-  isOpen, tempPhoto, existingPhotos, onResolve, onSkip, counter, backgroundNote, reason
+  isOpen, tempPhoto, existingPhotos, onResolve, onSkip, counter, backgroundNote, reason, backfill
 }: GoogleSyncConflictModalProps) {
   const [decision, setDecision] = useState<"keep_both" | "replace" | null>(null);
   const [selectedPhotoIds, setSelectedPhotoIds] = useState<number[]>([]);
@@ -145,7 +191,9 @@ export default function GoogleSyncConflictModal({
         <h3 style={{ margin: '0 0 6px 0', fontSize: '1.15rem', color: 'var(--text-color)', lineHeight: '1.4' }}>
           {reason === 'same_file'
             ? '這個檔案與相簿中已有的照片內容完全相同'
-            : '檔案內容不同，但拍攝時間相同，可能是同一張'}
+            : reason === 'same_image'
+              ? '畫面看起來一樣，但不是同一個檔'
+              : '檔案內容不同，但拍攝時間相同，可能是同一張'}
           {counter && (
             <span style={{ marginLeft: 8, fontSize: '0.9rem', color: 'var(--text-light)', fontWeight: 400 }}>
               （第 {counter.current} / {counter.total} 張）
@@ -160,7 +208,9 @@ export default function GoogleSyncConflictModal({
         <p style={{ margin: '0 0 15px 0', fontSize: '0.85rem', color: 'var(--text-light)', lineHeight: '1.5' }}>
           {reason === 'same_file'
             ? '請選擇保留兩份或取代既有照片，也可略過不處理。'
-            : '連拍照片的拍攝時間可能相同，不一定是同一張。'}
+            : reason === 'same_image'
+              ? '像素比對認得出這是同一個畫面（同一個檔從手機 App 與電腦網頁傳就會這樣：兩邊的縮圖是不同的編碼器產的，特徵碼永遠對不上）。但連拍、同一個場景也會長得一樣，請比對檔名與檔案大小再決定。'
+              : '連拍照片的拍攝時間可能相同，不一定是同一張。'}
           {' '}點縮圖右上角的 <strong>🔍</strong> 可放大比對。
         </p>
 
@@ -193,6 +243,11 @@ export default function GoogleSyncConflictModal({
                 }}
               >
                 {tempPhoto.name}
+              </div>
+            )}
+            {sizeText(tempPhoto.size) && (
+              <div style={{ marginTop: '2px', fontSize: '0.78rem', color: 'var(--text-light)' }}>
+                {sizeText(tempPhoto.size)}
               </div>
             )}
           </div>
@@ -258,10 +313,17 @@ export default function GoogleSyncConflictModal({
                     >
                       {p.name || `#${p.id}`}
                     </div>
+                    {sizeText(p.size) && (
+                      <div style={{ color: 'var(--text-light)' }}>{sizeText(p.size)}</div>
+                    )}
                     <div style={{ color: 'var(--text-light)' }}>
                       {decision === 'replace' && isSelected
                         ? '將被取代'
-                        : (p.sameFile ? '內容相同' : '時間相同')}
+                        : p.sameFile
+                          ? '內容相同'
+                          : p.sameImage
+                            ? '畫面相同'
+                            : '時間相同'}
                     </div>
                   </div>
                 </div>
@@ -284,6 +346,27 @@ export default function GoogleSyncConflictModal({
             兩份都保留
           </button>
         </div>
+
+        {backfill && (
+          <div style={{ marginTop: '10px' }}>
+            <button
+              type="button"
+              onClick={backfill.onClick}
+              style={{
+                width: '100%', padding: '10px', borderRadius: '10px',
+                background: 'transparent', color: 'var(--accent-color)',
+                border: '2px dashed var(--accent-color)',
+                cursor: 'pointer', fontSize: '0.95rem', fontWeight: 'bold',
+              }}
+            >
+              就是同一張：只補缺的備份（{backfill.need}）
+            </button>
+            <p style={{ margin: '6px 0 0 0', fontSize: '0.8rem', color: 'var(--text-light)', lineHeight: '1.5' }}>
+              站上不會多出一格，只把這個原始檔補進上面那一張缺的 Google Drive 備份；
+              它的標籤、留言、Story 與手動修過的時間地點全都留著。
+            </p>
+          </div>
+        )}
 
         <div style={{ marginTop: '20px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '12px' }}>
           {onSkip && (

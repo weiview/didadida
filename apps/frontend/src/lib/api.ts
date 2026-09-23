@@ -2286,8 +2286,25 @@ export interface DuplicateMatch {
   thumb_lg: string | null;
   taken_at: string | null;
   media_type: 'photo' | 'video' | 'gif';
+  /**
+   * 原始檔的大小（位元組）。**舊的列是 null** —— 0031 刻意不 backfill，
+   * 而且後端量不到（原始檔直傳 Drive、從來不經過 Worker），只有上傳的客戶端送得出來。
+   * ⚠️ null 的時候畫面上**整格不寫**，不可以印成 0 —— 「不知道」跟「0 位元組」是兩件事。
+   */
+  file_size: number | null;
   /** 這一列跟手上這個檔是**位元組層級**的同一份（file_hash 一樣）。只有它才敢自動補 */
   same_file: boolean;
+  /**
+   * 像素特徵值（phash）一樣＝**看起來是同一張**。
+   *
+   * 這是**唯一跨平台對得上的訊號**：file_hash 算的是 800px 縮圖的位元組，
+   * 而瀏覽器與 Android 的編碼器不同、重取樣次數也不同，同一個原始檔從手機傳、
+   * 從電腦傳必定算出不同的 hash。phash 比的是畫面本身（9x8 灰階、不管長寬比），
+   * 所以兩邊一致。
+   * ⚠️ 但它**只證明「看起來一樣」**：連拍、同一場景的兩張也會一樣，
+   *    所以絕不拿它自動動手，一律跳視窗讓人自己看檔名與檔案大小。
+   */
+  same_image: boolean;
   /** Drive 上有沒有那份 4K。**影片與 GIF 一律 true** —— 它們沒有 4K 這一份 */
   has_4k: boolean;
   /** Drive 上有沒有原始檔 */
@@ -2302,7 +2319,7 @@ export interface DuplicateMatch {
  */
 export type UploadResult =
   | { status: 'ok'; photo: UploadedPhoto }
-  | { status: 'duplicate'; reason: 'same_file' | 'same_time'; existing: DuplicateMatch[] }
+  | { status: 'duplicate'; reason: 'same_file' | 'same_image' | 'same_time'; existing: DuplicateMatch[] }
   | { status: 'error'; reason: string };
 
 /**
@@ -2337,6 +2354,15 @@ export async function uploadPhoto(
    *    之後 /admin 的掃描還會再花一次 Drive 讀取去掃我們剛剛才掃過的照片。
    */
   motionOffset?: number,
+  /**
+   * 原始檔的大小（位元組），存進 Photo.file_size（0031）給重複視窗當人工判斷的線索。
+   *
+   * ⚠️ **不是 file.size** —— 這一支收到的 file 是縮到 2000px 的那份
+   *    （影片是封面圖、GIF 是第一格），量它等於量錯東西。原始檔只有呼叫端手上有
+   *    （rawFile / item.file），所以由呼叫端送。
+   * ⚠️ 沒送就留 null＝「不知道」，畫面上整格不寫。
+   */
+  originalSize?: number,
 ): Promise<UploadResult> {
   const formData = new FormData();
   formData.append('album_id', albumId);
@@ -2403,6 +2429,11 @@ export async function uploadPhoto(
     } catch { /* 比對是加分項，掛掉不影響上傳 */ }
   }
 
+  // 原始檔大小（重複視窗拿它跟檔名一起給人判斷）。壞值不送，後端也會再驗一次
+  if (typeof originalSize === 'number' && Number.isFinite(originalSize) && originalSize > 0) {
+    formData.append('file_size', String(Math.round(originalSize)));
+  }
+
   if (exifData) {
     try {
       const allowedKeys = [
@@ -2457,7 +2488,14 @@ export async function uploadPhoto(
     if (data?.duplicate) {
       return {
         status: 'duplicate',
-        reason: data.reason === 'same_file' ? 'same_file' : 'same_time',
+        /*
+         * ⚠️ 認不得的一律退回**最弱**的那一種（same_time）。退到強的那邊會讓使用者
+         *    看到「確定是同一個檔」而放心按下取代，結果取代掉的是另一張照片。
+         */
+        reason:
+          data.reason === 'same_file' ? 'same_file'
+          : data.reason === 'same_image' ? 'same_image'
+          : 'same_time',
         /*
          * ⚠️ 那幾個旗標**一定要在這裡補上預設值**，不能直接把 JSON 丟出去。
          * 邊快取裡還躺著舊版後端的回應時它們是 undefined，而 `!undefined` 是 true
@@ -2471,7 +2509,9 @@ export async function uploadPhoto(
           thumb_lg: e?.thumb_lg ?? null,
           taken_at: e?.taken_at ?? null,
           media_type: e?.media_type === 'video' || e?.media_type === 'gif' ? e.media_type : 'photo',
+          file_size: typeof e?.file_size === 'number' && e.file_size > 0 ? e.file_size : null,
           same_file: e?.same_file === true,
+          same_image: e?.same_image === true,
           has_4k: e?.has_4k !== false,
           has_original: e?.has_original !== false,
         })) as DuplicateMatch[],

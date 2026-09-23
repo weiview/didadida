@@ -7100,6 +7100,13 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         const exifData = formData.get('exif') as string || null;
         const takenAt = formData.get('taken_at') as string || null;
         const clientPhash = formData.get('phash') as string || null;
+        /*
+         * 使用者手上那個**原始檔**的大小（位元組）。後端量不出來 —— 原始檔直傳
+         * Drive，從來不經過 Worker —— 所以由前端／App 送上來，只拿來在重複視窗
+         * 上給人判斷（0031）。送壞值就當作沒送，那一格畫面上直接不寫（不是 0）。
+         */
+        const fileSizeRaw = Number(formData.get('file_size'));
+        const fileSize = Number.isSafeInteger(fileSizeRaw) && fileSizeRaw > 0 ? fileSizeRaw : null;
         // 使用者在重複清單裡按了「照樣上傳」才會帶這個旗標
         const allowDuplicate = formData.get('allow_duplicate') === '1';
 
@@ -7208,23 +7215,39 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
          * 重複偵測。**一定要排在 R2.put 前面** —— 判定重複之後才發現檔案已經寫進去，
          * 等於白佔一份免費額度，還得回頭刪（[[free-tier-is-top-priority]]）。
          *
-         * 兩個依據，範圍限同一本相簿：
+         * 三個依據，範圍限同一本相簿：
          * 1. `file_hash`：同一台電腦重傳同一個檔，前端縮圖的位元組一模一樣，抓得準。
-         * 2. `taken_at`：縮圖參數一改、或換個瀏覽器，hash 就對不上了，但 EXIF 的
+         * 2. `phash`：畫面本身的 dHash。**這是唯一跨平台對得上的訊號** ——
+         *    `file_hash` 算的是「上傳進來的那顆 800px 縮圖的位元組」，而網頁是
+         *    原圖→2000px→800px（兩次重取樣）、App 是原圖→800px（一次），編碼器
+         *    也不同（libwebp vs Android），位元組一模一樣**物理上做不到**。
+         *    phash 取樣成 9×8 灰階、不管長寬比，所以兩邊算出來一樣。
+         *    ⚠️ 兩邊都早就在送了（網頁 `uploadPhoto`、App `Ingest.phashOf`），
+         *    欄位與 `idx_photo_phash` 也早就在 —— 缺的一直只有這裡沒比。
+         * 3. `taken_at`：縮圖參數一改、或換個瀏覽器，hash 就對不上了，但 EXIF 的
          *    快門時間不受縮圖影響。代價是連拍可能同秒 —— 所以是「問使用者」而不是
          *    「直接擋」，誤判的成本只有多按一下。
          *
-         * 不比 pHash：本機上傳這條路從來沒送過 phash，欄位是 NULL，比了也是白比。
+         * ⚠️ **只比「完全一樣的 phash」，不算漢明距離。** 相等吃得到
+         * `idx_photo_phash`，多這一段是零成本；要算距離就得把整本相簿的列全撈回來
+         * 逐一比，那是每次上傳掃幾千列 D1（[[free-tier-is-top-priority]]）。
+         * 「有點像」那件事由 /admin「相片的像素比對」負責，它本來就在瀏覽器算距離。
          *
-         * ⚠️⚠️ **兩個依據不是平起平坐的：特徵碼對得上就到此為止，不再往下看時間。**
+         * ⚠️⚠️ **三個依據不是平起平坐的：特徵碼對得上就到此為止，不再往下看。**
          * 一句 SQL 撈回來的是兩種命中混在一起的清單，而「拍攝時間一樣」在連拍時
          * 一次命中好幾列是常態。hash 一樣＝位元組層級同一個檔，答案已經確定了，
          * 這時候再把那幾列同秒的端出去只有壞處：使用者要在五張長得都像的縮圖裡
          * 挑一張，而自動補那段（前端 `incompleteTwin` 要求**剛好命中一列**）
          * 也會因為多出來的那幾列而放棄，於是「網站有、Drive 缺一半」補不起來。
-         * 所以 hash 有命中就**只回 hash 那幾列**，`reason` 跟著是 `same_file`。
-         * `ORDER BY (file_hash = ?) DESC` 是配套的 —— `LIMIT 5` 不能讓一串同秒的
-         * 連拍把真正對得上的那一列擠掉。
+         * 所以 hash 有命中就**只回 hash 那幾列**，`reason` 跟著是 `same_file`；
+         * hash 沒中但 phash 中了就只回那幾列（`same_image`）；都沒中才輪到時間。
+         * `ORDER BY (file_hash = ?) DESC, (phash = ?) DESC` 是配套的 —— `LIMIT 5`
+         * 不能讓一串同秒的連拍把真正對得上的那一列擠掉。
+         * （SQLite 的 DESC 排出來是 1 → 0 → NULL，剛好就是這個優先序。）
+         *
+         * ⚠️ **自動補備份（前端 `incompleteTwin()`）照舊只認 `same_file`。**
+         * phash 只說「看起來一樣」，連拍與同一個場景的兩張也會一樣 —— 拿 A 的
+         * 原始檔去填 B 的 Drive 欄位會錯得很安靜。`same_image` 一律走視窗讓人看一眼。
          */
         if (!allowDuplicate) {
           /*
@@ -7233,19 +7256,41 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
            * 「時間相同」會一口氣命中那一整批，看起來像每張都重複。當沒有時間處理。
            */
           const dupTakenAt = uploadTakenAt && uploadTakenAt !== 'null' ? uploadTakenAt : null;
+          /*
+           * ⚠️⚠️ **整片同色的那兩個值不可以拿來比對。** 全黑的影片封面、空白的
+           * 掃描件算出來的 dHash 一定是全 0 或全 f —— 那不是「長得一樣」的證據，
+           * 是「沒有東西可以比」。不擋的話站上每一張黑畫面都會互相認親。
+           * （跟 lib/phash.ts 的 `isFlatPhash` 同一件事，那邊是分組時擋。）
+           * 順便驗一次格式：這個值是前端送上來的，壞值不能進 SQL 當比對鍵。
+           */
+          const phashLower = (clientPhash ?? '').toLowerCase();
+          const dupPhash =
+            /^[0-9a-f]{16}$/.test(phashLower) &&
+            phashLower !== '0000000000000000' &&
+            phashLower !== 'ffffffffffffffff'
+              ? phashLower
+              : null;
           const { results: dupes } = await env.DB.prepare(
-            `SELECT id, title, thumb_sm_url, thumb_url, url, taken_at, file_hash,
+            `SELECT id, title, thumb_sm_url, thumb_url, url, taken_at, file_hash, phash, file_size,
                     media_type, drive_file_id, drive_original_id
                FROM Photo
               WHERE album_id = ?
-                AND (file_hash = ? OR (? IS NOT NULL AND taken_at = ?))
-              ORDER BY (file_hash = ?) DESC
+                AND (file_hash = ?
+                  OR (? IS NOT NULL AND phash = ?)
+                  OR (? IS NOT NULL AND taken_at = ?))
+              ORDER BY (file_hash = ?) DESC, (phash = ?) DESC
               LIMIT 5`
-          ).bind(albumId, fileHash, dupTakenAt, dupTakenAt, fileHash).all<any>();
+          ).bind(
+            albumId, fileHash, dupPhash, dupPhash, dupTakenAt, dupTakenAt, fileHash, dupPhash,
+          ).all<any>();
 
-          // 特徵碼有命中就只認那幾列，時間相同的那些一律不端出去（理由見上面）
+          // 優先序 same_file > same_image > same_time，只端出最強的那一種（理由見上面）
           const hashHits = dupes.filter((d: any) => d.file_hash === fileHash);
-          const matched = hashHits.length > 0 ? hashHits : dupes;
+          const imageHits = dupPhash
+            ? dupes.filter((d: any) => String(d.phash ?? '').toLowerCase() === dupPhash)
+            : [];
+          const matched =
+            hashHits.length > 0 ? hashHits : imageHits.length > 0 ? imageHits : dupes;
 
           if (matched.length > 0) {
             /*
@@ -7273,8 +7318,16 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
             };
             return new Response(JSON.stringify({
               duplicate: true,
-              // 讓前端講得出「哪裡像」：hash 一樣是同一個檔，只有時間一樣就是疑似
-              reason: hashHits.length > 0 ? 'same_file' : 'same_time',
+              /*
+               * 讓前端講得出「哪裡像」，三句話要做的事完全不同：
+               *   same_file  位元組一樣＝確定同一個檔
+               *   same_image 畫面一樣（多半是同一張從手機／從電腦各傳一次），
+               *              但也可能是連拍或同場景 —— 請人看一眼檔名與大小
+               *   same_time  只有快門秒數一樣，最弱的訊號
+               */
+              reason: hashHits.length > 0
+                ? 'same_file'
+                : imageHits.length > 0 ? 'same_image' : 'same_time',
               existing: matched.map((d: any) => ({
                 id: d.id,
                 // `title` 存的就是原始檔名。⚠️ 視窗一定要顯示它 —— 縮到 100px 的
@@ -7289,8 +7342,15 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
                 thumb_lg: d.thumb_url || d.url || d.thumb_sm_url,
                 taken_at: d.taken_at,
                 media_type: kindOf(d),
+                /*
+                 * 原始檔大小（0031）。⚠️ 舊的列是 NULL —— 前端要把「不知道」
+                 * 跟「0 位元組」分開，那一格不知道就不要寫。
+                 */
+                file_size: typeof d.file_size === 'number' ? d.file_size : null,
                 // 這一筆是不是**位元組層級**的同一個檔（hash 一樣）。只有它才敢自動補
                 same_file: d.file_hash === fileHash,
+                // 畫面一樣（跨平台的同一張多半落在這裡）。⚠️ **不敢自動補**，見上面
+                same_image: dupPhash != null && String(d.phash ?? '').toLowerCase() === dupPhash,
                 has_4k: kindOf(d) === 'photo' ? Boolean(d.drive_file_id) : true,
                 has_original: Boolean(d.drive_original_id),
               })),
@@ -7354,13 +7414,13 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           // 而漏填的照片 shuffle_key 是 NULL，會被 /api/albums 的預覽查詢整個跳過。
           // random() & 0x7FFFFFFF 保證落在 JS 安全整數內，後端才算得出同樣的種子。
           `INSERT INTO Photo
-             (title, file_name, album_id, url, thumb_url, thumb_sm_url, exif, taken_at, file_hash, phash,
+             (title, file_name, album_id, url, thumb_url, thumb_sm_url, exif, taken_at, file_hash, phash, file_size,
               lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by,
               media_type, duration_ms, gif_key, motion_offset, shuffle_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
           originalName, fileName, albumId, fileUrl, thumbUrl, thumbSmUrl, exifData,
-          uploadTakenAt, fileHash, clientPhash,
+          uploadTakenAt, fileHash, clientPhash, fileSize,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
           uploadTimeSource, me.uid, mediaType, durationMs, gifKey, motionOffset,
         ).run();
