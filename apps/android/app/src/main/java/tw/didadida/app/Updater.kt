@@ -11,6 +11,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import okhttp3.Request
 import org.json.JSONObject
@@ -68,51 +69,79 @@ object Updater {
         return if (f.isFile) f to code else null
     }
 
-    fun check(activity: Activity, force: Boolean = false) {
+    /**
+     * `manual` ＝使用者自己按了「檢查 App 更新」（帳號牌上那顆，走 JS bridge `checkUpdate()`）：
+     * 不看一小時的節流、每一種結果都要講出來（已是最新／找到新版／失敗），
+     * 下載完**直接問要不要現在裝**，不等離開 App —— 他按這顆就是想現在更新。
+     * 自動檢查（`onResume`）照舊安安靜靜，失敗也不吵人。
+     */
+    fun check(activity: Activity, manual: Boolean = false) {
         val app = activity.applicationContext
         val p = prefs(app)
         val now = System.currentTimeMillis()
-        // 手上已經有下載好的新版：舊系統在這裡問一次；新系統等離開 App 時自己裝
+        // 手上已經有下載好的新版：舊系統在這裡問一次；新系統等離開 App 時自己裝（手動按的也當場問）
         readyApk(app)?.let { (file, code) ->
-            if (!silentCapable(app)) promptInstall(activity, file, code, p.getString("readyName", "").orEmpty())
+            if (manual || !silentCapable(app)) {
+                promptInstall(activity, file, code, p.getString("readyName", "").orEmpty(), manual)
+            }
             return
         }
-        if (!force && now - p.getLong("last", 0) < CHECK_EVERY_MS) return
-        if (!running.compareAndSet(false, true)) return
+        if (!manual && now - p.getLong("last", 0) < CHECK_EVERY_MS) return
+        if (!running.compareAndSet(false, true)) {
+            if (manual) toast(app, "正在檢查更新…")
+            return
+        }
+        if (manual) toast(app, "檢查更新中…")
         Thread {
             try {
                 val url = "${Config.SITE}/app/version-${BuildConfig.FLAVOR}.json?cb=$now"
                 val json = Net.client.newCall(Request.Builder().url(url).build()).execute().use { res ->
                     if (!res.isSuccessful) null else res.body?.string()?.let { JSONObject(it) }
-                } ?: return@Thread
+                }
+                if (json == null) {
+                    if (manual) toast(app, "檢查失敗，請稍後再試")
+                    return@Thread
+                }
                 p.edit().putLong("last", now).apply()
                 val code = json.optInt("versionCode", 0)
                 val name = json.optString("versionName", "")
                 val apk = json.optString("apk", "")
-                if (code <= BuildConfig.VERSION_CODE || apk.isEmpty()) return@Thread
+                if (code <= BuildConfig.VERSION_CODE || apk.isEmpty()) {
+                    if (manual) toast(app, "已是最新版 ${BuildConfig.VERSION_NAME}")
+                    return@Thread
+                }
 
                 // 第一次：還沒允許安裝未知的應用程式。這一步繞不過去，只能請使用者去開
                 if (Build.VERSION.SDK_INT >= 26 && !app.packageManager.canRequestPackageInstalls()) {
                     main.post { askPermission(activity, name) }
                     return@Thread
                 }
-                val file = download(app, "${Config.SITE}/app/$apk?v=$code", code) ?: return@Thread
+                if (manual) toast(app, "找到新版 $name，下載中…")
+                val file = download(app, "${Config.SITE}/app/$apk?v=$code", code)
+                if (file == null) {
+                    if (manual) toast(app, "下載失敗，請稍後再試")
+                    return@Thread
+                }
                 p.edit().putInt("ready", code).putString("readyName", name).apply()
                 main.post {
-                    if (silentCapable(app)) {
+                    if (!manual && silentCapable(app)) {
                         // 使用者可能在下載的這段時間已經離開 App 了
                         if (!MainActivity.visible) installIfReady(app)
                     } else {
-                        promptInstall(activity, file, code, name)
+                        promptInstall(activity, file, code, name, manual)
                     }
                 }
             } catch (_: Exception) {
-                // 沒網路、站台還沒放 version.json —— 下次再問，不必吵使用者
+                // 沒網路、站台還沒放 version.json —— 自動檢查下次再問，不必吵使用者
+                if (manual) toast(app, "檢查失敗，請稍後再試")
             } finally {
                 running.set(false)
             }
         }.start()
     }
+
+    private fun toast(app: Context, msg: String) =
+        main.post { Toast.makeText(app, msg, Toast.LENGTH_SHORT).show() }
 
     /**
      * 離開 App（`MainActivity.onStop`）與上傳收工（`UploadService`）時叫。
@@ -213,9 +242,12 @@ object Updater {
             .show()
     }
 
-    private fun promptInstall(activity: Activity, apk: File, code: Int, name: String) {
+    private fun promptInstall(activity: Activity, apk: File, code: Int, name: String, manual: Boolean = false) {
         if (activity.isFinishing || activity.isDestroyed) return
-        if (busy()) return   // 上傳中不問，收工後下次回前景再問
+        if (busy()) {   // 上傳中不問，收工後下次回前景再問
+            if (manual) toast(activity.applicationContext, "新版 $name 已下載好，上傳完成後再安裝")
+            return
+        }
         AlertDialog.Builder(activity)
             .setTitle("新版本 $name 已下載好")
             .setMessage("目前是 ${BuildConfig.VERSION_NAME}。安裝時 App 會關掉，要現在安裝嗎？")

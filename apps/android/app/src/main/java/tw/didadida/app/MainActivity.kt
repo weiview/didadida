@@ -204,6 +204,17 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
         )
     }
 
+    override fun onUploadProgress(albumId: Long, index: Int, total: Int, name: String, sent: Long, size: Long) {
+        // 檔名是使用者的字串，一定要 quote 過才塞進 JS
+        val detail = org.json.JSONObject()
+            .put("albumId", albumId.toString()).put("current", index).put("total", total)
+            .put("fileName", name).put("sent", sent).put("size", size)
+        web.evaluateJavascript(
+            "window.dispatchEvent(new CustomEvent('${Config.JS_UPLOAD_PROGRESS}',{detail:$detail}))",
+            null,
+        )
+    }
+
     override fun onDuplicates() {
         startActivity(Intent(this, DuplicateActivity::class.java))
     }
@@ -363,6 +374,10 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
         /** 登出：把這支手機從站上的推播名單撤掉 */
         @JavascriptInterface
         fun clearSession() = Push.clearSession(this@MainActivity)
+
+        /** 帳號牌上那顆「檢查 App 更新」：不看節流，結果一律講出來（見 Updater.check） */
+        @JavascriptInterface
+        fun checkUpdate() = runOnUiThread { Updater.check(this@MainActivity, manual = true) }
     }
 
     companion object {

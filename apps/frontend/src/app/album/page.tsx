@@ -1,6 +1,6 @@
 "use client";
 
-import { nativeApp, NATIVE_UPLOAD_DONE } from "@/lib/nativeApp";
+import { nativeApp, NATIVE_UPLOAD_DONE, NATIVE_UPLOAD_PROGRESS } from "@/lib/nativeApp";
 import { useEffect, useState, useRef, Suspense, useMemo, useCallback } from "react";
 import styles from "./album.module.css";
 import TimelineRail from "./TimelineRail";
@@ -189,7 +189,11 @@ function AlbumContent() {
   const [uploadProgress, setUploadProgress] = useState<{
     current: number; total: number; fileName: string;
     bytes?: { sent: number; total: number };
+    /** App 傳來的照片階段百分比：`bytes` 只拿來算進度條，不寫成「上傳 x / y」 */
+    stage?: boolean;
   } | null>(null);
+  /** Android App 的原生上傳正在跑（進度由 `NATIVE_UPLOAD_PROGRESS` 事件餵） */
+  const [nativeUploading, setNativeUploading] = useState(false);
   /** Drive 沒接上時的原因。照片照樣傳得上去，只是少了 4K 與原始檔備份 */
   const [driveError, setDriveError] = useState<string | null>(null);
   /**
@@ -864,12 +868,50 @@ function AlbumContent() {
   const loadDataRef = useRef(loadData);
   loadDataRef.current = loadData;
   useEffect(() => {
+    /*
+     * ⚠️ App 切到背景時原生那頭不送事件（listener 在 onPause 清掉），「傳完了」那一則
+     * 可能根本收不到 —— 所以另掛一支逾時：兩分鐘沒有任何進度就當作收工，
+     * 不然進度列會永遠停在畫面上。影片一塊 8MB，再慢的網路兩分鐘也該有一則。
+     */
+    let stale: ReturnType<typeof setTimeout> | null = null;
+    const clear = () => {
+      if (stale) { clearTimeout(stale); stale = null; }
+      setNativeUploading(false);
+      setUploadProgress(null);
+    };
     const onDone = (e: Event) => {
       const detail = (e as CustomEvent<{ albumId?: string }>).detail;
-      if (!detail?.albumId || String(detail.albumId) === String(id)) void loadDataRef.current({ silent: true });
+      if (!detail?.albumId || String(detail.albumId) === String(id)) {
+        clear();
+        void loadDataRef.current({ silent: true });
+      }
+    };
+    const onProgress = (e: Event) => {
+      const d = (e as CustomEvent<{
+        albumId?: string; current?: number; total?: number; fileName?: string; sent?: number; size?: number;
+      }>).detail;
+      if (!d || String(d.albumId) !== String(id)) return;
+      const size = Number(d.size) || 0;
+      const sent = Number(d.sent) || 0;
+      setNativeUploading(true);
+      setUploadProgress({
+        current: Number(d.current) || 1,
+        total: Number(d.total) || 1,
+        fileName: d.fileName || '',
+        bytes: size > 0 ? { sent, total: size } : undefined,
+        // 照片送的是階段百分比（size 固定 100），不是位元組
+        stage: size === 100,
+      });
+      if (stale) clearTimeout(stale);
+      stale = setTimeout(clear, 120_000);
     };
     window.addEventListener(NATIVE_UPLOAD_DONE, onDone);
-    return () => window.removeEventListener(NATIVE_UPLOAD_DONE, onDone);
+    window.addEventListener(NATIVE_UPLOAD_PROGRESS, onProgress);
+    return () => {
+      window.removeEventListener(NATIVE_UPLOAD_DONE, onDone);
+      window.removeEventListener(NATIVE_UPLOAD_PROGRESS, onProgress);
+      if (stale) clearTimeout(stale);
+    };
   }, [id]);
 
   /**
@@ -880,7 +922,7 @@ function AlbumContent() {
    * 編輯照片）看 `canEditAlbum`。在別人的相簿裡就只剩上傳那一顆。
    */
   const buildFabActions = (): FabAction[] => {
-    if (uploading || syncingGoogle) {
+    if (uploading || syncingGoogle || nativeUploading) {
       /*
        * 還在等使用者挑照片那一段是**可以按的**：`popup.closed` 靠不住
        *（見 handleGoogleSync），沒有人猜得出他是關掉視窗不想匯了，
@@ -2666,7 +2708,7 @@ function AlbumContent() {
           </div>
           <p className={styles.progressText}>
             正在處理：{uploadProgress.fileName}（{uploadProgress.current} / {uploadProgress.total}）
-            {uploadProgress.bytes && (
+            {uploadProgress.bytes && !uploadProgress.stage && (
               <> · 上傳 {formatBytes(uploadProgress.bytes.sent)} / {formatBytes(uploadProgress.bytes.total)}</>
             )}
           </p>
@@ -3120,7 +3162,7 @@ function AlbumContent() {
       />
 
       {/*
-        * 旋轉只動 R2 那兩顆縮圖（Drive 的原始檔與 4K 不碰，那兩份本來就是正的）。
+        * 旋轉動 R2 那兩顆縮圖，Drive 的 4K 方向不一致時跟著換一份（原始檔不碰）。
         * ⚠️ **成功之後不重抓（不呼叫 loadData）** —— 同那顆「不開放」的快速鎖：
         *    重抓一次捲軸就回頂端，一本幾千張的相簿要重新捲回剛剛那一格。
         *    後端換掉了 R2 的物件鍵、舊物件當場刪除，所以新網址要就地併回手上那一列，
@@ -3130,13 +3172,17 @@ function AlbumContent() {
         isOpen={showRotate}
         photos={selectedPhotos.map((pid) => photos.find((p) => p.id === pid)).filter(Boolean) as Photo[]}
         onClose={() => setShowRotate(false)}
-        onDone={({ rotated, failures, skipped }) => {
+        onDone={({ rotated, failures, skipped, aligned }) => {
           const patch = new Map(rotated.map((r) => [r.id, r]));
           setPhotos((prev) => prev.map((p) => {
             const r = patch.get(p.id);
             // ⚠️ thumb_sm_url 的 null 是有主張的（後端已經把欄位清成 NULL），
             //    留著舊值會指向一顆剛被刪掉的物件
-            return r ? { ...p, url: r.url, thumb_url: r.thumb_url, thumb_sm_url: r.thumb_sm_url ?? undefined } : p;
+            if (!r) return p;
+            const next = { ...p, url: r.url, thumb_url: r.thumb_url, thumb_sm_url: r.thumb_sm_url ?? undefined };
+            // 4K 換成新檔時 id 跟著換 —— /full 的網址帶著它，不換的話燈箱還是舊快取裡歪的那張
+            if (r.drive_file_id) next.drive_file_id = r.drive_file_id;
+            return next;
           }));
           // 封面存的是網址不是 id，換了鍵就要跟著換，不然首頁那張變破圖
           const cover = rotated.find((r) => currentCoverPhotoUrl && photos.find((p) => p.id === r.id)?.url === currentCoverPhotoUrl);
@@ -3145,6 +3191,7 @@ function AlbumContent() {
           lastSelectedIndexRef.current = null;
           // 失敗一律逐張講原因，收工一次講完 —— 批次跑到一半 alert 會蓋住還在跑的那幾張
           const parts = [`已旋轉 ${rotated.length} 張`];
+          if (aligned > 0) parts.push(`Drive 上的 4K 已對齊 ${aligned} 張`);
           if (skipped > 0) parts.push(`${skipped} 個影片或 GIF 未處理`);
           let msg = parts.join('，');
           if (failures.length > 0) {

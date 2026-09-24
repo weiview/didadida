@@ -7,6 +7,7 @@ import AvatarPicker from "./AvatarPicker";
 import Avatar from "./Avatar";
 import { fetchNotifications, type NotificationItem } from "@/lib/api";
 import { uploadSummary } from "@/lib/uploadSummary";
+import { nativeApp } from "@/lib/nativeApp";
 
 /**
  * 右上角的帳號牌。收合時只有一顆圓鈕（顯示名稱的第一個字），點開才是整張卡。
@@ -348,6 +349,18 @@ export default function AccountBadge() {
                 >
                   ⚙ 後台設定
                 </Link>
+              )}
+
+              {/* 只在 App 裡、而且是有 checkUpdate 的那幾版才端出來（面板點開才 render，
+                  讀 window 不會 hydration mismatch）。結果由 App 用 Toast 講。 */}
+              {nativeApp()?.checkUpdate && (
+                <button
+                  type="button"
+                  onClick={() => { setOpen(false); nativeApp()?.checkUpdate?.(); }}
+                  style={{ ...plainBtn, marginTop: 8, width: "100%" }}
+                >
+                  ⟳ 檢查 App 更新{nativeApp()?.version ? `（目前 ${nativeApp()!.version!()}）` : ""}
+                </button>
               )}
 
               <button

@@ -50,10 +50,11 @@
 
 import {
   fetchDriveConfig, saveDriveFolders, saveAlbumDriveFolder, recordPhotoDrive, fetchAlbum,
-  fetchDriveWriterToken, DriveWriterError,
+  fetchDriveWriterToken, DriveWriterError, photoFullSrc,
   type DriveConfig,
 } from './api';
 import { encode4kWebp } from './imageUtils';
+import { dhashFromBlob, phashToInts, hamming } from './phash';
 
 const DRIVE_FILES = 'https://www.googleapis.com/drive/v3/files';
 const DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
@@ -713,6 +714,102 @@ export async function pushPhotoToDrive(
 
   const ok = fourK !== 'failed' && original !== 'failed';
   return { ok, fourK, original, ...(ok ? {} : { reason: reasons.join('；') || 'Google Drive 上傳失敗' }) };
+}
+
+/**
+ * 旋轉縮圖之後，讓 Drive 上那份 4K 跟著轉到同一個方向（使用者拍板的「方案 A」）。
+ *
+ *  - **原始檔一個位元組都不碰** —— 它是相機給的事實，EXIF 方向也還在裡面，
+ *    任何看圖軟體都會自己轉正。會歪的只有我們自己產的衍生版（4K／縮圖）。
+ *  - **不是「縮圖轉幾度 4K 就轉幾度」**：兩邊各自可能是歪的也可能是正的
+ *    （EXIF 被套兩次那個坑只咬縮圖，4K 通常本來就正）。做法是拿轉好的 800px
+ *    當標準答案，把 4K 的 0／90／180／270 各算一次 dHash，挑最像的那個角度。
+ *    最像的是 0° ＝本來就對齊了，什麼都不做；四個都不像（距離 > ALIGN_MAX_DIST）
+ *    代表比不出來，也什麼都不做 —— 猜錯的代價是把好好的 4K 轉歪。
+ *  - 換上去的是**一個新檔**（新的 file id）：`/full` 是一年 immutable，快取鍵跟著
+ *    `drive_file_id` 走，就地覆寫的話邊緣與瀏覽器都會一直端出舊的那張。
+ *    舊的那份由後端 `replace_4k` 排進 `trash/`（不呼叫 files.delete）。
+ *  - 回傳新的 file id；沒有要換（已對齊／比不出來／沒有 4K）回 null；
+ *    真的失敗往外丟 —— 呼叫端收進失敗清單，**縮圖那半的旋轉照樣算數**。
+ *
+ * 成本：一次 `/full`（Worker 請求＋可能一趟 Drive 取檔）＋一次 Drive 上傳＋一次記錄，
+ * 只在使用者按下旋轉時才發生，而且每張只有一次。
+ */
+const ALIGN_MAX_DIST = 12;
+
+export async function alignFourKToThumb(
+  photo: { id: number; title?: string | null; media_type?: string | null; drive_file_id?: string | null },
+  thumbBlob: Blob,
+  /** 真的要換才叫（大多數 4K 本來就是正的，不必為它去確認 Drive 資料夾） */
+  getTarget: () => Promise<{ folderId: string; token: string }>,
+): Promise<string | null> {
+  if (!photo.drive_file_id) return null;
+  if (photo.media_type === 'video' || photo.media_type === 'gif') return null;
+
+  const want = phashToInts((await dhashFromBlob(thumbBlob)) ?? '');
+  if (!want) return null;
+
+  const res = await fetch(photoFullSrc(photo));
+  // 302 回 R2 的 800px（Drive 沒接上）時 fetch 會自己跟過去 —— 那不是 4K，不能拿來比
+  if (!res.ok || res.redirected) return null;
+  if (!(res.headers.get('Content-Type') || '').startsWith('image/')) return null;
+  const src = await loadBlobImage(await res.blob());
+
+  let bestDeg = 0;
+  let bestDist = Infinity;
+  for (const deg of [0, 90, 180, 270]) {
+    const small = await drawRotated(src, deg, 400, 'image/jpeg', 0.9);
+    const h = small ? phashToInts((await dhashFromBlob(small)) ?? '') : null;
+    if (!h) continue;
+    const d = hamming(h, want);
+    if (d < bestDist) { bestDist = d; bestDeg = deg; }
+  }
+  if (bestDeg === 0 || bestDist > ALIGN_MAX_DIST) return null;
+
+  let out = await drawRotated(src, bestDeg, 3840, 'image/webp', 0.8);
+  if (!out || out.type !== 'image/webp') out = await drawRotated(src, bestDeg, 3840, 'image/jpeg', 0.9);
+  if (!out) throw new Error('4K 重新編碼失敗');
+
+  const base = (photo.title || String(photo.id)).replace(/\.[^/.]+$/, '');
+  const ext = out.type === 'image/webp' ? 'webp' : 'jpg';
+  const target = await getTarget();
+  const fileId = await uploadToDrive(target.token, out, `${photo.id}_${base}_4k.${ext}`, target.folderId);
+  for (let attempt = 1; attempt <= DRIVE_MAX_TRIES; attempt++) {
+    const r = await recordPhotoDrive(photo.id, { driveFileId: fileId }, { replace4k: true });
+    if (r.ok) return fileId;
+    if (!r.retryable) break;
+    if (attempt < DRIVE_MAX_TRIES) await sleep(attempt * 1000);
+  }
+  throw new Error('新的 4K 已上傳至 Google Drive，但未能記錄至網站');
+}
+
+function loadBlobImage(blob: Blob): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('讀不到 4K')); };
+    img.src = url;
+  });
+}
+
+/** 轉 deg 度並把長邊夾在 maxEdge；90／270 度畫布長寬對調 */
+function drawRotated(
+  img: HTMLImageElement, deg: number, maxEdge: number, type: string, quality: number,
+): Promise<Blob | null> {
+  const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.max(1, Math.round(img.naturalWidth * scale));
+  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const swap = deg === 90 || deg === 270;
+  const canvas = document.createElement('canvas');
+  canvas.width = swap ? h : w;
+  canvas.height = swap ? w : h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return Promise.resolve(null);
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate((deg * Math.PI) / 180);
+  ctx.drawImage(img, -w / 2, -h / 2, w, h);
+  return new Promise((resolve) => canvas.toBlob(resolve, type, quality));
 }
 
 /* ---- 診斷（已移除）----

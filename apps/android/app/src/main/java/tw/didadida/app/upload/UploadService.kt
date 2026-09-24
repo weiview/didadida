@@ -124,6 +124,7 @@ class UploadService : Service() {
             val pct = if (size > 0) (sent * 100 / size).toInt().coerceIn(0, 100) else 0
             val text = if (size > 0 && sent > 0) "$name（$pct%）" else name
             showProgress("上傳中 $index/$total", text, total * 100, (index - 1) * 100 + pct)
+            UploadEvents.progress(albumId, index, total, name, sent, size)
         }
         runCatching { ingest.announce() }
         UploadEvents.uploadDone(albumId)
@@ -220,6 +221,8 @@ class UploadService : Service() {
             .setOnlyAlertOnce(true)
             .setSilent(true)
             .setProgress(max, value, indeterminate)
+            // Android 12+ 預設會把前景服務的通知延後最多 10 秒才顯示 —— 一小批照片早就傳完了
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(openAppIntent())
             .build()
 
@@ -318,6 +321,7 @@ object UploadEvents {
     interface Listener {
         fun onUploadDone(albumId: Long)
         fun onDuplicates()
+        fun onUploadProgress(albumId: Long, index: Int, total: Int, name: String, sent: Long, size: Long)
     }
 
     @Volatile var listener: Listener? = null
@@ -326,6 +330,17 @@ object UploadEvents {
     fun uploadDone(albumId: Long) {
         val l = listener ?: return
         main.post { l.onUploadDone(albumId) }
+    }
+
+    @Volatile private var lastProgress = 0L
+
+    /** 網頁那條進度條（同網頁的 uploadProgress）。一秒最多四次，換下一個檔一定送 */
+    fun progress(albumId: Long, index: Int, total: Int, name: String, sent: Long, size: Long) {
+        val l = listener ?: return
+        val now = System.currentTimeMillis()
+        if (now - lastProgress < 250 && sent > 0 && sent < size) return
+        lastProgress = now
+        main.post { l.onUploadProgress(albumId, index, total, name, sent, size) }
     }
 
     fun showDuplicates(): Boolean {

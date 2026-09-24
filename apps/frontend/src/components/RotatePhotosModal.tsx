@@ -2,21 +2,24 @@
 
 import { useEffect, useState } from 'react';
 import { photoThumbSrc, rotatePhotoThumbs, isVideo, isGif, type Photo, type RotateDegrees, type RotatedThumbs } from '@/lib/api';
+import { alignFourKToThumb, ensureDriveFolders, ensureAlbumFolder } from '@/lib/drive';
 
 interface Props {
   isOpen: boolean;
   /** 選取的那幾張（要整筆 Photo，不是 id）—— 預覽與「哪些轉不了」都要看 media_type */
   photos: Photo[];
   onClose: () => void;
-  onDone: (result: { rotated: RotatedThumbs[]; failures: string[]; skipped: number }) => void;
+  /** aligned ＝ Drive 上的 4K 跟著換成對齊方向的那幾張（新 id 在 rotated[].drive_file_id） */
+  onDone: (result: { rotated: RotatedThumbs[]; failures: string[]; skipped: number; aligned: number }) => void;
 }
 
 /**
  * 批次把 R2 的縮圖轉個方向。
  *
- * **轉的只有網站上那兩顆縮圖**（見 `rotatePhotoThumbs`）—— Drive 上那份 4K 吃的是
- * 原始檔、本來就是正的，歪掉的一直只有縮圖。所以這個視窗要講清楚「轉的是哪一份」，
- * 不然使用者會以為原始檔被動過。
+ * 先轉 R2 那兩顆縮圖（`rotatePhotoThumbs`），再拿轉好的 800px 當標準答案去比
+ * Drive 上那份 4K（`alignFourKToThumb`）：方向不一致就換一份轉正的 4K 上去，
+ * 本來就一致的什麼都不做。**Drive 上的原始檔一律不動**（使用者拍板的方案 A）。
+ * 4K 那半失敗只記進失敗清單，縮圖那半的旋轉照樣算數。
  *
  * ⚠️ **只收 90 的倍數**：任意角度會在四個角露出空白，而這裡要解的是「相機把方向
  *    記錯了」，那本來就只差 90 的倍數。
@@ -57,13 +60,36 @@ export default function RotatePhotosModal({ isOpen, photos, onClose, onDone }: P
     // 同時開幾十份會把記憶體與頻寬吃光（同重複照片那條佇列的理由）
     const rotated: RotatedThumbs[] = [];
     const failures: string[] = [];
+    let aligned = 0;
+    // Drive 資料夾只在真的要換 4K 時才去確認，而且整批只確認一次、每本相簿一次
+    let foldersP: ReturnType<typeof ensureDriveFolders> | null = null;
+    const albumFolders = new Map<number, Promise<string>>();
+    const targetFor = (albumId: number) => async () => {
+      foldersP ??= ensureDriveFolders();
+      const f = await foldersP;
+      if (!albumFolders.has(albumId)) albumFolders.set(albumId, ensureAlbumFolder(f, albumId));
+      return { folderId: await albumFolders.get(albumId)!, token: f.token };
+    };
     for (const p of targets) {
+      const name = p.title || p.file_name || p.id;
+      let r: RotatedThumbs;
       try {
-        rotated.push(await rotatePhotoThumbs(p, deg as RotateDegrees));
+        r = await rotatePhotoThumbs(p, deg as RotateDegrees);
+        rotated.push(r);
       } catch (e: any) {
         // ⚠️ 失敗**不可以當場 alert**，那會蓋在還在跑的批次上面。
         //    逐張記下原因，收工一次講完（同 IngestResult.failures 的規矩）
-        failures.push(`${p.title || p.file_name || p.id}：${e?.message || '未知錯誤'}`);
+        failures.push(`${name}：${e?.message || '未知錯誤'}`);
+        setDone((n) => n + 1);
+        continue;
+      }
+      if (p.drive_file_id && r.blob) {
+        try {
+          const newId = await alignFourKToThumb(p, r.blob, targetFor(p.album_id));
+          if (newId) { r.drive_file_id = newId; aligned++; }
+        } catch (e: any) {
+          failures.push(`${name}：縮圖已旋轉，但 4K 未能對齊（${e?.message || '未知錯誤'}）`);
+        }
       }
       setDone((n) => n + 1);
     }
@@ -74,7 +100,7 @@ export default function RotatePhotosModal({ isOpen, photos, onClose, onDone }: P
       setError(`全部處理失敗。${failures[0]}`);
       return;
     }
-    onDone({ rotated, failures, skipped });
+    onDone({ rotated, failures, skipped, aligned });
     onClose();
   };
 
@@ -149,7 +175,7 @@ export default function RotatePhotosModal({ isOpen, photos, onClose, onDone }: P
           {targets.length > 1 && '，選取的照片將套用相同角度。'}
         </p>
         <p style={{ fontSize: 12.5, color: '#64748b', margin: '0 0 10px', lineHeight: 1.6 }}>
-          僅旋轉站上的縮圖（相簿、首頁、地圖），Google Drive 上的原始檔與大圖不受影響。
+          旋轉站上的縮圖（相簿、首頁、地圖）。Google Drive 上的 4K 若方向與縮圖不一致，會自動換成對齊後的版本；原始檔不變動。
         </p>
         {skipped > 0 && (
           <p style={{ fontSize: 12.5, color: '#b45309', margin: '0 0 10px', lineHeight: 1.6 }}>

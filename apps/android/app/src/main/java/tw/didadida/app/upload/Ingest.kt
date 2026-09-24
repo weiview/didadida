@@ -96,7 +96,8 @@ class Ingest(
                 if (source.isVideo) {
                     ingestVideo(source) { sent, size -> progress.update(i + 1, total, source.name, sent, size) }
                 } else {
-                    ingestImage(source)
+                    // 照片沒有位元組層級的進度，改報階段：縮圖進站 → 4K → 原始檔
+                    ingestImage(source) { pct -> progress.update(i + 1, total, source.name, pct.toLong(), 100) }
                 }
             } catch (e: OutOfMemoryError) {
                 failures.add("${source.name}：檔案太大，手機記憶體不足")
@@ -187,7 +188,7 @@ class Ingest(
 
     /* ---- 照片與 GIF ---- */
 
-    private fun ingestImage(source: MediaSource) {
+    private fun ingestImage(source: MediaSource, stage: (Int) -> Unit = {}) {
         val gif = Media.isGif(source.mime, source.name)
         if (gif && source.size > Media.GIF_MAX_BYTES) {
             failures.add(
@@ -212,10 +213,11 @@ class Ingest(
             albumId, source.name, thumbs.md, thumbs.sm, exif?.toString(), takenAt,
             phash, kind, null, motionOffset, gifBytes, source.size, false,
         )
+        stage(30)
         when (result) {
             is Api.UploadResult.Created -> {
                 newPhotos++
-                pushOrRecord(result.id, source, fourK = !gif)
+                pushOrRecord(result.id, source, fourK = !gif, stage = stage)
             }
             is Api.UploadResult.Duplicate -> {
                 val twin = incompleteTwin(result.existing, kind)
@@ -266,13 +268,13 @@ class Ingest(
     }
 
     /** 照片已經在 R2 了：送 Drive，失敗**只是少一份備份**，記進 `driveMissing` */
-    private fun pushOrRecord(id: Long, source: MediaSource, fourK: Boolean) {
+    private fun pushOrRecord(id: Long, source: MediaSource, fourK: Boolean, stage: (Int) -> Unit = {}) {
         if (folder() == null) {
             driveMissing.add("${source.name}：Google Drive 備份未完成（${driveError ?: "無法連線"}）")
             return
         }
         val res = try {
-            pushPhoto(id, source, fourK, true)
+            pushPhoto(id, source, fourK, true, stage)
         } catch (e: Exception) {
             PushResult(false, "failed", "failed", errText(e))
         }
@@ -282,7 +284,9 @@ class Ingest(
     data class PushResult(val ok: Boolean, val fourK: String, val original: String, val reason: String?)
 
     /** `pushPhotoToDrive`。⚠️ 半套不算成功 */
-    private fun pushPhoto(id: Long, source: MediaSource, want4k: Boolean, wantOriginal: Boolean): PushResult {
+    private fun pushPhoto(
+        id: Long, source: MediaSource, want4k: Boolean, wantOriginal: Boolean, stage: (Int) -> Unit = {},
+    ): PushResult {
         val fid = folder() ?: return PushResult(false, "failed", "failed", driveError ?: "無法連線至 Google Drive")
         val base = source.name.replace(Regex("""\.[^/.]+$"""), "")
         val reasons = ArrayList<String>()
@@ -301,6 +305,7 @@ class Ingest(
             } catch (e: Exception) {
                 reasons.add("4K：${errText(e)}")
             }
+            stage(60)
         }
 
         var originalId: String? = null

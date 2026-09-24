@@ -75,6 +75,16 @@
                 android:resource="@xml/widget_featured_info" />
         </receiver>
 
+        <!-- 小工具的透明度設定（WidgetConfigActivity.kt）。系統的桌面要能叫它，所以要 exported -->
+        <activity
+            android:name=".WidgetConfigActivity"
+            android:exported="true"
+            android:label="@string/widget_featured_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+
         <!-- 自我更新：PackageInstaller 的安裝結果，只收自己發的 PendingIntent -->
         <receiver android:name=".InstallReceiver" android:exported="false" />
 

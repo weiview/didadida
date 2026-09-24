@@ -153,12 +153,18 @@ export function photoThumbSrc(
  * ⚠️ 網址一定要帶 `mt`（見 MEDIA_TOKEN_KEY）。這條路由已經不在進站閘門的白名單上，
  *    沒帶簽章一律 401 —— 而 `<img>` 的 401 在畫面上就只是一張破圖，很難查。
  */
-export function photoFullSrc(photo: { id: number }): string {
+export function photoFullSrc(photo: { id: number; drive_file_id?: string | null }): string {
   const base = `${API_BASE_URL}/photos/${photo.id}/full`;
   const mt = typeof window !== 'undefined' ? localStorage.getItem(MEDIA_TOKEN_KEY) : null;
   // 沒有就照原樣送出去讓後端擋掉。在這裡自己判斷「應該有才對」修不了任何事，
   // 而 checkAuth() 每次進站都會補上一張新的
-  return mt ? `${base}?mt=${encodeURIComponent(mt)}` : base;
+  const params: string[] = [];
+  if (mt) params.push(`mt=${encodeURIComponent(mt)}`);
+  // ⚠️ `/full` 回的是一年 immutable：旋轉對齊把 4K 換成新檔之後，瀏覽器自己那份
+  //    快取不換網址就永遠是躺著的舊圖。拿 Drive id 的尾巴當版本號（後端 cache key
+  //    也照 drive_file_id 分，這個 `v` 在那邊會被丟掉）
+  if (photo.drive_file_id) params.push(`v=${encodeURIComponent(photo.drive_file_id.slice(-8))}`);
+  return params.length ? `${base}?${params.join('&')}` : base;
 }
 
 /**
@@ -2194,15 +2200,18 @@ export interface RotatedThumbs {
   url: string;
   thumb_url: string;
   thumb_sm_url: string | null;
+  /** 轉好的 800px（拿去跟 Drive 4K 比方向，見 drive.ts 的 alignFourKToThumb） */
+  blob?: Blob;
+  /** Drive 4K 也跟著轉了的話，新的 file id */
+  drive_file_id?: string;
 }
 
 /**
  * 把一張照片在 R2 的兩顆縮圖轉個方向。
  *
- * **轉的只有 R2 那兩顆**（相簿格線、首頁輪播、地圖標記看到的那張）。Drive 上
- * 那份 4K 不動 —— 它走 `encode4kWebp(rawFile)`，吃的是原始檔、EXIF 只被套用
- * 一次，本來就是正的；歪掉的一直只有縮圖（見 imageUtils 的 `Orientation` 那段）。
- * 沒有 Drive 備份的照片燈箱本來就退回 800px，所以那些也一起修好了。
+ * 這一支只轉 R2 那兩顆（相簿格線、首頁輪播、地圖標記看到的那張）。Drive 4K
+ * 由呼叫端接著交給 `alignFourKToThumb()`（lib/drive.ts）：它拿轉好的縮圖當基準
+ * 比方向，不一致才重編一份換上去。**Drive 原始檔永遠不動**（使用者拍板）。
  *
  * 位元組全部在瀏覽器裡處理：抓下現有的 800px → canvas 轉向 → 重編 800／400 →
  * 交給 `POST /api/photos/:id/thumbs` 換上去。Worker 沒有影像解碼器，這件事
@@ -2258,6 +2267,7 @@ export async function rotatePhotoThumbs(
     // ⚠️ 這裡的 null 是**有主張的**（後端沒收到 400px 那顆，已經把欄位清成 NULL）。
     //    呼叫端要照著清掉，留著舊值會指向一顆剛被刪掉的物件 ＝ 破圖
     thumb_sm_url: p.thumb_sm_url ? String(p.thumb_sm_url) : null,
+    blob: md,
   };
 }
 
@@ -2653,6 +2663,7 @@ export async function saveDriveFolders(photosFolderId: string, trashFolderId: st
 export async function recordPhotoDrive(
   photoId: number,
   ids: { driveFileId?: string | null; driveOriginalId?: string | null },
+  opts: { replace4k?: boolean } = {},
 ): Promise<{ ok: boolean; retryable: boolean; status?: number }> {
   if (!ids.driveFileId && !ids.driveOriginalId) return { ok: false, retryable: false };
   try {
@@ -2662,6 +2673,8 @@ export async function recordPhotoDrive(
       body: JSON.stringify({
         drive_file_id: ids.driveFileId ?? undefined,
         drive_original_id: ids.driveOriginalId ?? undefined,
+        // 蓋掉既有的 4K（旋轉對齊用），舊的那份由後端排進 trash/
+        replace_4k: opts.replace4k ? true : undefined,
       }),
     });
     // 429 也算暫時的：那是「太快了」不是「不行」

@@ -27,6 +27,8 @@ import kotlin.concurrent.thread
  *  - 清單在 prefs 裡快取 `LIST_TTL_MS`（3 小時）—— 精選幾天才動一次，換一張不需要
  *    每次都問一次 API；換的只有「抓哪一顆縮圖」。
  *  - 圖用的是 800px 那顆（`thumb_url`）：縮圖那條路由（photos/view）在進站閘門白名單上，不必帶票。
+ *  - 照片 `fitCenter` 完整顯示不裁切；空出來的地方是背景。背景與照片的透明度由
+ *    `WidgetConfigActivity` 調（prefs `widget_bg_alpha`／`widget_img_alpha`，0–255）。
  *
  * ⚠️ 票（`admin_token`）是網頁交給 `Push.setSession` 的同一張 —— 沒登入過 App、或登出了，
  *    小工具就只寫「打開 App 登入後顯示精選」。
@@ -63,6 +65,8 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val KEY_LIST_SESSION = "widget_featured_session"
         private const val KEY_INDEX = "widget_featured_index"
         private const val LIST_TTL_MS = 3L * 3600 * 1000
+        private const val KEY_BG_ALPHA = "widget_bg_alpha"
+        private const val KEY_IMG_ALPHA = "widget_img_alpha"
         private const val MAX_PX = 720   // RemoteViews 的點陣圖有大小上限，也沒有必要比小工具本身大
 
         private val http by lazy {
@@ -79,6 +83,36 @@ class FeaturedWidget : AppWidgetProvider() {
             thread(name = "featured-widget") {
                 runCatching { render(app, advance = false) }.onFailure { Log.w(TAG, "小工具更新失敗", it) }
             }
+        }
+
+        fun backgroundAlpha(ctx: Context) = prefs(ctx).getInt(KEY_BG_ALPHA, 255).coerceIn(0, 255)
+        fun imageAlpha(ctx: Context) = prefs(ctx).getInt(KEY_IMG_ALPHA, 255).coerceIn(0, 255)
+
+        fun setBackgroundAlpha(ctx: Context, alpha: Int) {
+            prefs(ctx).edit().putInt(KEY_BG_ALPHA, alpha.coerceIn(0, 255)).apply()
+            applyStyle(ctx)
+        }
+
+        fun setImageAlpha(ctx: Context, alpha: Int) {
+            prefs(ctx).edit().putInt(KEY_IMG_ALPHA, alpha.coerceIn(0, 255)).apply()
+            applyStyle(ctx)
+        }
+
+        /** 只換顏色與透明度（partiallyUpdate），不碰畫面上那張圖 —— 拖拉桿時每一下都叫 */
+        private fun applyStyle(ctx: Context) {
+            val ids = ids(ctx)
+            if (ids.isEmpty()) return
+            val v = RemoteViews(ctx.packageName, R.layout.widget_featured)
+            style(ctx, v)
+            AppWidgetManager.getInstance(ctx).partiallyUpdateAppWidget(ids, v)
+        }
+
+        private fun style(ctx: Context, v: RemoteViews) {
+            val bg = backgroundAlpha(ctx)
+            v.setInt(R.id.widget_root, "setBackgroundColor", (bg shl 24) or 0x222222)
+            // 底下那條字的黑底跟著背景一起淡，字本身靠陰影撐著
+            v.setInt(R.id.widget_caption, "setBackgroundColor", ((0x88 * bg / 255) shl 24))
+            v.setInt(R.id.widget_image, "setImageAlpha", imageAlpha(ctx))
         }
 
         private fun ids(ctx: Context): IntArray =
@@ -112,6 +146,7 @@ class FeaturedWidget : AppWidgetProvider() {
             val item = items[index]
             val bmp = download(item.optString("src"))
             val views = RemoteViews(ctx.packageName, R.layout.widget_featured)
+            style(ctx, views)
             if (bmp != null) {
                 views.setImageViewBitmap(R.id.widget_image, bmp)
                 views.setViewVisibility(R.id.widget_message, View.GONE)
@@ -143,6 +178,7 @@ class FeaturedWidget : AppWidgetProvider() {
 
         private fun message(ctx: Context, text: String): RemoteViews {
             val v = RemoteViews(ctx.packageName, R.layout.widget_featured)
+            style(ctx, v)
             v.setImageViewResource(R.id.widget_image, android.R.color.transparent)
             v.setViewVisibility(R.id.widget_message, View.VISIBLE)
             v.setTextViewText(R.id.widget_message, text)

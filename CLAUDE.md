@@ -1751,7 +1751,7 @@ id 仍是 `video-meta`，換掉會弄丟 localStorage 那個開合狀態）。
   ⚠️ 掃出東西就 `bumpContentEpoch()`：`SELECT p.*` 會把這一欄帶進相簿 JSON，
   訪客那份共用邊緣快取不換 key 的話角標不會出現。
 
-## 旋轉：只轉 R2 的兩顆縮圖
+## 旋轉：轉 R2 的兩顆縮圖，Drive 的 4K 跟著對齊
 
 2026-08-31 加的。入口在**編輯模式底部那排動作鈕**（`🔄 旋轉`，跟 📍 指定地點／🕒 修正時間
 並排，可以一次選很多張），視窗是 `components/RotatePhotosModal.tsx`。
@@ -1764,8 +1764,21 @@ id 仍是 `video-meta`，換掉會弄丟 localStorage 那個開合狀態）。
   `encode4kWebp(rawFile)` 吃的是原始檔、只轉一次，是正的。「只有網站縮圖轉向不對」
   就是這麼來的。**已修**：`piexif.dump` 之前把 `0th`／`1st` 的 `Orientation` 改寫成 1。
   這只救得了之後上傳的，**已經歪掉的那些要靠這個功能轉回來**。
-- **只轉 R2 那兩顆縮圖**（使用者拍板）。Drive 上那份 4K 與原始檔不動 —— 它們本來就是
-  正的，而重編一份 4K 再上傳等於把整條上傳流程再跑一次。
+- **縮圖照使用者選的角度轉；Drive 上那份 4K 是「對齊縮圖」不是「跟著轉幾度」**
+  （2026-09-24 改，使用者：「有些是 4K 本身也是方向錯誤…對齊手動修正的縮圖方向」；
+  原始檔拍板**方案 A：一個位元組都不動** —— 它是相機給的事實，EXIF 方向也還在裡面）。
+  `alignFourKToThumb()`（`lib/drive.ts`）拿轉好的 800px 當標準答案算 dHash，
+  把 `/full` 抓回來的 4K 轉 0／90／180／270 各算一次，挑漢明距離最小的。
+  ⚠️ **最像的是 0°（本來就對齊）或四個都不像（> `ALIGN_MAX_DIST` 12）就什麼都不做**
+  —— 猜錯的代價是把好好的 4K 轉歪。⚠️ `/full` 被 302 到 R2 的 800px（Drive 沒接上）時
+  `res.redirected` 為真，那不是 4K，跳過。
+  要換才上傳一份**新檔**，並 `POST /api/photos/:id/drive` 帶 **`replace_4k: true`**：
+  後端把舊的 4K 排進 `DriveTrash`、覆寫 `drive_file_id`。
+  ⚠️ **不可以就地覆寫 Drive 上的檔**：`/full` 是一年 immutable，所以後端 cache key 用
+  `__d=<drive_file_id>`，前端 `photoFullSrc()` 帶 `v=<drive_file_id 後 8 碼>` 讓瀏覽器那份
+  也換網址 —— id 一換兩層快取自然作廢。收工時把新的 `drive_file_id` 併回那一列。
+  ⚠️ 4K 那半失敗**只記進失敗清單，縮圖的旋轉照樣算數**。Drive 資料夾只在真的要換時才確認
+  （`getTarget` 是惰性的：整批一次、每本相簿一次）。App 不必改 —— 旋轉只在網頁上做。
 - **位元組全在瀏覽器裡處理**（`rotatePhotoThumbs()`，`lib/api.ts`）：`fetch` 現有的 800px →
   canvas 轉向 → 重編 800／400 → `POST /api/photos/:id/thumbs`。Worker 沒有影像解碼器，
   也沒有 10ms CPU 以外的預算，這件事在後端做不到。
@@ -2149,9 +2162,14 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
 
 兩支 APK 可以同時裝在同一台手機上。
 
-- **網頁與 App 的接點只有兩個**（`apps/frontend/src/lib/nativeApp.ts`）：
-  `window.DidadidaApp.pickAndUpload(albumId, token)`（相簿頁的「上傳照片」在 App 裡改叫它），
-  以及原生傳完一批之後丟的 `didadida:native-upload-done`（相簿頁接到就 `loadData({silent:true})`）。
+- **網頁與 App 的上傳接點**（`apps/frontend/src/lib/nativeApp.ts`）：
+  `window.DidadidaApp.pickAndUpload(albumId, token)`（相簿頁的「上傳照片」在 App 裡改叫它）、
+  原生傳完一批之後丟的 `didadida:native-upload-done`（相簿頁接到就 `loadData({silent:true})`），
+  以及傳的過程中丟的 `didadida:native-upload-progress`（1.0.6，`{albumId,current,total,fileName,sent,size}`，
+  250ms 節流；相簿頁照網頁上傳那條進度畫）。⚠️ 照片送的是**階段百分比**（`size === 100`，
+  `sent` 30／60／100），影片才是真的位元組 —— 前端靠 `stage` 分辨，階段的不寫成「x MB / y MB」。
+  ⚠️ App 在背景時事件收不到（listener 在 `onPause` 清掉），所以相簿頁有一支 120 秒沒動靜就收掉進度的保險。
+  通知列那則前景服務通知也跟著更新（`FOREGROUND_SERVICE_IMMEDIATE`，不然 Android 12+ 前 10 秒不顯示）。
   一般瀏覽器裡 `window.DidadidaApp` 不存在，走原本那條。
 - ⚠️⚠️ **上傳管線有兩份實作：網頁的 TS 與 App 的 Kotlin**（`app/src/main/java/tw/didadida/app/upload/`：
   `Ingest`／`Media`（縮圖）／`Phash`／`MotionPhoto`／`VideoMeta`／`Geo`／`Drive`／`Api`）。
@@ -2189,6 +2207,10 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   確認畫面，在背景改發「點這裡安裝」通知（Android 14 不准背景啟動 Activity）。
   ⚠️ 前提是「允許安裝未知的應用程式」已經開著；沒開就跳一次請他去開。
   「稍後」只是這一次不裝，**不會永久跳過那一版**。
+  **手動檢查**（1.0.7）：帳號牌上那顆「⟳ 檢查 App 更新」叫 bridge 的 `checkUpdate()` →
+  `Updater.check(activity, manual = true)`：不看 1 小時節流、每一步都用 Toast 講結果
+  （已是最新版／找到新版下載中／失敗），下載好**當場問要不要裝**（不等離開 App）。
+  按鈕只在 `nativeApp()?.checkUpdate` 存在時才端出來（1.0.6 以前的 App 沒有）。
   ⚠️ 檔名一定要帶 flavor：dev 與 prod 兩個 Pages
   部署吃的是**同一份 `public/`**，只放一份會叫 dev 的 App 去裝 prod 的 APK。
 - ⚠️⚠️ **簽章金鑰 `apps/android/keystore.jks` ＋ `keystore.properties`（gitignore，不在 repo）
@@ -2229,6 +2251,9 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
 - **桌面小工具 `FeaturedWidget.kt`**（「本次精選」）：輪播 `GET /api/featured`，系統每 30 分鐘換一張、
   右上 ⟳ 手動換，點圖開那張照片。清單在 prefs 快取 3 小時（精選幾天才動一次），
   **不開放的一律跳過**（桌面是誰都看得到的地方），沒登入時寫「打開 App 登入後…」。
+  照片 `fitCenter` 完整顯示不裁切；背景與照片透明度由 `WidgetConfigActivity`（長按小工具 →「設定」，
+  `widgetFeatures="reconfigurable|configuration_optional"`）調，存 prefs `widget_bg_alpha`／`widget_img_alpha`，
+  拉桿當下走 `partiallyUpdateAppWidget` 只換顏色與 alpha，**不重抓清單也不重下載縮圖**。
   ⚠️ KDoc 裡不要寫 `/api/photos/view/*` —— Kotlin 的註解會巢狀，`/*` 會開一個永遠關不掉的註解。
 
 ### 狀態列與「這一版改了什麼」（1.0.5）

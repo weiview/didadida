@@ -5639,6 +5639,17 @@ if (method === "POST" && pathname === "/api/verify-password") {
         keyUrl.searchParams.delete("mt");
         keyUrl.searchParams.delete("adm");
         if (isRestricted) keyUrl.searchParams.set("adm", "1");
+        /*
+         * ⚠️ 快取鍵要跟著 Drive 那份 4K 的 id 走：旋轉會把 4K 換成一個新檔
+         * （POST /api/photos/:id/drive 的 replace_4k），而這份回應是一年 immutable ——
+         * 鍵不換的話邊緣快取會一直端出轉之前那張。前端帶的 `v` 只是讓**瀏覽器**
+         * 那份快取也換網址，這裡刪掉它、改由後端自己 set，免得任何人塞亂數
+         * 把每一次請求都變成一趟 Drive 取檔。
+         */
+        keyUrl.searchParams.delete("v");
+        if (typeof photo.drive_file_id === "string" && photo.drive_file_id) {
+          keyUrl.searchParams.set("__d", photo.drive_file_id);
+        }
         const cacheKey = new Request(keyUrl.toString(), { method: "GET" });
         const hit = await cache.match(cacheKey);
         if (hit) return hit;
@@ -7707,13 +7718,34 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         const photoId = pathname.split("/")[3];
         if (!(await canTouchPhoto(photoId))) return forbidden(headers);
         const body = await request.json().catch(() => ({})) as {
-          drive_file_id?: unknown; drive_original_id?: unknown;
+          drive_file_id?: unknown; drive_original_id?: unknown; replace_4k?: unknown;
         };
         const fileId = typeof body.drive_file_id === "string" && body.drive_file_id ? body.drive_file_id : null;
         const originalId = typeof body.drive_original_id === "string" && body.drive_original_id ? body.drive_original_id : null;
 
         if (!fileId && !originalId) {
           return new Response(JSON.stringify({ error: "drive_file_id 與 drive_original_id 至少要給一個" }), { status: 400, headers });
+        }
+
+        /*
+         * 旋轉對齊（前端 alignFourKToThumb）：Drive 上那份 4K 方向跟手動轉正的縮圖對不上時，
+         * 前端重編一份轉過的 4K 傳上去，再叫這裡**換掉**既有那一欄（上面那個 COALESCE
+         * 刻意不蓋既有值，所以要另開一條）。舊的那份排進 DriveTrash 搬去 trash/ ——
+         * ⚠️ 一定要在覆寫 id 之前排，覆寫之後就沒有地方記得它了（同 queueDriveTrash 的規矩）。
+         * 原始檔一個位元組都不動（使用者拍板）。
+         */
+        if (body.replace_4k === true) {
+          if (!fileId) {
+            return new Response(JSON.stringify({ error: "replace_4k 需要 drive_file_id" }), { status: 400, headers });
+          }
+          const cur = await env.DB.prepare("SELECT id, drive_file_id FROM Photo WHERE id = ?")
+            .bind(photoId).first<{ id: number; drive_file_id: string | null }>();
+          if (!cur) return new Response(JSON.stringify({ error: "Photo not found" }), { status: 404, headers });
+          if (cur.drive_file_id && cur.drive_file_id !== fileId) {
+            await queueDriveTrash(env, [{ id: cur.id, drive_file_id: cur.drive_file_id }]);
+          }
+          await env.DB.prepare("UPDATE Photo SET drive_file_id = ? WHERE id = ?").bind(fileId, photoId).run();
+          return new Response(JSON.stringify({ success: true, replaced: cur.drive_file_id !== fileId }), { headers });
         }
 
         const res = await env.DB.prepare(`

@@ -7,5 +7,7 @@
     android:updatePeriodMillis="1800000"
     android:resizeMode="horizontal|vertical"
     android:widgetCategory="home_screen"
+    android:configure="tw.didadida.app.WidgetConfigActivity"
+    android:widgetFeatures="reconfigurable|configuration_optional"
     android:initialLayout="@layout/widget_featured"
     android:description="@string/widget_featured_desc" />

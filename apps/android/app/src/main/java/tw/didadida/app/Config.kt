@@ -21,4 +21,6 @@ object Config {
 
     /** 上傳完成後丟回 WebView 的事件名（前端 lib/nativeApp.ts 同一個字串） */
     const val JS_UPLOAD_DONE = "didadida:native-upload-done"
+    /** 上傳中的進度（`{albumId,current,total,fileName,sent,size}`），前端畫成跟網頁一樣的進度條 */
+    const val JS_UPLOAD_PROGRESS = "didadida:native-upload-progress"
 }
