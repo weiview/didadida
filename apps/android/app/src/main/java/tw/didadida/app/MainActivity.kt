@@ -170,6 +170,7 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
         // 在前景時才有重複照片要決定的，直接端出來
         if (tw.didadida.app.upload.DupStore.first() != null) onDuplicates()
         Updater.check(this)
+        MoodIcon.touch(this)
     }
 
     override fun onStart() {
@@ -179,6 +180,8 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
 
     override fun onStop() {
         visible = false
+        // 剛剛有來看 → 桌面圖示換回笑臉（開著的時候不換，見 MoodIcon）
+        MoodIcon.onLeave(this)
         // 離開 App 才裝新版：安裝會把行程殺掉，開著的時候裝等於 App 當場消失
         Updater.installIfReady(this)
         super.onStop()

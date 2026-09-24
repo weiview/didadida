@@ -8,5 +8,5 @@
     <string name="widget_featured_label">本次精選</string>
     <string name="widget_featured_desc">輪播站上的本次精選，點一下開那張照片</string>
     <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
-    <string name="whats_new">• 帳號選單新增「檢查 App 更新」，可手動檢查並安裝新版</string>
+    <string name="whats_new">• 桌面圖示換成寶寶的臉：隔一整天沒打開 App 會生氣，再隔一天會哭，打開就變回笑臉\n• 部分手機換圖示時會拿掉桌面上的捷徑，請從應用程式清單重新拖出來</string>
 </resources>

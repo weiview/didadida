@@ -15,5 +15,7 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         Push.init(this)
+        // 桌面圖示換臉的午夜鬧鐘：開機、更新、被系統叫醒時都會走到這裡，順手重排
+        MoodIcon.init(this)
     }
 }

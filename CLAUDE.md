@@ -2267,6 +2267,19 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   （**每發一版就改寫那一段，只寫這一版的**）。看過的版號記在 prefs `whats_new_seen`；
   全新安裝（`firstInstallTime == lastUpdateTime`）不跳。靜默更新的「已更新」通知（`UpdatedReceiver`）也顯示同一段。
 
+### 桌面圖示會換臉（1.0.8，`MoodIcon.kt`）
+
+笑臉／生氣／哭哭三張（`res/drawable-nodpi/ic_face_*.png`＋`mipmap-anydpi-v26/ic_launcher_*.xml`，白底 adaptive icon）。
+照**當地日期**算：最後看 App 是 D 日 → D、D+1 笑，D+2 生氣，D+3 起哭（使用者拍板「隔整整一天才生氣」）。
+
+- Android 沒有換圖示的 API：manifest 裡三個 `activity-alias`（`.LauncherSmile`／`Angry`／`Cry`）輪流啟用，
+  **MAIN/LAUNCHER 因此不在 `MainActivity` 身上**。其他地方開 App 一律用顯式 `Intent(…, MainActivity::class.java)`，不受影響。
+- ⚠️ **App 開著時不換**：停用當初開 App 的那個 alias，在某些桌面上會把整個 task 收掉。
+  `onResume` 只記日期（`MoodIcon.touch`），`onStop` 才換回笑臉（`onLeave`）；午夜鬧鐘遇到 `MainActivity.visible` 也跳過。
+- 每天 00:00 用不精確的 `setAndAllowWhileIdle`（不必要精確鬧鐘權限），在 `App.onCreate`、開機、換時區時重排。
+- ⚠️ 換 alias 時，有些桌面（尤其三星）會拿掉桌面上的捷徑。使用者已知道並接受；升到 1.0.8 那一次通常也會發生一次。
+  狀態已經對的時候 `apply()` 一個字都不動，就是為了少換幾次。
+
 ### 建置與發版
 
 工具鏈：JDK 17 在 `%LOCALAPPDATA%\Android\jdk\`、SDK 在 `%LOCALAPPDATA%\Android\Sdk`

@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- 自己裝更新（APK 放在自己的網站上，不上 Google Play） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 桌面圖示每天 00:00 換臉的鬧鐘，重開機後要重新排 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:name=".App"
@@ -25,10 +27,6 @@
             android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density"
             android:windowSoftInputMode="adjustResize">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
             <!-- Google 登入走 Custom Tab，回來是 didadida://auth?n=<亂數>#token=… -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -37,6 +35,42 @@
                 <data android:scheme="${authScheme}" android:host="auth" />
             </intent-filter>
         </activity>
+
+        <!-- 桌面圖示的三張臉（MoodIcon.kt）。Android 沒有換圖示的 API，只能三個 alias 輪流啟用；
+             LAUNCHER 因此不在 MainActivity 身上。⚠️ 必須排在 MainActivity 後面（targetActivity 要先宣告） -->
+        <activity-alias
+            android:name=".LauncherSmile"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_smile"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherAngry"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_angry"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherCry"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_cry"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
 
         <activity
             android:name=".DuplicateActivity"
@@ -92,6 +126,14 @@
         <receiver android:name=".UpdatedReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 桌面圖示換臉：每天 00:00 的鬧鐘與開機後重排（MoodIcon.kt） -->
+        <receiver android:name=".MoodIcon$Receiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
             </intent-filter>
         </receiver>
     </application>
