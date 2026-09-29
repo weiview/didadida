@@ -274,14 +274,15 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 
 ## 資料模型
 
-`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0032）。
+`schema.sql` 是歷史起點，之後所有變更在 `apps/backend/migrations/`（目前到 0033）。
 **新的 schema 變更一律加在那裡**，不要再往 `database/` 加。
 `wrangler.toml` 沒設 `migrations_dir`，預設就是 wrangler.toml 旁邊的 `migrations/`。
 
 現有表：`User`／`Album`／`Photo`／`PhotoFts`(FTS5, bigram)／`Tag`／`PhotoTag`／`Favorite`／
 `TripSegment`／`TrackDay`／`TrackPoint`／`AppSetting`／`DriveTrash`／`Comment`／`CommentNotify`／
 `Place`（打卡地點簿，0023，見「指定地點」）／`UploadEvent`（有人上傳的全站通知，0026，
-見「有人上傳了：全站通知」）／`PushDevice`（App 的 FCM token，0032，見「App 推播」）。
+見「有人上傳了：全站通知」）／`PushDevice`（App 的 FCM token，0032，見「App 推播」）／
+`PhotoSeen`（誰看過哪一張，0033，見「NEW 角標」）。
 **沒有多餘的表**—— `ShareLink`（從沒實作的分享連結）與 `TrackSegment`（拿掉的逐段交通工具）
 已由 0012 刪除，`database/schema.sql` 裡那兩塊 `CREATE TABLE` 也一併移除了。
 
@@ -326,7 +327,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
 - `TrackDay.day_key` 是**不透明字串**（多身分之後還帶使用者前綴），**不要拿去解析日期**。
 - `Comment`／`CommentNotify` 見「留言」一節；`Place` 見「指定地點」一節；
   `UploadEvent` 見「有人上傳了：全站通知」一節。
-- **DROP TABLE 要由子表往父表**：`CommentNotify→Comment→Favorite→PhotoTag→TripSegment→
+- **DROP TABLE 要由子表往父表**：`CommentNotify→Comment→Favorite→PhotoTag→PhotoSeen→TripSegment→
   UploadEvent→Photo→Album→TrackPoint→TrackDay→Tag→DriveTrash→AppSetting→PushDevice→User`
   （`UploadEvent` 指著 `User` 與 `Album`，要排在那兩張前面；`Place` 沒有外鍵，
   排哪裡都行）。開著外鍵時照字母序刪
@@ -551,6 +552,9 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   為了防到那個程度得把整條上傳流程改成有交易邊界的，不划算。
   ⚠️ INSERT 失敗（相簿在這中間被刪掉之類的 FK 錯）**只回 `success:false`，絕不往外丟**
   —— 通知掉一則無所謂，把剛剛傳完的那批講成失敗就糟了。
+  **它也順手把那本相簿排到首頁最前面**（2026-09-29）：`sort_order = MIN(sort_order) − 1`，
+  WHERE 帶著「本來就是第一本就不寫」，真的有寫才 `bumpContentEpoch()`。同樣包在 try 裡。
+  ⚠️ 所以**只有一批收工那一下**會把相簿往前推，App 與網頁都走這支（App 在 `Ingest` 收工時打）。
 - **前端在「一批收工」時打一次**，兩個呼叫端（`app/album/page.tsx`）：
   `finishIngest()`（一般上傳）與 `finishDuplicateQueue()`（重複視窗那條背景佇列）。
   ⚠️ `void` 不 await：通知掛掉不該讓人卡在上傳的收尾上（`announceUpload` 自己也
@@ -597,6 +601,28 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   分兩句就是每個人每次進站多一趟往返。
 - ⚠️ 訪客整個不參與：他沒有 `User` 那一列（同留言、同 presence），
   `/api/notifications` 對他是 401，presence 對他零 D1 動作。
+
+## NEW 角標：逐人、逐張、點開才算看過
+
+2026-09-29 使用者拍板：**一週內新增的**才掛 NEW、**逐人逐張**、**在燈箱點開那一張才算看過**
+（「要點開那張照片才算」—— 捲過去、進相簿都不算），超過一週不管看過沒一律拿掉。
+自己傳的不對自己顯示。
+
+- **表是 `PhotoSeen(user_id, photo_id, seen_at)`（0033，PK 兩欄，兩個外鍵都 CASCADE）**。
+  只記一週內新增的照片（`POST /api/photos/seen` 寫之前就濾掉舊的），cron 每天台灣凌晨 3 點
+  （UTC 19:00 那一格）`DELETE … WHERE seen_at < -8 days` —— 表永遠只有「最近一週 × 成員數」那麼大。
+- 讀：相簿內容那支每一列多帶 **`seen`（0／1）**（`markSeen()`：一句
+  `SELECT photo_id FROM PhotoSeen WHERE user_id = ?` 整份撈回來在 JS 對，自己傳的直接 1）；
+  `/api/albums` 每本多帶 **`new_unseen`**（一週內、不是自己傳的、沒看過的張數，`NOT EXISTS`）。
+  ⚠️ 兩欄都**只發給成員**，訪客的回應沒有這兩欄 —— 前端靠「欄位是 `undefined`」分辨訪客。
+- 寫：`POST /api/photos/seen {photoIds}`，`INSERT OR IGNORE`、切塊、`no-store`，成員限定。
+- 前端在 `lib/seen.ts`（module store ＋ `useSyncExternalStore`）：燈箱點開時 `markPhotoSeen()`
+  先記在記憶體（格線當場拿掉角標），攢 1.5 秒一批送出，`pagehide`／切背景／關燈箱時立刻送。
+  ⚠️ 燈箱自己那顆 NEW 用 `isPhotoNew(photo, {ignoreLocal: true})`，不然一點開就消失、只閃一下。
+  ⚠️ 登出要 `resetSeen()`。
+- **訪客**沒有 `User` 那一列，整份記在自己的 localStorage（`didadida:seen_photos`、
+  `didadida:album_opened`，留 8 天）。相簿卡片沒有逐張資訊，退而求其次：點進過那本、
+  之後沒有更新的照片就不新（比 `latest_photo_at`）。
 
 ## 本次精選：右上角那顆「★ 精選」
 
@@ -1338,6 +1364,12 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   - ⚠️ 按住的那半秒要有 `.timelineHeld` 撐著軌道的可見度 —— 那條軌平常是
     `visibility: hidden`，靠 `:hover` 或捲動中（`.timelineActive`，父層 1.2 秒後
     自己放掉）才現身，不撐的話會在手指按著的時候淡掉。
+- **第二層：挑日期**（2026-09-29 使用者要求）。選完一個月（拖曳放開或輕點節點）照舊先跳到
+  那個月，**同時**在軌道旁邊跳出那個月的日期格；點一天就瞬間跳到那一天的第一張，
+  點外面或 Esc 收起來。那個月只有一天就不跳。
+  ⚠️ 日期格是軌道的**兄弟節點**不是子節點 —— 軌道會 `visibility: hidden` 淡出，掛裡面會一起消失。
+  ⚠️ 點外面收起來聽 `pointerdown` 而且**不擋那一下**：點到照片照樣要打得開燈箱。
+  ⚠️ 清單換掉（換排序、篩選）之後那個月可能不在了，要跟著收。
 - ⚠️⚠️ **讀相簿的那支效果相依只有 `[id, isAdmin]`，不可以放 `searchParams`**
   （2026-09-11 修）。`closeLightbox` 會 `replaceState` 拿掉 `?photo=`，而 Next 14 的
   router 攔了 `history.replaceState` —— `useSearchParams` 跟著換一個新物件，
@@ -2171,6 +2203,21 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   ⚠️ App 在背景時事件收不到（listener 在 `onPause` 清掉），所以相簿頁有一支 120 秒沒動靜就收掉進度的保險。
   通知列那則前景服務通知也跟著更新（`FOREGROUND_SERVICE_IMMEDIATE`，不然 Android 12+ 前 10 秒不顯示）。
   一般瀏覽器裡 `window.DidadidaApp` 不存在，走原本那條。
+- **挑照片是自己的格子 `GalleryActivity`**（1.0.9，使用者：「點一下就選」—— 系統的
+  Photo Picker 第一張要長按才進多選）。直接讀 MediaStore 畫四欄格子，點一下勾、再點取消。
+  權限：13+ `READ_MEDIA_IMAGES`／`VIDEO`（14+ 可「只允許部分相片」）、12 以下 `READ_EXTERNAL_STORAGE`；
+  拒絕就回 `RESULT_USE_SYSTEM`，MainActivity 退回系統選擇器。
+  ⚠️⚠️ **`ACCESS_MEDIA_LOCATION` 一定要要，每個網址都要 `setRequireOriginal`** —— 不然系統把
+  EXIF／影片裡的 GPS 抹掉，足跡地圖上安靜地沒有點。沒這個權限時**不能**叫它（開檔會丟例外）。
+  回的是 MediaStore 網址，不用 `takePersistableUriPermission`。
+- **斷網自動續傳**（1.0.9）：`Ingest` 逐檔判斷「失敗的原因是網路」（例外鏈裡有 `IOException`，
+  或當下 `Net.online()` 是 false）→ 不記失敗，收進 `netFailed`；`UploadService.retryAfterNetwork()`
+  用 `Net.await()` 等網路回來（每輪最多 15 分鐘）、緩 3 秒、**整個檔重跑**，最多 5 次。
+  整檔重跑是安全的：照片已進 R2 的會撞 `same_file`，`incompleteTwin` 只補 Drive 缺的那半。
+  ⚠️ 重跑前要 `resetDrive()` —— Drive 資料夾「整批只試一次」的結果是斷網時拿到的，要作廢。
+  5 次用完還是失敗 → 收工那則通知**常駐**（`setOngoing`，滑不掉），只能按「知道了」
+  （`upload/NoticeDismissReceiver`）收掉。
+  `Net`（`upload/Net.kt`）另外持有全 App 共用的 `OkHttpClient`（讀寫逾時 5 分鐘，8MB 分塊在行動網路要夠久）。
 - ⚠️⚠️ **上傳管線有兩份實作：網頁的 TS 與 App 的 Kotlin**（`app/src/main/java/tw/didadida/app/upload/`：
   `Ingest`／`Media`（縮圖）／`Phash`／`MotionPhoto`／`VideoMeta`／`Geo`／`Drive`／`Api`）。
   **改了 `ingestSources`、`uploadPhoto`、`lib/drive.ts`、縮圖、phash、動態照片、影片 metadata、

@@ -8,6 +8,7 @@ import {
 } from './api';
 import { resetPresence } from './presence';
 import { resetFeatured } from './featured';
+import { resetSeen } from './seen';
 import { nativeApp } from './nativeApp';
 
 /**
@@ -295,6 +296,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     resetPresence();
     // 精選清單同理：下一個登入的人看得到的可能比較少（訪客、不開放的那幾張）
     resetFeatured();
+    // NEW 的「看過了沒」：先把手上那批送出去再清，不然下一個人會沿用這個人的已讀
+    resetSeen();
     setState({
       admin: false, guest: false, canViewMap: false,
       canViewComments: false, canComment: false, canUseTools: false, unreadNotifications: 0, drivePendingMine: 0,

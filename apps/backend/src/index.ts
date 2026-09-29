@@ -800,6 +800,41 @@ const canSeeRestricted = (actor: Actor | null): boolean => !!actor?.canManageOth
 /** WHERE 片段。用到它的 SQL 必須把 Photo 別名為 `p`（跟 LOCAL_TIME_EXPR 同一個規矩） */
 const RESTRICTED_VISIBLE_COND = "p.restricted = 0";
 
+/*
+ * ── NEW 角標：誰看過哪一張（0033 PhotoSeen）────────────────────────────────
+ * 上傳一週內、不是自己傳的、而且這個人還沒在燈箱點開過 → NEW。
+ * 在清單回應的每一列掛一個 `seen`（0／1）給前端判斷；只對成員做（訪客沒有 User 那一列，
+ * 他的「看過」記在自己瀏覽器的 localStorage）。
+ *
+ * ⚠️ 一句 `SELECT photo_id FROM PhotoSeen WHERE user_id = ?` 把這個人的整份讀回來，
+ *    **不用 `IN (?,?,…)`**：那張表只留最近 8 天（cron 在清），一個人頂多幾百列，
+ *    而一本相簿幾千張照片的 IN 要切幾十塊。清單裡沒有一週內的照片時連這一句都不打。
+ */
+const SEEN_WINDOW_MS = 7 * 86400_000;
+
+function isWithinSeenWindow(createdAt: unknown, now = Date.now()): boolean {
+  if (typeof createdAt !== "string" || !createdAt) return false;
+  const t = Date.parse(createdAt.replace(" ", "T") + (/[zZ]|[+-]\d\d:?\d\d$/.test(createdAt) ? "" : "Z"));
+  return Number.isFinite(t) && now - t < SEEN_WINDOW_MS;
+}
+
+async function markSeen(env: Env, photos: any[], uid: number): Promise<void> {
+  const now = Date.now();
+  const recent = photos.filter((p) => isWithinSeenWindow(p.created_at, now) && p.uploaded_by !== uid);
+  for (const p of photos) p.seen = 1;
+  if (recent.length === 0) return;
+  let seenIds = new Set<number>();
+  try {
+    const { results } = await env.DB.prepare("SELECT photo_id FROM PhotoSeen WHERE user_id = ?").bind(uid).all();
+    seenIds = new Set((results as any[]).map((r) => Number(r.photo_id)));
+  } catch (e) {
+    // 表還沒建（migration 沒套到）時當作全都看過 —— 寧可少一顆 NEW，不要整支清單 500
+    console.error("PhotoSeen read failed", e);
+    return;
+  }
+  for (const p of recent) p.seen = seenIds.has(Number(p.id)) ? 1 : 0;
+}
+
 /**
  * 「Drive 上還缺一半」的條件（照片要 4K ＋原始檔兩份，影片與 GIF 只有原始檔一份）。
  * 理由見 `/api/photos/drive-pending` 那一段。Photo **不帶別名**。
@@ -5460,25 +5495,43 @@ if (method === "POST" && pathname === "/api/verify-password") {
           `SELECT created_at FROM Photo
              WHERE album_id = ?${previewRestricted}${previewNoVideo}
             ORDER BY created_at DESC LIMIT 1`;
+        /*
+         * 成員多一句：這本裡「一週內新增、不是我傳的、我還沒點開過」的有幾張（0033）。
+         * 走 idx_photo_album_created 的範圍掃描，只讀一週內的那幾列。
+         * 成員的回應本來就不進共用邊緣快取（skip），所以可以按人算。
+         * 訪客沒有 User 那一列，照舊由前端拿 latest_photo_at 自己比。
+         */
+        const seenUid = albumsActor?.uid ?? null;
+        const unseenSelect =
+          `SELECT COUNT(*) AS n FROM Photo p
+             WHERE p.album_id = ? AND p.created_at > datetime('now', '-7 days')
+               ${canSeeRestricted(albumsActor) ? "" : `AND ${RESTRICTED_VISIBLE_COND}`}
+               AND (p.uploaded_by IS NULL OR p.uploaded_by != ?)
+               AND NOT EXISTS (SELECT 1 FROM PhotoSeen s WHERE s.user_id = ? AND s.photo_id = p.id)`;
+        const per = seenUid !== null ? 4 : 3;
         const statements = (albums as any[]).flatMap((a) => {
           const seed = seedFor(Number(a.id));
-          return [
+          const list = [
             env.DB.prepare(previewSelect(">=")).bind(a.id, seed),
             env.DB.prepare(previewSelect("<")).bind(a.id, seed),
             env.DB.prepare(latestSelect).bind(a.id),
           ];
+          if (seenUid !== null) list.push(env.DB.prepare(unseenSelect).bind(a.id, seenUid, seenUid));
+          return list;
         });
         const batched = await env.DB.batch<any>(statements);
 
         const albumsWithPhotos = (albums as any[]).map((album, i) => {
           // 同一張照片不可能同時滿足 >= 與 <，直接串接不會重複
-          const rows = [...batched[i * 3].results, ...batched[i * 3 + 1].results];
+          const rows = [...batched[i * per].results, ...batched[i * per + 1].results];
           return {
             ...album,
             preview_photos: rows.slice(0, 5).map((p: any) => p.url),
             // 「一週內」由前端自己算（isNewAlbum）—— 這裡只負責把時間送出去，
             // 不把「新不新」烘進回應：那是時間的函數，烘進共用邊緣快取會定格。
-            latest_photo_at: (batched[i * 3 + 2].results[0]?.created_at as string) ?? null,
+            latest_photo_at: (batched[i * per + 2].results[0]?.created_at as string) ?? null,
+            // 成員才有；undefined＝訪客（前端退回 latest_photo_at 那一套）
+            ...(seenUid !== null ? { new_unseen: Number(batched[i * per + 3].results[0]?.n ?? 0) } : {}),
           };
         });
 
@@ -5972,6 +6025,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
           ORDER BY p.sort_order ASC, p.created_at DESC
         `).bind(albumId).all();
         const photos = applyGeoPrivacy(rawPhotos as any[], albumIsAdmin);
+        if (albumActor?.uid != null) await markSeen(env, photos, albumActor.uid);
 
         // 取得這些照片的標籤
         if (photos.length > 0) {
@@ -6095,6 +6149,7 @@ if (method === "POST" && pathname === "/api/verify-password") {
         `).bind(...binds, limit, offset).all();
 
         const photos = applyGeoPrivacy(rawPhotos as any[], searchIsAdmin);
+        if (searchActor?.uid != null) await markSeen(env, photos, searchActor.uid);
 
         // 標籤只補這一頁的（最多 limit 張），而且用 Map 對應而不是每張照片 filter
         // 一次整份標籤 —— 那正是舊版的 O(n×m)。
@@ -6622,6 +6677,31 @@ if (method === "POST" && pathname === "/api/verify-password") {
        * 一批一起改是為了沿用相簿頁那套既有的選取列，不是為了大量操作 ——
        * 使用者要的是單張，燈箱那顆開關送的就是一個 id 的陣列。
        */
+      /*
+       * NEW 角標：在燈箱點開過的照片記下來（0033 PhotoSeen，見 markSeen）。
+       * 前端攢一批再送（計時器或關燈箱時），一批最多幾十個 id。
+       * 只記一週內的照片（WHERE 擋）—— 超過一週本來就不顯示 NEW，記了是白寫。
+       * ⚠️ 訪客沒有 uid，回 204 不寫（他記在自己的 localStorage）。不包 withEdgeCache。
+       * ⚠️ 要排在 `/api/photos/:id` 那幾支前面（同 restricted／featured）。
+       */
+      if (method === "POST" && pathname === "/api/photos/seen") {
+        if (me.uid == null) return new Response(null, { status: 204, headers });
+        const body: any = await request.json().catch(() => ({}));
+        const ids = sanitizePhotoIds(body?.photoIds, 500);
+        if (ids.length === 0) return new Response(JSON.stringify({ success: true, written: 0 }), { headers });
+        const res = await env.DB.batch(
+          chunkIds(ids, 1).map((c) => env.DB.prepare(
+            `INSERT OR IGNORE INTO PhotoSeen (user_id, photo_id)
+               SELECT ?, id FROM Photo
+                WHERE id IN (${placeholdersFor(c)}) AND created_at > datetime('now', '-7 days')`
+          ).bind(me.uid, ...c)),
+        );
+        const written = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+        return new Response(JSON.stringify({ success: true, written }), {
+          headers: { ...headers, "Cache-Control": "no-store" },
+        });
+      }
+
       if (method === "PUT" && pathname === "/api/photos/restricted") {
         if (!me.canManageOthers) {
           return forbidden(headers, "只有可管理全站內容的人能設定不開放");
@@ -8211,6 +8291,20 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           // **絕不能讓它把剛剛傳完的那批講成失敗**
           console.error("upload announce failed", e);
           return new Response(JSON.stringify({ success: false }), { headers });
+        }
+        // 有新東西的相簿排到最前面（sort_order 比目前最小的再小 1）。
+        // 已經是第一本就一列都不寫；之後照樣可以在首頁拖曳自訂排序。
+        // 失敗不影響通知（排序只是順手的事）。
+        if (album) {
+          try {
+            const r = await env.DB.prepare(
+              `UPDATE Album SET sort_order = (SELECT MIN(sort_order) FROM Album) - 1
+                WHERE id = ? AND sort_order > (SELECT MIN(sort_order) FROM Album)`
+            ).bind(album).run();
+            if ((r.meta?.changes ?? 0) > 0) await bumpContentEpoch(env);
+          } catch (e) {
+            console.error("album move-to-front failed", e);
+          }
         }
         // 手機推播（0032）。相簿名字在這裡查一次 —— 通知上要寫，而 App 點下去要開那一本
         ctx.waitUntil((async () => {
@@ -10197,8 +10291,22 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
    *
    * 本機 `wrangler dev` 不會自己跑 cron，要測就打 http://localhost:8787/__scheduled
    */
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil((async () => {
+      /*
+       * PhotoSeen（0033）一天清一次：UTC 19:00–19:09 那一個 tick（台灣凌晨三點）。
+       * 超過一週的照片本來就不顯示 NEW，那些列留著只是佔位子；多留一天是緩衝。
+       * 走 idx_photo_seen_at，讀寫的列數就是要刪的那幾列。跟 Drive 那兩件無關，放最前面。
+       */
+      const at = new Date(event.scheduledTime);
+      if (at.getUTCHours() === 19 && at.getUTCMinutes() < 10) {
+        try {
+          await env.DB.prepare("DELETE FROM PhotoSeen WHERE seen_at < datetime('now', '-8 days')").run();
+        } catch (e) {
+          console.error("PhotoSeen 清理（cron）", e);
+        }
+      }
+
       try {
         const r = await drainDriveTrash(env, 20);
         if (r.ok && (r.moved > 0 || r.failed.length > 0)) {

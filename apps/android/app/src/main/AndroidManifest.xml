@@ -11,6 +11,14 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 桌面圖示每天 00:00 換臉的鬧鐘，重開機後要重新排 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 自己的挑相片格子（GalleryActivity）直接讀 MediaStore：13+ 分照片／影片兩個權限，
+         14+ 多一個「只允許部分相片」；12 以下是舊的讀取儲存空間。
+         ACCESS_MEDIA_LOCATION 不給的話系統會把 EXIF 裡的 GPS 抹掉，足跡地圖就沒座標了 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
 
     <application
         android:name=".App"
@@ -77,6 +85,13 @@
             android:launchMode="singleTop"
             android:exported="false"
             android:label="@string/dup_title" />
+
+        <activity
+            android:name=".GalleryActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density" />
+
+        <receiver android:name=".upload.NoticeDismissReceiver" android:exported="false" />
 
         <service
             android:name=".upload.UploadService"

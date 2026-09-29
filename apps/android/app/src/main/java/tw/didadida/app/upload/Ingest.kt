@@ -42,32 +42,70 @@ class Ingest(
     /** 服務自己掛的東西（這一批的 URI，收工時釋放讀取權） */
     var tag: Any? = null
 
+    /**
+     * 因為**網路斷掉**而沒做完的那幾個檔（2026-09-29）。它們的失敗訊息不進 `failures`，
+     * 由 `UploadService` 等網路回來後整個檔重跑一次（`run(netFailed)`）。
+     * ⚠️ 整個檔重跑是安全的：照片已經進 R2 的話會撞 same_file，`incompleteTwin` 只補
+     *    Drive 缺的那一半；影片被回滾掉的就當新檔再傳一次。
+     */
+    val netFailed = ArrayList<MediaSource>()
+    /** 網路重試用完還是有檔沒傳完 —— 收工那則通知要常駐 */
+    @Volatile var netGaveUp = false
+    /** 這一個檔處理中碰到過網路層的錯（`errText` 看例外鏈裡有沒有 IOException） */
+    private var netErr = false
+
     /* ---- Drive：整批只 bootstrap 一次 ---- */
 
     private val drive = Drive(api)
     private var folderId: String? = null
     private var driveTried = false
     private var driveError: String? = null
+    /** 資料夾拿不到是因為網路斷了 —— 那就不該「整批只試一次」，下一個檔再試 */
+    private var driveNetFail = false
 
     /**
      * 這一本相簿在 Drive 上的資料夾。**失敗只試一次** —— 同一批的下一張再試
      * 也是同一個結果，而每一趟都是好幾次 Drive 請求。拿不到回 null，原因在 `driveError`。
      */
     private fun folder(): String? {
+        if (driveTried && folderId == null && driveNetFail) driveTried = false
         if (!driveTried) {
             driveTried = true
+            driveNetFail = false
             folderId = try {
                 drive.ensureAlbumFolder(albumId)
             } catch (e: Exception) {
                 driveError = errText(e)
+                driveNetFail = isNetError(e)
                 null
             }
         }
+        if (folderId == null && driveNetFail) netErr = true
         return folderId
     }
 
-    private fun errText(e: Throwable): String =
-        e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+    /** 等網路回來重跑之前叫：資料夾那個「只試一次」的結果作廢 */
+    fun resetDrive() {
+        driveTried = false
+        folderId = null
+        driveError = null
+        driveNetFail = false
+    }
+
+    private fun isNetError(e: Throwable): Boolean {
+        var c: Throwable? = e
+        var depth = 0
+        while (c != null && depth++ < 8) {
+            if (c is java.io.IOException) return true
+            c = c.cause
+        }
+        return false
+    }
+
+    private fun errText(e: Throwable): String {
+        if (isNetError(e)) netErr = true
+        return e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+    }
 
     private fun needLabel(fourK: Boolean, original: Boolean): String =
         listOfNotNull(if (fourK) "4K" else null, if (original) "原始檔" else null).joinToString(" ＋ ")
@@ -92,6 +130,10 @@ class Ingest(
         val total = sources.size
         for ((i, source) in sources.withIndex()) {
             progress.update(i + 1, total, source.name, 0, 0)
+            val f0 = failures.size
+            val d0 = driveMissing.size
+            val b0 = backfilled.size
+            netErr = false
             try {
                 if (source.isVideo) {
                     ingestVideo(source) { sent, size -> progress.update(i + 1, total, source.name, sent, size) }
@@ -104,7 +146,18 @@ class Ingest(
             } catch (e: Exception) {
                 failures.add("${source.name}：${errText(e)}")
             }
+            // 這個檔留下了失敗或缺備份，而原因是網路 → 不記失敗，等網路回來整個檔重跑
+            if ((failures.size > f0 || driveMissing.size > d0) && (netErr || !Net.online(context))) {
+                trim(failures, f0)
+                trim(driveMissing, d0)
+                trim(backfilled, b0)
+                netFailed.add(source)
+            }
         }
+    }
+
+    private fun trim(list: ArrayList<String>, size: Int) {
+        while (list.size > size) list.removeAt(list.size - 1)
     }
 
     /** 收尾：一批只通知一次。補備份與重複視窗跳過的不算（站上沒有多一格新的） */

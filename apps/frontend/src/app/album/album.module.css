@@ -838,6 +838,88 @@
 }
 
 /*
+ * 時間軸第二層：選完月份之後跳出來的日期格（TimelineRail）。
+ * 軌道的兄弟節點，自己決定位置；不受軌道淡入淡出影響。
+ * 格子做大一點：拇指就在右緣，這一格是給手指按的。
+ */
+.timelineDayPanel {
+  position: fixed;
+  right: 44px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2001;
+  width: min(280px, calc(100vw - 72px));
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 10px 12px 12px;
+  border-radius: 14px;
+  background: rgba(20, 20, 20, 0.92);
+  color: #fff;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  animation: fadeIn 0.15s ease;
+}
+
+.timelineDayHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: bold;
+  font-size: 0.95rem;
+  margin-bottom: 8px;
+}
+
+.timelineDayClose {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 1.3rem;
+  line-height: 1;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.timelineDayGrid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+}
+
+.timelineDayBtn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 7px 0 5px;
+  border: none;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  cursor: pointer;
+}
+
+.timelineDayBtn:hover,
+.timelineDayBtn:active {
+  background: var(--accent-color, #d1bfae);
+  color: #111;
+}
+
+.timelineDayNum {
+  font-size: 1rem;
+  font-weight: bold;
+}
+
+.timelineDayCount {
+  font-size: 0.68rem;
+  opacity: 0.7;
+}
+
+@media (max-width: 768px) {
+  .timelineDayPanel {
+    right: 30px;
+  }
+}
+
+/*
  * 手機：縮成一條細軌。桌機那塊深色底板＋月份文字在手機上會吃掉快四分之一個
  * 畫面寬，而它整條就蓋在最右邊那一欄照片上。
  * 月份文字整排拿掉 —— 上面那顆氣泡已經在講「現在捲到哪個月」；

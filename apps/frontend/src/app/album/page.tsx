@@ -3,12 +3,13 @@
 import { nativeApp, NATIVE_UPLOAD_DONE, NATIVE_UPLOAD_PROGRESS } from "@/lib/nativeApp";
 import { useEffect, useState, useRef, Suspense, useMemo, useCallback } from "react";
 import styles from "./album.module.css";
-import TimelineRail from "./TimelineRail";
+import TimelineRail, { type TimelineGroupItem } from "./TimelineRail";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
-import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, setPhotosRestricted, applyRestrictedPatch, hasMotion, isNewMedia, announceUpload, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
+import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, setPhotosRestricted, applyRestrictedPatch, hasMotion, announceUpload, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
 import { ensureAlbumFolder, ensureDriveFolders, prewarmDrive, pushPhotoToDrive, pushVideoToDrive } from "@/lib/drive";
 import { useAdmin } from "@/lib/useAdmin";
+import { isPhotoNew, markAlbumOpened, useSeenVersion } from "@/lib/seen";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
 import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
@@ -150,6 +151,8 @@ function AlbumContent() {
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const { isAdmin, isOwner, canEdit, canAddTo, canReorderIn, canManageOthers, restrictedBlur } = useAdmin();
+  // NEW 角標看的是「看過了沒」，燈箱點開一張之後格線要跟著重畫
+  useSeenVersion();
   /**
    * 「不開放先糊著」的遮罩：掀開了哪幾張。
    *
@@ -481,6 +484,15 @@ function AlbumContent() {
     
     const fresh = photoData || [];
     setPhotos(fresh);
+    /*
+     * 訪客的相簿 NEW：記下「點進來時最新那張」的時間（lib/seen.ts）。
+     * 成員每一列都帶 seen（後端逐張記），那條不走這裡。
+     */
+    if (fresh.length > 0 && fresh.every((p) => p.seen === undefined)) {
+      let latest = "";
+      for (const p of fresh) if (p.created_at && p.created_at > latest) latest = p.created_at;
+      if (latest) markAlbumOpened({ id: Number(id), latest_photo_at: latest });
+    }
     setAvailableTags(tags);
 
     if (!opts?.silent) setLoading(false);
@@ -734,8 +746,9 @@ function AlbumContent() {
    */
   const timelineGroup = useMemo(() => {
     if (sortBy === "custom" || displayPhotos.length === 0) return [];
-    const groups: { label: string; index: number }[] = [];
+    const groups: TimelineGroupItem[] = [];
     let lastLabel = "";
+    let lastDay = -1;
 
     displayPhotos.forEach((photo, index) => {
       const dateObj = timelineDateOf(photo, sortBy);
@@ -745,7 +758,22 @@ function AlbumContent() {
         : NO_DATE_LABEL;
       if (label !== lastLabel) {
         lastLabel = label;
-        groups.push({ label, index });
+        lastDay = -1;
+        groups.push({ label, index, days: [] });
+      }
+      /*
+       * 第二層：這個月裡的每一天（選完月份之後跳出來的那一格，見 TimelineRail）。
+       * 跟月份同一個欄位同一個走法，所以「那一天的第一張」就是格線上第一次碰到它的位置。
+       */
+      if (dateObj) {
+        const g = groups[groups.length - 1];
+        const day = dateObj.getDate();
+        if (day !== lastDay) {
+          lastDay = day;
+          g.days!.push({ day, index, count: 1 });
+        } else {
+          g.days![g.days!.length - 1].count++;
+        }
       }
     });
 
@@ -2820,7 +2848,7 @@ function AlbumContent() {
                 * GIF／動態那顆時間標示 2026-09-10 整批搬到**右下角**（使用者指定），
                 * 兩顆從此對角線分開，不必再互相讓位。
                 */}
-              {isNewMedia(photo) && (
+              {isPhotoNew(photo) && (
                 <span className={styles.newBadge} aria-label="最近新增">
                   <span className={styles.newBadgeText}>NEW</span>
                 </span>

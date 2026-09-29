@@ -120,12 +120,14 @@ class UploadService : Service() {
         val unreadable = uris.size - sources.size
         if (unreadable > 0) ingest.failures.add("有 $unreadable 個檔案讀不到")
 
-        ingest.run(sources) { index, total, name, sent, size ->
+        val progress = Ingest.Progress { index, total, name, sent, size ->
             val pct = if (size > 0) (sent * 100 / size).toInt().coerceIn(0, 100) else 0
             val text = if (size > 0 && sent > 0) "$name（$pct%）" else name
             showProgress("上傳中 $index/$total", text, total * 100, (index - 1) * 100 + pct)
             UploadEvents.progress(albumId, index, total, name, sent, size)
         }
+        ingest.run(sources, progress)
+        retryAfterNetwork(ingest, progress)
         runCatching { ingest.announce() }
         UploadEvents.uploadDone(albumId)
 
@@ -146,6 +148,36 @@ class UploadService : Service() {
                 "有 ${ingest.dupes.size} 張可能重複",
                 "點這裡決定要保留、取代還是跳過", pi, NOTIFY_DUP,
             )
+        }
+    }
+
+    /**
+     * 網路斷掉而沒傳完的那幾個檔：等網路回來再整個檔重跑，最多 `NET_RETRIES` 次
+     * （2026-09-29 使用者要求）。每一輪最多等 `NET_WAIT_MS`，等不到也算用掉一次。
+     * 用完還是失敗就收進 `failures`，收工那則通知常駐（`netGaveUp`）。
+     */
+    private fun retryAfterNetwork(ingest: Ingest, progress: Ingest.Progress) {
+        var attempt = 0
+        while (ingest.netFailed.isNotEmpty() && attempt < NET_RETRIES) {
+            attempt++
+            showProgress(
+                "等待網路恢復…",
+                "還有 ${ingest.netFailed.size} 個檔案，第 $attempt/$NET_RETRIES 次重試", 0, 0,
+            )
+            if (!Net.await(this, NET_WAIT_MS)) continue
+            // 剛接上的網路常常還在抖，緩一下再開始
+            try { Thread.sleep(NET_SETTLE_MS) } catch (_: InterruptedException) { break }
+            val again = ArrayList(ingest.netFailed)
+            ingest.netFailed.clear()
+            ingest.resetDrive()
+            ingest.run(again, progress)
+        }
+        if (ingest.netFailed.isNotEmpty()) {
+            ingest.netGaveUp = true
+            ingest.netFailed.forEach {
+                ingest.failures.add("${it.name}：網路中斷，重試 $NET_RETRIES 次仍未完成")
+            }
+            ingest.netFailed.clear()
         }
     }
 
@@ -192,7 +224,11 @@ class UploadService : Service() {
             ingest.driveMissing.isNotEmpty() -> "上傳完成，Drive 備份有缺"
             else -> "上傳完成"
         }
-        notice(title, if (lines.isEmpty()) "沒有新增任何照片" else lines.joinToString("\n"))
+        notice(
+            title, if (lines.isEmpty()) "沒有新增任何照片" else lines.joinToString("\n"),
+            sticky = ingest.netGaveUp,
+        )
+        ingest.netGaveUp = false
         ingest.failures.clear()
         ingest.backfilled.clear()
         ingest.driveMissing.clear()
@@ -241,16 +277,31 @@ class UploadService : Service() {
         nm.notify(NOTIFY_PROGRESS, progressNotification(title, text, max, value, max == 0))
     }
 
-    private fun notice(title: String, text: String, pi: PendingIntent? = null, id: Int = noticeSeq.incrementAndGet()) {
-        val n = NotificationCompat.Builder(this, Config.CHANNEL_NOTICE)
-            .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+    /**
+     * sticky＝網路重試用完還是失敗：點了不消失、滑不掉（`setOngoing`），
+     * 只能按「知道了」收掉（`NoticeDismissReceiver`）—— 使用者要的是「持續顯示」。
+     */
+    private fun notice(
+        title: String, text: String, pi: PendingIntent? = null,
+        id: Int = noticeSeq.incrementAndGet(), sticky: Boolean = false,
+    ) {
+        val b = NotificationCompat.Builder(this, Config.CHANNEL_NOTICE)
+            .setSmallIcon(if (sticky) android.R.drawable.stat_notify_error else android.R.drawable.stat_sys_upload_done)
             .setContentTitle(title)
             .setContentText(text.lineSequence().first())
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-            .setAutoCancel(true)
+            .setAutoCancel(!sticky)
+            .setOngoing(sticky)
             .setContentIntent(pi ?: openAppIntent())
-            .build()
-        runCatching { nm.notify(id, n) }
+        if (sticky) {
+            val dismiss = PendingIntent.getBroadcast(
+                this, id,
+                Intent(this, NoticeDismissReceiver::class.java).putExtra(NoticeDismissReceiver.EXTRA_ID, id),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            b.addAction(0, "知道了", dismiss)
+        }
+        runCatching { nm.notify(id, b.build()) }
     }
 
     companion object {
@@ -270,6 +321,9 @@ class UploadService : Service() {
 
         private const val NOTIFY_PROGRESS = 1
         private const val NOTIFY_DUP = 2
+        private const val NET_RETRIES = 5
+        private const val NET_WAIT_MS = 15 * 60 * 1000L
+        private const val NET_SETTLE_MS = 3000L
         private val noticeSeq = AtomicInteger(100)
 
         fun ensureChannels(context: Context) {

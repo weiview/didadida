@@ -4,7 +4,8 @@ import { useEffect, useState, useRef, useMemo, useCallback } from "react";
 import styles from "./page.module.css";
 import albumStyles from "./album/album.module.css";
 import Link from "next/link";
-import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc, setPhotosRestricted, applyRestrictedPatch, isNewMedia, isNewAlbum } from "@/lib/api";
+import { fetchAlbums, createAlbum, deleteAlbum, Album, reorderAlbums, searchPhotos, Photo, fetchTags, Tag, photoThumbSrc, setPhotosRestricted, applyRestrictedPatch } from "@/lib/api";
+import { isAlbumNew, isPhotoNew, useSeenVersion } from "@/lib/seen";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import SlideConfirmModal from "@/components/SlideConfirmModal";
@@ -23,6 +24,7 @@ import BottomActionBar from "@/components/BottomActionBar";
  * 才碰得到，所以它不看單本相簿是誰的。
  */
 function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, draggingIndex, longPressIndex, sortBy, index, handlePointerDown, handlePointerUpOrLeave, handleDragStart, handleDragEnter, handleDragEnd, isSelected, onSelectToggle }: any) {
+  useSeenVersion();
   const [hovered, setHovered] = useState(false);
   const [photoIndex, setPhotoIndex] = useState(0);
   const previews: string[] = album.preview_photos ?? [];
@@ -167,7 +169,7 @@ function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, dr
             * ⚠️ 判定用 `latest_photo_at`（後端每本多回一列），一樣是瀏覽器算的，
             *   所以它會自己隨時間過期。
             */}
-          {isNewAlbum(album) && (
+          {isAlbumNew(album) && (
             <span className={albumStyles.newBadge} aria-label="最近有新增">
               <span className={albumStyles.newBadgeText}>NEW</span>
             </span>
@@ -194,6 +196,9 @@ export default function Home() {
   const revealedRestricted = useRevealedRestricted();
   const isBlurred = (p: Photo) =>
     restrictedBlur && p.restricted === 1 && !revealedRestricted.has(p.id);
+
+  // NEW 角標看的是「看過了沒」（lib/seen.ts），看過之後要重畫
+  useSeenVersion();
 
   // Modal state
   const [showModal, setShowModal] = useState(false);
@@ -1014,7 +1019,7 @@ export default function Home() {
                       * album.module.css 的 .newBadge）。⚠️ 這裡的右上角本來是空的
                       * （搜尋結果沒有影片／GIF 角標），所以不必讓位。
                       */}
-                    {isNewMedia(photo) && (
+                    {isPhotoNew(photo) && (
                       <span className={albumStyles.newBadge} aria-label="最近新增">
                         <span className={albumStyles.newBadgeText}>NEW</span>
                       </span>

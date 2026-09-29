@@ -14,6 +14,14 @@
  * ⚠️ 還沒滿 `HOLD_MS` 手指就移動超過 `SLOP_PX` ＝他是要捲（這條軌或整頁），當場讓開，
  *    不然這條細軌會變成一塊捲不動的死區。`HOLD_MS` 越短這條就越要緊 ——
  *    200ms 已經短到「按下去順手往下滑」很容易就壓線，SLOP 是唯一分得開兩者的東西。
+ *
+ * **第二層：挑日期**（2026-09-29 使用者要求）。選完一個月（拖曳放開、或輕點節點）
+ * 先照舊跳到那個月，**同時**在軌道旁邊跳出那個月的日期格；點一天就瞬間跳到那一天的
+ * 第一張，點到外面就收起來。那個月只有一天的話不跳（沒有東西可以再挑）。
+ * ⚠️ 那一格是軌道的**兄弟節點**不是子節點 —— 軌道平常是 `visibility: hidden`、
+ *    捲動停了 1.2 秒就淡出，日期格掛在裡面會跟著一起消失。
+ * ⚠️ 點外面收起來聽的是 `pointerdown`，而且**不擋那一下** —— 使用者點到照片時，
+ *    照片照樣要打得開，不該先點一下關面板、再點一下才進燈箱。
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -25,7 +33,8 @@ import styles from "./album.module.css";
 const HOLD_MS = 200;
 const SLOP_PX = 8;
 
-export type TimelineGroupItem = { label: string; index: number };
+export type TimelineDayItem = { day: number; index: number; count: number };
+export type TimelineGroupItem = { label: string; index: number; days?: TimelineDayItem[] };
 
 // 'YYYY/MM' → 'YYYY年M月'，跟捲動時那顆氣泡同一個寫法；「無日期」原樣
 function bubbleText(label: string) {
@@ -51,6 +60,17 @@ export default function TimelineRail({
   const [scrubIndex, setScrubIndex] = useState<number | null>(null);
   // 手指按著、還沒滿 0.5 秒：這段期間軌道不能因為父層的計時器到了而淡出
   const [held, setHeld] = useState(false);
+  // 第二層：挑了哪個月（label）之後端出來的日期格；null ＝收著
+  const [dayPanel, setDayPanel] = useState<string | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // 選完一個月：先跳過去，那個月有兩天以上才端出日期格
+  const pickMonth = (g: TimelineGroupItem, instant: boolean) => {
+    onJumpRef.current(g.index, instant);
+    setDayPanel(g.days && g.days.length > 1 ? g.label : null);
+  };
+  const pickMonthRef = useRef(pickMonth);
+  pickMonthRef.current = pickMonth;
 
   // 監聽器只掛一次，最新的 groups／onJump 從 ref 讀，免得閉包拿到舊的
   const groupsRef = useRef(groups);
@@ -132,7 +152,7 @@ export default function TimelineRail({
         // 擋掉放開之後瀏覽器補發的 click，不然會再跳一次（跳到手指底下那一格）
         e.preventDefault();
         const g = groupsRef.current[picked];
-        if (g) onJumpRef.current(g.index, true);
+        if (g) pickMonthRef.current(g, true);
       }
       reset();
     };
@@ -157,11 +177,31 @@ export default function TimelineRail({
     };
   }, []);
 
+  // 日期格：點到外面收起來、Esc 收起來
+  useEffect(() => {
+    if (!dayPanel) return;
+    const onDown = (e: PointerEvent) => {
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) setDayPanel(null);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setDayPanel(null); };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [dayPanel]);
+
+  // 清單換掉（換排序、篩選）之後那個月可能已經不在了
+  const panelGroup = dayPanel ? groups.find((g) => g.label === dayPanel) : undefined;
+  const panelDays = panelGroup?.days && panelGroup.days.length > 1 ? panelGroup.days : null;
+
   const scrubbing = scrubIndex !== null;
   const selected = scrubbing && scrubIndex >= 0 ? groups[scrubIndex] : undefined;
   const bubbleShown = selected ? bubbleText(selected.label) : bubble;
 
   return (
+    <>
     <div
       className={[
         styles.timelineTrack,
@@ -176,7 +216,7 @@ export default function TimelineRail({
           <div
             key={item.label}
             className={`${styles.timelineNode} ${scrubIndex === i ? styles.timelineNodeSelected : ""}`}
-            onClick={() => onJump(item.index)}
+            onClick={() => pickMonth(item, false)}
             title={`前往 ${item.label}`}
           >
             <span className={styles.timelineNodeDot} />
@@ -185,5 +225,28 @@ export default function TimelineRail({
         ))}
       </div>
     </div>
+    {panelGroup && panelDays && !scrubbing && (
+      <div ref={panelRef} className={styles.timelineDayPanel} role="dialog" aria-label="挑一天">
+        <div className={styles.timelineDayHead}>
+          <span>{bubbleText(panelGroup.label)}</span>
+          <button type="button" className={styles.timelineDayClose} onClick={() => setDayPanel(null)} aria-label="關閉">×</button>
+        </div>
+        <div className={styles.timelineDayGrid}>
+          {panelDays.map((d) => (
+            <button
+              key={d.day}
+              type="button"
+              className={styles.timelineDayBtn}
+              onClick={() => { onJump(d.index, true); setDayPanel(null); }}
+              title={`${d.count} 張`}
+            >
+              <span className={styles.timelineDayNum}>{d.day}</span>
+              <span className={styles.timelineDayCount}>{d.count}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    )}
+    </>
   );
 }

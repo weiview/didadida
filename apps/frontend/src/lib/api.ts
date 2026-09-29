@@ -110,6 +110,11 @@ export interface Album {
    * ⚠️ 選填：邊快取裡躺著舊版後端的回應時它是 undefined，那時候一律當成不新。
    */
   latest_photo_at?: string | null;
+  /**
+   * 成員限定：這本相簿裡一週內新增、不是自己傳的、自己還沒點開過的張數（0033 PhotoSeen）。
+   * 訪客與舊版後端是 undefined —— 那時候 NEW 退回看 latest_photo_at（見 lib/seen.ts）。
+   */
+  new_unseen?: number;
 }
 
 /** 這本相簿裡有一週內新增的照片嗎（首頁卡片右上角那顆 NEW） */
@@ -254,6 +259,11 @@ export function isNewMedia(photo: { created_at?: string | null }, now = Date.now
 
 export interface Photo {
   id: number;
+  /**
+   * 成員限定：1 ＝這個人在燈箱點開過（或是自己傳的、或早就過了一週），0 ＝還沒。
+   * 訪客與舊版後端是 undefined。NEW 角標一律走 lib/seen.ts 的 `isPhotoNew()`。
+   */
+  seen?: number;
   title: string;
   description?: string;
   file_name: string;
@@ -688,6 +698,24 @@ export async function fetchPresence(): Promise<{
  * Workers 請求。失敗一律吞掉：通知掉一則無所謂，
  * **絕不能讓它把剛剛傳完的那批講成失敗**。
  */
+/**
+ * 把燈箱點開過的照片記回後端（NEW 角標，0033）。攢批由 lib/seen.ts 負責。
+ * `keepalive` 是為了關分頁／換頁那一下也送得出去。失敗吞掉 —— 頂多那幾張下次還掛著 NEW。
+ */
+export async function postPhotosSeen(ids: number[]): Promise<void> {
+  if (ids.length === 0) return;
+  try {
+    await fetch(`${API_BASE_URL}/photos/seen`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ photoIds: ids }),
+      keepalive: true,
+    });
+  } catch {
+    /* 吞掉 */
+  }
+}
+
 export async function announceUpload(
   input: { albumId: number | null; photos: number; videos: number },
 ): Promise<void> {

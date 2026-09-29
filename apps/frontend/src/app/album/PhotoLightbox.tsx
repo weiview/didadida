@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styles from "./lightbox.module.css";
 import PhotoComments from "./PhotoComments";
 import PhotoImage from "@/components/PhotoImage";
 import VideoPlayer from "@/components/VideoPlayer";
 import FixTimeModal from "@/components/FixTimeModal";
-import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, photoMotionSrc, hasMotion, isVideo, isGif, isNewMedia, setPhotosRestricted } from "@/lib/api";
+import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, photoMotionSrc, hasMotion, isVideo, isGif, setPhotosRestricted } from "@/lib/api";
+import { isPhotoNew, markPhotoSeen, flushSeen } from "@/lib/seen";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import { toggleFeatured, useFeatured } from "@/lib/featured";
@@ -85,6 +86,15 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
    * 以前是 useState(false)：每換一張就收回去，想一路看相機參數得一張按一次。
    */
   const showExif = useExifExpanded();
+  /*
+   * NEW 角標照「點開這一張的當下」算，之後就不變 —— 一點開就記成看過了（lib/seen.ts），
+   * 跟著即時狀態走的話那顆角標只會閃一下。相依只有 id：換下一張才重算。
+   */
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const newAtOpen = useMemo(() => isPhotoNew(photo), [photo.id]);
+  useEffect(() => { markPhotoSeen(photo); }, [photo.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  // 關燈箱時把攢著的那批送出去，回首頁時那本相簿的 NEW 才會跟著消失
+  useEffect(() => () => flushSeen(), []);
   // 「拍攝時間」那顆按鈕開的視窗。用的是相簿頁那支 FixTimeModal，只是鎖在「指定時間」
   const [showFixTime, setShowFixTime] = useState(false);
 
@@ -915,7 +925,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             * ⚠️ 它 `pointer-events: none` 且 z-index 低於關閉鈕、換頁箭頭與
             *   那顆鎖，只高過掀開遮罩（見 lightbox.module.css 那段）。
             */}
-          {isNewMedia(photo) && (
+          {newAtOpen && (
             <span className={styles.newBadge} aria-label="最近新增">
               <span className={styles.newBadgeText}>NEW</span>
             </span>

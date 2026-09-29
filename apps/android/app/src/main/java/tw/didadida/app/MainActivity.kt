@@ -85,6 +85,21 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
         pendingToken = ""
     }
 
+    /** 自己的挑相片格子（點一下就選）。沒給權限時回 RESULT_USE_SYSTEM，退回上面那條系統選擇器 */
+    private val pickGallery = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+        when (res.resultCode) {
+            RESULT_OK -> {
+                @Suppress("DEPRECATION")
+                val uris = res.data?.getParcelableArrayListExtra<Uri>(GalleryActivity.EXTRA_URIS)
+                if (uris.isNullOrEmpty() || pendingAlbum <= 0 || pendingToken.isEmpty()) return@registerForActivityResult
+                UploadService.upload(this, pendingAlbum, pendingToken, ArrayList(uris))
+                pendingToken = ""
+            }
+            GalleryActivity.RESULT_USE_SYSTEM -> pickMedia.launch(arrayOf("image/*", "video/*"))
+            else -> pendingToken = ""
+        }
+    }
+
     private val pickForWeb = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
         val cb = fileCallback ?: return@registerForActivityResult
         fileCallback = null
@@ -363,7 +378,7 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
             runOnUiThread {
                 pendingAlbum = id
                 pendingToken = token
-                pickMedia.launch(arrayOf("image/*", "video/*"))
+                pickGallery.launch(Intent(this@MainActivity, GalleryActivity::class.java))
             }
         }
 
