@@ -741,6 +741,19 @@
   cursor: grabbing;
 }
 
+/*
+ * 刻度、把手、日期實際排在這一段裡：上下各內縮半顆（拖曳中那顆）把手的高度。
+ * 把手是以中心對齊位置的，不內縮的話停在第一格時有半顆凸到帶子外面、
+ * 蓋住上面那顆「日」。內縮出來的那截仍然屬於帶子（吃得到點擊），手指比較好按。
+ */
+.timelineRange {
+  position: absolute;
+  top: 27px;
+  bottom: 27px;
+  left: 0;
+  right: 0;
+}
+
 .timelineLine {
   position: absolute;
   top: 0;
@@ -765,9 +778,9 @@
 .timelineKnob {
   position: absolute;
   right: 0;
-  width: 18px;
-  height: 36px;
-  border-radius: 18px 0 0 18px;
+  width: 22px;
+  height: 44px;
+  border-radius: 22px 0 0 22px;
   background: var(--accent-color);
   box-shadow: -1px 1px 6px rgba(0, 0, 0, 0.25);
   transform: translateY(-50%);
@@ -778,15 +791,15 @@
 /* 拖曳中跟手指走，不要補間（不然會落後手指一截） */
 .timelineScrubbing .timelineKnob {
   transition: none;
-  width: 22px;
-  height: 44px;
-  border-radius: 22px 0 0 22px;
+  width: 27px;
+  height: 54px;
+  border-radius: 27px 0 0 27px;
 }
 
 /* 半透明的日期（2026.09.10）：跟著把手，拖曳中放大到蓋住照片也沒關係 */
 .timelineDateLabel {
   position: absolute;
-  right: 26px;
+  right: 30px;
   transform: translateY(-50%);
   padding: 4px 10px;
   border-radius: 999px;
@@ -802,7 +815,7 @@
 
 .timelineScrubbing .timelineDateLabel {
   transition: none;
-  right: 32px;
+  right: 36px;
   padding: 8px 16px;
   font-size: 1.35rem;
   background: rgba(20, 20, 20, 0.6);
@@ -811,7 +824,7 @@
 
 /*
  * 手機：收著的那條寬度上限是「不可以碰到照片」—— .container 兩側是 2rem＝32px，
- * 所以 right ＋這條的寬度必須留在 32px 以內（現在是 0 ＋ 28）。
+ * 所以 right ＋這條的寬度必須留在 32px 以內（現在是 0 ＋ 30）。
  * 拖曳中的日期刻意放大蓋住照片（只活在手指按著的那幾秒），跟收著那條的規矩相反。
  * ⚠️ 這段必須留在檔案最後面。
  */
@@ -831,12 +844,13 @@
   }
 
   .timelineBand {
-    width: 28px;
+    width: 30px;
   }
 
+  /* 收著的把手 22 寬（上限見上面），高度給足 48 讓手指好按 */
   .timelineKnob {
-    width: 14px;
-    height: 30px;
-    border-radius: 15px 0 0 15px;
+    width: 22px;
+    height: 48px;
+    border-radius: 24px 0 0 24px;
   }
 }

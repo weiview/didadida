@@ -15,7 +15,7 @@ export type TimelineUnit = "year" | "month" | "day";
 type RailNode = { key: string; label: string; index: number };
 
 /** 按住多久才算「長按」。這條軌上沒有第二種長按手勢要區分，等半秒在手機上像沒反應 */
-const HOLD_MS = 200;
+const HOLD_MS = 100;
 /** 還沒滿 HOLD_MS 手指就移動超過這麼多 px ＝ 他是要捲頁面，整個讓開 */
 const SLOP_PX = 8;
 /** 點過這條軌之後撐著不淡掉多久 —— 不撐的話按「年／月／日」之前它就先消失了 */
@@ -75,6 +75,7 @@ export default function TimelineRail({
   const [restIdx, setRestIdx] = useState(0);
 
   const bandRef = useRef<HTMLDivElement>(null);
+  const rangeRef = useRef<HTMLDivElement>(null);
 
   // 讀 localStorage 一律放在掛載之後：靜態匯出的 HTML 第一次 render 要跟伺服器那份一樣
   useEffect(() => {
@@ -154,11 +155,17 @@ export default function TimelineRail({
     let ignored = false;
     let picked = -1;
 
-    const pick = (clientY: number) => {
+    // 位置照內層那段（.timelineRange）算：帶子上下多留的那截只是讓手指好按，
+    // 按在那裡＝夾到第一格／最後一格
+    const locate = (clientY: number) => {
       const ns = nodesRef.current;
-      const r = band.getBoundingClientRect();
+      const r = (rangeRef.current ?? band).getBoundingClientRect();
       const y = Math.min(Math.max(clientY - r.top, 0), r.height);
       const i = ns.length > 1 && r.height > 0 ? Math.round((y / r.height) * (ns.length - 1)) : 0;
+      return { i, y };
+    };
+    const pick = (clientY: number) => {
+      const { i, y } = locate(clientY);
       picked = i;
       setScrub((prev) => (prev && prev.i === i && prev.y === y ? prev : { i, y }));
     };
@@ -223,11 +230,7 @@ export default function TimelineRail({
       if (timer) {
         // 短按：直接跳到手指那個高度的那一格
         reset();
-        const ns = nodesRef.current;
-        const r = band.getBoundingClientRect();
-        const y = Math.min(Math.max(startY - r.top, 0), r.height);
-        const i = ns.length > 1 && r.height > 0 ? Math.round((y / r.height) * (ns.length - 1)) : 0;
-        jumpAt(i);
+        jumpAt(locate(startY).i);
         return;
       }
       reset();
@@ -313,16 +316,18 @@ export default function TimelineRail({
       </div>
 
       <div ref={bandRef} className={styles.timelineBand} aria-label="時間軸，長按後上下拖曳挑日期">
-        <div className={styles.timelineLine} />
-        {n > 1 && n <= MAX_TICKS && nodes.map((nd, i) => (
-          <span key={nd.key} className={styles.timelineTick} style={{ top: `${ratio(i) * 100}%` }} />
-        ))}
-        <div className={styles.timelineKnob} style={{ top: handleTop }} />
-        {showLabel && (
-          <div className={styles.timelineDateLabel} style={{ top: handleTop }}>
-            {shown.label}
-          </div>
-        )}
+        <div ref={rangeRef} className={styles.timelineRange}>
+          <div className={styles.timelineLine} />
+          {n > 1 && n <= MAX_TICKS && nodes.map((nd, i) => (
+            <span key={nd.key} className={styles.timelineTick} style={{ top: `${ratio(i) * 100}%` }} />
+          ))}
+          <div className={styles.timelineKnob} style={{ top: handleTop }} />
+          {showLabel && (
+            <div className={styles.timelineDateLabel} style={{ top: handleTop }}>
+              {shown.label}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
