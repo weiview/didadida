@@ -27,7 +27,6 @@ import PhotoLightbox from "./PhotoLightbox";
 import CustomSelect from "@/components/CustomSelect";
 import PhotoImage from "@/components/PhotoImage";
 import FilterBottomSheet from "@/components/FilterBottomSheet";
-import FootprintDayPicker, { monthOf, todayLocal } from "@/components/FootprintDayPicker";
 import FabMenu, { type FabAction } from "@/components/FabMenu";
 import BottomActionBar from "@/components/BottomActionBar";
 
@@ -118,25 +117,6 @@ function timelineDateOf(p: Photo, sortBy: SortMode): Date | null {
   if (!s) return null;
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
-}
-
-/**
- * 這張照片算**哪一天**（'YYYY-MM-DD'）。日期篩選與日曆上那些小點都吃這一支。
- *
- * 用的是**拍攝日期**（使用者拍板），而且優先 `taken_at_local`（牆上時間）——
- * 「8/15 那天拍的」問的是按快門當下**當地**日曆上的那一天，不是瀏覽器所在時區
- * 換算出來的那一天。兩者只在出國拍的照片上才差得出來，但差就是整整一天。
- * 沒有牆上時間的舊資料退回 `taken_at` 照瀏覽器時區換算，跟右邊那條時間軸一致。
- *
- * ⚠️ 回 null ＝ **沒有拍攝時間**（影片、掃描的老照片）。那一疊在有日期篩選時
- * 一律不出現 —— 它們還沒被指定時間，硬塞進任何一天都是編出來的。
- */
-function photoDayKey(p: Photo): string | null {
-  if (p.taken_at_local) return p.taken_at_local.slice(0, 10);
-  const d = timelineDateOf(p, "taken_date");
-  if (!d) return null;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
 function AlbumContent() {
@@ -302,15 +282,6 @@ function AlbumContent() {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTags, setSelectedTags] = useState<number[]>([]);
   const [sortBy, setSortBy] = useState<SortMode>(DEFAULT_SORT);
-  /**
-   * 日期篩選（拍攝日期，'YYYY-MM-DD'）。空字串＝沒選＝全部日期，跟地圖那邊同一套約定。
-   * 單日時 dateFrom === dateTo。
-   */
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
-  /** 日曆面板正在看哪個月。第一次載到照片時會跳到最新那張所在的月份（見下面那支效果） */
-  const [pickerMonth, setPickerMonth] = useState(() => monthOf(todayLocal()));
-  const pickerMonthInited = useRef(false);
   const [isMobileFilterOpen, setIsMobileFilterOpen] = useState(false);
   const [isTagModalOpen, setIsTagModalOpen] = useState(false);
 
@@ -532,49 +503,6 @@ function AlbumContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, isAdmin]);
 
-  /*
-   * 日曆要的兩份資料。**整本相簿的照片本來就全在手上**（相簿內容那支路由不分頁），
-   * 所以「哪幾天有照片」是純記憶體運算，不多打任何一次 API —— 這也是這個篩選
-   * 做成純前端的理由（同搜尋框）。
-   */
-  const photoDays = useMemo(() => {
-    const set = new Set<string>();
-    for (const p of photos) {
-      const day = photoDayKey(p);
-      if (day) set.add(day);
-    }
-    return set;
-  }, [photos]);
-
-  /** 日曆面板只問「這個月」哪幾天有照片 */
-  const pickerDays = useMemo(() => {
-    const set = new Set<string>();
-    photoDays.forEach(day => { if (monthOf(day) === pickerMonth) set.add(day); });
-    return set;
-  }, [photoDays, pickerMonth]);
-
-  /** 年份下拉：只列真的有照片的那幾年 */
-  const photoYears = useMemo(() => {
-    const set = new Set<string>();
-    photoDays.forEach(day => set.add(day.slice(0, 4)));
-    return Array.from(set).sort();
-  }, [photoDays]);
-
-  /*
-   * 第一次載到照片時把日曆跳到**最新一張**所在的月份。
-   *
-   * 預設停在「今天」的話，一本 2019 年的相簿打開日曆會是一整片點不下去的空月份，
-   * 使用者得自己一路往回翻。只做一次（`pickerMonthInited`）—— 之後他自己翻到哪
-   * 就是哪，重新整理才回到這個起點。
-   */
-  useEffect(() => {
-    if (pickerMonthInited.current || photoDays.size === 0) return;
-    pickerMonthInited.current = true;
-    let newest = "";
-    photoDays.forEach(day => { if (day > newest) newest = day; });
-    if (newest) setPickerMonth(monthOf(newest));
-  }, [photoDays]);
-
   // 計算經過篩選與排序的照片
   const displayPhotos = useMemo(() => {
     return photos.filter(photo => {
@@ -591,18 +519,6 @@ function AlbumContent() {
         const matchTitle = photo.title?.toLowerCase().includes(q);
         const matchDesc = photo.description?.toLowerCase().includes(q);
         if (!matchTitle && !matchDesc) return false;
-      }
-      /*
-       * 日期篩選（拍攝日期）。
-       * ⚠️ 沒有拍攝時間的那一疊（影片、掃描的老照片）在有日期篩選時**一律不出現** ——
-       *    它們還沒被指定時間，塞進任何一天都是編出來的。要找它們就把日期清掉，
-       *    它們本來就排在最前面。
-       */
-      if (dateFrom || dateTo) {
-        const day = photoDayKey(photo);
-        if (!day) return false;
-        if (dateFrom && day < dateFrom) return false;
-        if (dateTo && day > dateTo) return false;
       }
       // 多選標籤篩選 (需包含選取的任一標籤)
       if (selectedTags.length > 0) {
@@ -633,7 +549,7 @@ function AlbumContent() {
       }
       return 0;
     });
-  }, [photos, searchQuery, selectedTags, sortBy, dateFrom, dateTo, pinnedNew]);
+  }, [photos, searchQuery, selectedTags, sortBy, pinnedNew]);
 
   /**
    * `?photo=<id>` 直接開燈箱。通知列表、右上角「★ 精選」點過來的就是這種網址。
@@ -2240,7 +2156,7 @@ function AlbumContent() {
             共 {photos.length} 張照片
             {/*
               篩掉東西的時候一定要把「現在看到的是幾張」講出來 —— 只寫總數的話，
-              日期選在一天只有三張照片的日子，畫面看起來就像相簿壞了。
+              搜尋或標籤只命中三張的時候，畫面看起來就像相簿壞了。
             */}
             {displayPhotos.length !== photos.length && `（顯示 ${displayPhotos.length} 張）`}
           </p>
@@ -2292,30 +2208,6 @@ function AlbumContent() {
                   { value: "upload_date", label: "依上傳日期（新到舊）" },
                   { value: "taken_date", label: "依拍攝日期（新到舊）" }
                 ]}
-              />
-            </div>
-            {/*
-              日期篩選（拍攝日期）。用的是 /map 那支日曆本身 —— 同一件事不要做第二套 UI，
-              而且「哪幾天有東西才點得下去」正是這一頁需要的行為。
-              ⚠️ 它**擺在「依日期排序」右邊**（使用者要求），所以夾在兩塊 desktopOnly 中間：
-                 那個 class 在手機上是 display:none，把日期塞進去等於手機看不到日期篩選。
-              ⚠️ 也刻意**不收進手機那張篩選表**（FilterBottomSheet 是 overflow: hidden，
-                 會把絕對定位的面板整個切掉）。
-              ⚠️ 外面那層 .datePicker 不是裝飾用的：面板是靠左展開的 280px，
-                 而它現在排在中間，手機上得靠 CSS 把面板改成靠右對齊（見 album.module.css）。
-            */}
-            <div className={styles.datePicker}>
-              <FootprintDayPicker
-                from={dateFrom}
-                to={dateTo}
-                onChange={(f, t) => { setDateFrom(f); setDateTo(t); }}
-                month={pickerMonth}
-                onMonthChange={setPickerMonth}
-                daysWithData={loading ? null : pickerDays}
-                years={photoYears}
-                loading={loading}
-                noun="照片"
-                fieldLabel={null}
               />
             </div>
             <div className={pageStyles.desktopOnly}>

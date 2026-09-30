@@ -63,11 +63,6 @@
   line-height: 1.4;
 }
 
-/* 日期選擇器的外框。存在的理由見手機那段 media query 與 page.tsx 裡的註解 */
-.datePicker {
-  display: inline-flex;
-}
-
 .select {
   padding: 10px 15px;
   border-radius: 8px;
@@ -126,17 +121,6 @@
     min-width: 0;
     width: 100%;
     flex: 1;
-  }
-  /*
-   * 日期面板是絕對定位、靠左展開的 280px，而日期現在排在「依日期排序」右邊
-   * ——手機上那一格落在中間偏右，靠左展開會整片撐出畫面。這裡改成靠右對齊。
-   * ⚠️ 元件裡那個 left/top 是**行內樣式**，只有 !important 蓋得過去。
-   * ⚠️ `.datePicker > div > div` 剛好只命中面板：那顆觸發鈕是 button，
-   *    而 fieldLabel 傳 null 所以沒有標題那層 div。
-   */
-  .datePicker > div > div {
-    left: auto !important;
-    right: 0 !important;
   }
 }
 
