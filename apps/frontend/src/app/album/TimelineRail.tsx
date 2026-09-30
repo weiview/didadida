@@ -1,252 +1,329 @@
 "use client";
 
-/**
- * 相簿右邊那條時間軸（`timelineGroup` 的縮影，見 CLAUDE.md「相簿格線」）。
- *
- * 輕點一個節點＝跳到那個月（沿用原本的 onClick）。
- * **長按 0.2 秒＝進入拖曳選月份**：整條展開成完整的月份清單，手指上下滑動挑一個，
- * 放開就收回去並直接跳到那個月的第一張。
- *
- * ⚠️ 拆成獨立元件是為了**重畫範圍**：拖曳中每換一個月就是一次 setState，
- *    留在 page.tsx 裡等於每一下都重畫整片格線（幾百張卡片）。
- * ⚠️ 觸控監聽器一律原生 `{ passive: false }`（React 的 onTouchMove 是被動的，
- *    `preventDefault()` 擋不住捲頁面，見 CLAUDE.md「手勢」）。
- * ⚠️ 還沒滿 `HOLD_MS` 手指就移動超過 `SLOP_PX` ＝他是要捲（這條軌或整頁），當場讓開，
- *    不然這條細軌會變成一塊捲不動的死區。`HOLD_MS` 越短這條就越要緊 ——
- *    200ms 已經短到「按下去順手往下滑」很容易就壓線，SLOP 是唯一分得開兩者的東西。
- *
- * **第二層：挑日期**（2026-09-29 使用者要求）。選完一個月（拖曳放開、或輕點節點）
- * 先照舊跳到那個月，**同時**在軌道旁邊跳出那個月的日期格；點一天就瞬間跳到那一天的
- * 第一張，點到外面就收起來。那個月只有一天的話不跳（沒有東西可以再挑）。
- * ⚠️ 那一格是軌道的**兄弟節點**不是子節點 —— 軌道平常是 `visibility: hidden`、
- *    捲動停了 1.2 秒就淡出，日期格掛在裡面會跟著一起消失。
- * ⚠️ 點外面收起來聽的是 `pointerdown`，而且**不擋那一下** —— 使用者點到照片時，
- *    照片照樣要打得開，不該先點一下關面板、再點一下才進燈箱。
- */
-
-import { useEffect, useRef, useState } from "react";
-import { flushSync } from "react-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
 import styles from "./album.module.css";
 
-// 0.5 → 0.2 秒（2026-09-11 使用者要求）：這條軌上沒有別的長按手勢要區分，
-// 等半秒才展開在手機上感覺像沒反應
+/**
+ * 格線順序的縮影：由上往下每一段連續的照片一格。
+ * `key` 是 'YYYY-MM-DD'，或兩個特殊值：'__new'（排在最上面那疊還沒看過的 NEW）、
+ * '__nodate'（還沒有拍攝時間的那一疊）。`index` 是那一段第一張在 displayPhotos 裡的位置。
+ */
+export type TimelineItem = { key: string; index: number };
+
+export type TimelineUnit = "year" | "month" | "day";
+
+type RailNode = { key: string; label: string; index: number };
+
+/** 按住多久才算「長按」。這條軌上沒有第二種長按手勢要區分，等半秒在手機上像沒反應 */
 const HOLD_MS = 200;
+/** 還沒滿 HOLD_MS 手指就移動超過這麼多 px ＝ 他是要捲頁面，整個讓開 */
 const SLOP_PX = 8;
+/** 點過這條軌之後撐著不淡掉多久 —— 不撐的話按「年／月／日」之前它就先消失了 */
+const AWAKE_MS = 2500;
+const UNIT_KEY = "didadida:timeline_unit";
+/** 節點不多時才在軌上畫刻度，多了就是一整條糊掉的線 */
+const MAX_TICKS = 60;
 
-export type TimelineDayItem = { day: number; index: number; count: number };
-export type TimelineGroupItem = { label: string; index: number; days?: TimelineDayItem[] };
+const UNITS: { value: TimelineUnit; label: string }[] = [
+  { value: "year", label: "年" },
+  { value: "month", label: "月" },
+  { value: "day", label: "日" },
+];
 
-// 'YYYY/MM' → 'YYYY年M月'，跟捲動時那顆氣泡同一個寫法；「無日期」原樣
-function bubbleText(label: string) {
-  const [y, m] = label.split("/");
-  return m ? `${y}年${Number(m)}月` : label;
+function keyForUnit(key: string, unit: TimelineUnit): string {
+  if (key.startsWith("__")) return key;
+  if (unit === "year") return key.slice(0, 4);
+  if (unit === "month") return key.slice(0, 7);
+  return key;
 }
 
+function labelOf(key: string): string {
+  if (key === "__new") return "NEW";
+  if (key === "__nodate") return "無日期";
+  return key.replace(/-/g, ".");
+}
+
+/**
+ * 相簿右緣那條時間軸：一顆貼著右緣的半圓把手，長按之後上下拖，
+ * 旁邊一條半透明的日期（2026.09.10）跟著手指走，放開就跳過去。
+ * 拖一格是一個單位 —— 年、月或日（預設日），由軌道上方那組切換鈕決定。
+ *
+ * ⚠️⚠️ 刻意是獨立元件，不可以搬回 page.tsx：拖曳中每換一格就是一次 setState，
+ *    寫在相簿頁裡等於每一下都重畫整片格線（幾百張卡片）。props 都收進 ref，
+ *    所以監聽器那支效果的相依是 []。
+ * ⚠️ 觸控監聽器一律原生 `{ passive: false }` —— React 的 onTouchMove 是被動的，
+ *    在裡面 preventDefault() 擋不住瀏覽器捲頁面。
+ */
 export default function TimelineRail({
-  groups,
+  items,
   active,
-  bubble,
+  getTopIndex,
   onJump,
 }: {
-  groups: TimelineGroupItem[];
-  /** 頁面正在捲動（父層 1.2 秒後自己放掉） */
+  items: TimelineItem[];
+  /** 頁面正在捲（父層 1.2 秒後自己放掉）：軌道現身、日期也跟著顯示 */
   active: boolean;
-  bubble: string;
-  /** instant＝拖曳選完的那一跳：瞬間、而且把那個月的第一張放在畫面上緣 */
+  /** 目前畫面最上面那張的 index，用來決定把手平常停在哪一格 */
+  getTopIndex: () => number;
   onJump: (photoIdx: number, instant?: boolean) => void;
 }) {
-  const marksRef = useRef<HTMLDivElement>(null);
-  // null ＝沒在拖；數字＝目前挑中的節點
-  const [scrubIndex, setScrubIndex] = useState<number | null>(null);
-  // 手指按著、還沒滿 0.5 秒：這段期間軌道不能因為父層的計時器到了而淡出
+  const [unit, setUnit] = useState<TimelineUnit>("day");
+  /** 拖曳中：挑中的那一格＋手指在帶子裡的高度（px）。把手與日期跟著手指走，不跳格 */
+  const [scrub, setScrub] = useState<{ i: number; y: number } | null>(null);
   const [held, setHeld] = useState(false);
-  // 第二層：挑了哪個月（label）之後端出來的日期格；null ＝收著
-  const [dayPanel, setDayPanel] = useState<string | null>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
+  const [awake, setAwake] = useState(false);
+  const [restIdx, setRestIdx] = useState(0);
 
-  // 選完一個月：先跳過去，那個月有兩天以上才端出日期格
-  const pickMonth = (g: TimelineGroupItem, instant: boolean) => {
-    onJumpRef.current(g.index, instant);
-    setDayPanel(g.days && g.days.length > 1 ? g.label : null);
-  };
-  const pickMonthRef = useRef(pickMonth);
-  pickMonthRef.current = pickMonth;
+  const bandRef = useRef<HTMLDivElement>(null);
 
-  // 監聽器只掛一次，最新的 groups／onJump 從 ref 讀，免得閉包拿到舊的
-  const groupsRef = useRef(groups);
-  const onJumpRef = useRef(onJump);
-  groupsRef.current = groups;
-  onJumpRef.current = onJump;
-
+  // 讀 localStorage 一律放在掛載之後：靜態匯出的 HTML 第一次 render 要跟伺服器那份一樣
   useEffect(() => {
-    const el = marksRef.current;
-    if (!el) return;
+    try {
+      const v = localStorage.getItem(UNIT_KEY);
+      if (v === "year" || v === "month" || v === "day") setUnit(v);
+    } catch { /* 無痕模式之類的 */ }
+  }, []);
+
+  const nodes = useMemo<RailNode[]>(() => {
+    const out: RailNode[] = [];
+    for (const it of items) {
+      const k = keyForUnit(it.key, unit);
+      if (out.length && out[out.length - 1].key === k) continue;
+      out.push({ key: k, label: labelOf(k), index: it.index });
+    }
+    return out;
+  }, [items, unit]);
+
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+  const onJumpRef = useRef(onJump);
+  onJumpRef.current = onJump;
+  const getTopRef = useRef(getTopIndex);
+  getTopRef.current = getTopIndex;
+
+  /*
+   * 把手平常停在哪：畫面最上面那張落在哪一格。
+   * 用 rAF 收斂捲動事件，而且**只有格子換了才 setState** —— 捲動一秒是幾十個事件。
+   */
+  useEffect(() => {
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      const top = getTopRef.current();
+      const ns = nodesRef.current;
+      let i = 0;
+      for (let k = 0; k < ns.length; k++) {
+        if (ns[k].index <= top) i = k;
+        else break;
+      }
+      setRestIdx((prev) => (prev === i ? prev : i));
+    };
+    const onScroll = () => { if (!raf) raf = requestAnimationFrame(update); };
+    update();
+    const t = setTimeout(update, 300); // 格線剛畫出來時父層的 topIndex 還沒算
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      if (raf) cancelAnimationFrame(raf);
+      clearTimeout(t);
+    };
+  }, [nodes]);
+
+  // 點過之後撐一下（切換鈕要按得到）
+  const awakeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const poke = () => {
+    setAwake(true);
+    if (awakeTimer.current) clearTimeout(awakeTimer.current);
+    awakeTimer.current = setTimeout(() => setAwake(false), AWAKE_MS);
+  };
+  useEffect(() => () => { if (awakeTimer.current) clearTimeout(awakeTimer.current); }, []);
+
+  const pokeRef = useRef(poke);
+  pokeRef.current = poke;
+
+  // 觸控：長按起跑、拖著挑、放開跳。短按＝直接跳到那個高度的那一格
+  useEffect(() => {
+    const band = bandRef.current;
+    if (!band) return;
 
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let startX = 0;
     let startY = 0;
     let lastY = 0;
     let scrubbing = false;
+    let ignored = false;
     let picked = -1;
 
-    /*
-     * 手指的高度按比例對應整份清單，同時把清單捲到同樣的比例 ——
-     * 清單長過軌道時，挑中的那一格因此永遠停在手指旁邊；
-     * 最後再照實際位置挑離手指最近的那一格，所以短清單也對得準。
-     */
-    const pick = (y: number) => {
-      const rect = el.getBoundingClientRect();
-      const f = Math.min(1, Math.max(0, (y - rect.top) / rect.height));
-      el.scrollTop = f * (el.scrollHeight - el.clientHeight);
-      const nodes = el.children;
-      let best = 0;
-      let bestD = Infinity;
-      for (let i = 0; i < nodes.length; i++) {
-        const r = nodes[i].getBoundingClientRect();
-        const d = Math.abs(r.top + r.height / 2 - y);
-        if (d < bestD) { bestD = d; best = i; }
-      }
-      if (best !== picked) {
-        picked = best;
-        setScrubIndex(best);
-      }
+    const pick = (clientY: number) => {
+      const ns = nodesRef.current;
+      const r = band.getBoundingClientRect();
+      const y = Math.min(Math.max(clientY - r.top, 0), r.height);
+      const i = ns.length > 1 && r.height > 0 ? Math.round((y / r.height) * (ns.length - 1)) : 0;
+      picked = i;
+      setScrub((prev) => (prev && prev.i === i && prev.y === y ? prev : { i, y }));
     };
-
     const reset = () => {
-      if (timer) { clearTimeout(timer); timer = null; }
+      if (timer) clearTimeout(timer);
+      timer = null;
       scrubbing = false;
       picked = -1;
-      setScrubIndex(null);
+      setScrub(null);
       setHeld(false);
+    };
+    const jumpAt = (i: number) => {
+      const n = nodesRef.current[i];
+      if (n) onJumpRef.current(n.index, true);
     };
 
     const onStart = (e: TouchEvent) => {
-      if (e.touches.length !== 1) { reset(); return; }
-      startY = lastY = e.touches[0].clientY;
+      if (e.touches.length !== 1) { reset(); ignored = true; return; }
+      const t = e.touches[0];
+      startX = t.clientX;
+      startY = lastY = t.clientY;
+      ignored = false;
+      scrubbing = false;
       setHeld(true);
+      pokeRef.current();
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         timer = null;
         scrubbing = true;
-        navigator.vibrate?.(10);
-        // 先讓展開的樣式真的畫上去，量到的位置才是展開之後的
-        flushSync(() => setScrubIndex(-1));
+        try { navigator.vibrate?.(10); } catch { /* 不支援就算了 */ }
         pick(lastY);
       }, HOLD_MS);
     };
-
     const onMove = (e: TouchEvent) => {
-      if (e.touches.length !== 1) { reset(); return; }
-      lastY = e.touches[0].clientY;
-      if (scrubbing) {
-        e.preventDefault();
-        // 父層掛在 window 上的捲動處理器每一下都會掃過整片格線，拖曳中用不到它
-        e.stopPropagation();
-        pick(lastY);
-      } else if (timer && Math.abs(lastY - startY) > SLOP_PX) {
-        reset();
+      if (ignored) return;
+      const t = e.touches[0];
+      if (!t) return;
+      lastY = t.clientY;
+      if (!scrubbing) {
+        // 還沒滿 HOLD_MS 就移動 ＝ 他是要捲頁面（軌道自己貼在右緣，不讓開就是一塊捲不動的死區）
+        if (Math.abs(t.clientX - startX) > SLOP_PX || Math.abs(t.clientY - startY) > SLOP_PX) {
+          ignored = true;
+          reset();
+        }
+        return;
       }
+      e.preventDefault();
+      // 父層掛在 window 上的捲動處理器每一下都會掃過整片卡片，拖曳中用不到它
+      e.stopPropagation();
+      pick(t.clientY);
     };
-
     const onEnd = (e: TouchEvent) => {
+      if (ignored) { reset(); return; }
+      // 擋掉瀏覽器補發的 click
+      e.preventDefault();
       if (scrubbing) {
-        // 擋掉放開之後瀏覽器補發的 click，不然會再跳一次（跳到手指底下那一格）
-        e.preventDefault();
-        const g = groupsRef.current[picked];
-        if (g) pickMonthRef.current(g, true);
+        const i = picked;
+        reset();
+        if (i >= 0) jumpAt(i);
+        return;
+      }
+      if (timer) {
+        // 短按：直接跳到手指那個高度的那一格
+        reset();
+        const ns = nodesRef.current;
+        const r = band.getBoundingClientRect();
+        const y = Math.min(Math.max(startY - r.top, 0), r.height);
+        const i = ns.length > 1 && r.height > 0 ? Math.round((y / r.height) * (ns.length - 1)) : 0;
+        jumpAt(i);
+        return;
       }
       reset();
     };
+    const onCancel = () => reset();
+    // 長按在手機上會叫出系統選單
+    const onContext = (e: Event) => { if (timer || scrubbing) e.preventDefault(); };
 
-    // Android 長按會叫出選單／開始選字
-    const onContextMenu = (e: Event) => {
-      if (timer || scrubbing) e.preventDefault();
+    // 桌機：滑鼠按下去就開始拖，不必長按
+    const onMouseMove = (e: MouseEvent) => { if (scrubbing) { e.preventDefault(); pick(e.clientY); } };
+    const onMouseUp = () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      const i = picked;
+      reset();
+      if (i >= 0) jumpAt(i);
+    };
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      scrubbing = true;
+      setHeld(true);
+      pokeRef.current();
+      pick(e.clientY);
+      window.addEventListener("mousemove", onMouseMove);
+      window.addEventListener("mouseup", onMouseUp);
     };
 
-    el.addEventListener("touchstart", onStart, { passive: true });
-    el.addEventListener("touchmove", onMove, { passive: false });
-    el.addEventListener("touchend", onEnd, { passive: false });
-    el.addEventListener("touchcancel", reset);
-    el.addEventListener("contextmenu", onContextMenu);
+    band.addEventListener("touchstart", onStart, { passive: true });
+    band.addEventListener("touchmove", onMove, { passive: false });
+    band.addEventListener("touchend", onEnd, { passive: false });
+    band.addEventListener("touchcancel", onCancel);
+    band.addEventListener("contextmenu", onContext);
+    band.addEventListener("mousedown", onMouseDown);
     return () => {
+      band.removeEventListener("touchstart", onStart);
+      band.removeEventListener("touchmove", onMove);
+      band.removeEventListener("touchend", onEnd);
+      band.removeEventListener("touchcancel", onCancel);
+      band.removeEventListener("contextmenu", onContext);
+      band.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
       if (timer) clearTimeout(timer);
-      el.removeEventListener("touchstart", onStart);
-      el.removeEventListener("touchmove", onMove);
-      el.removeEventListener("touchend", onEnd);
-      el.removeEventListener("touchcancel", reset);
-      el.removeEventListener("contextmenu", onContextMenu);
     };
   }, []);
 
-  // 日期格：點到外面收起來、Esc 收起來
-  useEffect(() => {
-    if (!dayPanel) return;
-    const onDown = (e: PointerEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) setDayPanel(null);
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setDayPanel(null); };
-    document.addEventListener("pointerdown", onDown, true);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("pointerdown", onDown, true);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [dayPanel]);
+  const chooseUnit = (u: TimelineUnit) => {
+    setUnit(u);
+    poke();
+    try { localStorage.setItem(UNIT_KEY, u); } catch { /* 無痕模式之類的 */ }
+  };
 
-  // 清單換掉（換排序、篩選）之後那個月可能已經不在了
-  const panelGroup = dayPanel ? groups.find((g) => g.label === dayPanel) : undefined;
-  const panelDays = panelGroup?.days && panelGroup.days.length > 1 ? panelGroup.days : null;
+  const n = nodes.length;
+  const ratio = (i: number) => (n > 1 ? i / (n - 1) : 0);
+  // 拖曳中照手指的高度（跟著走、不跳格）；平常照格子換算成百分比
+  const handleTop = scrub ? `${scrub.y}px` : `${ratio(Math.min(restIdx, Math.max(n - 1, 0))) * 100}%`;
+  const shown = scrub ? nodes[scrub.i] : nodes[Math.min(restIdx, n - 1)];
+  const showLabel = !!shown && (!!scrub || active);
 
-  const scrubbing = scrubIndex !== null;
-  const selected = scrubbing && scrubIndex >= 0 ? groups[scrubIndex] : undefined;
-  const bubbleShown = selected ? bubbleText(selected.label) : bubble;
+  const cls = [
+    styles.timelineTrack,
+    active ? styles.timelineActive : "",
+    held || awake ? styles.timelineHeld : "",
+    scrub ? styles.timelineScrubbing : "",
+  ].filter(Boolean).join(" ");
 
   return (
-    <>
-    <div
-      className={[
-        styles.timelineTrack,
-        active ? styles.timelineActive : "",
-        held ? styles.timelineHeld : "",
-        scrubbing ? styles.timelineScrubbing : "",
-      ].join(" ")}
-    >
-      {bubbleShown && <div className={styles.timelineBubble}>{bubbleShown}</div>}
-      <div ref={marksRef} className={styles.timelineMarks}>
-        {groups.map((item, i) => (
-          <div
-            key={item.label}
-            className={`${styles.timelineNode} ${scrubIndex === i ? styles.timelineNodeSelected : ""}`}
-            onClick={() => pickMonth(item, false)}
-            title={`前往 ${item.label}`}
+    <div className={cls}>
+      <div className={styles.timelineUnits} role="radiogroup" aria-label="時間軸的單位">
+        {UNITS.map((u) => (
+          <button
+            key={u.value}
+            type="button"
+            role="radio"
+            aria-checked={unit === u.value}
+            className={`${styles.timelineUnitBtn} ${unit === u.value ? styles.timelineUnitOn : ""}`}
+            onClick={() => chooseUnit(u.value)}
           >
-            <span className={styles.timelineNodeDot} />
-            <span className={styles.timelineNodeText}>{item.label}</span>
-          </div>
+            {u.label}
+          </button>
         ))}
       </div>
-    </div>
-    {panelGroup && panelDays && !scrubbing && (
-      <div ref={panelRef} className={styles.timelineDayPanel} role="dialog" aria-label="挑一天">
-        <div className={styles.timelineDayHead}>
-          <span>{bubbleText(panelGroup.label)}</span>
-          <button type="button" className={styles.timelineDayClose} onClick={() => setDayPanel(null)} aria-label="關閉">×</button>
-        </div>
-        <div className={styles.timelineDayGrid}>
-          {panelDays.map((d) => (
-            <button
-              key={d.day}
-              type="button"
-              className={styles.timelineDayBtn}
-              onClick={() => { onJump(d.index, true); setDayPanel(null); }}
-              title={`${d.count} 張`}
-            >
-              <span className={styles.timelineDayNum}>{d.day}</span>
-              <span className={styles.timelineDayCount}>{d.count}</span>
-            </button>
-          ))}
-        </div>
+
+      <div ref={bandRef} className={styles.timelineBand} aria-label="時間軸，長按後上下拖曳挑日期">
+        <div className={styles.timelineLine} />
+        {n > 1 && n <= MAX_TICKS && nodes.map((nd, i) => (
+          <span key={nd.key} className={styles.timelineTick} style={{ top: `${ratio(i) * 100}%` }} />
+        ))}
+        <div className={styles.timelineKnob} style={{ top: handleTop }} />
+        {showLabel && (
+          <div className={styles.timelineDateLabel} style={{ top: handleTop }}>
+            {shown.label}
+          </div>
+        )}
       </div>
-    )}
-    </>
+    </div>
   );
 }

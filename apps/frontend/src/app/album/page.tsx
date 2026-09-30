@@ -3,7 +3,7 @@
 import { nativeApp, NATIVE_UPLOAD_DONE, NATIVE_UPLOAD_PROGRESS } from "@/lib/nativeApp";
 import { useEffect, useState, useRef, Suspense, useMemo, useCallback } from "react";
 import styles from "./album.module.css";
-import TimelineRail, { type TimelineGroupItem } from "./TimelineRail";
+import TimelineRail, { type TimelineItem } from "./TimelineRail";
 import pageStyles from "../page.module.css";
 import Link from "next/link";
 import { Photo, Tag, fetchPhotos, uploadPhoto, fetchAlbum, deletePhoto, reorderPhotos, fetchTags, updateAlbum, Album, createGooglePickerSession, fetchGooglePickerPhotos, fetchGoogleMediaFile, GoogleReauthError, photoThumbSrc, googleLoginUrl, DriveWriterError, setPhotosRestricted, applyRestrictedPatch, hasMotion, announceUpload, type UploadedPhoto, type DuplicateMatch } from "@/lib/api";
@@ -138,9 +138,6 @@ function photoDayKey(p: Photo): string | null {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
-
-/** 時間軸上「還沒有拍攝時間」那一段的節點文字 */
-const NO_DATE_LABEL = "無日期";
 
 function AlbumContent() {
   const searchParams = useSearchParams();
@@ -323,7 +320,14 @@ function AlbumContent() {
   const initialColumnsRef = useRef<number>(0);
 
   // 時間軸滾動條 State
-  const [currentTimelineDate, setCurrentTimelineDate] = useState<string>("");
+  // 畫面最上面那張卡片的索引（時間軸長按時從這一格起算，給 TimelineRail 讀，不觸發重畫）
+  const topIndexRef = useRef(0);
+  /*
+   * 排在最前面的 NEW 那幾張（未看過的）。是「載入當下」的快照，不是即時跟著 isPhotoNew 走 ——
+   * 點開一張就標成看過，即時重排的話它會在關掉燈箱的那一刻從最上面跳走，人就找不到了。
+   * 只在 loadData 重抓時更新（沿用上一份，再加上現在還是 NEW 的）。
+   */
+  const [pinnedNew, setPinnedNew] = useState<Set<number>>(() => new Set());
   const [isScrolling, setIsScrolling] = useState<boolean>(false);
   const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const photoCardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -484,6 +488,11 @@ function AlbumContent() {
     
     const fresh = photoData || [];
     setPhotos(fresh);
+    setPinnedNew((prev) => {
+      const next = new Set<number>();
+      for (const p of fresh) if (prev.has(p.id) || isPhotoNew(p)) next.add(p.id);
+      return next;
+    });
     /*
      * 訪客的相簿 NEW：記下「點進來時最新那張」的時間（lib/seen.ts）。
      * 成員每一列都帶 seen（後端逐張記），那條不走這裡。
@@ -602,6 +611,9 @@ function AlbumContent() {
       return true;
     }).sort((a, b) => {
       if (sortBy === "custom") return a.sort_order - b.sort_order;
+      // 沒看過的 NEW 一律排最上面（自訂排序不管，那是人手排的版面）
+      const an = pinnedNew.has(a.id), bn = pinnedNew.has(b.id);
+      if (an !== bn) return an ? -1 : 1;
       if (sortBy === "upload_date") return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
       if (sortBy === "taken_date") {
         /*
@@ -621,7 +633,7 @@ function AlbumContent() {
       }
       return 0;
     });
-  }, [photos, searchQuery, selectedTags, sortBy, dateFrom, dateTo]);
+  }, [photos, searchQuery, selectedTags, sortBy, dateFrom, dateTo, pinnedNew]);
 
   /**
    * `?photo=<id>` 直接開燈箱。通知列表、右上角「★ 精選」點過來的就是這種網址。
@@ -744,41 +756,27 @@ function AlbumContent() {
    * （自訂排序的 sort_order 跟時間毫無關係）。那不是壞掉，是這條軌在那個模式下
    * 沒有意義 —— 而且點下去會把人送到一個跟標籤對不上的位置，所以整條收起來。
    */
-  const timelineGroup = useMemo(() => {
-    if (sortBy === "custom" || displayPhotos.length === 0) return [];
-    const groups: TimelineGroupItem[] = [];
-    let lastLabel = "";
-    let lastDay = -1;
-
+  const timelineItems = useMemo(() => {
+    if (sortBy === "custom" || displayPhotos.length === 0) return [] as TimelineItem[];
+    const items: TimelineItem[] = [];
+    let last = "";
     displayPhotos.forEach((photo, index) => {
-      const dateObj = timelineDateOf(photo, sortBy);
-      // 沒有時間的那一疊也給一個節點：它們就排在最上面，點一下正好跳過去補時間
-      const label = dateObj
-        ? `${dateObj.getFullYear()}/${String(dateObj.getMonth() + 1).padStart(2, '0')}`
-        : NO_DATE_LABEL;
-      if (label !== lastLabel) {
-        lastLabel = label;
-        lastDay = -1;
-        groups.push({ label, index, days: [] });
+      let key: string;
+      if (pinnedNew.has(photo.id)) key = "__new";
+      else {
+        const d = timelineDateOf(photo, sortBy);
+        // 沒有時間的那一疊也給一格：它們就排在最上面，點一下正好跳過去補時間
+        key = d
+          ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
+          : "__nodate";
       }
-      /*
-       * 第二層：這個月裡的每一天（選完月份之後跳出來的那一格，見 TimelineRail）。
-       * 跟月份同一個欄位同一個走法，所以「那一天的第一張」就是格線上第一次碰到它的位置。
-       */
-      if (dateObj) {
-        const g = groups[groups.length - 1];
-        const day = dateObj.getDate();
-        if (day !== lastDay) {
-          lastDay = day;
-          g.days!.push({ day, index, count: 1 });
-        } else {
-          g.days![g.days!.length - 1].count++;
-        }
+      if (key !== last) {
+        last = key;
+        items.push({ key, index });
       }
     });
-
-    return groups;
-  }, [displayPhotos, sortBy]);
+    return items;
+  }, [displayPhotos, sortBy, pinnedNew]);
 
   // 監聽頁面滾動以動態計算目前畫面上可見照片的時間範圍
   useEffect(() => {
@@ -789,42 +787,13 @@ function AlbumContent() {
         setIsScrolling(false);
       }, 1200);
 
-      // 收集目前在視窗範圍內 (Viewport) 的所有照片時間
-      const visibleDates: Date[] = [];
-      // 畫面上有幾張還沒有拍攝時間。全都是的話氣泡不能留著上一個月份不動
-      let visibleNoDate = 0;
-      const windowHeight = window.innerHeight;
-
+      // 畫面最上面那張（時間軸長按時的起點）
       for (let i = 0; i < displayPhotos.length; i++) {
         const el = photoCardRefs.current.get(i);
-        if (el) {
-          const rect = el.getBoundingClientRect();
-          // 卡片只要出現在螢幕視野內
-          if (rect.bottom >= 0 && rect.top <= windowHeight) {
-            // 跟軌上的節點同一個欄位，不然氣泡寫的月份會跟旁邊的節點對不起來
-            const d = timelineDateOf(displayPhotos[i], sortBy);
-            if (d) visibleDates.push(d);
-            else visibleNoDate++;
-          }
+        if (el && el.getBoundingClientRect().bottom >= 0) {
+          topIndexRef.current = i;
+          break;
         }
-      }
-
-      if (visibleDates.length > 0) {
-        visibleDates.sort((a, b) => a.getTime() - b.getTime());
-        const startDate = visibleDates[0];
-        const endDate = visibleDates[visibleDates.length - 1];
-
-        const startStr = `${startDate.getFullYear()}年${startDate.getMonth() + 1}月`;
-        const endStr = `${endDate.getFullYear()}年${endDate.getMonth() + 1}月`;
-
-        if (startStr === endStr) {
-          setCurrentTimelineDate(startStr);
-        } else {
-          setCurrentTimelineDate(`${startStr} ~ ${endStr}`);
-        }
-      } else if (visibleNoDate > 0) {
-        // 整個畫面都是還沒補時間的那一疊
-        setCurrentTimelineDate("無拍攝時間");
       }
 
       // 無限滾動：當滾動距離頁面底部小於 1000px 時自動載入更多
@@ -2960,11 +2929,11 @@ function AlbumContent() {
       )}
 
       {/* 右側懸浮照片時間軸滾動條 */}
-      {timelineGroup.length > 0 && (
+      {timelineItems.length > 0 && (
         <TimelineRail
-          groups={timelineGroup}
+          items={timelineItems}
           active={isScrolling}
-          bubble={currentTimelineDate}
+          getTopIndex={() => topIndexRef.current}
           onJump={handleScrollToTimelineIndex}
         />
       )}

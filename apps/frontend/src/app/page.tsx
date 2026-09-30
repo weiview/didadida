@@ -348,6 +348,17 @@ export default function Home() {
   const querySeq = useRef(0);
 
   /**
+   * 有 NEW（還沒看過的照片）的相簿一律排最前面，其餘維持後端給的順序（stable）。
+   * ⚠️ 排的是 `albums` 這份 state 本身、而且只在抓回來那一刻排 —— 拖曳排序那幾支
+   *    處理器照索引動 `albums`，排序另外寫在 render 裡的話索引就跟畫面對不起來。
+   *    也因為只在抓回來時排，點進去看過再回來才會掉回原位，不會在眼前跳走。
+   */
+  const pinNewFirst = (list: Album[]) => {
+    const fresh = list.filter((a) => isAlbumNew(a));
+    return fresh.length === 0 ? list : [...fresh, ...list.filter((a) => !isAlbumNew(a))];
+  };
+
+  /**
    * ⚠️ `silent` ＝ **不要把整片內容換成「載入中...」**。`loading` 一翻上去底下
    *    整塊就 unmount，頁面高度當場塌成 0，瀏覽器把捲軸收回頂端 —— 資料回來
    *    重畫完也回不去了。燈箱裡改完資料那條路一律走 silent（見下面的燈箱）。
@@ -367,7 +378,7 @@ export default function Home() {
     ]);
     if (seq !== querySeq.current) return;
 
-    setAlbums(albumPage.albums);
+    setAlbums(pinNewFirst(albumPage.albums));
     setHasMoreAlbums(albumPage.hasMore);
     setDisplayPhotos(photoPage.photos);
     if (!opts?.silent) setLoading(false);
@@ -412,7 +423,14 @@ export default function Home() {
       setAlbums((prev) => {
         // 兩次請求之間如果有相簿被新增，offset 會讓某幾本重複出現，用 id 去重
         const seen = new Set(prev.map((a) => a.id));
-        return [...prev, ...page.albums.filter((a) => !seen.has(a.id))];
+        const more = page.albums.filter((a) => !seen.has(a.id));
+        // 後面幾頁撈到有 NEW 的，照樣併進最前面那一段
+        const moreNew = more.filter((a) => isAlbumNew(a));
+        if (moreNew.length === 0) return [...prev, ...more];
+        const cut = prev.findIndex((a) => !isAlbumNew(a));
+        const head = cut === -1 ? prev : prev.slice(0, cut);
+        const tail = cut === -1 ? [] : prev.slice(cut);
+        return [...head, ...moreNew, ...tail, ...more.filter((a) => !isAlbumNew(a))];
       });
       setHasMoreAlbums(page.hasMore);
       setLoadingMoreAlbums(false);

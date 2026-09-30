@@ -17,7 +17,7 @@
   display: flex;
   flex-direction: column;
   gap: 15px;
-  align-items: flex-end;
+  align-items: stretch;
 }
 
 .filters {
@@ -649,7 +649,7 @@
 /* 時間軸滾動條樣式 (類似 Google 相片滾動軸) */
 .timelineTrack {
   position: fixed;
-  right: 6px;
+  right: 0;
   /*
    * 上下用固定邊界圈出一條帶，而不是 top:50% 垂直置中。
    *
@@ -666,7 +666,7 @@
   z-index: 2000;
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
+  align-items: stretch;
   /* 高度改由上下邊界決定，內容自己在帶子裡置中 */
   justify-content: center;
   gap: 10px;
@@ -694,286 +694,149 @@
   visibility: visible;
 }
 
-/*
- * 長按 0.2 秒拖曳選月份（TimelineRail）：展開成完整的月份清單。
- * 一律寫成兩層以上的選擇器 —— 特異性高過手機那段 media query 的單一 class，
- * 不必跟它比順序（那段照舊必須留在檔案最後）。
- * 月份字放在點的左邊（row-reverse）：拇指按在最右緣，字放右邊會被手指蓋住。
- * ⚠️ 展開的這一份**刻意做大到會蓋住照片**（使用者要求）：它只活在手指按著的
- *    那幾秒，而拇指在最右緣、字級小的話根本看不出現在選到哪個月。
- *    收著那條細軌則相反，永遠不可以碰到照片（見檔案最後那段 media query）。
- * ⚠️ 挑中的那格只換顏色不換尺寸，不然每挑一格整份清單就跳一下。
- */
-.timelineScrubbing .timelineMarks {
-  gap: 3px;
-  padding: 10px 8px;
-  border-radius: 14px;
-  background: rgba(20, 20, 20, 0.92);
-  backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-}
-
-.timelineScrubbing .timelineNode {
-  flex-direction: row-reverse;
-  gap: 10px;
-  padding: 6px 12px;
-  border-radius: 10px;
-}
-
-.timelineScrubbing .timelineNodeText {
-  display: inline;
-  font-size: 1rem;
-  color: #fff;
-}
-
-.timelineScrubbing .timelineNodeDot {
-  width: 7px;
-  height: 7px;
-}
-
-.timelineScrubbing .timelineNode.timelineNodeSelected {
-  background: var(--accent-color, #d1bfae);
-  transform: none;
-}
-
-.timelineScrubbing .timelineNode.timelineNodeSelected .timelineNodeText {
-  color: #111;
-  font-weight: bold;
-}
-
-.timelineScrubbing .timelineNode.timelineNodeSelected .timelineNodeDot {
-  background: #111;
-}
-
-.timelineBubble {
-  background: var(--accent-color, #d1bfae);
-  color: #111;
-  font-weight: bold;
-  font-size: 0.85rem;
-  padding: 6px 14px;
-  border-radius: 20px;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
-  margin-bottom: 8px;
-  white-space: nowrap;
-  animation: fadeIn 0.2s ease;
-  /*
-   * 這只是一顆日期標籤，永遠不該是點擊目標。
-   *
-   * 它原本寫死 pointer-events: auto，蓋過父層 track 隱藏時的 none —— 結果整條
-   * 淡出成 opacity: 0 之後，這塊 95x34 的透明區還在 z-index 2000 上吃點擊，
-   * 而且滑鼠碰到它就觸發 .timelineTrack:hover，把整條看不見的軌道連同它的
-   * pointer-events 一起復活。使用者看到的是「這裡明明空的，按下去卻沒反應」。
-   */
-  pointer-events: none;
-}
-
-.timelineMarks {
+/* 年／月／日 切換鈕：排在帶子上面，決定拖一格是多大的單位 */
+.timelineUnits {
   display: flex;
   flex-direction: column;
-  gap: 12px;
   align-items: flex-end;
-  background: rgba(20, 20, 20, 0.75);
-  backdrop-filter: blur(12px);
-  padding: 14px 10px;
-  border-radius: 24px;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  /* 長按拖曳選月份時不要叫出選字與系統選單 */
+  gap: 4px;
+  padding-right: 4px;
+  pointer-events: auto;
+}
+
+.timelineUnitBtn {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(20, 20, 20, 0.45);
+  color: #fff;
+  font-size: 0.72rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
+
+.timelineUnitOn {
+  background: var(--accent-color);
+  color: #222;
+  font-weight: 700;
+}
+
+/* 可按的那條帶子：只有它吃點擊（見上面 track 的 pointer-events 說明） */
+.timelineBand {
+  position: relative;
+  flex: 1;
+  align-self: flex-end;
+  width: 30px;
+  pointer-events: auto;
+  cursor: grab;
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
-  /* 上限交給父層那條帶（見 .timelineTrack）。min-height: 0 是 flex 子項要能
-     真的溢出捲動的前提，少了它 overflow-y 不會生效 */
-  max-height: 100%;
-  min-height: 0;
-  overflow-y: auto;
-  /* 整條 track 裡唯一可按的區塊。看不見時由 track 的 visibility: hidden 一併關掉 */
-  pointer-events: auto;
-  scrollbar-width: none; /* Firefox */
-  box-shadow: 0 8px 32px rgba(0,0,0,0.3);
 }
 
-.timelineMarks::-webkit-scrollbar {
-  display: none; /* Chrome/Safari */
+.timelineScrubbing .timelineBand {
+  cursor: grabbing;
 }
 
-.timelineNode {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  padding: 3px 6px;
-  border-radius: 12px;
-  transition: all 0.2s ease;
+.timelineLine {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 6px;
+  width: 2px;
+  border-radius: 1px;
+  background: rgba(120, 120, 120, 0.35);
 }
 
-.timelineNode:hover {
-  background: rgba(255, 255, 255, 0.15);
-  transform: translateX(-4px);
+.timelineTick {
+  position: absolute;
+  right: 4px;
+  width: 6px;
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 1px;
+  background: rgba(120, 120, 120, 0.55);
 }
 
-.timelineNodeText {
-  font-size: 0.75rem;
-  color: rgba(255, 255, 255, 0.8);
-  white-space: nowrap;
-  font-family: system-ui, -apple-system, sans-serif;
-}
-
-.timelineNode:hover .timelineNodeText {
-  color: #fff;
-  font-weight: bold;
-}
-
-.timelineNodeDot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.4);
-  transition: all 0.2s ease;
-}
-
-.timelineNode:hover .timelineNodeDot {
-  background: var(--accent-color, #d1bfae);
-  transform: scale(1.6);
-}
-
-/*
- * 時間軸第二層：選完月份之後跳出來的日期格（TimelineRail）。
- * 軌道的兄弟節點，自己決定位置；不受軌道淡入淡出影響。
- * 格子做大一點：拇指就在右緣，這一格是給手指按的。
- */
-.timelineDayPanel {
-  position: fixed;
-  right: 44px;
-  top: 50%;
+/* 半圓把手：平貼右緣、圓的那一邊朝左 */
+.timelineKnob {
+  position: absolute;
+  right: 0;
+  width: 18px;
+  height: 36px;
+  border-radius: 18px 0 0 18px;
+  background: var(--accent-color);
+  box-shadow: -1px 1px 6px rgba(0, 0, 0, 0.25);
   transform: translateY(-50%);
-  z-index: 2001;
-  width: min(280px, calc(100vw - 72px));
-  max-height: 70vh;
-  overflow-y: auto;
-  padding: 10px 12px 12px;
-  border-radius: 14px;
-  background: rgba(20, 20, 20, 0.92);
+  pointer-events: none;
+  transition: top 0.15s ease, width 0.15s ease, height 0.15s ease;
+}
+
+/* 拖曳中跟手指走，不要補間（不然會落後手指一截） */
+.timelineScrubbing .timelineKnob {
+  transition: none;
+  width: 22px;
+  height: 44px;
+  border-radius: 22px 0 0 22px;
+}
+
+/* 半透明的日期（2026.09.10）：跟著把手，拖曳中放大到蓋住照片也沒關係 */
+.timelineDateLabel {
+  position: absolute;
+  right: 26px;
+  transform: translateY(-50%);
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(20, 20, 20, 0.55);
   color: #fff;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
-  animation: fadeIn 0.15s ease;
+  font-size: 0.8rem;
+  font-weight: 600;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  transition: top 0.15s ease;
 }
 
-.timelineDayHead {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-weight: bold;
-  font-size: 0.95rem;
-  margin-bottom: 8px;
-}
-
-.timelineDayClose {
-  background: none;
-  border: none;
-  color: rgba(255, 255, 255, 0.7);
-  font-size: 1.3rem;
-  line-height: 1;
-  padding: 2px 6px;
-  cursor: pointer;
-}
-
-.timelineDayGrid {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 6px;
-}
-
-.timelineDayBtn {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 1px;
-  padding: 7px 0 5px;
-  border: none;
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.1);
-  color: #fff;
-  cursor: pointer;
-}
-
-.timelineDayBtn:hover,
-.timelineDayBtn:active {
-  background: var(--accent-color, #d1bfae);
-  color: #111;
-}
-
-.timelineDayNum {
-  font-size: 1rem;
-  font-weight: bold;
-}
-
-.timelineDayCount {
-  font-size: 0.68rem;
-  opacity: 0.7;
-}
-
-@media (max-width: 768px) {
-  .timelineDayPanel {
-    right: 30px;
-  }
+.timelineScrubbing .timelineDateLabel {
+  transition: none;
+  right: 32px;
+  padding: 8px 16px;
+  font-size: 1.35rem;
+  background: rgba(20, 20, 20, 0.6);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
 }
 
 /*
- * 手機：縮成一條細軌。桌機那塊深色底板＋月份文字在手機上會吃掉快四分之一個
- * 畫面寬，而它整條就蓋在最右邊那一欄照片上。
- * 月份文字整排拿掉 —— 上面那顆氣泡已經在講「現在捲到哪個月」；
- * 只留一串小點當捲軸刻度，點下去照樣跳過去。
- * ⚠️⚠️ **寬度的上限是「不可以碰到照片」**（使用者拍板）：`.container` 兩側是
- *    2rem＝32px 的 padding，所以 `right` 加上這條的寬度必須留在 32px 以內。
- *    現在是 3 ＋ (5+3+6+3+5) ＝ 25px，還剩 7px 的縫。點再放大就會開始壓到
- *    最右邊那一欄。要更看得清楚是**長按展開**那一份的事（見上面 .timelineScrubbing），
- *    那一份才可以蓋住照片。
- * ⚠️ 必須留在檔案最後：特異性跟上面那幾條一樣，靠順序蓋過去。
+ * 手機：收著的那條寬度上限是「不可以碰到照片」—— .container 兩側是 2rem＝32px，
+ * 所以 right ＋這條的寬度必須留在 32px 以內（現在是 0 ＋ 28）。
+ * 拖曳中的日期刻意放大蓋住照片（只活在手指按著的那幾秒），跟收著那條的規矩相反。
+ * ⚠️ 這段必須留在檔案最後面。
  */
 @media (max-width: 768px) {
   .timelineTrack {
-    right: 3px;
-    gap: 5px;
-  }
-
-  .timelineBubble {
-    font-size: 0.72rem;
-    padding: 3px 9px;
-    border-radius: 10px;
-    margin-bottom: 0;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
-  }
-
-  .timelineMarks {
     gap: 6px;
-    padding: 8px 5px;
-    border-radius: 10px;
-    background: rgba(20, 20, 20, 0.38);
-    backdrop-filter: none;
-    border: none;
-    box-shadow: none;
   }
 
-  .timelineNode {
-    gap: 0;
-    padding: 2px 3px;
-    border-radius: 5px;
+  .timelineUnits {
+    padding-right: 2px;
   }
 
-  /* 觸控的 :hover 點完會黏著，位移跟底色在細軌上只會像跳了一下 */
-  .timelineNode:hover {
-    background: transparent;
-    transform: none;
+  .timelineUnitBtn {
+    width: 24px;
+    height: 24px;
+    font-size: 0.68rem;
   }
 
-  .timelineNodeText {
-    display: none;
+  .timelineBand {
+    width: 28px;
   }
 
-  .timelineNodeDot {
-    width: 6px;
-    height: 6px;
-    background: rgba(255, 255, 255, 0.8);
+  .timelineKnob {
+    width: 14px;
+    height: 30px;
+    border-radius: 15px 0 0 15px;
   }
 }
