@@ -989,11 +989,8 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                     onKeyDown={e => { if(e.key === 'Enter') handleAddTag() }}
                     placeholder="新增標籤"
                     className={styles.framelessInput}
-                    list="available-tags"
+                    autoComplete="off"
                   />
-                  <datalist id="available-tags">
-                    {availableTags.map(t => <option key={t.id} value={t.name} />)}
-                  </datalist>
                 </>
               )}
               {!photo.tags?.length && !isAdmin && <span style={{ color: '#777' }}>無標籤</span>}
