@@ -20,7 +20,6 @@ const HOLD_MS = 100;
 const SLOP_PX = 8;
 /** 點過這條軌之後撐著不淡掉多久 —— 不撐的話按「年／月／日」之前它就先消失了 */
 const AWAKE_MS = 2500;
-const UNIT_KEY = "didadida:timeline_unit";
 /** 節點不多時才在軌上畫刻度，多了就是一整條糊掉的線 */
 const MAX_TICKS = 60;
 
@@ -37,6 +36,17 @@ function keyForUnit(key: string, unit: TimelineUnit): string {
   return key;
 }
 
+/**
+ * 一排幾張 → 時間軸的單位：1–2 日、3–4 月、5–6 年。
+ * `columns` 是 0（自動）時照捏合那邊的基準欄數算（手機 2、平板／電腦 4）。
+ */
+function unitForColumns(columns: number): TimelineUnit {
+  const c = columns > 0 ? columns : window.innerWidth <= 768 ? 2 : 4;
+  if (c <= 2) return "day";
+  if (c <= 4) return "month";
+  return "year";
+}
+
 function labelOf(key: string): string {
   if (key === "__new") return "NEW";
   if (key === "__nodate") return "無日期";
@@ -46,7 +56,9 @@ function labelOf(key: string): string {
 /**
  * 相簿右緣那條時間軸：一顆貼著右緣的半圓把手，長按之後上下拖，
  * 旁邊一條半透明的日期（2026.09.10）跟著手指走，放開就跳過去。
- * 拖一格是一個單位 —— 年、月或日（預設日），由軌道上方那組切換鈕決定。
+ * 拖一格是一個單位 —— 年、月或日，**跟著一排幾張走**（`unitForColumns`）：
+ * 欄數一換就重新套一次；軌道上方那組切換鈕可以臨時改，下次換欄數又被蓋回去。
+ * 刻意不存 localStorage —— 存了就跟「跟著欄數走」打架。
  *
  * ⚠️⚠️ 刻意是獨立元件，不可以搬回 page.tsx：拖曳中每換一格就是一次 setState，
  *    寫在相簿頁裡等於每一下都重畫整片格線（幾百張卡片）。props 都收進 ref，
@@ -56,11 +68,14 @@ function labelOf(key: string): string {
  */
 export default function TimelineRail({
   items,
+  columns,
   active,
   getTopIndex,
   onJump,
 }: {
   items: TimelineItem[];
+  /** 相簿頁的欄數（0 ＝自動），決定單位 */
+  columns: number;
   /** 頁面正在捲（父層 1.2 秒後自己放掉）：軌道現身、日期也跟著顯示 */
   active: boolean;
   /** 目前畫面最上面那張的 index，用來決定把手平常停在哪一格 */
@@ -77,13 +92,10 @@ export default function TimelineRail({
   const bandRef = useRef<HTMLDivElement>(null);
   const rangeRef = useRef<HTMLDivElement>(null);
 
-  // 讀 localStorage 一律放在掛載之後：靜態匯出的 HTML 第一次 render 要跟伺服器那份一樣
+  // 放在效果裡（不是初值）：自動欄數要看 window，靜態匯出的第一次 render 拿不到
   useEffect(() => {
-    try {
-      const v = localStorage.getItem(UNIT_KEY);
-      if (v === "year" || v === "month" || v === "day") setUnit(v);
-    } catch { /* 無痕模式之類的 */ }
-  }, []);
+    setUnit(unitForColumns(columns));
+  }, [columns]);
 
   const nodes = useMemo<RailNode[]>(() => {
     const out: RailNode[] = [];
@@ -281,7 +293,6 @@ export default function TimelineRail({
   const chooseUnit = (u: TimelineUnit) => {
     setUnit(u);
     poke();
-    try { localStorage.setItem(UNIT_KEY, u); } catch { /* 無痕模式之類的 */ }
   };
 
   const n = nodes.length;

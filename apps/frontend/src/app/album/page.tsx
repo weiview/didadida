@@ -2824,6 +2824,7 @@ function AlbumContent() {
       {timelineItems.length > 0 && (
         <TimelineRail
           items={timelineItems}
+          columns={gridColumns}
           active={isScrolling}
           getTopIndex={() => topIndexRef.current}
           onJump={handleScrollToTimelineIndex}
