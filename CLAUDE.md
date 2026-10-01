@@ -2309,12 +2309,23 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   後端送推播用的是 `GOOGLE_DRIVE_SA_KEY` 那把 `didadida-gps-reader@…`，它在 IAM 上有
   「Firebase Cloud Messaging API 管理員」角色，FCM API 已啟用 —— 所以 `FCM_SA_KEY`／`FCM_PROJECT_ID` **沒灌**。
   ⚠️ Firebase 自己建的 `firebase-adminsdk-fbsvc@…` **沒有用到**（我們沒有它的金鑰）。推播從 **1.0.4** 起生效。
-- **桌面小工具 `FeaturedWidget.kt`**（「本次精選」）：輪播 `GET /api/featured`，系統每 30 分鐘換一張、
+- **桌面小工具 `FeaturedWidget.kt`**（「本次精選」，1.0.12 改版）：輪播 `GET /api/featured`，
   右上 ⟳ 手動換，點圖開那張照片。清單在 prefs 快取 3 小時（精選幾天才動一次），
   **不開放的一律跳過**（桌面是誰都看得到的地方），沒登入時寫「打開 App 登入後…」。
-  照片 `fitCenter` 完整顯示不裁切；背景與照片透明度由 `WidgetConfigActivity`（長按小工具 →「設定」，
-  `widgetFeatures="reconfigurable|configuration_optional"`）調，存 prefs `widget_bg_alpha`／`widget_img_alpha`，
-  拉桿當下走 `partiallyUpdateAppWidget` 只換顏色與 alpha，**不重抓清單也不重下載縮圖**。
+  設定在 `WidgetConfigActivity`（長按小工具 →「設定」，`widgetFeatures="reconfigurable|configuration_optional"`），
+  全部小工具共用一份 prefs：`widget_interval`（0／1／5／10／15，預設 5）、`widget_bg_alpha`、
+  `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）。拉桿**放手才重畫**。
+  - **換圖間隔**：1–15 分鐘是 AlarmManager 的 `RTC` 鬧鐘（`ACTION_TICK`），能用精確鬧鐘就 `setExact`
+    （manifest 有 `USE_EXACT_ALARM`／`SCHEDULE_EXACT_ALARM` ≤32），否則退回 `setAndAllowWhileIdle`。
+    `schedule(force=false)` 遇到已排好的不重排。`onDisabled` 收掉鬧鐘。
+  - **0＝連續漸變**：`widget_featured_flip`（ViewFlipper，8 秒、淡入淡出）塞 `widget_featured_page` 幾頁。
+    ⚠️ RemoteViews 的點陣圖有總量上限（螢幕 ×4×1.5），頁數照「60% 預算 ÷ 每頁大小」算、最多 6，
+    不到 2 頁就退回靜態。翻頁中的 ⟳ 走 `showNext`。
+  - **尺寸與滿版**：照 `getAppWidgetOptions` 拿每一個小工具自己的大小（直向用 MIN_WIDTH×MAX_HEIGHT），
+    center-crop 烤成剛好那個比例（長邊上限：靜態 720px、翻頁 480px），`onAppWidgetOptionsChanged` 重畫。
+  - **圓角與柔邊是烤進點陣圖的**（`compose()`：ALPHA_8 圓角遮罩 ＋ `BlurMaskFilter` → DST_IN），
+    RemoteViews 不能設 clip／outline。背景色也一起烤（DST_OVER）。
+  - 縮圖存在 `cacheDir/widget_thumbs/<sha1(url)>`，清單重抓時清掉沒用到的 —— 每分鐘換圖不會每次下載。
   ⚠️ KDoc 裡不要寫 `/api/photos/view/*` —— Kotlin 的註解會巢狀，`/*` 會開一個永遠關不掉的註解。
 
 ### 狀態列與「這一版改了什麼」（1.0.5）
