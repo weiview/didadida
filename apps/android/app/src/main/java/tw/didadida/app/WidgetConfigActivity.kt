@@ -54,7 +54,7 @@ class WidgetConfigActivity : AppCompatActivity() {
             for (m in FeaturedWidget.INTERVALS) {
                 addView(RadioButton(this@WidgetConfigActivity).apply {
                     id = 1000 + m
-                    text = if (m == 0) "連續漸變（每 8 秒淡入下一張）" else "$m 分鐘"
+                    text = if (m == 0) "連續漸變（每 2 秒淡入下一張）" else "$m 分鐘"
                     isChecked = m == current
                 })
             }

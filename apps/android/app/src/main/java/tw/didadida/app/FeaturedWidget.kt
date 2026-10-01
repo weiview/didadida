@@ -13,8 +13,8 @@ import android.graphics.BitmapFactory
 import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.Paint
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffXfermode
+import android.graphics.BitmapShader
+import android.graphics.Shader
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Build
@@ -128,6 +128,8 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val STATIC_MAX_PX = 720   // 一次一張：長邊上限
         private const val FLIP_MAX_PX = 480     // 連續漸變一次好幾張，每張小一點才塞得下
         private const val FLIP_MAX = 6
+        /** 柔邊拉到 100% 時的模糊半徑（短邊的幾分之幾） */
+        private const val FEATHER_MAX = 0.12f
         private const val RC_TICK = 2
         private const val RC_PAGE = 100
 
@@ -370,42 +372,54 @@ class FeaturedWidget : AppWidgetProvider() {
         }
 
         /**
-         * 置中裁切滿版 → 套照片透明度 → 用一張圓角（＋模糊邊）的遮罩挖出形狀 → 底下墊背景。
-         * 柔邊＝遮罩先往內縮一點再模糊，讓邊緣從不透明漸漸淡到透明，而不是硬切。
+         * 置中裁切滿版 → 套照片透明度 → 挖成圓角（＋柔邊）→ 底下墊背景。
+         *
+         * ⚠️ 照片是當成 `BitmapShader` 拿去「填一個圓角矩形」，柔邊是那個矩形自己的
+         * `BlurMaskFilter`：形狀與模糊一筆畫完。1.0.12 是另外畫一張 ALPHA_8 遮罩再用
+         * DST_IN 疊回去，在實機上沒有作用（圓角、柔邊拉到底都看不出來）—— 不要改回去。
+         * 柔邊＝形狀先往內縮一個模糊半徑再模糊，邊緣從不透明漸漸淡到透明；
+         * 上限是短邊的 `FEATHER_MAX`，太小的話會被桌面本身的圓角裁切蓋掉。
          */
         private fun compose(src: Bitmap, w: Int, h: Int, look: Look): Bitmap {
-            val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            val c = Canvas(out)
+            // 1. 置中裁切成剛好 w×h
+            val photo = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             val scale = max(w.toFloat() / src.width, h.toFloat() / src.height)
             val sw = (w / scale).toInt().coerceIn(1, src.width)
             val sh = (h / scale).toInt().coerceIn(1, src.height)
             val sx = (src.width - sw) / 2
             val sy = (src.height - sh) / 2
-            c.drawBitmap(
+            Canvas(photo).drawBitmap(
                 src, Rect(sx, sy, sx + sw, sy + sh), RectF(0f, 0f, w.toFloat(), h.toFloat()),
-                Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { alpha = look.imgAlpha },
+                Paint(Paint.FILTER_BITMAP_FLAG),
             )
 
+            // 2. 形狀
             val short = min(w, h).toFloat()
-            val feather = look.feather / 100f * short * 0.08f
-            val inset = if (feather >= 1f) feather * 1.3f else 0f
+            val feather = look.feather / 100f * short * FEATHER_MAX
+            val soft = feather >= 1f
+            val inset = if (soft) feather else 0f
             val rect = RectF(inset, inset, w - inset, h - inset)
             val radius = (look.corner / 100f * short / 2f).coerceAtMost(min(rect.width(), rect.height()) / 2f)
             fun shapePaint() = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                if (feather >= 1f) maskFilter = BlurMaskFilter(feather, BlurMaskFilter.Blur.NORMAL)
+                if (soft) maskFilter = BlurMaskFilter(feather, BlurMaskFilter.Blur.NORMAL)
             }
 
-            val mask = Bitmap.createBitmap(w, h, Bitmap.Config.ALPHA_8)
-            Canvas(mask).drawRoundRect(rect, radius, radius, shapePaint())
-            c.drawBitmap(mask, 0f, 0f, Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) })
-            mask.recycle()
-
+            val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            out.setHasAlpha(true)
+            val c = Canvas(out)
+            // 3. 背景先畫在底下（同一個形狀、同樣的柔邊）
             if (look.bgAlpha > 0) {
                 c.drawRoundRect(rect, radius, radius, shapePaint().apply {
                     color = (look.bgAlpha shl 24) or 0x222222
-                    xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OVER)
                 })
             }
+            // 4. 照片填進同一個形狀
+            c.drawRoundRect(rect, radius, radius, shapePaint().apply {
+                isFilterBitmap = true
+                shader = BitmapShader(photo, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                alpha = look.imgAlpha
+            })
+            photo.recycle()
             return out
         }
 

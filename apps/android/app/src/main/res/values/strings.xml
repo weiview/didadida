@@ -8,5 +8,5 @@
     <string name="widget_featured_label">本次精選</string>
     <string name="widget_featured_desc">輪播站上的本次精選（可調換圖間隔、圓角、柔邊），點一下開那張照片</string>
     <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
-    <string name="whats_new">• 桌面小工具可選換圖間隔：連續漸變、1／5／10／15 分鐘\n• 小工具照片改為滿版，可調圓角與柔邊\n• 小工具可長按拖曳邊框調整大小</string>
+    <string name="whats_new">• 小工具的圓角與柔邊設定現在會正確套用\n• 小工具連續漸變改為每 2 秒換一張</string>
 </resources>

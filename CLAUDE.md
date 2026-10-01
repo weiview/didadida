@@ -2318,13 +2318,15 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   - **換圖間隔**：1–15 分鐘是 AlarmManager 的 `RTC` 鬧鐘（`ACTION_TICK`），能用精確鬧鐘就 `setExact`
     （manifest 有 `USE_EXACT_ALARM`／`SCHEDULE_EXACT_ALARM` ≤32），否則退回 `setAndAllowWhileIdle`。
     `schedule(force=false)` 遇到已排好的不重排。`onDisabled` 收掉鬧鐘。
-  - **0＝連續漸變**：`widget_featured_flip`（ViewFlipper，8 秒、淡入淡出）塞 `widget_featured_page` 幾頁。
+  - **0＝連續漸變**：`widget_featured_flip`（ViewFlipper，`flipInterval` 2 秒、淡入淡出 700ms）塞 `widget_featured_page` 幾頁。
     ⚠️ RemoteViews 的點陣圖有總量上限（螢幕 ×4×1.5），頁數照「60% 預算 ÷ 每頁大小」算、最多 6，
     不到 2 頁就退回靜態。翻頁中的 ⟳ 走 `showNext`。
   - **尺寸與滿版**：照 `getAppWidgetOptions` 拿每一個小工具自己的大小（直向用 MIN_WIDTH×MAX_HEIGHT），
     center-crop 烤成剛好那個比例（長邊上限：靜態 720px、翻頁 480px），`onAppWidgetOptionsChanged` 重畫。
-  - **圓角與柔邊是烤進點陣圖的**（`compose()`：ALPHA_8 圓角遮罩 ＋ `BlurMaskFilter` → DST_IN），
-    RemoteViews 不能設 clip／outline。背景色也一起烤（DST_OVER）。
+  - **圓角與柔邊是烤進點陣圖的**（RemoteViews 不能設 clip／outline）。`compose()`：照片先裁成 w×h，
+    再用 **`BitmapShader` 填進一個圓角矩形**，那支 Paint 帶 `BlurMaskFilter`（柔邊）與 imgAlpha；
+    背景是同一個形狀、同一個模糊先畫在底下。柔邊 100% ＝短邊的 `FEATHER_MAX`（12%）。
+    ⚠️⚠️ **不要改回 1.0.12 那種「ALPHA_8 遮罩 ＋ DST_IN／DST_OVER」**：實機上圓角與柔邊完全沒作用（1.0.13 修）。
   - 縮圖存在 `cacheDir/widget_thumbs/<sha1(url)>`，清單重抓時清掉沒用到的 —— 每分鐘換圖不會每次下載。
   ⚠️ KDoc 裡不要寫 `/api/photos/view/*` —— Kotlin 的註解會巢狀，`/*` 會開一個永遠關不掉的註解。
 

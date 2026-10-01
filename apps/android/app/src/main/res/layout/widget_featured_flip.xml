@@ -10,7 +10,7 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:autoStart="true"
-        android:flipInterval="8000"
+        android:flipInterval="2000"
         android:animateFirstView="false"
         android:inAnimation="@anim/widget_fade_in"
         android:outAnimation="@anim/widget_fade_out" />
