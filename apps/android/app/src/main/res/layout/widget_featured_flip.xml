@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 連續漸變：ViewFlipper 自己計時、自己淡入淡出，App 不必醒著。每一頁是 widget_featured_page -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <ViewFlipper
+        android:id="@+id/widget_flipper"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:autoStart="true"
+        android:flipInterval="8000"
+        android:animateFirstView="false"
+        android:inAnimation="@anim/widget_fade_in"
+        android:outAnimation="@anim/widget_fade_out" />
+
+    <TextView
+        android:id="@+id/widget_next"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="4dp"
+        android:layout_marginEnd="4dp"
+        android:gravity="center"
+        android:text="⟳"
+        android:textColor="#FFFFFFFF"
+        android:textSize="20sp"
+        android:shadowColor="#FF000000"
+        android:shadowRadius="6" />
+</FrameLayout>

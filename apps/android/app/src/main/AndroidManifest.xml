@@ -19,6 +19,10 @@
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
+    <!-- 小工具 1／5／10／15 分鐘換圖要準時：13+ 用 USE_EXACT_ALARM（安裝即給），
+         12 用 SCHEDULE_EXACT_ALARM。拿不到就退回不精確的鬧鐘，見 FeaturedWidget.schedule -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />
 
     <application
         android:name=".App"
