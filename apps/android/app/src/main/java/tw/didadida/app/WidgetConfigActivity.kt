@@ -91,6 +91,10 @@ class WidgetConfigActivity : AppCompatActivity() {
             setPadding(0, dp(16), 0, dp(12))
         })
         root.addView(Button(this).apply {
+            text = "也設成鎖定畫面的動態桌布"
+            setOnClickListener { FeaturedWallpaper.open(this@WidgetConfigActivity) }
+        })
+        root.addView(Button(this).apply {
             text = "完成"
             setOnClickListener { finish() }
         })

@@ -362,6 +362,15 @@ export default function AccountBadge() {
                   ⟳ 檢查 App 更新{nativeApp()?.version ? `（目前 ${nativeApp()!.version!()}）` : ""}
                 </button>
               )}
+              {nativeApp()?.setWallpaper && (
+                <button
+                  type="button"
+                  onClick={() => { setOpen(false); nativeApp()?.setWallpaper?.(); }}
+                  style={{ ...plainBtn, marginTop: 8, width: "100%" }}
+                >
+                  🖼 設成精選動態桌布
+                </button>
+              )}
 
               <button
                 type="button"

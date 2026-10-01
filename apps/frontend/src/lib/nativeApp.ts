@@ -29,6 +29,11 @@ interface DidadidaAppBridge {
    * 有新版就下載並問要不要現在裝。選填 —— 1.0.6 之前的 App 沒有這一支（那顆按鈕就不端出來）。
    */
   checkUpdate?(): void;
+  /**
+   * 帳號牌上那顆「設成精選動態桌布」：開系統的動態桌布預覽，套用後鎖定畫面全螢幕輪播本次精選。
+   * 選填 —— 1.0.15 之前的 App 沒有這一支（那顆按鈕就不端出來）。
+   */
+  setWallpaper?(): void;
 }
 
 declare global {

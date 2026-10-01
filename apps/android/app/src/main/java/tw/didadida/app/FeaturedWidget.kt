@@ -425,8 +425,14 @@ class FeaturedWidget : AppWidgetProvider() {
 
         // ── 清單與縮圖 ──────────────────────────────────────────
 
-        /** 快取過的清單（沒過期、而且是同一張票拿的）；否則打一次 API。失敗回 null */
-        private fun list(ctx: Context, session: String): List<JSONObject>? {
+        /** 快取過的清單（沒過期、而且是同一張票拿的）；否則打一次 API。失敗回 null。動態桌布（`FeaturedWallpaper`）也吃這一份 */
+        internal fun list(ctx: Context, session: String): List<JSONObject>? = synchronized(listLock) {
+            listLocked(ctx, session)
+        }
+
+        private val listLock = Any()
+
+        private fun listLocked(ctx: Context, session: String): List<JSONObject>? {
             val p = prefs(ctx)
             val sig = session.hashCode().toString()
             val cached = p.getString(KEY_LIST, null)
@@ -482,8 +488,8 @@ class FeaturedWidget : AppWidgetProvider() {
             thumbDir(ctx).listFiles()?.forEach { if (it.name !in keep) it.delete() }
         }
 
-        /** 先看磁碟上那一份，沒有才下載（下載完存起來）。解碼時縮到長邊不超過 `STATIC_MAX_PX` 附近 */
-        private fun load(ctx: Context, url: String): Bitmap? {
+        /** 先看磁碟上那一份，沒有才下載（下載完存起來）。解碼時縮到長邊不超過 `maxPx` 附近（桌布給 0＝原尺寸） */
+        internal fun load(ctx: Context, url: String, maxPx: Int = STATIC_MAX_PX): Bitmap? {
             if (!url.startsWith("https://")) return null
             val file = File(thumbDir(ctx), thumbName(url))
             if (!file.exists() || file.length() == 0L) {
@@ -504,7 +510,7 @@ class FeaturedWidget : AppWidgetProvider() {
                 val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 BitmapFactory.decodeFile(file.path, bounds)
                 var sample = 1
-                while (max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= STATIC_MAX_PX) sample *= 2
+                while (maxPx > 0 && max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxPx) sample *= 2
                 BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample })
                     ?: run { file.delete(); null }
             } catch (e: Exception) {

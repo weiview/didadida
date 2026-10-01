@@ -396,6 +396,10 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
         /** 帳號牌上那顆「檢查 App 更新」：不看節流，結果一律講出來（見 Updater.check） */
         @JavascriptInterface
         fun checkUpdate() = runOnUiThread { Updater.check(this@MainActivity, manual = true) }
+
+        /** 帳號牌上那顆「設成精選動態桌布」：開系統的動態桌布預覽（見 FeaturedWallpaper.open） */
+        @JavascriptInterface
+        fun setWallpaper() = runOnUiThread { FeaturedWallpaper.open(this@MainActivity) }
     }
 
     companion object {

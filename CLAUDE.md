@@ -2331,6 +2331,15 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
     ⚠️⚠️ **不要改回 1.0.12 那種「ALPHA_8 遮罩 ＋ DST_IN／DST_OVER」**：實機上圓角與柔邊完全沒作用（1.0.13 修）。
   - 縮圖存在 `cacheDir/widget_thumbs/<sha1(url)>`，清單重抓時清掉沒用到的 —— 每分鐘換圖不會每次下載。
   ⚠️ KDoc 裡不要寫 `/api/photos/view/*` —— Kotlin 的註解會巢狀，`/*` 會開一個永遠關不掉的註解。
+- **動態桌布 `FeaturedWallpaper.kt`**（「本次精選」，1.0.15）：`WallpaperService`，全螢幕輪播精選，
+  亮螢幕還沒解鎖就看得到（Pixel 套用時多半主畫面也一起換）。每張停 6 秒、淡入 1.2 秒，800px 縮圖置中裁切滿版。
+  - 清單與縮圖**跟小工具共用**：`FeaturedWidget.list(ctx, session)`（同一份 3 小時快取、已濾掉不開放的）
+    與 `FeaturedWidget.load(ctx, url, maxPx)`（`maxPx = 0` 不縮）。票從 `Push.session()` 拿，沒登入畫一行提示。
+  - ⚠️ **看不見時一個像素都不畫**（`onVisibilityChanged(false)` 收掉所有計時器），平常停在靜止的圖上，只有淡入那 1.2 秒逐格重畫。
+  - ⚠️ 淡入結束才排下一張靠 `finished` 旗標 —— `Handler.hasCallbacks` 是 API 29，minSdk 是 28。
+  - 套用入口三個：帳號牌「🖼 設成精選動態桌布」（bridge `setWallpaper()`，選填，1.0.15 以前的 App 沒有）、
+    小工具設定頁那顆按鈕。都走 `FeaturedWallpaper.open()`：`ACTION_CHANGE_LIVE_WALLPAPER` 直接停在這一張，
+    打不開退回 `ACTION_LIVE_WALLPAPER_CHOOSER`，再不行 Toast。
 
 ### 狀態列與「這一版改了什麼」（1.0.5）
 

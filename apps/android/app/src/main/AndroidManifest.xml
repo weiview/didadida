@@ -138,6 +138,20 @@
             </intent-filter>
         </activity>
 
+        <!-- 動態桌布：全螢幕輪播本次精選（FeaturedWallpaper.kt）。系統要能綁它，所以 exported ＋ BIND_WALLPAPER -->
+        <service
+            android:name=".FeaturedWallpaper"
+            android:exported="true"
+            android:label="@string/wallpaper_featured_label"
+            android:permission="android.permission.BIND_WALLPAPER">
+            <intent-filter>
+                <action android:name="android.service.wallpaper.WallpaperService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.wallpaper"
+                android:resource="@xml/wallpaper_featured" />
+        </service>
+
         <!-- 自我更新：PackageInstaller 的安裝結果，只收自己發的 PendingIntent -->
         <receiver android:name=".InstallReceiver" android:exported="false" />
 
