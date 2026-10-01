@@ -2933,6 +2933,22 @@ export async function removePhotoTag(photoId: number, tagId: number): Promise<bo
   }
 }
 
+/** 把標籤從全站每一張照片上拿掉（後端只認 canManageOthers）。回傳拔掉了幾張，失敗 null */
+export async function deleteTag(tagId: number): Promise<number | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/tags/${tagId}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Number(data.removed) || 0;
+  } catch (error) {
+    console.error(error);
+    return null;
+  }
+}
+
 export async function fetchTags(): Promise<Tag[]> {
   try {
     const res = await fetch(`${API_BASE_URL}/tags`, { headers: getAuthHeaders() });

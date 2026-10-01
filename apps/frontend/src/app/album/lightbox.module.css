@@ -639,6 +639,90 @@ input:checked + .slider:before {
   color: #ff4757;
 }
 
+/* 「加入既有標籤」那一排；長按任一顆標籤進入刪除模式（× ＋輕輕抖） */
+.quickTags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  align-items: center;
+}
+
+.quickTagsLabel {
+  font-size: 0.75rem;
+  color: #888;
+}
+
+.quickTag {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: rgba(255, 255, 255, 0.9);
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+.quickTag:hover:not(:disabled) {
+  background: var(--accent-color);
+  color: #fff;
+}
+
+.quickTag:disabled {
+  opacity: 0.5;
+}
+
+.quickTagX,
+.tagX {
+  color: #ff6b6b;
+  font-weight: bold;
+  font-size: 0.95rem;
+  line-height: 1;
+  margin-right: 5px;
+}
+
+.tagX {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+.tag {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.quickTagWiggle {
+  animation: tagWiggle 0.32s ease-in-out infinite alternate;
+}
+
+@keyframes tagWiggle {
+  from { transform: rotate(-2deg); }
+  to { transform: rotate(2deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .quickTagWiggle { animation: none; }
+}
+
+.quickTagsDone {
+  background: var(--accent-color);
+  border: none;
+  color: #fff;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
 /* EXIF Toggle Row */
 .exifToggleRow {
   margin-top: 5px;

@@ -1192,6 +1192,17 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   每一幀重畫描邊等於每秒幾十次 canvas 合成，而那一圈是固定的。
   ⚠️ 沒在播的時候不要叫 `triggerRepaint()`，不然整張地圖會一直重繪。
 
+## 標籤：長按進刪除模式
+
+燈箱「標籤」那一格（2026-10-01）。**長按任一顆標籤 0.5 秒**進入刪除模式：每顆前面出現 ×、整排輕輕抖
+（`.quickTagWiggle`，`prefers-reduced-motion` 時不抖），點 × 刪、按「完成」或點標籤區以外（`[data-tag-zone]`）收掉。
+
+- 這張照片上的標籤：`isAdmin` 就能進，刪的是這一張的（`handleRemoveTag`）。
+- 「加入既有標籤」那一排：**只有 `canManageOthers`** 會進刪除模式，刪的是**整個標籤**，
+  走 `DELETE /api/tags/:id`（連同所有照片上的 PhotoTag，之後 `syncFtsForPhotos` ＋ `bumpContentEpoch`）。
+  在那之前那一排**沒有任何刪除路徑**，打錯字的標籤只能一張一張拿掉。
+- ⚠️ 長按之後瀏覽器補發的 click 要吞掉（`suppressTagClickRef`），不然一放手就把那顆加進照片／刪掉。
+
 ## 搜尋：檔名本來就搜得到
 
 **不要再為「搜檔名」做第二支路由或第二個索引。** `Photo.title` 存的就是上傳當下的
@@ -2253,6 +2264,10 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   確認畫面，在背景改發「點這裡安裝」通知（Android 14 不准背景啟動 Activity）。
   ⚠️ 前提是「允許安裝未知的應用程式」已經開著；沒開就跳一次請他去開。
   「稍後」只是這一次不裝，**不會永久跳過那一版**。
+  **安裝失敗要講出來**（1.0.11）：`InstallReceiver` 收到 `STATUS_FAILURE_*`（使用者自己按取消的 `ABORTED` 除外）
+  → `Updater.reportInstallFailure()`：前景 Toast、背景發一則通知，**靜默安裝的同一版背景失敗只通知一次**
+  （prefs `failNotified`，不擋的話每次離開 App 重試都叮一聲）。`INVALID` 順手丟掉那份 APK 讓下次重新下載。
+  版號與 silent 旗標是 `commitSession` 塞進 PendingIntent 的 extras 帶回來的。
   **手動檢查**（1.0.7）：帳號牌上那顆「⟳ 檢查 App 更新」叫 bridge 的 `checkUpdate()` →
   `Updater.check(activity, manual = true)`：不看 1 小時節流、每一步都用 Toast 講結果
   （已是最新版／找到新版下載中／失敗），下載好**當場問要不要裝**（不等離開 App）。

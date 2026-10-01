@@ -6076,6 +6076,38 @@ if (method === "POST" && pathname === "/api/verify-password") {
       }
 
       /*
+       * 路由：把一個標籤從全站拿掉（燈箱「加入既有標籤」那一排長按進入刪除模式）。
+       *
+       * 那一排就是 GET /api/tags，而它只列「還有照片在用」的標籤 —— 所以「刪掉」
+       * 等於從**每一張**照片上拔掉它，連別人相簿裡的也一樣。因此只認 canManageOthers。
+       * 先撈出受影響的照片，FTS 要逐張重算（標籤名在索引裡）。
+       */
+      if (method === "DELETE" && pathname.startsWith("/api/tags/") && pathname.split("/").length === 4) {
+        const actor = await currentActor(request, env);
+        if (!actor?.canManageOthers) return forbidden(headers, "只有可管理全站內容的人能刪除標籤");
+        const tagId = Number(pathname.split("/")[3]);
+        if (!Number.isInteger(tagId) || tagId <= 0) {
+          return new Response(JSON.stringify({ error: "bad tag id" }), { status: 400, headers });
+        }
+        const { results: rows } = await env.DB.prepare(
+          "SELECT photo_id FROM PhotoTag WHERE tag_id = ?",
+        ).bind(tagId).all();
+        const photoIds = (rows as any[]).map((r) => Number(r.photo_id));
+        await env.DB.batch([
+          env.DB.prepare("DELETE FROM PhotoTag WHERE tag_id = ?").bind(tagId),
+          env.DB.prepare("DELETE FROM Tag WHERE id = ?").bind(tagId),
+        ]);
+        if (photoIds.length > 0) {
+          await syncFtsForPhotos(env.DB, photoIds);
+          // 訪客那份共用邊緣快取的相簿 JSON 帶著 tags，不換 key 要等過期才消失
+          await bumpContentEpoch(env);
+        }
+        return new Response(JSON.stringify({ success: true, removed: photoIds.length }), {
+          headers: { ...headers, "Cache-Control": "no-store" },
+        });
+      }
+
+      /*
        * 路由：搜尋照片（取代舊的 /api/all-photos）
        *
        * 舊版一次回傳全站每一張照片，讓前端在瀏覽器裡用 includes() 過濾。首頁沒打

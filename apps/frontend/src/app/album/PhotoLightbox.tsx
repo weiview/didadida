@@ -4,7 +4,7 @@ import PhotoComments from "./PhotoComments";
 import PhotoImage from "@/components/PhotoImage";
 import VideoPlayer from "@/components/VideoPlayer";
 import FixTimeModal from "@/components/FixTimeModal";
-import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, photoFullSrc, photoThumbSrc, photoMotionSrc, hasMotion, isVideo, isGif, setPhotosRestricted } from "@/lib/api";
+import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, deleteTag, photoFullSrc, photoThumbSrc, photoMotionSrc, hasMotion, isVideo, isGif, setPhotosRestricted } from "@/lib/api";
 import { isPhotoNew, markPhotoSeen, flushSeen } from "@/lib/seen";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
@@ -618,6 +618,61 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
     if (success) onUpdate();
   };
 
+  /*
+   * 「加入既有標籤」那一排的刪除模式：長按任一顆（只給 canManageOthers）→ 每顆前面
+   * 變成 ×、整排輕輕抖，點 × 就把那個標籤從**所有照片**上拿掉（那一排就是
+   * GET /api/tags，只列還有照片在用的 —— 不拔光就永遠刪不掉）。
+   * 長按用 pointer 事件：手指移動超過 8px（在捲動）或 pointercancel 就不算。
+   * 長按成立後放手會補發一次 click，用 suppressTagClickRef 吃掉，不然會順手加進這張。
+   */
+  const [tagDeleteMode, setTagDeleteMode] = useState(false);
+  const suppressTagClickRef = useRef(false);
+  const tagPressRef = useRef<{ timer: number; x: number; y: number } | null>(null);
+  useEffect(() => { setTagDeleteMode(false); }, [photo.id]);
+  const cancelTagPress = () => {
+    if (tagPressRef.current) window.clearTimeout(tagPressRef.current.timer);
+    tagPressRef.current = null;
+  };
+  useEffect(() => cancelTagPress, []);
+  // 點到標籤區以外的地方就收掉刪除模式
+  useEffect(() => {
+    if (!tagDeleteMode) return;
+    const onDown = (e: PointerEvent) => {
+      if (!(e.target as Element | null)?.closest?.('[data-tag-zone]')) setTagDeleteMode(false);
+    };
+    document.addEventListener('pointerdown', onDown);
+    return () => document.removeEventListener('pointerdown', onDown);
+  }, [tagDeleteMode]);
+  const tagLongPress = {
+    onPointerDown: (e: React.PointerEvent) => {
+      if (tagDeleteMode || (e.pointerType === 'mouse' && e.button !== 0)) return;
+      cancelTagPress();
+      const timer = window.setTimeout(() => {
+        tagPressRef.current = null;
+        suppressTagClickRef.current = true;
+        setTagDeleteMode(true);
+        navigator.vibrate?.(15);
+      }, 500);
+      tagPressRef.current = { timer, x: e.clientX, y: e.clientY };
+    },
+    onPointerMove: (e: React.PointerEvent) => {
+      const p = tagPressRef.current;
+      if (p && Math.hypot(e.clientX - p.x, e.clientY - p.y) > 8) cancelTagPress();
+    },
+    onPointerUp: cancelTagPress,
+    onPointerCancel: cancelTagPress,
+    onPointerLeave: cancelTagPress,
+    onContextMenu: (e: React.MouseEvent) => e.preventDefault(),
+  };
+  const handleDeleteGlobalTag = async (t: Tag) => {
+    if (!window.confirm(`把標籤「${t.name}」從所有照片上拿掉？\n（照片本身不受影響）`)) return;
+    setIsAddingTag(true);
+    const removed = await deleteTag(t.id);
+    setIsAddingTag(false);
+    if (removed === null) { window.alert('刪除標籤失敗，請稍後再試'); return; }
+    onUpdate();
+  };
+
   const formatExposureTime = (time: number | string | undefined) => {
     if (!time) return null;
     const t = Number(time);
@@ -969,11 +1024,18 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
           {showMore && (<>
           <div className={styles.section}>
             <h3>標籤</h3>
-            <div className={styles.tagsArea} onClick={() => { if(isAdmin && (photo.tags?.length || 0) < 10) document.getElementById('tag-input')?.focus() }}>
-              {photo.tags?.map(tag => (
-                <span key={tag.id} className={styles.tag}>
+            <div data-tag-zone className={styles.tagsArea} onClick={() => { if(isAdmin && (photo.tags?.length || 0) < 10) document.getElementById('tag-input')?.focus() }}>
+              {photo.tags?.map((tag, i) => (
+                <span key={tag.id}
+                  className={`${styles.tag} ${tagDeleteMode ? styles.quickTagWiggle : ''}`}
+                  style={tagDeleteMode ? { animationDelay: `${(i % 5) * -0.07}s` } : undefined}
+                  {...(isAdmin ? tagLongPress : {})}>
+                  {isAdmin && tagDeleteMode && (
+                    <button type="button" className={styles.tagX}
+                      onClick={(e) => { e.stopPropagation(); handleRemoveTag(tag.id); }}>×</button>
+                  )}
                   {tag.name}
-                  {isAdmin && (
+                  {isAdmin && !tagDeleteMode && (
                     <span className={styles.removeTag} onClick={(e) => { e.stopPropagation(); handleRemoveTag(tag.id); }}>×</span>
                   )}
                 </span>
@@ -998,37 +1060,39 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
 
             {/* 管理員新增標籤時：快捷選取既有標籤膠囊按鈕 */}
             {isAdmin && (photo.tags?.length || 0) < 10 && availableTags.filter(t => !photo.tags?.some(pt => pt.name === t.name)).length > 0 && (
-              <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px', alignItems: 'center' }}>
-                <span style={{ fontSize: '0.75rem', color: '#888' }}>加入既有標籤：</span>
+              <div data-tag-zone className={styles.quickTags}>
+                <span className={styles.quickTagsLabel}>
+                  {tagDeleteMode && canManageOthers ? '點 × 從所有照片拿掉：' : '加入既有標籤：'}
+                </span>
                 {availableTags
                   .filter(t => !photo.tags?.some(pt => pt.name === t.name))
-                  .map(t => (
+                  .map((t, i) => (
                     <button
                       key={t.id}
                       type="button"
+                      className={`${styles.quickTag} ${tagDeleteMode && canManageOthers ? styles.quickTagWiggle : ''}`}
+                      style={tagDeleteMode && canManageOthers ? { animationDelay: `${(i % 5) * -0.07}s` } : undefined}
+                      disabled={isAddingTag}
+                      {...(canManageOthers ? tagLongPress : {})}
                       onClick={async (e) => {
                         e.stopPropagation();
+                        if (suppressTagClickRef.current) { suppressTagClickRef.current = false; return; }
+                        if (tagDeleteMode && canManageOthers) { await handleDeleteGlobalTag(t); return; }
                         setIsAddingTag(true);
                         const tag = await addPhotoTag(photo.id, t.name);
                         if (tag) onUpdate();
                         setIsAddingTag(false);
                       }}
-                      style={{
-                        background: 'rgba(255, 255, 255, 0.08)',
-                        border: '1px solid rgba(255, 255, 255, 0.2)',
-                        color: 'rgba(255, 255, 255, 0.9)',
-                        padding: '2px 8px',
-                        borderRadius: '12px',
-                        fontSize: '0.75rem',
-                        cursor: 'pointer',
-                        transition: 'all 0.2s ease'
-                      }}
-                      onMouseOver={(e) => { e.currentTarget.style.background = 'var(--accent-color)'; e.currentTarget.style.color = '#fff'; }}
-                      onMouseOut={(e) => { e.currentTarget.style.background = 'rgba(255, 255, 255, 0.08)'; e.currentTarget.style.color = 'rgba(255, 255, 255, 0.9)'; }}
                     >
-                      + {t.name}
+                      {tagDeleteMode && canManageOthers ? <span className={styles.quickTagX}>×</span> : '+ '}{t.name}
                     </button>
                   ))}
+                {tagDeleteMode && (
+                  <button type="button" className={styles.quickTagsDone}
+                    onClick={(e) => { e.stopPropagation(); setTagDeleteMode(false); }}>
+                    完成
+                  </button>
+                )}
               </div>
             )}
           </div>
