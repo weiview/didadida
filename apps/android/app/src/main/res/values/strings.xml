@@ -8,5 +8,5 @@
     <string name="widget_featured_label">本次精選</string>
     <string name="widget_featured_desc">輪播站上的本次精選，點一下開那張照片</string>
     <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
-    <string name="whats_new">• 檢查更新更準確：一定會抓到最新的版本\n• 手動檢查更新一定會告訴你結果</string>
+    <string name="whats_new">• 更新安裝失敗時會顯示原因\n• 照片標籤可長按進入刪除模式</string>
 </resources>

@@ -194,6 +194,25 @@ object Updater {
     /** 安裝結果回來（`InstallReceiver`）之後放掉鎖，失敗的下次離開 App 再試 */
     internal fun installFinished() = installing.set(false)
 
+    /**
+     * 安裝失敗（`InstallReceiver`）。在前景直接 Toast；在背景發一則通知，
+     * ⚠️ 但同一版的背景失敗只通知一次 —— 靜默安裝每次離開 App 都會再試，不擋就是每次都叮一聲。
+     * 檔案本身有問題（INVALID）就丟掉那份，下次檢查會重新下載。
+     */
+    internal fun reportInstallFailure(ctx: Context, code: Int, silent: Boolean, reason: String, dropApk: Boolean) {
+        val app = ctx.applicationContext
+        if (dropApk) clearApks(app)
+        val msg = "更新安裝失敗：$reason"
+        if (MainActivity.visible) {
+            main.post { Toast.makeText(app, msg, Toast.LENGTH_LONG).show() }
+            return
+        }
+        val p = prefs(app)
+        if (silent && p.getInt("failNotified", 0) == code) return
+        p.edit().putInt("failNotified", code).apply()
+        InstallReceiver.notifyFailure(app, msg)
+    }
+
     private fun download(app: Context, url: String, code: Int): File? {
         val dir = apkDir(app)
         val out = File(dir, "didadida-$code.apk")
@@ -243,7 +262,9 @@ object Updater {
             }
             val pi = PendingIntent.getBroadcast(
                 app, code,
-                Intent(app, InstallReceiver::class.java).setPackage(app.packageName),
+                Intent(app, InstallReceiver::class.java).setPackage(app.packageName)
+                    .putExtra(InstallReceiver.EXTRA_CODE, code)
+                    .putExtra(InstallReceiver.EXTRA_SILENT, silent),
                 // ⚠️ 一定要 MUTABLE：安裝結果是系統往這個 Intent 裡塞 extras 送回來的
                 PendingIntent.FLAG_UPDATE_CURRENT or
                     (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0),
@@ -283,7 +304,17 @@ object Updater {
             .setMessage("目前是 ${BuildConfig.VERSION_NAME}。安裝時 App 會關掉，要現在安裝嗎？")
             .setPositiveButton("安裝") { _, _ ->
                 val app = activity.applicationContext
-                Thread { runCatching { commitSession(app, apk, code, silent = false) } }.start()
+                Thread {
+                    try {
+                        commitSession(app, apk, code, silent = false)
+                    } catch (e: Exception) {
+                        // 連交給安裝器都失敗（多半是檔案壞了或空間不足）：講出來，並丟掉那份讓下次重新下載
+                        clearApks(app)
+                        main.post {
+                            Toast.makeText(app, "安裝失敗：${e.message ?: "無法開始安裝"}，稍後會重新下載", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }.start()
             }
             .setNegativeButton("稍後", null)
             .show()
