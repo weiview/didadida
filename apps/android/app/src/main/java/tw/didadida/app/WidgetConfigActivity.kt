@@ -12,6 +12,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 
 /**
  * 桌面小工具「本次精選」的設定：換圖間隔、背景／照片透明度、圓角、柔邊。
@@ -29,6 +30,10 @@ import androidx.appcompat.app.AppCompatActivity
 class WidgetConfigActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // ⚠️ 手機開著深色模式時，DayNight 主題把文字畫成白色，而 SystemBars 把底色墊成白的 ——
+        //    白底白字，上面那排換圖間隔的選項整個看不見（Pixel 7 Pro 回報）。這一頁鎖在淺色。
+        //    一定要在 super.onCreate 之前設，之後設會整頁重建一次。
+        delegate.localNightMode = AppCompatDelegate.MODE_NIGHT_NO
         super.onCreate(savedInstanceState)
         val widgetId = intent?.extras?.getInt(
             AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID,
