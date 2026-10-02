@@ -29,7 +29,7 @@ import kotlin.math.min
  *    同一個 `cacheDir/widget_thumbs/`。所以桌布換一輪不會再下載一次。
  *  - 畫質是 800px 那顆縮圖（使用者拍板，不接 Drive 4K），預設置中裁切滿版；
  *    小工具設定選了「完整顯示」（`FeaturedWidget.fit`，同一格 prefs）時整張縮進畫面、旁邊留黑。
- *  - ⚠️ **不開放的照片一律跳過**（清單在 `FeaturedWidget.list` 就濾掉了）—— 鎖定畫面誰都看得到。
+ *  - ⚠️ **不開放的照片與影片一律跳過**（清單在 `FeaturedWidget.list` 就濾掉了）—— 鎖定畫面誰都看得到。
  *  - ⚠️ **看不見的時候一個像素都不畫**（`onVisibilityChanged(false)` 就把計時器全收掉）：
  *    螢幕關著還在重畫就是白白耗電。平常停在一張靜止的圖上，只有換圖那 `FADE_MS` 才逐格重畫。
  *  - 網路與解碼在自己的背景執行緒（`worker`），畫在主執行緒。

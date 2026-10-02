@@ -10,5 +10,5 @@
     <string name="wallpaper_featured_label">本次精選</string>
     <string name="wallpaper_featured_desc">全螢幕輪播站上的本次精選，鎖定畫面也看得到</string>
     <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
-    <string name="whats_new">• 小工具與鎖定畫面桌布可以選「完整顯示」：直的照片就直的、橫的就橫的（長按小工具 →「設定」→「照片顯示方式」）\n• 完整顯示時把背景透明度拉到 100%，小工具看起來會跟著每張照片變形</string>
+    <string name="whats_new">• 小工具與鎖定畫面桌布不再顯示影片，只輪播照片</string>
 </resources>

@@ -2311,7 +2311,7 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   ⚠️ Firebase 自己建的 `firebase-adminsdk-fbsvc@…` **沒有用到**（我們沒有它的金鑰）。推播從 **1.0.4** 起生效。
 - **桌面小工具 `FeaturedWidget.kt`**（「本次精選」，1.0.12 改版）：輪播 `GET /api/featured`，
   右上 ⟳ 手動換，點圖開那張照片。清單在 prefs 快取 3 小時（精選幾天才動一次），
-  **不開放的一律跳過**（桌面是誰都看得到的地方），沒登入時寫「打開 App 登入後…」。
+  **不開放的一律跳過**（桌面是誰都看得到的地方），**影片也跳過**（1.0.18，`media_type == "video"`：小工具播不了、桌布上只是一張封面；動態照片與 GIF 照留。快取 key 因此換成 `widget_featured_v2`），沒登入時寫「打開 App 登入後…」。
   設定在 `WidgetConfigActivity`（長按小工具 →「設定」，`widgetFeatures="reconfigurable|configuration_optional"`），
   全部小工具共用一份 prefs：`widget_interval`（0／1／5／10／15，預設 5）、`widget_bg_alpha`、
   `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_flip_sec`（秒）、`widget_fit`（1.0.17：完整顯示，直的就直的、橫的就橫的；
@@ -2334,7 +2334,7 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   ⚠️ KDoc 裡不要寫 `/api/photos/view/*` —— Kotlin 的註解會巢狀，`/*` 會開一個永遠關不掉的註解。
 - **動態桌布 `FeaturedWallpaper.kt`**（「本次精選」，1.0.15）：`WallpaperService`，全螢幕輪播精選，
   亮螢幕還沒解鎖就看得到（Pixel 套用時多半主畫面也一起換）。每張停 6 秒、淡入 1.2 秒，800px 縮圖置中裁切滿版（`widget_fit` 開著時整張縮進畫面、外圍留黑，換圖時舊的也一起淡出）。
-  - 清單與縮圖**跟小工具共用**：`FeaturedWidget.list(ctx, session)`（同一份 3 小時快取、已濾掉不開放的）
+  - 清單與縮圖**跟小工具共用**：`FeaturedWidget.list(ctx, session)`（同一份 3 小時快取、已濾掉不開放的與影片）
     與 `FeaturedWidget.load(ctx, url, maxPx)`（`maxPx = 0` 不縮）。票從 `Push.session()` 拿，沒登入畫一行提示。
   - ⚠️ **看不見時一個像素都不畫**（`onVisibilityChanged(false)` 收掉所有計時器），平常停在靜止的圖上，只有淡入那 1.2 秒逐格重畫。
   - ⚠️ 淡入結束才排下一張靠 `finished` 旗標 —— `Handler.hasCallbacks` 是 API 29，minSdk 是 28。

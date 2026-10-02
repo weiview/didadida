@@ -61,7 +61,8 @@ import kotlin.math.min
  *
  * ⚠️ 票（`admin_token`）是網頁交給 `Push.setSession` 的同一張 —— 沒登入過 App、或登出了，
  *    小工具就只寫「打開 App 登入後顯示精選」。
- * ⚠️ **不開放的照片一律跳過**：桌面是任何人都看得到的地方。
+ * ⚠️ **不開放的照片一律跳過**：桌面是任何人都看得到的地方。**影片也跳過**（`media_type == "video"`）——
+ * 小工具播不了影片、桌布上只會是封面。動態照片與 GIF 是照片，照樣留著。
  * ⚠️ 網路在 `goAsync()` 的背景執行緒上跑（onReceive 在主執行緒，而且只有 10 秒可用），
  *    所以另外一個逾時很短的 client —— 共用那個的讀取逾時是 5 分鐘（給 Drive 分塊用的）。
  */
@@ -116,7 +117,8 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val TAG = "FeaturedWidget"
         private const val ACTION_NEXT = "tw.didadida.app.FEATURED_NEXT"
         private const val ACTION_TICK = "tw.didadida.app.FEATURED_TICK"
-        private const val KEY_LIST = "widget_featured"
+        // 1.0.18 起清單濾掉影片：換一把 key，舊版存下的那份（含影片）不再被讀到
+        private const val KEY_LIST = "widget_featured_v2"
         private const val KEY_LIST_AT = "widget_featured_at"
         private const val KEY_LIST_SESSION = "widget_featured_session"
         private const val KEY_INDEX = "widget_featured_index"
@@ -492,11 +494,13 @@ class FeaturedWidget : AppWidgetProvider() {
                 Log.w(TAG, "讀精選失敗", e)
                 return if (sameSession) parse(JSONArray(cached)) else null
             }
-            // 只留要用的幾欄，並在這裡就把不開放的濾掉、挑好縮圖網址
+            // 只留要用的幾欄，並在這裡就把不開放的與影片濾掉、挑好縮圖網址
             val slim = JSONArray()
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
                 if (o.optInt("restricted") == 1) continue
+                // 影片不上桌面：小工具播不了，桌布上也只會是一張不會動的封面（使用者拍板，1.0.18）
+                if (o.optString("media_type") == "video") continue
                 val src = listOf("thumb_url", "url", "thumb_sm_url")
                     .map { if (o.isNull(it)) "" else o.optString(it) }
                     .firstOrNull { it.startsWith("https://") } ?: continue
