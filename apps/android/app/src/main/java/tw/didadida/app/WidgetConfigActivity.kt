@@ -15,7 +15,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 
 /**
- * 桌面小工具「本次精選」的設定：換圖間隔（連續漸變的秒數）、背景／照片透明度、圓角、柔邊。
+ * 桌面小工具「本次精選」的設定：換圖間隔（連續漸變的秒數）、照片顯示方式、背景／照片透明度、圓角、柔邊。
  *
  *  - 從哪裡進來：Android 12+ 長按小工具 →「設定」（`widgetFeatures="reconfigurable"`）；
  *    更舊的系統在加小工具的當下跳一次（`configuration_optional` 在那裡不認）。
@@ -23,7 +23,9 @@ import androidx.appcompat.app.AppCompatDelegate
  *    （`onStopTrackingTouch` → `FeaturedWidget.refresh`），拖曳中不重畫。
  *    縮圖在磁碟上有快取，重畫不會重新下載。
  *  - 值是全部小工具共用一份（prefs `app`）；每個小工具照自己的尺寸各畫一份。
- *  - 尺寸不在這裡調：長按小工具、拖邊框就能拉大拉小，照片會跟著重新裁切滿版。
+ *  - 尺寸不在這裡調：長按小工具、拖邊框就能拉大拉小，照片會跟著重畫。
+ *  - 「照片顯示方式」（裁切滿版／完整顯示）是 `FeaturedWidget.fit`，鎖定畫面的動態桌布也看這一格。
+ *    Android 不准 App 自己改小工具的尺寸，所以「跟著照片直橫變形」是靠完整顯示＋背景全透明做出來的。
  *  - ⚠️ 從「加小工具」進來時一定要 `setResult(RESULT_OK, …EXTRA_APPWIDGET_ID)`，
  *    不然系統當作使用者取消，剛放上去的小工具會被收掉。按返回鍵也算數，所以一進來就先設。
  */
@@ -69,6 +71,29 @@ class WidgetConfigActivity : AppCompatActivity() {
             }
         })
 
+        root.addView(TextView(this).apply {
+            text = "照片顯示方式"
+            setPadding(0, dp(20), 0, dp(4))
+        })
+        val fit = FeaturedWidget.fit(this)
+        root.addView(RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            addView(RadioButton(this@WidgetConfigActivity).apply {
+                id = 2000
+                text = "裁切滿版"
+                isChecked = !fit
+            })
+            addView(RadioButton(this@WidgetConfigActivity).apply {
+                id = 2001
+                text = "完整顯示（直的就直的、橫的就橫的）"
+                isChecked = fit
+            })
+            setOnCheckedChangeListener { _, checkedId ->
+                FeaturedWidget.setFit(this@WidgetConfigActivity, checkedId == 2001)
+                FeaturedWidget.refresh(this@WidgetConfigActivity)
+            }
+        })
+
         root.addView(slider(
             label = "連續漸變：每張停",
             initial = FeaturedWidget.flipSeconds(this),
@@ -93,7 +118,9 @@ class WidgetConfigActivity : AppCompatActivity() {
             FeaturedWidget.setFeather(this, pct)
         })
         root.addView(TextView(this).apply {
-            text = "放開拉桿後桌面上的小工具會跟著變。照片會裁切成滿版；" +
+            text = "放開拉桿後桌面上的小工具會跟著變。" +
+                "選「完整顯示」再把背景透明度拉到 100%，小工具就會跟著每張照片的直橫變形；" +
+                "鎖定畫面的動態桌布也照這個設定（照片外圍是黑的）。" +
                 "要換尺寸，長按桌面上的小工具、拖曳邊框就能拉大拉小。"
             setPadding(0, dp(16), 0, dp(12))
         })

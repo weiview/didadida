@@ -2314,7 +2314,8 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   **不開放的一律跳過**（桌面是誰都看得到的地方），沒登入時寫「打開 App 登入後…」。
   設定在 `WidgetConfigActivity`（長按小工具 →「設定」，`widgetFeatures="reconfigurable|configuration_optional"`），
   全部小工具共用一份 prefs：`widget_interval`（0／1／5／10／15，預設 5）、`widget_bg_alpha`、
-  `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_flip_sec`（秒）。拉桿**放手才重畫**。
+  `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_flip_sec`（秒）、`widget_fit`（1.0.17：完整顯示，直的就直的、橫的就橫的；
+  Android 不准 App 改小工具的尺寸，「跟著照片變形」是完整顯示＋背景透明度 100% 做出來的，動態桌布也看這一格）。拉桿**放手才重畫**。
   ⚠️ 設定頁**鎖在淺色**（`delegate.localNightMode = MODE_NIGHT_NO`，要在 `super.onCreate` 之前）：主題是 DayNight，
   手機開深色模式時文字變白、而 `SystemBars` 把底墊成白的 —— 白底白字，選項整排看不見（1.0.14 修，Pixel 7 Pro）。
   - **換圖間隔**：1–15 分鐘是 AlarmManager 的 `RTC` 鬧鐘（`ACTION_TICK`），能用精確鬧鐘就 `setExact`
@@ -2332,7 +2333,7 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   - 縮圖存在 `cacheDir/widget_thumbs/<sha1(url)>`，清單重抓時清掉沒用到的 —— 每分鐘換圖不會每次下載。
   ⚠️ KDoc 裡不要寫 `/api/photos/view/*` —— Kotlin 的註解會巢狀，`/*` 會開一個永遠關不掉的註解。
 - **動態桌布 `FeaturedWallpaper.kt`**（「本次精選」，1.0.15）：`WallpaperService`，全螢幕輪播精選，
-  亮螢幕還沒解鎖就看得到（Pixel 套用時多半主畫面也一起換）。每張停 6 秒、淡入 1.2 秒，800px 縮圖置中裁切滿版。
+  亮螢幕還沒解鎖就看得到（Pixel 套用時多半主畫面也一起換）。每張停 6 秒、淡入 1.2 秒，800px 縮圖置中裁切滿版（`widget_fit` 開著時整張縮進畫面、外圍留黑，換圖時舊的也一起淡出）。
   - 清單與縮圖**跟小工具共用**：`FeaturedWidget.list(ctx, session)`（同一份 3 小時快取、已濾掉不開放的）
     與 `FeaturedWidget.load(ctx, url, maxPx)`（`maxPx = 0` 不縮）。票從 `Push.session()` 拿，沒登入畫一行提示。
   - ⚠️ **看不見時一個像素都不畫**（`onVisibilityChanged(false)` 收掉所有計時器），平常停在靜止的圖上，只有淡入那 1.2 秒逐格重畫。

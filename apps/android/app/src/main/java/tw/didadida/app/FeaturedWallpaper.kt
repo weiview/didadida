@@ -20,13 +20,15 @@ import android.widget.Toast
 import org.json.JSONObject
 import tw.didadida.app.push.Push
 import kotlin.math.max
+import kotlin.math.min
 
 /**
  * 動態桌布：全螢幕輪播「★ 本次精選」，亮螢幕還沒解鎖時就看得到（Pixel 上多半主畫面也一起套）。
  *
  *  - 清單與縮圖跟桌面小工具**共用同一份**（`FeaturedWidget.list`／`load`）：同一個 prefs 快取（3 小時）、
  *    同一個 `cacheDir/widget_thumbs/`。所以桌布換一輪不會再下載一次。
- *  - 畫質是 800px 那顆縮圖（使用者拍板，不接 Drive 4K），置中裁切滿版。
+ *  - 畫質是 800px 那顆縮圖（使用者拍板，不接 Drive 4K），預設置中裁切滿版；
+ *    小工具設定選了「完整顯示」（`FeaturedWidget.fit`，同一格 prefs）時整張縮進畫面、旁邊留黑。
  *  - ⚠️ **不開放的照片一律跳過**（清單在 `FeaturedWidget.list` 就濾掉了）—— 鎖定畫面誰都看得到。
  *  - ⚠️ **看不見的時候一個像素都不畫**（`onVisibilityChanged(false)` 就把計時器全收掉）：
  *    螢幕關著還在重畫就是白白耗電。平常停在一張靜止的圖上，只有換圖那 `FADE_MS` 才逐格重畫。
@@ -173,7 +175,9 @@ class FeaturedWallpaper : WallpaperService() {
                 val nxt = next
                 if (nxt != null) {
                     val t = ((SystemClock.uptimeMillis() - fadeStart).toFloat() / FADE_MS).coerceIn(0f, 1f)
-                    cur?.let { drawCover(canvas, it, 255) }
+                    // 完整顯示時兩張大小不一樣：舊的不淡出的話，它露在新照片外面那一圈會在淡入結束時突然消失
+                    val curAlpha = if (FeaturedWidget.fit(applicationContext)) ((1f - t) * 255).toInt() else 255
+                    cur?.let { drawCover(canvas, it, curAlpha) }
                     drawCover(canvas, nxt, (t * 255).toInt())
                     if (t >= 1f) { current = nxt; next = null; finished = true } else fading = true
                 } else if (cur != null) {
@@ -191,8 +195,21 @@ class FeaturedWallpaper : WallpaperService() {
             if (fading) main.postDelayed(frame, FRAME_MS) else if (finished) scheduleAdvance()
         }
 
-        /** 置中裁切填滿整個畫面 */
+        /**
+         * 預設置中裁切填滿整個畫面；小工具設定選了「完整顯示」（`FeaturedWidget.fit`）時
+         * 整張照片縮進畫面、置中，旁邊留黑。
+         */
         private fun drawCover(canvas: Canvas, bmp: Bitmap, alpha: Int) {
+            paint.alpha = alpha
+            if (FeaturedWidget.fit(applicationContext)) {
+                val scale = min(width.toFloat() / bmp.width, height.toFloat() / bmp.height)
+                val dw = (bmp.width * scale).toInt()
+                val dh = (bmp.height * scale).toInt()
+                val dx = (width - dw) / 2
+                val dy = (height - dh) / 2
+                canvas.drawBitmap(bmp, null, Rect(dx, dy, dx + dw, dy + dh), paint)
+                return
+            }
             val scale = max(width.toFloat() / bmp.width, height.toFloat() / bmp.height)
             val sw = (width / scale).toInt()
             val sh = (height / scale).toInt()

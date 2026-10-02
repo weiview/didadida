@@ -47,7 +47,9 @@ import kotlin.math.min
  *    ⚠️ RemoteViews 的點陣圖總量有上限（約螢幕像素 × 4 × 1.5），所以張數照小工具的
  *    尺寸算（`flipCount`），塞不下兩張就退回一次一張。
  *
- * 外觀：照片**置中裁切滿版**，圓角、柔邊、背景、照片透明度全部**烤進那張點陣圖**
+ * 外觀：照片預設**置中裁切滿版**；prefs `widget_fit` 開著時改成**完整顯示**（直的就直的、
+ * 橫的就橫的，圓角柔邊套在照片本身，旁邊透明 —— 背景透明度 100% 時看起來就像小工具跟著照片變形；
+ * 鎖定畫面的動態桌布也看同一格）。圓角、柔邊、背景、照片透明度全部**烤進那張點陣圖**
  * （`compose`）—— RemoteViews 沒辦法替 ImageView 加圓角或模糊邊。所以每一個小工具
  * 照**它自己的尺寸**各畫一份（`getAppWidgetOptions`），使用者拉大拉小時
  * （`onAppWidgetOptionsChanged`）重畫一次。
@@ -108,7 +110,7 @@ class FeaturedWidget : AppWidgetProvider() {
     }
 
     /** 烤進點陣圖的外觀，一次讀齊 */
-    private class Look(val bgAlpha: Int, val imgAlpha: Int, val corner: Int, val feather: Int)
+    private class Look(val bgAlpha: Int, val imgAlpha: Int, val corner: Int, val feather: Int, val fit: Boolean)
 
     companion object {
         private const val TAG = "FeaturedWidget"
@@ -126,6 +128,8 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val KEY_IMG_ALPHA = "widget_img_alpha"
         private const val KEY_CORNER = "widget_corner"
         private const val KEY_FEATHER = "widget_feather"
+        /** true＝完整顯示（直的照片就是直的、橫的就是橫的，旁邊留空）；false＝裁切滿版。動態桌布也看這一格 */
+        private const val KEY_FIT = "widget_fit"
         private const val LIST_TTL_MS = 3L * 3600 * 1000
         private const val STATIC_MAX_PX = 720   // 一次一張：長邊上限
         private const val FLIP_MAX_PX = 480     // 連續漸變一次好幾張，每張小一點才塞得下
@@ -167,6 +171,9 @@ class FeaturedWidget : AppWidgetProvider() {
         fun corner(ctx: Context) = prefs(ctx).getInt(KEY_CORNER, 30).coerceIn(0, 100)
         fun feather(ctx: Context) = prefs(ctx).getInt(KEY_FEATHER, 40).coerceIn(0, 100)
 
+        fun fit(ctx: Context) = prefs(ctx).getBoolean(KEY_FIT, false)
+        fun setFit(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean(KEY_FIT, on).apply()
+
         fun flipSeconds(ctx: Context) = prefs(ctx).getInt(KEY_FLIP_SEC, 2).coerceIn(FLIP_SEC_MIN, FLIP_SEC_MAX)
 
         fun setInterval(ctx: Context, minutes: Int) = put(ctx, KEY_INTERVAL, minutes)
@@ -183,7 +190,7 @@ class FeaturedWidget : AppWidgetProvider() {
 
         private fun prefs(ctx: Context) = ctx.getSharedPreferences("app", Context.MODE_PRIVATE)
 
-        private fun look(ctx: Context) = Look(backgroundAlpha(ctx), imageAlpha(ctx), corner(ctx), feather(ctx))
+        private fun look(ctx: Context) = Look(backgroundAlpha(ctx), imageAlpha(ctx), corner(ctx), feather(ctx), fit(ctx))
 
         // ── 鬧鐘 ────────────────────────────────────────────────
 
@@ -383,49 +390,71 @@ class FeaturedWidget : AppWidgetProvider() {
         }
 
         /**
-         * 置中裁切滿版 → 套照片透明度 → 挖成圓角（＋柔邊）→ 底下墊背景。
+         * 擺照片（裁切滿版或完整顯示）→ 套照片透明度 → 挖成圓角（＋柔邊）→ 底下墊背景。
          *
          * ⚠️ 照片是當成 `BitmapShader` 拿去「填一個圓角矩形」，柔邊是那個矩形自己的
          * `BlurMaskFilter`：形狀與模糊一筆畫完。1.0.12 是另外畫一張 ALPHA_8 遮罩再用
          * DST_IN 疊回去，在實機上沒有作用（圓角、柔邊拉到底都看不出來）—— 不要改回去。
          * 柔邊＝形狀先往內縮一個模糊半徑再模糊，邊緣從不透明漸漸淡到透明；
          * 上限是短邊的 `FEATHER_MAX`，太小的話會被桌面本身的圓角裁切蓋掉。
+         *
+         * 完整顯示（`look.fit`）：照片整張縮進框裡置中，圓角與柔邊套在**照片自己**那塊上
+         * （照它的短邊算），旁邊是透明的。小工具的框大小 Android 不准 App 改，
+         * 背景透明度 100% 時看起來就是「直的照片是直的框、橫的是橫的框」。
+         * 背景照舊鋪滿整個框（使用者自己調得掉）。
          */
         private fun compose(src: Bitmap, w: Int, h: Int, look: Look): Bitmap {
-            // 1. 置中裁切成剛好 w×h
+            // 1. 照片要擺在哪一塊（dst），從原圖取哪一塊（srcRect）
+            val dst: RectF
+            val srcRect: Rect
+            if (look.fit) {
+                val scale = min(w.toFloat() / src.width, h.toFloat() / src.height)
+                val dw = src.width * scale
+                val dh = src.height * scale
+                val ox = (w - dw) / 2f
+                val oy = (h - dh) / 2f
+                dst = RectF(ox, oy, ox + dw, oy + dh)
+                srcRect = Rect(0, 0, src.width, src.height)
+            } else {
+                val scale = max(w.toFloat() / src.width, h.toFloat() / src.height)
+                val sw = (w / scale).toInt().coerceIn(1, src.width)
+                val sh = (h / scale).toInt().coerceIn(1, src.height)
+                val sx = (src.width - sw) / 2
+                val sy = (src.height - sh) / 2
+                dst = RectF(0f, 0f, w.toFloat(), h.toFloat())
+                srcRect = Rect(sx, sy, sx + sw, sy + sh)
+            }
             val photo = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            val scale = max(w.toFloat() / src.width, h.toFloat() / src.height)
-            val sw = (w / scale).toInt().coerceIn(1, src.width)
-            val sh = (h / scale).toInt().coerceIn(1, src.height)
-            val sx = (src.width - sw) / 2
-            val sy = (src.height - sh) / 2
-            Canvas(photo).drawBitmap(
-                src, Rect(sx, sy, sx + sw, sy + sh), RectF(0f, 0f, w.toFloat(), h.toFloat()),
-                Paint(Paint.FILTER_BITMAP_FLAG),
-            )
+            Canvas(photo).drawBitmap(src, srcRect, dst, Paint(Paint.FILTER_BITMAP_FLAG))
 
-            // 2. 形狀
-            val short = min(w, h).toFloat()
-            val feather = look.feather / 100f * short * FEATHER_MAX
-            val soft = feather >= 1f
-            val inset = if (soft) feather else 0f
-            val rect = RectF(inset, inset, w - inset, h - inset)
-            val radius = (look.corner / 100f * short / 2f).coerceAtMost(min(rect.width(), rect.height()) / 2f)
-            fun shapePaint() = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                if (soft) maskFilter = BlurMaskFilter(feather, BlurMaskFilter.Blur.NORMAL)
+            // 2. 形狀：照片那一塊（滿版時就是整個框）
+            fun shape(area: RectF): Pair<RectF, Float> {
+                val short = min(area.width(), area.height())
+                val f = look.feather / 100f * short * FEATHER_MAX
+                val inset = if (f >= 1f) f else 0f
+                val r = RectF(area.left + inset, area.top + inset, area.right - inset, area.bottom - inset)
+                val radius = (look.corner / 100f * short / 2f).coerceAtMost(min(r.width(), r.height()) / 2f)
+                return r to radius
+            }
+            fun shapePaint(area: RectF) = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                val f = look.feather / 100f * min(area.width(), area.height()) * FEATHER_MAX
+                if (f >= 1f) maskFilter = BlurMaskFilter(f, BlurMaskFilter.Blur.NORMAL)
             }
 
             val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             out.setHasAlpha(true)
             val c = Canvas(out)
-            // 3. 背景先畫在底下（同一個形狀、同樣的柔邊）
+            // 3. 背景先畫在底下（整個框、同樣的圓角與柔邊）
             if (look.bgAlpha > 0) {
-                c.drawRoundRect(rect, radius, radius, shapePaint().apply {
+                val frame = RectF(0f, 0f, w.toFloat(), h.toFloat())
+                val (rect, radius) = shape(frame)
+                c.drawRoundRect(rect, radius, radius, shapePaint(frame).apply {
                     color = (look.bgAlpha shl 24) or 0x222222
                 })
             }
-            // 4. 照片填進同一個形狀
-            c.drawRoundRect(rect, radius, radius, shapePaint().apply {
+            // 4. 照片填進它自己的形狀
+            val (rect, radius) = shape(dst)
+            c.drawRoundRect(rect, radius, radius, shapePaint(dst).apply {
                 isFilterBitmap = true
                 shader = BitmapShader(photo, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
                 alpha = look.imgAlpha
