@@ -229,7 +229,7 @@ class FeaturedWallpaper : WallpaperService() {
 
     companion object {
         private const val TAG = "FeaturedWallpaper"
-        private const val KEY_INDEX = "wallpaper_index"
+        internal const val KEY_INDEX = "wallpaper_index"
         private const val HOLD_MS = 6_000L
         private const val FADE_MS = 1_200L
         private const val FRAME_MS = 33L

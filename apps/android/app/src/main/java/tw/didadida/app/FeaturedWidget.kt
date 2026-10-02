@@ -117,8 +117,8 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val TAG = "FeaturedWidget"
         private const val ACTION_NEXT = "tw.didadida.app.FEATURED_NEXT"
         private const val ACTION_TICK = "tw.didadida.app.FEATURED_TICK"
-        // 1.0.18 起清單濾掉影片：換一把 key，舊版存下的那份（含影片）不再被讀到
-        private const val KEY_LIST = "widget_featured_v2"
+        // 1.0.18 起清單濾掉影片、1.0.20 起帶拍攝時間：換一把 key，舊版存下的那份不再被讀到
+        private const val KEY_LIST = "widget_featured_v3"
         private const val KEY_LIST_AT = "widget_featured_at"
         private const val KEY_LIST_SESSION = "widget_featured_session"
         private const val KEY_INDEX = "widget_featured_index"
@@ -132,6 +132,10 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val KEY_FEATHER = "widget_feather"
         /** true＝完整顯示（直的照片就是直的、橫的就是橫的，旁邊留空）；false＝裁切滿版。動態桌布也看這一格 */
         private const val KEY_FIT = "widget_fit"
+        /** 播放順序（動態桌布也看這一格）：true＝隨機；false＝照拍攝時間，舊到新 */
+        private const val KEY_SHUFFLE = "widget_shuffle"
+        /** 隨機的種子：同一份清單排出來的順序要固定，index 一張一張往下走才不會重複或跳過 */
+        private const val KEY_SHUFFLE_SEED = "widget_shuffle_seed"
         private const val LIST_TTL_MS = 3L * 3600 * 1000
         private const val STATIC_MAX_PX = 720   // 一次一張：長邊上限
         private const val FLIP_MAX_PX = 480     // 連續漸變一次好幾張，每張小一點才塞得下
@@ -175,6 +179,12 @@ class FeaturedWidget : AppWidgetProvider() {
 
         fun fit(ctx: Context) = prefs(ctx).getBoolean(KEY_FIT, false)
         fun setFit(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean(KEY_FIT, on).apply()
+
+        fun shuffle(ctx: Context) = prefs(ctx).getBoolean(KEY_SHUFFLE, false)
+        /** 換順序就從頭播（新種子＋index 歸零），不然會停在新順序裡隨便一張上 */
+        fun setShuffle(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean(KEY_SHUFFLE, on)
+            .putLong(KEY_SHUFFLE_SEED, System.nanoTime()).putInt(KEY_INDEX, 0)
+            .putInt(FeaturedWallpaper.KEY_INDEX, 0).apply()
 
         fun flipSeconds(ctx: Context) = prefs(ctx).getInt(KEY_FLIP_SEC, 2).coerceIn(FLIP_SEC_MIN, FLIP_SEC_MAX)
 
@@ -469,7 +479,20 @@ class FeaturedWidget : AppWidgetProvider() {
 
         /** 快取過的清單（沒過期、而且是同一張票拿的）；否則打一次 API。失敗回 null。動態桌布（`FeaturedWallpaper`）也吃這一份 */
         internal fun list(ctx: Context, session: String): List<JSONObject>? = synchronized(listLock) {
-            listLocked(ctx, session)
+            listLocked(ctx, session)?.let { ordered(ctx, it) }
+        }
+
+        /** 照設定排順序：隨機（種子固定，清單重抓時換一顆）或拍攝時間舊到新（沒有時間的排最後，維持精選的先後） */
+        private fun ordered(ctx: Context, items: List<JSONObject>): List<JSONObject> {
+            if (shuffle(ctx)) {
+                val p = prefs(ctx)
+                var seed = p.getLong(KEY_SHUFFLE_SEED, 0L)
+                if (seed == 0L) { seed = System.nanoTime(); p.edit().putLong(KEY_SHUFFLE_SEED, seed).apply() }
+                return items.sortedBy { it.optLong("id") }.shuffled(java.util.Random(seed))
+            }
+            // taken_at 是 D1 的 ISO 字串，字串比就是時間比
+            return items.sortedWith(compareBy<JSONObject> { it.optString("taken_at").isEmpty() }
+                .thenBy { it.optString("taken_at") })
         }
 
         private val listLock = Any()
@@ -510,10 +533,13 @@ class FeaturedWidget : AppWidgetProvider() {
                         .put("album_id", o.optLong("album_id"))
                         .put("title", o.optString("title"))
                         .put("album_name", if (o.isNull("album_name")) "" else o.optString("album_name"))
+                        .put("taken_at", if (o.isNull("taken_at")) "" else o.optString("taken_at"))
                         .put("src", src),
                 )
             }
+            // 隨機的話每次重抓清單就換一輪新順序
             p.edit().putString(KEY_LIST, slim.toString()).putLong(KEY_LIST_AT, System.currentTimeMillis())
+                .putLong(KEY_SHUFFLE_SEED, System.nanoTime())
                 .putString(KEY_LIST_SESSION, sig).apply()
             val items = parse(slim)
             pruneThumbs(ctx, items.map { thumbName(it.optString("src")) }.toSet())

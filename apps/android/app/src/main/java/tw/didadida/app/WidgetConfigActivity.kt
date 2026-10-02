@@ -94,6 +94,29 @@ class WidgetConfigActivity : AppCompatActivity() {
             }
         })
 
+        root.addView(TextView(this).apply {
+            text = "播放順序（動態桌布也一樣）"
+            setPadding(0, dp(20), 0, dp(4))
+        })
+        val shuffle = FeaturedWidget.shuffle(this)
+        root.addView(RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            addView(RadioButton(this@WidgetConfigActivity).apply {
+                id = 3000
+                text = "照拍攝日期（舊到新）"
+                isChecked = !shuffle
+            })
+            addView(RadioButton(this@WidgetConfigActivity).apply {
+                id = 3001
+                text = "隨機"
+                isChecked = shuffle
+            })
+            setOnCheckedChangeListener { _, checkedId ->
+                FeaturedWidget.setShuffle(this@WidgetConfigActivity, checkedId == 3001)
+                FeaturedWidget.refresh(this@WidgetConfigActivity)
+            }
+        })
+
         root.addView(slider(
             label = "連續漸變：每張停",
             initial = FeaturedWidget.flipSeconds(this),

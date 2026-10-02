@@ -2312,6 +2312,7 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
 - **桌面小工具 `FeaturedWidget.kt`**（「本次精選」，1.0.12 改版）：輪播 `GET /api/featured`，
   右上 ⟳ 手動換，點圖開那張照片。清單在 prefs 快取 3 小時（精選幾天才動一次），
   **不開放的一律跳過**（桌面是誰都看得到的地方），**影片也跳過**（1.0.18，`media_type == "video"`：小工具播不了、桌布上只是一張封面；動態照片與 GIF 照留。快取 key 因此換成 `widget_featured_v2`），沒登入時寫「打開 App 登入後…」。
+  **播放順序**（1.0.20，`widget_shuffle`，動態桌布也看這一格）：預設照拍攝時間舊到新（沒有時間的排最後），或隨機。排序在 `FeaturedWidget.list()` 出口做（`ordered()`），所以兩邊自動一致；`/api/featured` 為此多回 `taken_at`，清單快取 key 換成 `widget_featured_v3`。隨機靠固定的 `widget_shuffle_seed`（index 一張張往下走才不重複），重抓清單時換一顆；切換順序時 index 歸零從頭播。
   設定在 `WidgetConfigActivity`（長按小工具 →「設定」，`widgetFeatures="reconfigurable|configuration_optional"`），
   全部小工具共用一份 prefs：`widget_interval`（0／1／5／10／15，預設 5）、`widget_bg_alpha`、
   `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_flip_sec`（秒）、`widget_fit`（1.0.17：完整顯示，直的就直的、橫的就橫的；

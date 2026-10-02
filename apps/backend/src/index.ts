@@ -903,7 +903,7 @@ async function listFeatured(env: Env, actor: Actor | null): Promise<any[]> {
   }
   const { results } = await env.DB.prepare(
     `SELECT p.id, p.album_id, p.title, p.media_type, p.url, p.thumb_url, p.thumb_sm_url,
-            p.restricted, p.featured_at, a.name AS album_name
+            p.restricted, p.featured_at, p.taken_at, a.name AS album_name
        FROM Photo p JOIN Album a ON a.id = p.album_id
       WHERE p.featured_at IS NOT NULL${cond}
       ORDER BY p.featured_at DESC, p.id DESC
