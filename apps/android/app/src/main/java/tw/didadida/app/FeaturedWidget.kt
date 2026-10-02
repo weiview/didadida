@@ -70,7 +70,8 @@ class FeaturedWidget : AppWidgetProvider() {
 
     override fun onUpdate(ctx: Context, mgr: AppWidgetManager, ids: IntArray) {
         // 定時模式下換圖是鬧鐘的事，這裡只補畫（開機、剛放上桌面）並確認鬧鐘還在
-        refreshAsync(ctx, advance = interval(ctx) == 0, reschedule = false)
+        // 連續漸變不在這裡往前推：render 自己照「這一批放了多久」接著播（見 KEY_FLIP_AT）
+        refreshAsync(ctx, advance = false, reschedule = false)
     }
 
     override fun onAppWidgetOptionsChanged(ctx: Context, mgr: AppWidgetManager, id: Int, options: Bundle) {
@@ -86,17 +87,13 @@ class FeaturedWidget : AppWidgetProvider() {
     override fun onReceive(ctx: Context, intent: Intent) {
         when (intent.action) {
             ACTION_NEXT -> {
-                if (prefs(ctx).getBoolean(KEY_FLIPPING, false)) {
-                    // 連續漸變：那一批已經在桌面上了，翻下一頁就好，不重畫
-                    val v = RemoteViews(ctx.packageName, R.layout.widget_featured_flip)
-                    v.showNext(R.id.widget_flipper)
-                    runCatching { AppWidgetManager.getInstance(ctx).partiallyUpdateAppWidget(ids(ctx), v) }
-                } else {
-                    refreshAsync(ctx, advance = true, reschedule = true)
-                }
+                // 連續漸變也重畫一批（從畫面上那一張的下一張開始）—— 只 showNext 的話
+                // 記下來的位置跟畫面對不上，下一次重畫就跳回去了
+                refreshAsync(ctx, advance = true, reschedule = true)
                 return
             }
-            ACTION_TICK -> { refreshAsync(ctx, advance = true, reschedule = true); return }
+            // 連續漸變的鬧鐘是「這一批快播完了」：從最後一頁接著畫下一批，不再往前推一張
+            ACTION_TICK -> { refreshAsync(ctx, advance = interval(ctx) != 0, reschedule = true); return }
         }
         super.onReceive(ctx, intent)
     }
@@ -124,6 +121,10 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val KEY_INDEX = "widget_featured_index"
         private const val KEY_FLIPPING = "widget_flipping"
         private const val KEY_FLIP_N = "widget_flip_n"
+        /** 這一批連續漸變是什麼時候畫上去的：用來估畫面現在播到第幾頁 */
+        private const val KEY_FLIP_AT = "widget_flip_at"
+        /** 畫面上那一張（連續漸變是這一批的第一張）的照片 id：清單重抓、重排之後照 id 找回位置，不靠 index */
+        private const val KEY_CUR_ID = "widget_featured_cur_id"
         private const val KEY_INTERVAL = "widget_interval"
         private const val KEY_FLIP_SEC = "widget_flip_sec"
         private const val KEY_BG_ALPHA = "widget_bg_alpha"
@@ -223,11 +224,11 @@ class FeaturedWidget : AppWidgetProvider() {
          * 能排精確的就排精確的 —— 不精確的鬧鐘在 Android 上可以晚好幾分鐘，
          * 「一分鐘換一張」就名不副實了。
          */
-        private fun schedule(ctx: Context, minutes: Int, force: Boolean) {
+        private fun schedule(ctx: Context, delayMs: Long, force: Boolean) {
             if (!force && tickIntent(ctx, PendingIntent.FLAG_NO_CREATE) != null) return
             val am = ctx.getSystemService(AlarmManager::class.java) ?: return
             val pi = tickIntent(ctx, PendingIntent.FLAG_UPDATE_CURRENT) ?: return
-            val at = System.currentTimeMillis() + minutes * 60_000L
+            val at = System.currentTimeMillis() + delayMs
             val exact = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || am.canScheduleExactAlarms()
             try {
                 if (exact) am.setExact(AlarmManager.RTC, at, pi)
@@ -252,7 +253,7 @@ class FeaturedWidget : AppWidgetProvider() {
                 mgr.updateAppWidget(ids, message(ctx, "打開 App 登入後\n這裡會輪播本次精選"))
                 return@synchronized
             }
-            if (minutes > 0) schedule(ctx, minutes, reschedule) else cancelAlarm(ctx)
+            if (minutes > 0) schedule(ctx, minutes * 60_000L, reschedule)
 
             // 讀不到（沒網路、票過期）：畫面上那一張留著，不要換成錯誤訊息
             val items = list(ctx, session) ?: return@synchronized
@@ -262,9 +263,21 @@ class FeaturedWidget : AppWidgetProvider() {
                 return@synchronized
             }
 
-            val wasFlipping = p.getBoolean(KEY_FLIPPING, false)
-            val step = if (minutes == 0 && wasFlipping) p.getInt(KEY_FLIP_N, 1).coerceAtLeast(1) else 1
-            var index = p.getInt(KEY_INDEX, 0) + if (advance) step else 0
+            // 起點照 id 找：清單重抓（多了一張精選、順序變了）之後同一個 index 指的是別張，會跳
+            val curId = p.getLong(KEY_CUR_ID, -1L)
+            var index = items.indexOfFirst { it.optLong("id") == curId }
+                .takeIf { it >= 0 } ?: p.getInt(KEY_INDEX, 0)
+            val flipMs = flipSeconds(ctx) * 1000L
+            val now = System.currentTimeMillis()
+            if (minutes == 0 && p.getBoolean(KEY_FLIPPING, false)) {
+                // 連續漸變：ViewFlipper 自己在桌面上翻，記下來的只有這一批的第一張。
+                // 照放了多久估畫面現在在第幾頁，從那一頁接著畫 —— 不然一重畫（改尺寸、30 分鐘的例行更新）
+                // 就跳回這一批的開頭。螢幕關著時 flipper 不翻，估多了也夾在這一批的最後一頁。
+                val n = p.getInt(KEY_FLIP_N, 1).coerceAtLeast(1)
+                val at = p.getLong(KEY_FLIP_AT, 0L)
+                if (at in 1..now) index += ((now - at) / flipMs).coerceAtMost((n - 1).toLong()).toInt()
+            }
+            if (advance) index += 1
             index = ((index % items.size) + items.size) % items.size
 
             val look = look(ctx)
@@ -290,7 +303,15 @@ class FeaturedWidget : AppWidgetProvider() {
                     staticViews(ctx, items, index, w, h, look, photo(index))
                 })
             }
-            p.edit().putInt(KEY_INDEX, index).putBoolean(KEY_FLIPPING, flipping).putInt(KEY_FLIP_N, flipN).apply()
+            p.edit().putInt(KEY_INDEX, index).putLong(KEY_CUR_ID, items[index].optLong("id"))
+                .putBoolean(KEY_FLIPPING, flipping).putInt(KEY_FLIP_N, flipN).putLong(KEY_FLIP_AT, now).apply()
+            if (minutes == 0) {
+                // 一批最多 FLIP_MAX 張，flipper 播完會繞回這一批的第一張（看起來就是倒退）。
+                // 清單比一批長時，在播到最後一頁那一刻重畫下一批（從最後一頁接著），順序才一路往下走。
+                // RTC 不叫醒手機：螢幕關著就等亮起來再說。
+                if (flipping && items.size > flipN) schedule(ctx, (flipN - 1) * flipMs + 300, force = true)
+                else cancelAlarm(ctx)
+            }
         }
 
         private fun staticViews(
@@ -490,9 +511,22 @@ class FeaturedWidget : AppWidgetProvider() {
                 if (seed == 0L) { seed = System.nanoTime(); p.edit().putLong(KEY_SHUFFLE_SEED, seed).apply() }
                 return items.sortedBy { it.optLong("id") }.shuffled(java.util.Random(seed))
             }
-            // taken_at 是 D1 的 ISO 字串，字串比就是時間比
-            return items.sortedWith(compareBy<JSONObject> { it.optString("taken_at").isEmpty() }
-                .thenBy { it.optString("taken_at") })
+            // ⚠️ 不能直接字串比：taken_at 有 `…T…Z`（toISOString）也有 `YYYY-MM-DD HH:MM:SS`、毫秒位數不一，
+            //    混在一起字串比會排錯（空白比 T 小）。一律換成毫秒再比，同一瞬間照 id。
+            val ms = items.associateWith { takenMs(it.optString("taken_at")) }
+            return items.sortedWith(compareBy<JSONObject> { ms[it] == null }
+                .thenBy { ms[it] ?: 0L }
+                .thenBy { it.optLong("id") })
+        }
+
+        private fun takenMs(s: String): Long? {
+            val t = s.trim()
+            if (t.isEmpty()) return null
+            return runCatching { java.time.Instant.parse(t).toEpochMilli() }
+                .recoverCatching { java.time.OffsetDateTime.parse(t).toInstant().toEpochMilli() }
+                .recoverCatching { java.time.LocalDateTime.parse(t.replace(' ', 'T')).toInstant(java.time.ZoneOffset.UTC).toEpochMilli() }
+                .recoverCatching { java.time.LocalDate.parse(t.take(10)).atStartOfDay(java.time.ZoneOffset.UTC).toInstant().toEpochMilli() }
+                .getOrNull()
         }
 
         private val listLock = Any()
@@ -537,11 +571,14 @@ class FeaturedWidget : AppWidgetProvider() {
                         .put("src", src),
                 )
             }
-            // 隨機的話每次重抓清單就換一輪新順序
-            p.edit().putString(KEY_LIST, slim.toString()).putLong(KEY_LIST_AT, System.currentTimeMillis())
-                .putLong(KEY_SHUFFLE_SEED, System.nanoTime())
-                .putString(KEY_LIST_SESSION, sig).apply()
             val items = parse(slim)
+            // 隨機的種子只在精選真的變了（多一張、少一張）才換：每 3 小時重抓都換的話，
+            // 順序整個重洗、一輪還沒播完就又從別處開始，看起來就是亂跳
+            val oldIds = cached?.let { runCatching { parse(JSONArray(it)).map { o -> o.optLong("id") }.toSet() }.getOrNull() }
+            val changed = oldIds != items.map { it.optLong("id") }.toSet()
+            p.edit().putString(KEY_LIST, slim.toString()).putLong(KEY_LIST_AT, System.currentTimeMillis())
+                .apply { if (changed) putLong(KEY_SHUFFLE_SEED, System.nanoTime()) }
+                .putString(KEY_LIST_SESSION, sig).apply()
             pruneThumbs(ctx, items.map { thumbName(it.optString("src")) }.toSet())
             return items
         }

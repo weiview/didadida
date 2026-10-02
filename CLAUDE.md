@@ -2313,18 +2313,20 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   右上 ⟳ 手動換，點圖開那張照片。清單在 prefs 快取 3 小時（精選幾天才動一次），
   **不開放的一律跳過**（桌面是誰都看得到的地方），**影片也跳過**（1.0.18，`media_type == "video"`：小工具播不了、桌布上只是一張封面；動態照片與 GIF 照留。快取 key 因此換成 `widget_featured_v2`），沒登入時寫「打開 App 登入後…」。
   **播放順序**（1.0.20，`widget_shuffle`，動態桌布也看這一格）：預設照拍攝時間舊到新（沒有時間的排最後），或隨機。排序在 `FeaturedWidget.list()` 出口做（`ordered()`），所以兩邊自動一致；`/api/featured` 為此多回 `taken_at`，清單快取 key 換成 `widget_featured_v3`。隨機靠固定的 `widget_shuffle_seed`（index 一張張往下走才不重複），重抓清單時換一顆；切換順序時 index 歸零從頭播。
+  ⚠️⚠️ **位置記的是「現在那張的 id」（`widget_featured_cur_id`），不是 index**（1.0.21，使用者：「明明選照拍照時間順序，但照片還是會亂跳」）：清單每 3 小時重抓、精選增減都會讓 index 指到別張。`ordered()` 把 `taken_at` **解析成毫秒再比**（字串格式不一，直接比會亂），同時間再比 id。隨機的 seed **只在精選的 id 集合真的變了才換**（以前每次重抓都換＝每 3 小時整串洗牌）。`onUpdate`／換尺寸只重畫、不前進也不重排鬧鐘。
   設定在 `WidgetConfigActivity`（長按小工具 →「設定」，`widgetFeatures="reconfigurable|configuration_optional"`），
   全部小工具共用一份 prefs：`widget_interval`（0／1／5／10／15，預設 5）、`widget_bg_alpha`、
   `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_flip_sec`（秒）、`widget_fit`（1.0.17：完整顯示，直的就直的、橫的就橫的；
   Android 不准 App 改小工具的尺寸，「跟著照片變形」是完整顯示＋背景透明度 100% 做出來的，動態桌布也看這一格）。拉桿**放手才重畫**。
   ⚠️ 設定頁**鎖在淺色**（`delegate.localNightMode = MODE_NIGHT_NO`，要在 `super.onCreate` 之前）：主題是 DayNight，
   手機開深色模式時文字變白、而 `SystemBars` 把底墊成白的 —— 白底白字，選項整排看不見（1.0.14 修，Pixel 7 Pro）。
-  - **換圖間隔**：1–15 分鐘是 AlarmManager 的 `RTC` 鬧鐘（`ACTION_TICK`），能用精確鬧鐘就 `setExact`
+  - **換圖間隔**（設定頁是一根拉桿，五格對應 `INTERVALS` 0／1／5／10／15）：1–15 分鐘是 AlarmManager 的 `RTC` 鬧鐘（`ACTION_TICK`），能用精確鬧鐘就 `setExact`
     （manifest 有 `USE_EXACT_ALARM`／`SCHEDULE_EXACT_ALARM` ≤32），否則退回 `setAndAllowWhileIdle`。
     `schedule(force=false)` 遇到已排好的不重排。`onDisabled` 收掉鬧鐘。
   - **0＝連續漸變**：`widget_featured_flip`（ViewFlipper，每張停 `widget_flip_sec` 秒（2–60，預設 2，設定頁的拉桿）—— 用 `setInt(…, "setFlipInterval", ms)` 蓋掉 layout 裡的 2000；淡入淡出 700ms）塞 `widget_featured_page` 幾頁。
     ⚠️ RemoteViews 的點陣圖有總量上限（螢幕 ×4×1.5），頁數照「60% 預算 ÷ 每頁大小」算、最多 6，
-    不到 2 頁就退回靜態。翻頁中的 ⟳ 走 `showNext`。
+    不到 2 頁就退回靜態。
+    ⚠️ 一批翻完要接下一批：`widget_flip_at` 記這一批開始的時間，重畫時照經過的頁數接著播（不從頭），清單比一批長時排一支鬧鐘在這批播完時換下一批。⟳ 是整批往後推一張並重畫（不是 `showNext`，那樣狀態對不上）。
   - **尺寸與滿版**：照 `getAppWidgetOptions` 拿每一個小工具自己的大小（直向用 MIN_WIDTH×MAX_HEIGHT），
     center-crop 烤成剛好那個比例（長邊上限：靜態 720px、翻頁 480px），`onAppWidgetOptionsChanged` 重畫。
   - **圓角與柔邊是烤進點陣圖的**（RemoteViews 不能設 clip／outline）。`compose()`：照片先裁成 w×h，

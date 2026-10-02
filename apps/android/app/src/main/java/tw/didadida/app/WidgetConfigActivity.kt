@@ -51,25 +51,14 @@ class WidgetConfigActivity : AppCompatActivity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
         })
 
-        root.addView(TextView(this).apply {
-            text = "換圖間隔"
-            setPadding(0, dp(20), 0, dp(4))
-        })
-        val current = FeaturedWidget.interval(this)
-        root.addView(RadioGroup(this).apply {
-            orientation = RadioGroup.VERTICAL
-            for (m in FeaturedWidget.INTERVALS) {
-                addView(RadioButton(this@WidgetConfigActivity).apply {
-                    id = 1000 + m
-                    text = if (m == 0) "連續漸變（照下面的秒數淡入下一張）" else "$m 分鐘"
-                    isChecked = m == current
-                })
-            }
-            setOnCheckedChangeListener { _, checkedId ->
-                FeaturedWidget.setInterval(this@WidgetConfigActivity, checkedId - 1000)
-                FeaturedWidget.refresh(this@WidgetConfigActivity)
-            }
-        })
+        // 拉桿的格子對到 INTERVALS（0＝連續漸變、1／5／10／15 分鐘），放手才重畫
+        val steps = FeaturedWidget.INTERVALS
+        root.addView(slider(
+            "換圖間隔",
+            steps.indexOf(FeaturedWidget.interval(this)).coerceAtLeast(0),
+            max = steps.size - 1,
+            format = { i -> if (steps[i] == 0) "連續漸變（照下面的秒數淡入下一張）" else "${steps[i]} 分鐘" },
+        ) { i -> FeaturedWidget.setInterval(this, steps[i]) })
 
         root.addView(TextView(this).apply {
             text = "照片顯示方式"
@@ -167,20 +156,21 @@ class WidgetConfigActivity : AppCompatActivity() {
         min: Int = 0,
         max: Int = 100,
         suffix: String = "%",
+        format: (Int) -> String = { "$it$suffix" },
         onChange: (Int) -> Unit,
     ): LinearLayout {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(20), 0, 0)
         }
-        val title = TextView(this).apply { text = "$label：${initial.coerceIn(min, max)}$suffix" }
+        val title = TextView(this).apply { text = "$label：${format(initial.coerceIn(min, max))}" }
         val bar = SeekBar(this).apply {
             this.min = min
             this.max = max
             progress = initial.coerceIn(min, max)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar, value: Int, fromUser: Boolean) {
-                    title.text = "$label：$value$suffix"
+                    title.text = "$label：${format(value)}"
                     if (fromUser) onChange(value)
                 }
                 override fun onStartTrackingTouch(s: SeekBar) {}

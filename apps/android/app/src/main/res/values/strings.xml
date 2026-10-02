@@ -10,5 +10,5 @@
     <string name="wallpaper_featured_label">本次精選</string>
     <string name="wallpaper_featured_desc">全螢幕輪播站上的本次精選，鎖定畫面也看得到</string>
     <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
-    <string name="whats_new">• 小工具與動態桌布的精選可以選播放順序：照拍攝日期或隨機（長按小工具 →「設定」）</string>
+    <string name="whats_new">• 修正小工具照拍攝日期播放時順序會亂跳\n• 換圖間隔改成拉桿</string>
 </resources>
