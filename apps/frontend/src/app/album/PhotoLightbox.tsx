@@ -6,6 +6,7 @@ import VideoPlayer from "@/components/VideoPlayer";
 import FixTimeModal from "@/components/FixTimeModal";
 import { Photo, Tag, updatePhoto, addPhotoTag, removePhotoTag, deleteTag, photoFullSrc, photoThumbSrc, photoMotionSrc, hasMotion, isVideo, isGif, setPhotosRestricted } from "@/lib/api";
 import { isPhotoNew, markPhotoSeen, flushSeen } from "@/lib/seen";
+import { photoShareUrl, sharePhotoLink } from "@/lib/share";
 import { useAdmin } from "@/lib/useAdmin";
 import { revealRestricted, toggleRestrictedReveal, useRevealedRestricted } from "@/lib/restrictedReveal";
 import { toggleFeatured, useFeatured } from "@/lib/featured";
@@ -176,6 +177,20 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
     const ok = await toggleFeatured(photo.id, !isFeatured);
     setIsSavingFeatured(false);
     if (!ok) alert("設定失敗，請稍後再試");
+  };
+
+  // 分享：複製成功時在按鈕上寫兩秒「已複製」，不跳 alert
+  const [shareNote, setShareNote] = useState<string | null>(null);
+  const shareNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (shareNoteTimer.current) clearTimeout(shareNoteTimer.current); }, []);
+  const handleShare = async () => {
+    const url = photoShareUrl(photo.album_id, photo.id);
+    const outcome = await sharePhotoLink(url, photo.title || 'didadida');
+    if (outcome === 'copied') {
+      setShareNote('已複製連結');
+      if (shareNoteTimer.current) clearTimeout(shareNoteTimer.current);
+      shareNoteTimer.current = setTimeout(() => setShareNote(null), 2000);
+    }
   };
 
   useEffect(() => {
@@ -907,8 +922,22 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             * 旁邊那顆 ★ 是「本次精選」，同一個權限、同一個規矩：
             * 關著很淡，開著亮起來並寫出「精選」兩個字。
             */}
+          {/*
+            * 分享：所有人都有（收到連結的人照樣要過進站閘門，見 lib/share.ts）。
+            * 鎖與精選留在 canManageOthers 裡，所以這一排一定畫得出來。
+            */}
+          <div className={styles.cornerBtns}>
+            <button
+              type="button"
+              className={styles.restrictBtn}
+              title={`分享這${isVideo(photo) ? '支影片' : '張照片'}的連結（對方點開會直接到這一張）`}
+              onClick={(e) => { e.stopPropagation(); handleShare(); }}
+            >
+              <span className={styles.restrictIcon} aria-hidden>🔗</span>
+              {shareNote && <span>{shareNote}</span>}
+            </button>
           {canManageOthers && (
-            <div className={styles.cornerBtns}>
+            <>
               <button
                 type="button"
                 className={`${styles.restrictBtn} ${photo.restricted === 1 ? styles.restrictBtnOn : ''}`}
@@ -935,8 +964,9 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
                 <span className={styles.restrictIcon} aria-hidden>{isFeatured ? '★' : '☆'}</span>
                 {isFeatured && <span>精選</span>}
               </button>
-            </div>
+            </>
           )}
+          </div>
           {/*
             * 蓋著的時候整塊都是「點一下掀開」。這一層一定要蓋在影片上面 ——
             * 不然糊著的影片還是按得到播放鍵，遮罩等於沒有。

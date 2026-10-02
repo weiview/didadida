@@ -169,6 +169,14 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
      *    讀完就拿掉，不然轉個螢幕（Activity 重建）又跳一次。
      */
     private fun openPath(intent: Intent?): String? {
+        // App Links：別人分享的照片連結（`<站台>/album?id=…&photo=…`）點下去由 App 開。
+        // 只收自家站台的 https，拆成站內路徑再走同一條（同樣讀完就清掉）
+        val data = intent?.data
+        if (data != null && data.scheme == "https" && isOwnSite(data)) {
+            intent.data = null
+            val path = (data.encodedPath ?: "/") + (data.encodedQuery?.let { "?$it" } ?: "")
+            return path.takeIf { it.startsWith("/") && !it.startsWith("//") }
+        }
         val p = intent?.getStringExtra(EXTRA_OPEN_PATH) ?: return null
         intent.removeExtra(EXTRA_OPEN_PATH)
         return p.takeIf { it.startsWith("/") && !it.startsWith("//") }
@@ -400,6 +408,16 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
         /** 帳號牌上那顆「設成精選動態桌布」：開系統的動態桌布預覽（見 FeaturedWallpaper.open） */
         @JavascriptInterface
         fun setWallpaper() = runOnUiThread { FeaturedWallpaper.open(this@MainActivity) }
+
+        /** 燈箱的「分享」：系統的分享面板（WebView 沒有 navigator.share） */
+        @JavascriptInterface
+        fun share(url: String, title: String) = runOnUiThread {
+            val send = Intent(Intent.ACTION_SEND)
+                .setType("text/plain")
+                .putExtra(Intent.EXTRA_TEXT, url)
+                .putExtra(Intent.EXTRA_SUBJECT, title)
+            startActivity(Intent.createChooser(send, "分享照片"))
+        }
     }
 
     companion object {

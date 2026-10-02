@@ -75,6 +75,7 @@ android {
         create("prod") {
             dimension = "env"
             manifestPlaceholders["authScheme"] = "didadida"
+            manifestPlaceholders["siteHost"] = "didadida-frontend.pages.dev"
             buildConfigField("String", "SITE_URL", "\"https://didadida-frontend.pages.dev\"")
             buildConfigField("String", "API_URL", "\"https://didadida-api.didadida.workers.dev/api\"")
             firebaseFields("prod")
@@ -85,6 +86,7 @@ android {
             applicationIdSuffix = ".dev"
             versionNameSuffix = "-dev"
             manifestPlaceholders["authScheme"] = "didadida-dev"
+            manifestPlaceholders["siteHost"] = "dev.didadida-frontend.pages.dev"
             buildConfigField("String", "SITE_URL", "\"https://dev.didadida-frontend.pages.dev\"")
             buildConfigField("String", "API_URL", "\"https://didadida-api-dev.didadida.workers.dev/api\"")
             firebaseFields("dev")

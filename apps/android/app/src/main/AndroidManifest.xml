@@ -46,6 +46,13 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="${authScheme}" android:host="auth" />
             </intent-filter>
+            <!-- App Links：分享出去的照片連結由 App 開（驗證檔在前端 public/.well-known/assetlinks.json） -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="${siteHost}" android:pathPrefix="/album" />
+            </intent-filter>
         </activity>
 
         <!-- 桌面圖示的三張臉（MoodIcon.kt）。Android 沒有換圖示的 API，只能三個 alias 輪流啟用；

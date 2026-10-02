@@ -2342,6 +2342,24 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
     小工具設定頁那顆按鈕。都走 `FeaturedWallpaper.open()`：`ACTION_CHANGE_LIVE_WALLPAPER` 直接停在這一張，
     打不開退回 `ACTION_LIVE_WALLPAPER_CHOOSER`，再不行 Toast。
 
+### 分享連結與 App Links（1.0.19）
+
+燈箱左上角那一排（`.cornerBtns`）第一顆 🔗 **所有人都有**（鎖與精選照舊只給 `canManageOthers`）。
+連結就是 `/album?id=<相簿>&photo=<id>`（`lib/share.ts` 的 `photoShareUrl()`），點開直接落在那一張燈箱。
+
+- `sharePhotoLink()` 依序試：App 的 `window.DidadidaApp.share(url, title)`（系統分享面板，選填，1.0.18 以前的 App 沒有）
+  → `navigator.share` → 剪貼簿（按鈕上顯示「已複製連結」2 秒）→ `window.prompt`。使用者取消分享不算錯。
+- ⚠️ **收到連結的人多半還沒登入**：進站閘門擋著，Google 登入繞一圈回來 `?photo=` 就丟了（state 只帶得回 albumId）。
+  所以 `googleLoginUrl()` 先把目前路徑存進 localStorage `didadida:login_return`（10 分鐘），
+  `consumeAuthHash()` 收完 token 再 `location.replace` 回去。只收 `/` 開頭、不是 `//` 的（不做開放轉址）。
+- **App Links**：MainActivity 的 `<intent-filter android:autoVerify="true">` 認 `https://${siteHost}/album*`
+  （`siteHost` 是 build.gradle.kts 的 manifestPlaceholder，prod／dev 各自的 Pages 網域），
+  `openPath()` 把 `intent.data` 換成站內路徑再 `loadUrl`。驗證檔是 `public/.well-known/assetlinks.json`
+  （兩個套件名、同一把簽章的 SHA-256）。⚠️ **換簽章金鑰要同步改那個指紋**，不然連結改由瀏覽器開。
+- ⚠️ `functions/_middleware.ts` 對 `/.well-known/*` **不做國家閘門** —— Google 的驗證伺服器在美國，擋掉就驗不過。
+  那個檔是公開資訊（套件名＋憑證指紋）。
+- 驗證是**裝 App（或更新）那一刻**才做的。沒過的話 Android 12+ 可以在「設定 → 應用程式 → 預設開啟」手動勾那個網域。
+
 ### 狀態列與「這一版改了什麼」（1.0.5）
 
 - ⚠️⚠️ **targetSdk 35 在 Android 15 上強制 edge-to-edge**：WebView 畫到狀態列底下，

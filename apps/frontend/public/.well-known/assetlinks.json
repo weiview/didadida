@@ -1,0 +1,18 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "tw.didadida.app",
+      "sha256_cert_fingerprints": ["E2:24:67:C6:A0:BB:E2:3D:55:22:BA:55:07:47:A7:63:7A:35:9B:A4:AC:32:F2:D9:86:10:00:E4:8C:C1:1D:85"]
+    }
+  },
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "tw.didadida.app.dev",
+      "sha256_cert_fingerprints": ["E2:24:67:C6:A0:BB:E2:3D:55:22:BA:55:07:47:A7:63:7A:35:9B:A4:AC:32:F2:D9:86:10:00:E4:8C:C1:1D:85"]
+    }
+  }
+]

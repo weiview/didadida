@@ -14,6 +14,10 @@
 const ALLOWED_COUNTRIES = new Set(['TW', 'AU', 'NZ', 'XX', 'T1']);
 
 export const onRequest = async (context: any) => {
+  // App Links 的驗證檔要讓 Google 的驗證伺服器（在美國）抓得到，不然 App 開不了分享連結。
+  // 它是公開的（只有套件名與簽章憑證的指紋），不必擋
+  if (new URL(context.request.url).pathname.startsWith('/.well-known/')) return context.next();
+
   const country = context.request.headers.get('cf-ipcountry');
 
   if (country && !ALLOWED_COUNTRIES.has(country.toUpperCase())) {

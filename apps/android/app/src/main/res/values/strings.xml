@@ -10,5 +10,5 @@
     <string name="wallpaper_featured_label">本次精選</string>
     <string name="wallpaper_featured_desc">全螢幕輪播站上的本次精選，鎖定畫面也看得到</string>
     <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
-    <string name="whats_new">• 小工具與鎖定畫面桌布不再顯示影片，只輪播照片</string>
+    <string name="whats_new">• 燈箱多一顆分享鈕，可以把這一張的連結傳給別人\n• 別人分享的照片連結會直接用 App 開到那一張\n• 在 App 裡可以長按拖曳排序相簿與照片</string>
 </resources>

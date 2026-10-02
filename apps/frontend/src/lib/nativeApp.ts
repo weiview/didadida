@@ -34,6 +34,11 @@ interface DidadidaAppBridge {
    * 選填 —— 1.0.15 之前的 App 沒有這一支（那顆按鈕就不端出來）。
    */
   setWallpaper?(): void;
+  /**
+   * 燈箱的「分享」：開系統的分享面板（WebView 沒有 navigator.share）。
+   * 選填 —— 1.0.19 之前的 App 沒有這一支（退回複製連結）。
+   */
+  share?(url: string, title: string): void;
 }
 
 declare global {

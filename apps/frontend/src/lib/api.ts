@@ -56,7 +56,40 @@ function getAuthHeaders() {
 
 /** 管理員登入 = Google 登入。`albumId` 只是為了登入後回到原本那本相簿 */
 export function googleLoginUrl(albumId?: string | number): string {
+  rememberReturnPath();
   return `${API_BASE_URL}/auth/google/login${albumId ? `?state=${albumId}` : ''}`;
+}
+
+/*
+ * 登入回來要回到「按登入那一刻的網址」。後端的 state 只帶得回相簿 id，
+ * 分享出去的照片連結（`/album?id=…&photo=…`）從進站閘門按 Google 登入，
+ * 回來會掉成首頁或只剩相簿 —— 所以出門前把整段 path＋query 記在 localStorage，
+ * 回來 `consumeAuthHash()` 收完 token 再整頁換過去。
+ * 用 localStorage 不用 sessionStorage：App 那條是 Custom Tab 繞一圈再
+ * `loadUrl` 回來，不保證是同一個瀏覽環境。十分鐘沒回來就作廢。
+ */
+const RETURN_PATH_KEY = 'didadida:login_return';
+const RETURN_PATH_TTL_MS = 10 * 60 * 1000;
+
+function rememberReturnPath() {
+  if (typeof window === 'undefined') return;
+  const path = window.location.pathname + window.location.search;
+  try {
+    if (path === '/' || path === '') localStorage.removeItem(RETURN_PATH_KEY);
+    else localStorage.setItem(RETURN_PATH_KEY, JSON.stringify({ path, at: Date.now() }));
+  } catch { /* 存不了就只是回首頁 */ }
+}
+
+function takeReturnPath(): string | null {
+  try {
+    const raw = localStorage.getItem(RETURN_PATH_KEY);
+    localStorage.removeItem(RETURN_PATH_KEY);
+    if (!raw) return null;
+    const { path, at } = JSON.parse(raw) as { path?: string; at?: number };
+    if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')) return null;
+    if (typeof at !== 'number' || Date.now() - at > RETURN_PATH_TTL_MS) return null;
+    return path;
+  } catch { return null; }
 }
 
 /**
@@ -85,7 +118,14 @@ export function consumeAuthHash(): AuthHashResult {
   if (!error && !token) return empty;
 
   if (token) localStorage.setItem(SITE_TOKEN_KEY, token);
-  window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
+  const here = window.location.pathname + window.location.search;
+  const back = takeReturnPath();
+  if (token && back && back !== here) {
+    // 整頁換過去（不是 replaceState）：相簿頁的深連結是載入時讀 searchParams 決定的
+    window.location.replace(back);
+    return { admin: true, error };
+  }
+  window.history.replaceState({}, document.title, here);
   return { admin: !!token, error };
 }
 
