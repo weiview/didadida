@@ -114,8 +114,7 @@ class FeaturedWallpaper : WallpaperService() {
             val ctx = applicationContext
             worker.post {
                 val list = runCatching { FeaturedWidget.list(ctx, s) }.getOrNull()
-                val start = prefs(ctx).getInt(KEY_INDEX, 0)
-                val i = if (list.isNullOrEmpty()) 0 else ((start % list.size) + list.size) % list.size
+                val i = if (list.isNullOrEmpty()) 0 else position(ctx, list)
                 val bmp = list?.getOrNull(i)?.let { FeaturedWidget.load(ctx, it.optString("src"), 0) }
                 main.post {
                     loading = false
@@ -146,14 +145,18 @@ class FeaturedWallpaper : WallpaperService() {
             val s = session ?: return
             val target = (index + 1) % list.size
             worker.post {
-                // 繞完一圈順手問一次清單（快取 3 小時，沒過期就不會打網路）
-                val fresh = if (target == 0) runCatching { FeaturedWidget.list(ctx, s) }.getOrNull() else null
-                val src = (fresh ?: list).getOrNull(target % (fresh ?: list).size.coerceAtLeast(1))
+                // 每一張都問一次清單（快取 3 小時，沒過期就不會打網路）。清單換了（精選增減、
+                // 隨機重排）就照「現在這張的 id」在新清單裡找位置，不然同一個 index 指到別張 —— 會跳
+                val fresh = runCatching { FeaturedWidget.list(ctx, s) }.getOrNull()?.takeIf { it.isNotEmpty() }
+                val use = fresh ?: list
+                val t = if (fresh == null) target else (position(ctx, fresh) + 1) % fresh.size
+                val src = use.getOrNull(t)
                 val bmp = src?.let { FeaturedWidget.load(ctx, it.optString("src"), 0) }
                 main.post {
-                    if (fresh != null && fresh.isNotEmpty()) items = fresh
-                    index = target
-                    prefs(ctx).edit().putInt(KEY_INDEX, index).apply()
+                    items = use
+                    index = t
+                    prefs(ctx).edit().putInt(KEY_INDEX, index)
+                        .putLong(KEY_CUR_ID, src?.optLong("id") ?: -1L).apply()
                     if (!visible) return@post
                     if (bmp == null) { scheduleAdvance(); return@post }
                     next = bmp
@@ -230,6 +233,18 @@ class FeaturedWallpaper : WallpaperService() {
     companion object {
         private const val TAG = "FeaturedWallpaper"
         internal const val KEY_INDEX = "wallpaper_index"
+        /** 現在畫面上那張的 id —— 位置照它找，index 只是找不到時的退路 */
+        internal const val KEY_CUR_ID = "wallpaper_cur_id"
+
+        /** 記下來的那一張在這份清單裡的位置 */
+        private fun position(ctx: Context, list: List<org.json.JSONObject>): Int {
+            val p = ctx.getSharedPreferences("app", Context.MODE_PRIVATE)
+            val id = p.getLong(KEY_CUR_ID, -1L)
+            val i = list.indexOfFirst { it.optLong("id") == id }
+            if (i >= 0) return i
+            val start = p.getInt(KEY_INDEX, 0)
+            return ((start % list.size) + list.size) % list.size
+        }
         private const val HOLD_MS = 6_000L
         private const val FADE_MS = 1_200L
         private const val FRAME_MS = 33L

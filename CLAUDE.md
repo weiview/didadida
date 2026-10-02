@@ -2314,6 +2314,8 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   **不開放的一律跳過**（桌面是誰都看得到的地方），**影片也跳過**（1.0.18，`media_type == "video"`：小工具播不了、桌布上只是一張封面；動態照片與 GIF 照留。快取 key 因此換成 `widget_featured_v2`），沒登入時寫「打開 App 登入後…」。
   **播放順序**（1.0.20，`widget_shuffle`，動態桌布也看這一格）：預設照拍攝時間舊到新（沒有時間的排最後），或隨機。排序在 `FeaturedWidget.list()` 出口做（`ordered()`），所以兩邊自動一致；`/api/featured` 為此多回 `taken_at`，清單快取 key 換成 `widget_featured_v3`。隨機靠固定的 `widget_shuffle_seed`（index 一張張往下走才不重複），重抓清單時換一顆；切換順序時 index 歸零從頭播。
   ⚠️⚠️ **位置記的是「現在那張的 id」（`widget_featured_cur_id`），不是 index**（1.0.21，使用者：「明明選照拍照時間順序，但照片還是會亂跳」）：清單每 3 小時重抓、精選增減都會讓 index 指到別張。`ordered()` 把 `taken_at` **解析成毫秒再比**（字串格式不一，直接比會亂），同時間再比 id。隨機的 seed **只在精選的 id 集合真的變了才換**（以前每次重抓都換＝每 3 小時整串洗牌）。`onUpdate`／換尺寸只重畫、不前進也不重排鬧鐘。
+  ⚠️⚠️ **連續漸變不要「照經過的時間估現在翻到第幾頁」**（1.0.22 拿掉，那是 1.0.21 還在跳的元凶）：螢幕關著 flipper 不翻、桌面重新套用 RemoteViews 會從第一頁重來，估出來的跟畫面對不上。現在只有「這一批播完」的鬧鐘（`batch`）才往前推 `flipN − 1` 頁；`updatePeriodMillis` 改成 **0**（例行 onUpdate 會把 flipper 拉回第一頁），整份清單一批裝得下時改排一支 3 小時的鬧鐘重抓清單。動態桌布同樣改記 id（`wallpaper_cur_id`），換清單照 id 找位置。
+  設定頁：兩組選項（顯示方式、播放順序）橫排；換圖間隔拉桿跟其他拉桿排在一起。
   設定在 `WidgetConfigActivity`（長按小工具 →「設定」，`widgetFeatures="reconfigurable|configuration_optional"`），
   全部小工具共用一份 prefs：`widget_interval`（0／1／5／10／15，預設 5）、`widget_bg_alpha`、
   `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_flip_sec`（秒）、`widget_fit`（1.0.17：完整顯示，直的就直的、橫的就橫的；

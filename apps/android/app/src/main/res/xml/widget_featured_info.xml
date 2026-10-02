@@ -6,7 +6,7 @@
     android:minResizeHeight="110dp"
     android:targetCellWidth="3"
     android:targetCellHeight="3"
-    android:updatePeriodMillis="1800000"
+    android:updatePeriodMillis="0"
     android:resizeMode="horizontal|vertical"
     android:widgetCategory="home_screen"
     android:configure="tw.didadida.app.WidgetConfigActivity"

@@ -51,30 +51,23 @@ class WidgetConfigActivity : AppCompatActivity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
         })
 
-        // 拉桿的格子對到 INTERVALS（0＝連續漸變、1／5／10／15 分鐘），放手才重畫
-        val steps = FeaturedWidget.INTERVALS
-        root.addView(slider(
-            "換圖間隔",
-            steps.indexOf(FeaturedWidget.interval(this)).coerceAtLeast(0),
-            max = steps.size - 1,
-            format = { i -> if (steps[i] == 0) "連續漸變（照下面的秒數淡入下一張）" else "${steps[i]} 分鐘" },
-        ) { i -> FeaturedWidget.setInterval(this, steps[i]) })
-
         root.addView(TextView(this).apply {
-            text = "照片顯示方式"
+            text = "照片顯示方式（完整顯示：直的就直的、橫的就橫的）"
             setPadding(0, dp(20), 0, dp(4))
         })
         val fit = FeaturedWidget.fit(this)
         root.addView(RadioGroup(this).apply {
-            orientation = RadioGroup.VERTICAL
+            orientation = RadioGroup.HORIZONTAL
             addView(RadioButton(this@WidgetConfigActivity).apply {
                 id = 2000
+                layoutParams = RadioGroup.LayoutParams(RadioGroup.LayoutParams.WRAP_CONTENT, RadioGroup.LayoutParams.WRAP_CONTENT)
+                    .apply { marginEnd = dp(28) }
                 text = "裁切滿版"
                 isChecked = !fit
             })
             addView(RadioButton(this@WidgetConfigActivity).apply {
                 id = 2001
-                text = "完整顯示（直的就直的、橫的就橫的）"
+                text = "完整顯示"
                 isChecked = fit
             })
             setOnCheckedChangeListener { _, checkedId ->
@@ -84,15 +77,17 @@ class WidgetConfigActivity : AppCompatActivity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "播放順序（動態桌布也一樣）"
+            text = "播放順序（照拍攝日期是舊到新；動態桌布也一樣）"
             setPadding(0, dp(20), 0, dp(4))
         })
         val shuffle = FeaturedWidget.shuffle(this)
         root.addView(RadioGroup(this).apply {
-            orientation = RadioGroup.VERTICAL
+            orientation = RadioGroup.HORIZONTAL
             addView(RadioButton(this@WidgetConfigActivity).apply {
                 id = 3000
-                text = "照拍攝日期（舊到新）"
+                layoutParams = RadioGroup.LayoutParams(RadioGroup.LayoutParams.WRAP_CONTENT, RadioGroup.LayoutParams.WRAP_CONTENT)
+                    .apply { marginEnd = dp(28) }
+                text = "照拍攝日期"
                 isChecked = !shuffle
             })
             addView(RadioButton(this@WidgetConfigActivity).apply {
@@ -106,6 +101,14 @@ class WidgetConfigActivity : AppCompatActivity() {
             }
         })
 
+        // 拉桿的格子對到 INTERVALS（0＝連續漸變、1／5／10／15 分鐘），放手才重畫
+        val steps = FeaturedWidget.INTERVALS
+        root.addView(slider(
+            "換圖間隔",
+            steps.indexOf(FeaturedWidget.interval(this)).coerceAtLeast(0),
+            max = steps.size - 1,
+            format = { i -> if (steps[i] == 0) "連續漸變（照下面的秒數淡入下一張）" else "${steps[i]} 分鐘" },
+        ) { i -> FeaturedWidget.setInterval(this, steps[i]) })
         root.addView(slider(
             label = "連續漸變：每張停",
             initial = FeaturedWidget.flipSeconds(this),
