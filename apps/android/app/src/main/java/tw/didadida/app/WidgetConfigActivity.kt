@@ -15,7 +15,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 
 /**
- * 桌面小工具「本次精選」的設定：換圖間隔（連續漸變的秒數）、照片顯示方式、背景／照片透明度、圓角、柔邊。
+ * 桌面小工具「本次精選」的設定：換圖間隔（秒）、照片顯示方式、背景／照片透明度、圓角、柔邊。
  *
  *  - 從哪裡進來：Android 12+ 長按小工具 →「設定」（`widgetFeatures="reconfigurable"`）；
  *    更舊的系統在加小工具的當下跳一次（`configuration_optional` 在那裡不認）。
@@ -101,21 +101,16 @@ class WidgetConfigActivity : AppCompatActivity() {
             }
         })
 
-        // 拉桿的格子對到 INTERVALS（0＝連續漸變、1／5／10／15 分鐘），放手才重畫
-        val steps = FeaturedWidget.INTERVALS
+        // 換圖間隔只有這一根（秒）：≤ 60 秒由 flipper 淡入淡出，更長由鬧鐘一張一張換（FeaturedWidget 自己選）。
+        // 格子對到 INTERVAL_STEPS（一分鐘內逐秒、五分鐘內每 10 秒、之後每分鐘），放手才重畫
+        val steps = FeaturedWidget.INTERVAL_STEPS
+        val cur = FeaturedWidget.intervalSeconds(this)
         root.addView(slider(
             "換圖間隔",
-            steps.indexOf(FeaturedWidget.interval(this)).coerceAtLeast(0),
+            steps.indices.minByOrNull { kotlin.math.abs(steps[it] - cur) } ?: 0,
             max = steps.size - 1,
-            format = { i -> if (steps[i] == 0) "連續漸變（照下面的秒數淡入下一張）" else "${steps[i]} 分鐘" },
-        ) { i -> FeaturedWidget.setInterval(this, steps[i]) })
-        root.addView(slider(
-            label = "連續漸變：每張停",
-            initial = FeaturedWidget.flipSeconds(this),
-            min = FeaturedWidget.FLIP_SEC_MIN,
-            max = FeaturedWidget.FLIP_SEC_MAX,
-            suffix = " 秒",
-        ) { sec -> FeaturedWidget.setFlipSeconds(this, sec) })
+            format = { i -> FeaturedWidget.formatInterval(steps[i]) },
+        ) { i -> FeaturedWidget.setIntervalSeconds(this, steps[i]) })
         root.addView(slider(
             label = "背景透明度",
             initial = 100 - FeaturedWidget.backgroundAlpha(this) * 100 / 255,

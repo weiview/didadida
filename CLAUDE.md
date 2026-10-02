@@ -2317,15 +2317,19 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   ⚠️⚠️ **連續漸變不要「照經過的時間估現在翻到第幾頁」**（1.0.22 拿掉，那是 1.0.21 還在跳的元凶）：螢幕關著 flipper 不翻、桌面重新套用 RemoteViews 會從第一頁重來，估出來的跟畫面對不上。現在只有「這一批播完」的鬧鐘（`batch`）才往前推 `flipN − 1` 頁；`updatePeriodMillis` 改成 **0**（例行 onUpdate 會把 flipper 拉回第一頁），整份清單一批裝得下時改排一支 3 小時的鬧鐘重抓清單。動態桌布同樣改記 id（`wallpaper_cur_id`），換清單照 id 找位置。
   設定頁：兩組選項（顯示方式、播放順序）橫排；換圖間隔拉桿跟其他拉桿排在一起。
   設定在 `WidgetConfigActivity`（長按小工具 →「設定」，`widgetFeatures="reconfigurable|configuration_optional"`），
-  全部小工具共用一份 prefs：`widget_interval`（0／1／5／10／15，預設 5）、`widget_bg_alpha`、
-  `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_flip_sec`（秒）、`widget_fit`（1.0.17：完整顯示，直的就直的、橫的就橫的；
+  全部小工具共用一份 prefs：`widget_interval_sec`（秒，2 秒～15 分鐘，預設 5 分鐘）、`widget_bg_alpha`、
+  `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_fit`（1.0.17：完整顯示，直的就直的、橫的就橫的；
   Android 不准 App 改小工具的尺寸，「跟著照片變形」是完整顯示＋背景透明度 100% 做出來的，動態桌布也看這一格）。拉桿**放手才重畫**。
   ⚠️ 設定頁**鎖在淺色**（`delegate.localNightMode = MODE_NIGHT_NO`，要在 `super.onCreate` 之前）：主題是 DayNight，
   手機開深色模式時文字變白、而 `SystemBars` 把底墊成白的 —— 白底白字，選項整排看不見（1.0.14 修，Pixel 7 Pro）。
-  - **換圖間隔**（設定頁是一根拉桿，五格對應 `INTERVALS` 0／1／5／10／15）：1–15 分鐘是 AlarmManager 的 `RTC` 鬧鐘（`ACTION_TICK`），能用精確鬧鐘就 `setExact`
+  - **換圖間隔只有一個設定**（1.0.23 使用者：「換圖間隔跟連續漸變應該是一樣的東西」）：設定頁一根拉桿走 `INTERVAL_STEPS`
+    （一分鐘內逐秒、五分鐘內每 10 秒、之後每分鐘），由 `FeaturedWidget` 照長短自己選做法：**≤ 60 秒（`FLIP_SEC_MAX`）走連續漸變**，
+    **更長走鬧鐘一張一張換**；≤ 60 秒但 flipper 塞不下兩張時也退回鬧鐘。`ACTION_TICK` 看 `widget_flipping`（上一次實際畫的是哪一種）
+    決定是「接下一批」還是「往前一張」。舊版的 `widget_interval`（分鐘，0＝連續漸變）＋`widget_flip_sec` 在 `intervalSeconds()` 第一次讀時換算。
+    鬧鐘是 AlarmManager 的 `RTC`（`ACTION_TICK`），能用精確鬧鐘就 `setExact`
     （manifest 有 `USE_EXACT_ALARM`／`SCHEDULE_EXACT_ALARM` ≤32），否則退回 `setAndAllowWhileIdle`。
     `schedule(force=false)` 遇到已排好的不重排。`onDisabled` 收掉鬧鐘。
-  - **0＝連續漸變**：`widget_featured_flip`（ViewFlipper，每張停 `widget_flip_sec` 秒（2–60，預設 2，設定頁的拉桿）—— 用 `setInt(…, "setFlipInterval", ms)` 蓋掉 layout 裡的 2000；淡入淡出 700ms）塞 `widget_featured_page` 幾頁。
+  - **連續漸變**：`widget_featured_flip`（ViewFlipper，每張停「換圖間隔」那麼久 —— 用 `setInt(…, "setFlipInterval", ms)` 蓋掉 layout 裡的 2000；淡入淡出 700ms）塞 `widget_featured_page` 幾頁。
     ⚠️ RemoteViews 的點陣圖有總量上限（螢幕 ×4×1.5），頁數照「60% 預算 ÷ 每頁大小」算、最多 6，
     不到 2 頁就退回靜態。
     ⚠️ 一批翻完要接下一批：`widget_flip_at` 記這一批開始的時間，重畫時照經過的頁數接著播（不從頭），清單比一批長時排一支鬧鐘在這批播完時換下一批。⟳ 是整批往後推一張並重畫（不是 `showNext`，那樣狀態對不上）。

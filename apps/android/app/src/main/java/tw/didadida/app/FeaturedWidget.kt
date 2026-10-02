@@ -37,13 +37,16 @@ import kotlin.math.min
 /**
  * 桌面小工具：輪播「★ 本次精選」（`GET /api/featured`），點一張開那張照片。
  *
- * 兩種換圖方式（prefs `widget_interval`，`WidgetConfigActivity` 調）：
- *  - **1／5／10／15 分鐘**：AlarmManager 定時叫 `ACTION_TICK` 換下一張。
- *    `updatePeriodMillis` 的下限是 30 分鐘，比它短只能自己排鬧鐘。鬧鐘是**不喚醒**的
- *    （`RTC`）—— 螢幕關著沒人看，不必為了換圖把手機叫醒。
- *  - **連續漸變（0）**：一次把幾張（最多 `FLIP_MAX`）塞進 ViewFlipper，由桌面那一端
- *    自己計時、淡入淡出，App 不必醒著。每張停幾秒是 prefs `widget_flip_sec`（2–60，預設 2），
- *    用 `setInt(…, "setFlipInterval", ms)` 蓋掉 layout 裡的預設值。一批播完由鬧鐘接下一批。
+ * 換圖間隔只有一個設定：prefs `widget_interval_sec`（秒，2 秒～15 分鐘，`WidgetConfigActivity` 的拉桿），
+ * 依長短自動選兩種做法之一：
+ *  - **≤ 60 秒（`FLIP_SEC_MAX`）**：一次把幾張（最多 `FLIP_MAX`）塞進 ViewFlipper，由桌面那一端
+ *    自己計時、淡入淡出，App 不必醒著。間隔用 `setInt(…, "setFlipInterval", ms)` 蓋掉 layout
+ *    裡的預設值。一批播完由鬧鐘接下一批。
+ *  - **> 60 秒**：AlarmManager 定時叫 `ACTION_TICK` 換下一張（flipper 一批最多 6 張，
+ *    間隔太長時一批要播好幾分鐘，不如一張一張換）。`updatePeriodMillis` 的下限是 30 分鐘，
+ *    比它短只能自己排鬧鐘。鬧鐘是**不喚醒**的（`RTC`）—— 螢幕關著沒人看，不必為了換圖把手機叫醒。
+ *    ≤ 60 秒但 flipper 塞不下兩張時也走這條。
+ *  ⚠️ 舊版的兩格（`widget_interval` 分鐘、0＝連續漸變 ＋ `widget_flip_sec`）在第一次讀的時候換算過來。
  *    ⚠️ `updatePeriodMillis` 是 0：例行的 onUpdate 會把 flipper 拉回這一批的第一頁（看起來就是跳）。
  *    ⚠️ RemoteViews 的點陣圖總量有上限（約螢幕像素 × 4 × 1.5），所以張數照小工具的
  *    尺寸算（`flipCount`），塞不下兩張就退回一次一張。
@@ -94,8 +97,9 @@ class FeaturedWidget : AppWidgetProvider() {
                 return
             }
             // 連續漸變的鬧鐘是「這一批快播完了」：從最後一頁接著畫下一批（batch），不是往前推一張
+            // 一張一張換的鬧鐘才往前推一張；看的是上一次實際畫的是哪一種
             ACTION_TICK -> {
-                val flip = interval(ctx) == 0
+                val flip = prefs(ctx).getBoolean(KEY_FLIPPING, false)
                 refreshAsync(ctx, advance = !flip, reschedule = true, batch = flip); return
             }
         }
@@ -129,8 +133,10 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val KEY_FLIP_AT = "widget_flip_at"
         /** 畫面上那一張（連續漸變是這一批的第一張）的照片 id：清單重抓、重排之後照 id 找回位置，不靠 index */
         private const val KEY_CUR_ID = "widget_featured_cur_id"
-        private const val KEY_INTERVAL = "widget_interval"
-        private const val KEY_FLIP_SEC = "widget_flip_sec"
+        private const val KEY_INTERVAL_SEC = "widget_interval_sec"
+        /** 1.0.22 以前的兩格，只用來換算成 `KEY_INTERVAL_SEC` */
+        private const val KEY_OLD_INTERVAL = "widget_interval"
+        private const val KEY_OLD_FLIP_SEC = "widget_flip_sec"
         private const val KEY_BG_ALPHA = "widget_bg_alpha"
         private const val KEY_IMG_ALPHA = "widget_img_alpha"
         private const val KEY_CORNER = "widget_corner"
@@ -150,12 +156,19 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val RC_TICK = 2
         private const val RC_PAGE = 100
 
-        /** 設定頁的選項（分鐘，0＝連續漸變） */
-        val INTERVALS = intArrayOf(0, 1, 5, 10, 15)
+        /** 最短 2 秒（淡入淡出本身就要 0.7 秒，再短看不清楚）；≤ FLIP_SEC_MAX 用 flipper 自己翻 */
+        private const val INTERVAL_SEC_MIN = 2
+        private const val FLIP_SEC_MAX = 60
+        private const val INTERVAL_SEC_MAX = 15 * 60
 
-        /** 連續漸變每張停幾秒（淡入淡出本身就要 0.7 秒，再短看不清楚） */
-        const val FLIP_SEC_MIN = 2
-        const val FLIP_SEC_MAX = 60
+        /** 設定頁拉桿的每一格（秒）：一分鐘內逐秒、五分鐘內每 10 秒、之後每分鐘 */
+        val INTERVAL_STEPS: IntArray = ((2..60) + (70..300 step 10) + (360..INTERVAL_SEC_MAX step 60)).toIntArray()
+
+        fun formatInterval(sec: Int): String = when {
+            sec < 60 -> "$sec 秒"
+            sec % 60 == 0 -> "${sec / 60} 分鐘"
+            else -> "${sec / 60} 分 ${sec % 60} 秒"
+        }
 
         private val lock = Any()
 
@@ -176,7 +189,16 @@ class FeaturedWidget : AppWidgetProvider() {
             }
         }
 
-        fun interval(ctx: Context) = prefs(ctx).getInt(KEY_INTERVAL, 5).takeIf { it in INTERVALS } ?: 5
+        /** 換圖間隔（秒）。還沒存過新格子時從舊版的兩格換算（預設 5 分鐘） */
+        fun intervalSeconds(ctx: Context): Int {
+            val p = prefs(ctx)
+            val sec = if (p.contains(KEY_INTERVAL_SEC)) p.getInt(KEY_INTERVAL_SEC, 300)
+            else when (val old = p.getInt(KEY_OLD_INTERVAL, 5)) {
+                0 -> p.getInt(KEY_OLD_FLIP_SEC, 2)
+                else -> old * 60
+            }
+            return sec.coerceIn(INTERVAL_SEC_MIN, INTERVAL_SEC_MAX)
+        }
         fun backgroundAlpha(ctx: Context) = prefs(ctx).getInt(KEY_BG_ALPHA, 0).coerceIn(0, 255)
         fun imageAlpha(ctx: Context) = prefs(ctx).getInt(KEY_IMG_ALPHA, 255).coerceIn(0, 255)
         fun corner(ctx: Context) = prefs(ctx).getInt(KEY_CORNER, 30).coerceIn(0, 100)
@@ -192,10 +214,7 @@ class FeaturedWidget : AppWidgetProvider() {
             .putInt(FeaturedWallpaper.KEY_INDEX, 0)
             .remove(KEY_CUR_ID).remove(FeaturedWallpaper.KEY_CUR_ID).apply()
 
-        fun flipSeconds(ctx: Context) = prefs(ctx).getInt(KEY_FLIP_SEC, 2).coerceIn(FLIP_SEC_MIN, FLIP_SEC_MAX)
-
-        fun setInterval(ctx: Context, minutes: Int) = put(ctx, KEY_INTERVAL, minutes)
-        fun setFlipSeconds(ctx: Context, sec: Int) = put(ctx, KEY_FLIP_SEC, sec.coerceIn(FLIP_SEC_MIN, FLIP_SEC_MAX))
+        fun setIntervalSeconds(ctx: Context, sec: Int) = put(ctx, KEY_INTERVAL_SEC, sec.coerceIn(INTERVAL_SEC_MIN, INTERVAL_SEC_MAX))
         fun setBackgroundAlpha(ctx: Context, alpha: Int) = put(ctx, KEY_BG_ALPHA, alpha.coerceIn(0, 255))
         fun setImageAlpha(ctx: Context, alpha: Int) = put(ctx, KEY_IMG_ALPHA, alpha.coerceIn(0, 255))
         fun setCorner(ctx: Context, pct: Int) = put(ctx, KEY_CORNER, pct.coerceIn(0, 100))
@@ -250,7 +269,9 @@ class FeaturedWidget : AppWidgetProvider() {
             if (ids.isEmpty()) { cancelAlarm(ctx); return@synchronized }
             val mgr = AppWidgetManager.getInstance(ctx)
             val p = prefs(ctx)
-            val minutes = interval(ctx)
+            val sec = intervalSeconds(ctx)
+            val stepMs = sec * 1000L
+            val useFlip = sec <= FLIP_SEC_MAX
             val session = Push.session(ctx)
             if (session == null) {
                 cancelAlarm(ctx)
@@ -258,7 +279,8 @@ class FeaturedWidget : AppWidgetProvider() {
                 mgr.updateAppWidget(ids, message(ctx, "打開 App 登入後\n這裡會輪播本次精選"))
                 return@synchronized
             }
-            if (minutes > 0) schedule(ctx, minutes * 60_000L, reschedule)
+            // 一張一張換：先排好鬧鐘，清單這一趟讀不到也照樣會再來
+            if (!useFlip) schedule(ctx, stepMs, reschedule)
 
             // 讀不到（沒網路、票過期）：畫面上那一張留著，不要換成錯誤訊息
             val items = list(ctx, session) ?: return@synchronized
@@ -272,13 +294,12 @@ class FeaturedWidget : AppWidgetProvider() {
             val curId = p.getLong(KEY_CUR_ID, -1L)
             var index = items.indexOfFirst { it.optLong("id") == curId }
                 .takeIf { it >= 0 } ?: p.getInt(KEY_INDEX, 0)
-            val flipMs = flipSeconds(ctx) * 1000L
             val now = System.currentTimeMillis()
             // 連續漸變：ViewFlipper 自己在桌面上翻，記下來的是這一批的第一張。
             // ⚠️ 不要再「照放了多久估現在翻到第幾頁」（1.0.21 以前）：螢幕關著 flipper 不翻、
             // 桌面重新套用 RemoteViews 會從第一頁重來，估出來的跟畫面對不上，一重畫就跳。
             // 只有「這一批播完」的鬧鐘（batch）才往前推，推到這一批的最後一頁（畫面上正在看的那張）。
-            if (batch && minutes == 0 && p.getBoolean(KEY_FLIPPING, false)) {
+            if (batch && p.getBoolean(KEY_FLIPPING, false)) {
                 val n = p.getInt(KEY_FLIP_N, 1).coerceAtLeast(1)
                 if (items.size > n) index += n - 1
             }
@@ -295,7 +316,7 @@ class FeaturedWidget : AppWidgetProvider() {
             var flipping = false
             var flipN = 1
             for (id in ids) {
-                val views = if (minutes == 0 && items.size > 1) {
+                val views = if (useFlip && items.size > 1) {
                     val (w, h) = sizePx(ctx, mgr, id, FLIP_MAX_PX)
                     val n = flipCount(ctx, w, h, items.size)
                     if (n >= 2) {
@@ -310,14 +331,16 @@ class FeaturedWidget : AppWidgetProvider() {
             }
             p.edit().putInt(KEY_INDEX, index).putLong(KEY_CUR_ID, items[index].optLong("id"))
                 .putBoolean(KEY_FLIPPING, flipping).putInt(KEY_FLIP_N, flipN).putLong(KEY_FLIP_AT, now).apply()
-            if (minutes == 0) {
+            if (useFlip) {
                 // 一批最多 FLIP_MAX 張，flipper 播完會繞回這一批的第一張（看起來就是倒退）。
                 // 清單比一批長時，在播到最後一頁那一刻重畫下一批（從最後一頁接著），順序才一路往下走。
                 // RTC 不叫醒手機：螢幕關著就等亮起來再說。
-                if (flipping && items.size > flipN) schedule(ctx, (flipN - 1) * flipMs + 300, force = true)
+                if (flipping && items.size > flipN) schedule(ctx, (flipN - 1) * stepMs + 300, force = true)
                 // 整份清單一批就裝得下：不必接下一批，但精選會增減 —— 3 小時後重抓一次清單
                 // （小工具已經不靠 updatePeriodMillis 例行重畫了，那會把 flipper 拉回第一頁）
                 else if (flipping) schedule(ctx, LIST_TTL_MS, force = true)
+                // 塞不下兩張（或只有一張精選）：退回一張一張換，間隔照設定
+                else if (items.size > 1) schedule(ctx, stepMs, force = reschedule || batch)
                 else cancelAlarm(ctx)
             }
         }
@@ -349,8 +372,8 @@ class FeaturedWidget : AppWidgetProvider() {
         ): RemoteViews {
             val views = RemoteViews(ctx.packageName, R.layout.widget_featured_flip)
             views.removeAllViews(R.id.widget_flipper)
-            // 每張停幾秒是設定頁調的；layout 裡那個 2000 只是預設值
-            views.setInt(R.id.widget_flipper, "setFlipInterval", flipSeconds(ctx) * 1000)
+            // 換圖間隔是設定頁調的；layout 裡那個 2000 只是預設值
+            views.setInt(R.id.widget_flipper, "setFlipInterval", intervalSeconds(ctx) * 1000)
             for (k in 0 until n) {
                 val i = (start + k) % items.size
                 val item = items[i]

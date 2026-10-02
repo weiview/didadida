@@ -10,5 +10,5 @@
     <string name="wallpaper_featured_label">本次精選</string>
     <string name="wallpaper_featured_desc">全螢幕輪播站上的本次精選，鎖定畫面也看得到</string>
     <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
-    <string name="whats_new">• 修正小工具與動態桌布播放時照片會亂跳\n• 小工具設定頁：選項並排，拉桿放在一起</string>
+    <string name="whats_new">• 小工具的換圖間隔與連續漸變合併成一根拉桿，以秒為單位調整（2 秒～15 分鐘）</string>
 </resources>
