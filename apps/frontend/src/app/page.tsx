@@ -15,6 +15,7 @@ import PhotoImage, { PhotoSpinner } from "@/components/PhotoImage";
 import FilterBottomSheet from "@/components/FilterBottomSheet";
 import FabMenu from "@/components/FabMenu";
 import BottomActionBar from "@/components/BottomActionBar";
+import { useTouchReorder, NO_LONG_PRESS_STYLE } from "@/lib/touchReorder";
 
 /**
  * `canEdit` = 這本相簿是不是我動得了的（我建的，或我可以管全站內容）。
@@ -23,7 +24,7 @@ import BottomActionBar from "@/components/BottomActionBar";
  * `canReorder` 是另一回事：排序是**全站共用**的一份順序，只有可以管別人內容的人
  * 才碰得到，所以它不看單本相簿是誰的。
  */
-function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, draggingIndex, longPressIndex, sortBy, index, handlePointerDown, handlePointerUpOrLeave, handleDragStart, handleDragEnter, handleDragEnd, isSelected, onSelectToggle }: any) {
+function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, draggingIndex, longPressIndex, touchLifted, sortBy, index, handlePointerDown, handlePointerUpOrLeave, handleDragStart, handleDragEnter, handleDragEnd, isSelected, onSelectToggle }: any) {
   useSeenVersion();
   const [hovered, setHovered] = useState(false);
   const [photoIndex, setPhotoIndex] = useState(0);
@@ -103,8 +104,12 @@ function AlbumCardComponent({ album, isAdmin, canEdit, canReorder, isEditing, dr
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         className={`glass-panel ${styles.albumCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""}`}
-        draggable={isAdmin && canReorder && longPressIndex === index && sortBy === "custom"}
-        onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
+        // 手指舉起來的走 useTouchReorder，不開原生拖放（兩條同時跑會存兩次排序）
+        draggable={isAdmin && canReorder && longPressIndex === index && sortBy === "custom" && !touchLifted}
+        data-reorder-index={index}
+        style={isAdmin && canReorder && sortBy === "custom" ? NO_LONG_PRESS_STYLE : undefined}
+        onContextMenu={(e) => { if (isAdmin && canReorder && sortBy === "custom") e.preventDefault(); }}
+        onPointerDown={(e) => sortBy === "custom" && handlePointerDown(index, e.pointerType)}
         onPointerUp={handlePointerUpOrLeave}
         onPointerLeave={handlePointerUpOrLeave}
         // ⚠️ 捏合縮放時瀏覽器接管手勢，發的是這一顆不是 pointerup
@@ -230,6 +235,8 @@ export default function Home() {
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [longPressIndex, setLongPressIndex] = useState<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  /** 這次長按是不是手指（是的話舉起來之後走 useTouchReorder，見 lib/touchReorder.ts） */
+  const liftByTouch = useRef(false);
 
   /**
    * 取消還沒成立的長按，並把已經舉起來的那一張放回去。
@@ -641,7 +648,8 @@ export default function Home() {
   };
 
   // Drag and Drop handlers
-  const handlePointerDown = (index: number) => {
+  const handlePointerDown = (index: number, pointerType?: string) => {
+    liftByTouch.current = pointerType === "touch";
     // 篩選中畫面上只是子集合，拖曳算出來的 sort_order 會是錯的（見 handleDragEnd）。
     // 排序是全站共用的一份，動得了它的只有可以管別人內容的人
     if (!isAdmin || isFiltering || !canManageOthers) return;
@@ -706,6 +714,14 @@ export default function Home() {
     setDraggingIndex(null);
     setLongPressIndex(null);
   };
+
+  // App（Android WebView）裡手指不會觸發原生拖放，舉起來之後改走觸控那條
+  const touchLifted = longPressIndex !== null && liftByTouch.current;
+  useTouchReorder(touchLifted ? longPressIndex : null, {
+    start: handleDragStart,
+    enter: handleDragEnter,
+    end: handleDragEnd,
+  });
 
   return (
     <main className={styles.container}>
@@ -1125,6 +1141,7 @@ export default function Home() {
                     isEditing={isEditingAlbums}
                     draggingIndex={draggingIndex}
                     longPressIndex={longPressIndex}
+                    touchLifted={touchLifted}
                     sortBy={sortBy}
                     handlePointerDown={handlePointerDown}
                     handlePointerUpOrLeave={handlePointerUpOrLeave}
@@ -1163,6 +1180,7 @@ export default function Home() {
               isEditing={isEditingAlbums}
               draggingIndex={draggingIndex}
               longPressIndex={longPressIndex}
+              touchLifted={touchLifted}
               sortBy={sortBy}
               handlePointerDown={handlePointerDown}
               handlePointerUpOrLeave={handlePointerUpOrLeave}

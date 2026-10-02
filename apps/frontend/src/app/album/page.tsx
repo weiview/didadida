@@ -29,6 +29,7 @@ import PhotoImage from "@/components/PhotoImage";
 import FilterBottomSheet from "@/components/FilterBottomSheet";
 import FabMenu, { type FabAction } from "@/components/FabMenu";
 import BottomActionBar from "@/components/BottomActionBar";
+import { useTouchReorder, NO_LONG_PRESS_STYLE } from "@/lib/touchReorder";
 
 /**
  * 被判定為重複、還沒寫進去的那一張。
@@ -311,6 +312,8 @@ function AlbumContent() {
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [longPressIndex, setLongPressIndex] = useState<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  /** 這次長按是不是手指（是的話舉起來之後走 useTouchReorder，見 lib/touchReorder.ts） */
+  const liftByTouch = useRef(false);
 
   /**
    * 取消還沒成立的長按，並把已經舉起來的那一張放回去。
@@ -1995,7 +1998,8 @@ function AlbumContent() {
   };
 
   // Drag and Drop handlers
-  const handlePointerDown = (index: number) => {
+  const handlePointerDown = (index: number, pointerType?: string) => {
+    liftByTouch.current = pointerType === "touch";
     if (!canReorderPhotos) return;
     timerRef.current = setTimeout(() => {
       setLongPressIndex(index);
@@ -2050,6 +2054,14 @@ function AlbumContent() {
     setDraggingIndex(null);
     setLongPressIndex(null);
   };
+
+  // App（Android WebView）裡手指不會觸發原生拖放，舉起來之後改走觸控那條
+  const touchLifted = longPressIndex !== null && liftByTouch.current;
+  useTouchReorder(touchLifted ? longPressIndex : null, {
+    start: handleDragStart,
+    enter: handleDragEnter,
+    end: handleDragEnd,
+  });
 
   const [isEditingName, setIsEditingName] = useState(false);
   const [editingNameInput, setEditingNameInput] = useState("");
@@ -2619,7 +2631,11 @@ function AlbumContent() {
                 else photoCardRefs.current.delete(index);
               }}
               className={`${styles.photoCard} ${draggingIndex === index ? styles.dragging : ""} ${longPressIndex === index ? styles.readyToDrag : ""} ${isBlurred(photo) ? styles.blurredPhoto : ""}`}
-              draggable={canReorderPhotos && longPressIndex === index && sortBy === "custom"}
+              // 手指舉起來的走 useTouchReorder，不開原生拖放（兩條同時跑會存兩次排序）
+              draggable={canReorderPhotos && longPressIndex === index && sortBy === "custom" && !touchLifted}
+              data-reorder-index={index}
+              style={canReorderPhotos && sortBy === "custom" ? NO_LONG_PRESS_STYLE : undefined}
+              onContextMenu={(e) => { if (canReorderPhotos && sortBy === "custom") e.preventDefault(); }}
               onClick={async () => {
                 // ⚠️ 比的是 `=== index` 不是 `!== null` —— 萬一哪一張卡在「舉起來」的
                 //    狀態，只有它自己點不動，不會連累格線上其他每一張
@@ -2652,7 +2668,7 @@ function AlbumContent() {
                 }
                 setSelectedPhotoIndex(index);
               }}
-              onPointerDown={() => sortBy === "custom" && handlePointerDown(index)}
+              onPointerDown={(e) => sortBy === "custom" && handlePointerDown(index, e.pointerType)}
               onPointerUp={handlePointerUpOrLeave}
               onPointerLeave={handlePointerUpOrLeave}
               // ⚠️ 捏合縮放時瀏覽器接管手勢，發的是這一顆不是 pointerup
