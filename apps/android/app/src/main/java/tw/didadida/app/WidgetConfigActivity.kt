@@ -15,7 +15,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 
 /**
- * 桌面小工具「本次精選」的設定：換圖間隔、背景／照片透明度、圓角、柔邊。
+ * 桌面小工具「本次精選」的設定：換圖間隔（連續漸變的秒數）、背景／照片透明度、圓角、柔邊。
  *
  *  - 從哪裡進來：Android 12+ 長按小工具 →「設定」（`widgetFeatures="reconfigurable"`）；
  *    更舊的系統在加小工具的當下跳一次（`configuration_optional` 在那裡不認）。
@@ -59,7 +59,7 @@ class WidgetConfigActivity : AppCompatActivity() {
             for (m in FeaturedWidget.INTERVALS) {
                 addView(RadioButton(this@WidgetConfigActivity).apply {
                     id = 1000 + m
-                    text = if (m == 0) "連續漸變（每 2 秒淡入下一張）" else "$m 分鐘"
+                    text = if (m == 0) "連續漸變（照下面的秒數淡入下一張）" else "$m 分鐘"
                     isChecked = m == current
                 })
             }
@@ -69,6 +69,13 @@ class WidgetConfigActivity : AppCompatActivity() {
             }
         })
 
+        root.addView(slider(
+            label = "連續漸變：每張停",
+            initial = FeaturedWidget.flipSeconds(this),
+            min = FeaturedWidget.FLIP_SEC_MIN,
+            max = FeaturedWidget.FLIP_SEC_MAX,
+            suffix = " 秒",
+        ) { sec -> FeaturedWidget.setFlipSeconds(this, sec) })
         root.addView(slider(
             label = "背景透明度",
             initial = 100 - FeaturedWidget.backgroundAlpha(this) * 100 / 255,
@@ -103,18 +110,27 @@ class WidgetConfigActivity : AppCompatActivity() {
         SystemBars.apply(this, scroll)
     }
 
-    private fun slider(label: String, initial: Int, max: Int = 100, onChange: (Int) -> Unit): LinearLayout {
+    /** SeekBar 的 `min` 要 API 26 —— minSdk 28，可以直接用 */
+    private fun slider(
+        label: String,
+        initial: Int,
+        min: Int = 0,
+        max: Int = 100,
+        suffix: String = "%",
+        onChange: (Int) -> Unit,
+    ): LinearLayout {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(20), 0, 0)
         }
-        val title = TextView(this).apply { text = "$label：${initial.coerceIn(0, max)}%" }
+        val title = TextView(this).apply { text = "$label：${initial.coerceIn(min, max)}$suffix" }
         val bar = SeekBar(this).apply {
+            this.min = min
             this.max = max
-            progress = initial.coerceIn(0, max)
+            progress = initial.coerceIn(min, max)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar, value: Int, fromUser: Boolean) {
-                    title.text = "$label：$value%"
+                    title.text = "$label：$value$suffix"
                     if (fromUser) onChange(value)
                 }
                 override fun onStartTrackingTouch(s: SeekBar) {}

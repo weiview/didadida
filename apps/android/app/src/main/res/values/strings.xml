@@ -10,5 +10,5 @@
     <string name="wallpaper_featured_label">本次精選</string>
     <string name="wallpaper_featured_desc">全螢幕輪播站上的本次精選，鎖定畫面也看得到</string>
     <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
-    <string name="whats_new">• 新增「本次精選」動態桌布，鎖定畫面可全螢幕輪播（帳號選單或小工具設定裡可以套用）</string>
+    <string name="whats_new">• 小工具「連續漸變」每張停幾秒可以自己設定（2–60 秒，長按小工具 →「設定」）</string>
 </resources>

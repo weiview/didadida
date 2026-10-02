@@ -42,7 +42,8 @@ import kotlin.math.min
  *    `updatePeriodMillis` 的下限是 30 分鐘，比它短只能自己排鬧鐘。鬧鐘是**不喚醒**的
  *    （`RTC`）—— 螢幕關著沒人看，不必為了換圖把手機叫醒。
  *  - **連續漸變（0）**：一次把幾張（最多 `FLIP_MAX`）塞進 ViewFlipper，由桌面那一端
- *    自己計時、淡入淡出，App 不必醒著。系統每 30 分鐘叫一次 `onUpdate` 換下一批。
+ *    自己計時、淡入淡出，App 不必醒著。每張停幾秒是 prefs `widget_flip_sec`（2–60，預設 2），
+ *    用 `setInt(…, "setFlipInterval", ms)` 蓋掉 layout 裡的預設值。系統每 30 分鐘叫一次 `onUpdate` 換下一批。
  *    ⚠️ RemoteViews 的點陣圖總量有上限（約螢幕像素 × 4 × 1.5），所以張數照小工具的
  *    尺寸算（`flipCount`），塞不下兩張就退回一次一張。
  *
@@ -120,6 +121,7 @@ class FeaturedWidget : AppWidgetProvider() {
         private const val KEY_FLIPPING = "widget_flipping"
         private const val KEY_FLIP_N = "widget_flip_n"
         private const val KEY_INTERVAL = "widget_interval"
+        private const val KEY_FLIP_SEC = "widget_flip_sec"
         private const val KEY_BG_ALPHA = "widget_bg_alpha"
         private const val KEY_IMG_ALPHA = "widget_img_alpha"
         private const val KEY_CORNER = "widget_corner"
@@ -135,6 +137,10 @@ class FeaturedWidget : AppWidgetProvider() {
 
         /** 設定頁的選項（分鐘，0＝連續漸變） */
         val INTERVALS = intArrayOf(0, 1, 5, 10, 15)
+
+        /** 連續漸變每張停幾秒（淡入淡出本身就要 0.7 秒，再短看不清楚） */
+        const val FLIP_SEC_MIN = 2
+        const val FLIP_SEC_MAX = 60
 
         private val lock = Any()
 
@@ -161,7 +167,10 @@ class FeaturedWidget : AppWidgetProvider() {
         fun corner(ctx: Context) = prefs(ctx).getInt(KEY_CORNER, 30).coerceIn(0, 100)
         fun feather(ctx: Context) = prefs(ctx).getInt(KEY_FEATHER, 40).coerceIn(0, 100)
 
+        fun flipSeconds(ctx: Context) = prefs(ctx).getInt(KEY_FLIP_SEC, 2).coerceIn(FLIP_SEC_MIN, FLIP_SEC_MAX)
+
         fun setInterval(ctx: Context, minutes: Int) = put(ctx, KEY_INTERVAL, minutes)
+        fun setFlipSeconds(ctx: Context, sec: Int) = put(ctx, KEY_FLIP_SEC, sec.coerceIn(FLIP_SEC_MIN, FLIP_SEC_MAX))
         fun setBackgroundAlpha(ctx: Context, alpha: Int) = put(ctx, KEY_BG_ALPHA, alpha.coerceIn(0, 255))
         fun setImageAlpha(ctx: Context, alpha: Int) = put(ctx, KEY_IMG_ALPHA, alpha.coerceIn(0, 255))
         fun setCorner(ctx: Context, pct: Int) = put(ctx, KEY_CORNER, pct.coerceIn(0, 100))
@@ -292,6 +301,8 @@ class FeaturedWidget : AppWidgetProvider() {
         ): RemoteViews {
             val views = RemoteViews(ctx.packageName, R.layout.widget_featured_flip)
             views.removeAllViews(R.id.widget_flipper)
+            // 每張停幾秒是設定頁調的；layout 裡那個 2000 只是預設值
+            views.setInt(R.id.widget_flipper, "setFlipInterval", flipSeconds(ctx) * 1000)
             for (k in 0 until n) {
                 val i = (start + k) % items.size
                 val item = items[i]

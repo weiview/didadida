@@ -2314,13 +2314,13 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   **不開放的一律跳過**（桌面是誰都看得到的地方），沒登入時寫「打開 App 登入後…」。
   設定在 `WidgetConfigActivity`（長按小工具 →「設定」，`widgetFeatures="reconfigurable|configuration_optional"`），
   全部小工具共用一份 prefs：`widget_interval`（0／1／5／10／15，預設 5）、`widget_bg_alpha`、
-  `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）。拉桿**放手才重畫**。
+  `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_flip_sec`（秒）。拉桿**放手才重畫**。
   ⚠️ 設定頁**鎖在淺色**（`delegate.localNightMode = MODE_NIGHT_NO`，要在 `super.onCreate` 之前）：主題是 DayNight，
   手機開深色模式時文字變白、而 `SystemBars` 把底墊成白的 —— 白底白字，選項整排看不見（1.0.14 修，Pixel 7 Pro）。
   - **換圖間隔**：1–15 分鐘是 AlarmManager 的 `RTC` 鬧鐘（`ACTION_TICK`），能用精確鬧鐘就 `setExact`
     （manifest 有 `USE_EXACT_ALARM`／`SCHEDULE_EXACT_ALARM` ≤32），否則退回 `setAndAllowWhileIdle`。
     `schedule(force=false)` 遇到已排好的不重排。`onDisabled` 收掉鬧鐘。
-  - **0＝連續漸變**：`widget_featured_flip`（ViewFlipper，`flipInterval` 2 秒、淡入淡出 700ms）塞 `widget_featured_page` 幾頁。
+  - **0＝連續漸變**：`widget_featured_flip`（ViewFlipper，每張停 `widget_flip_sec` 秒（2–60，預設 2，設定頁的拉桿）—— 用 `setInt(…, "setFlipInterval", ms)` 蓋掉 layout 裡的 2000；淡入淡出 700ms）塞 `widget_featured_page` 幾頁。
     ⚠️ RemoteViews 的點陣圖有總量上限（螢幕 ×4×1.5），頁數照「60% 預算 ÷ 每頁大小」算、最多 6，
     不到 2 頁就退回靜態。翻頁中的 ⟳ 走 `showNext`。
   - **尺寸與滿版**：照 `getAppWidgetOptions` 拿每一個小工具自己的大小（直向用 MIN_WIDTH×MAX_HEIGHT），
