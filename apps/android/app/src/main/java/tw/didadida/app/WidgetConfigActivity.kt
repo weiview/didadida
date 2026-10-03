@@ -101,8 +101,8 @@ class WidgetConfigActivity : AppCompatActivity() {
             }
         })
 
-        // 換圖間隔只有這一根（秒）：≤ 60 秒由 flipper 淡入淡出，更長由鬧鐘一張一張換（FeaturedWidget 自己選）。
-        // 格子對到 INTERVAL_STEPS（一分鐘內逐秒、五分鐘內每 10 秒、之後每分鐘），放手才重畫
+        // 換圖間隔只有這一根（秒，5 秒～15 分鐘），一律由我們的鬧鐘一張一張換。
+        // 格子對到 INTERVAL_STEPS（一分鐘內每秒、五分鐘內每 10 秒、之後每分鐘），放手才重畫
         val steps = FeaturedWidget.INTERVAL_STEPS
         val cur = FeaturedWidget.intervalSeconds(this)
         root.addView(slider(

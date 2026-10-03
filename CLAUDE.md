@@ -2314,27 +2314,22 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   **不開放的一律跳過**（桌面是誰都看得到的地方），**影片也跳過**（1.0.18，`media_type == "video"`：小工具播不了、桌布上只是一張封面；動態照片與 GIF 照留。快取 key 因此換成 `widget_featured_v2`），沒登入時寫「打開 App 登入後…」。
   **播放順序**（1.0.20，`widget_shuffle`，動態桌布也看這一格）：預設照拍攝時間舊到新（沒有時間的排最後），或隨機。排序在 `FeaturedWidget.list()` 出口做（`ordered()`），所以兩邊自動一致；`/api/featured` 為此多回 `taken_at`，清單快取 key 換成 `widget_featured_v3`。隨機靠固定的 `widget_shuffle_seed`（index 一張張往下走才不重複），重抓清單時換一顆；切換順序時 index 歸零從頭播。
   ⚠️⚠️ **位置記的是「現在那張的 id」（`widget_featured_cur_id`），不是 index**（1.0.21，使用者：「明明選照拍照時間順序，但照片還是會亂跳」）：清單每 3 小時重抓、精選增減都會讓 index 指到別張。`ordered()` 把 `taken_at` **解析成毫秒再比**（字串格式不一，直接比會亂），同時間再比 id。隨機的 seed **只在精選的 id 集合真的變了才換**（以前每次重抓都換＝每 3 小時整串洗牌）。`onUpdate`／換尺寸只重畫、不前進也不重排鬧鐘。
-  ⚠️⚠️ **連續漸變不要「照經過的時間估現在翻到第幾頁」**（1.0.22 拿掉，那是 1.0.21 還在跳的元凶）：螢幕關著 flipper 不翻、桌面重新套用 RemoteViews 會從第一頁重來，估出來的跟畫面對不上。現在只有「這一批播完」的鬧鐘（`batch`）才往前推 `flipN − 1` 頁；`updatePeriodMillis` 改成 **0**（例行 onUpdate 會把 flipper 拉回第一頁），整份清單一批裝得下時改排一支 3 小時的鬧鐘重抓清單。動態桌布同樣改記 id（`wallpaper_cur_id`），換清單照 id 找位置。
+  ⚠️⚠️ **翻頁一律由我們的鬧鐘負責，沒有 ViewFlipper**（1.0.24 拿掉）：flipper 在桌面那一端自己翻，螢幕關著不翻、桌面重新套用 RemoteViews 就從第一頁重來，App 永遠不知道畫面上是哪一張 —— 1.0.21～1.0.23 的「亂跳」都是它。**不要再把連續漸變加回來。** `updatePeriodMillis` 是 **0**（例行 onUpdate 只會打亂節奏）。
   設定頁：兩組選項（顯示方式、播放順序）橫排；換圖間隔拉桿跟其他拉桿排在一起。
   設定在 `WidgetConfigActivity`（長按小工具 →「設定」，`widgetFeatures="reconfigurable|configuration_optional"`），
-  全部小工具共用一份 prefs：`widget_interval_sec`（秒，2 秒～15 分鐘，預設 5 分鐘）、`widget_bg_alpha`、
+  全部小工具共用一份 prefs：`widget_interval_sec`（秒，5 秒～15 分鐘，預設 5 分鐘）、`widget_bg_alpha`、
   `widget_img_alpha`、`widget_corner`（%）、`widget_feather`（%）、`widget_fit`（1.0.17：完整顯示，直的就直的、橫的就橫的；
   Android 不准 App 改小工具的尺寸，「跟著照片變形」是完整顯示＋背景透明度 100% 做出來的，動態桌布也看這一格）。拉桿**放手才重畫**。
   ⚠️ 設定頁**鎖在淺色**（`delegate.localNightMode = MODE_NIGHT_NO`，要在 `super.onCreate` 之前）：主題是 DayNight，
   手機開深色模式時文字變白、而 `SystemBars` 把底墊成白的 —— 白底白字，選項整排看不見（1.0.14 修，Pixel 7 Pro）。
-  - **換圖間隔只有一個設定**（1.0.23 使用者：「換圖間隔跟連續漸變應該是一樣的東西」）：設定頁一根拉桿走 `INTERVAL_STEPS`
-    （一分鐘內逐秒、五分鐘內每 10 秒、之後每分鐘），由 `FeaturedWidget` 照長短自己選做法：**≤ 60 秒（`FLIP_SEC_MAX`）走連續漸變**，
-    **更長走鬧鐘一張一張換**；≤ 60 秒但 flipper 塞不下兩張時也退回鬧鐘。`ACTION_TICK` 看 `widget_flipping`（上一次實際畫的是哪一種）
-    決定是「接下一批」還是「往前一張」。舊版的 `widget_interval`（分鐘，0＝連續漸變）＋`widget_flip_sec` 在 `intervalSeconds()` 第一次讀時換算。
+  - **換圖間隔只有一個設定**：設定頁一根拉桿走 `INTERVAL_STEPS`（5～60 秒每秒、五分鐘內每 10 秒、之後每分鐘），
+    每一次換圖都是 `ACTION_TICK` 往前一張（`render(advance = true)`）。最短 5 秒是刻意的 —— 鬧鐘再密就是在耗電。
+    舊版的 `widget_interval`（分鐘，0＝連續漸變）＋`widget_flip_sec` 在 `intervalSeconds()` 第一次讀時換算（夾進 5～900）。
     鬧鐘是 AlarmManager 的 `RTC`（`ACTION_TICK`），能用精確鬧鐘就 `setExact`
     （manifest 有 `USE_EXACT_ALARM`／`SCHEDULE_EXACT_ALARM` ≤32），否則退回 `setAndAllowWhileIdle`。
     `schedule(force=false)` 遇到已排好的不重排。`onDisabled` 收掉鬧鐘。
-  - **連續漸變**：`widget_featured_flip`（ViewFlipper，每張停「換圖間隔」那麼久 —— 用 `setInt(…, "setFlipInterval", ms)` 蓋掉 layout 裡的 2000；淡入淡出 700ms）塞 `widget_featured_page` 幾頁。
-    ⚠️ RemoteViews 的點陣圖有總量上限（螢幕 ×4×1.5），頁數照「60% 預算 ÷ 每頁大小」算、最多 6，
-    不到 2 頁就退回靜態。
-    ⚠️ 一批翻完要接下一批：`widget_flip_at` 記這一批開始的時間，重畫時照經過的頁數接著播（不從頭），清單比一批長時排一支鬧鐘在這批播完時換下一批。⟳ 是整批往後推一張並重畫（不是 `showNext`，那樣狀態對不上）。
   - **尺寸與滿版**：照 `getAppWidgetOptions` 拿每一個小工具自己的大小（直向用 MIN_WIDTH×MAX_HEIGHT），
-    center-crop 烤成剛好那個比例（長邊上限：靜態 720px、翻頁 480px），`onAppWidgetOptionsChanged` 重畫。
+    center-crop 烤成剛好那個比例（長邊上限 720px），`onAppWidgetOptionsChanged` 重畫。
   - **圓角與柔邊是烤進點陣圖的**（RemoteViews 不能設 clip／outline）。`compose()`：照片先裁成 w×h，
     再用 **`BitmapShader` 填進一個圓角矩形**，那支 Paint 帶 `BlurMaskFilter`（柔邊）與 imgAlpha；
     背景是同一個形狀、同一個模糊先畫在底下。柔邊 100% ＝短邊的 `FEATHER_MAX`（12%）。
@@ -2347,6 +2342,10 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
     與 `FeaturedWidget.load(ctx, url, maxPx)`（`maxPx = 0` 不縮）。票從 `Push.session()` 拿，沒登入畫一行提示。
   - ⚠️ **看不見時一個像素都不畫**（`onVisibilityChanged(false)` 收掉所有計時器），平常停在靜止的圖上，只有淡入那 1.2 秒逐格重畫。
   - ⚠️ 淡入結束才排下一張靠 `finished` 旗標 —— `Handler.hasCallbacks` 是 API 29，minSdk 是 28。
+  - ⚠️⚠️ **每一個引擎各自記位置**（1.0.24）：主畫面與鎖定畫面分開套用時系統開兩個引擎，以前共用一格
+    `wallpaper_cur_id` 互相蓋掉。現在位置活在引擎身上（`curId`），存檔 key 照 `slotKey()` 分開
+    （Android 14+ 看 `wallpaperFlags` 分 `:home`／`:lock`，之前只有一個引擎），預覽引擎不存。
+    換播放順序時 `FeaturedWidget.setShuffle()` 叫 `FeaturedWallpaper.resetPositions()` 清掉所有存檔。
   - 套用入口三個：帳號牌「🖼 設成精選動態桌布」（bridge `setWallpaper()`，選填，1.0.15 以前的 App 沒有）、
     小工具設定頁那顆按鈕。都走 `FeaturedWallpaper.open()`：`ACTION_CHANGE_LIVE_WALLPAPER` 直接停在這一張，
     打不開退回 `ACTION_LIVE_WALLPAPER_CHOOSER`，再不行 Toast。

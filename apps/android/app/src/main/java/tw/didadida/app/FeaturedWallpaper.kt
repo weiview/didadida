@@ -33,6 +33,10 @@ import kotlin.math.min
  *  - ⚠️ **看不見的時候一個像素都不畫**（`onVisibilityChanged(false)` 就把計時器全收掉）：
  *    螢幕關著還在重畫就是白白耗電。平常停在一張靜止的圖上，只有換圖那 `FADE_MS` 才逐格重畫。
  *  - 網路與解碼在自己的背景執行緒（`worker`），畫在主執行緒。
+ *  - ⚠️⚠️ **每一個引擎各自記位置**（1.0.24）：主畫面與鎖定畫面分開套用時系統會開兩個引擎，
+ *    以前兩個共用一格 `wallpaper_cur_id`，互相把對方的位置蓋掉 —— 一亮螢幕就跳到別張。
+ *    現在位置活在引擎自己身上（`curId`），存檔的 key 照引擎套在哪裡分開（`slotKey()`），
+ *    預覽畫面的引擎一律不存。
  */
 class FeaturedWallpaper : WallpaperService() {
 
@@ -51,6 +55,8 @@ class FeaturedWallpaper : WallpaperService() {
         private var items: List<JSONObject>? = null
         private var session: String? = null
         private var index = 0
+        /** 這個引擎畫面上那一張的 id（-1＝還沒有），位置一律照它找 */
+        private var curId = -1L
         private var current: Bitmap? = null
         private var next: Bitmap? = null
         private var fadeStart = 0L
@@ -114,7 +120,7 @@ class FeaturedWallpaper : WallpaperService() {
             val ctx = applicationContext
             worker.post {
                 val list = runCatching { FeaturedWidget.list(ctx, s) }.getOrNull()
-                val i = if (list.isNullOrEmpty()) 0 else position(ctx, list)
+                val i = if (list.isNullOrEmpty()) 0 else position(list)
                 val bmp = list?.getOrNull(i)?.let { FeaturedWidget.load(ctx, it.optString("src"), 0) }
                 main.post {
                     loading = false
@@ -122,7 +128,10 @@ class FeaturedWallpaper : WallpaperService() {
                         // 讀不到（沒網路、票過期）：手上那張留著，下次亮起來再試
                         list == null -> if (current == null) message = "暫時讀不到精選"
                         list.isEmpty() -> { items = list; current = null; message = "目前沒有精選" }
-                        else -> { items = list; index = i; current = bmp ?: current; message = null }
+                        else -> {
+                            items = list; index = i; curId = list[i].optLong("id")
+                            current = bmp ?: current; message = null
+                        }
                     }
                     if (list == null) items = null
                     draw()
@@ -149,14 +158,16 @@ class FeaturedWallpaper : WallpaperService() {
                 // 隨機重排）就照「現在這張的 id」在新清單裡找位置，不然同一個 index 指到別張 —— 會跳
                 val fresh = runCatching { FeaturedWidget.list(ctx, s) }.getOrNull()?.takeIf { it.isNotEmpty() }
                 val use = fresh ?: list
-                val t = if (fresh == null) target else (position(ctx, fresh) + 1) % fresh.size
+                val t = if (fresh == null) target else (position(fresh) + 1) % fresh.size
                 val src = use.getOrNull(t)
                 val bmp = src?.let { FeaturedWidget.load(ctx, it.optString("src"), 0) }
                 main.post {
                     items = use
                     index = t
-                    prefs(ctx).edit().putInt(KEY_INDEX, index)
-                        .putLong(KEY_CUR_ID, src?.optLong("id") ?: -1L).apply()
+                    curId = src?.optLong("id") ?: -1L
+                    slotKey()?.let { k ->
+                        prefs(ctx).edit().putInt(KEY_INDEX + k, index).putLong(KEY_CUR_ID + k, curId).apply()
+                    }
                     if (!visible) return@post
                     if (bmp == null) { scheduleAdvance(); return@post }
                     next = bmp
@@ -164,6 +175,34 @@ class FeaturedWallpaper : WallpaperService() {
                     draw()
                 }
             }
+        }
+
+        /**
+         * 這個引擎存檔用的 key 尾巴：主畫面、鎖定畫面各一格（Android 14 起才分得出來，
+         * 之前只有一個引擎）。預覽畫面回 null —— 它不該動到正式那一份的位置。
+         */
+        private fun slotKey(): String? {
+            if (isPreview) return null
+            if (android.os.Build.VERSION.SDK_INT < 34) return ""
+            val f = wallpaperFlags
+            val lock = f and WallpaperManager.FLAG_LOCK != 0
+            val home = f and WallpaperManager.FLAG_SYSTEM != 0
+            return when {
+                lock && !home -> ":lock"
+                home && !lock -> ":home"
+                else -> ""
+            }
+        }
+
+        /** 這一張在這份清單裡的位置：先看引擎自己手上那張，剛建起來的引擎才回頭看存檔 */
+        private fun position(list: List<JSONObject>): Int {
+            val p = prefs(applicationContext)
+            val k = slotKey()
+            val id = if (curId >= 0) curId else if (k != null) p.getLong(KEY_CUR_ID + k, -1L) else -1L
+            val i = list.indexOfFirst { it.optLong("id") == id }
+            if (i >= 0) return i
+            val start = if (curId >= 0) index else if (k != null) p.getInt(KEY_INDEX + k, 0) else 0
+            return ((start % list.size) + list.size) % list.size
         }
 
         private fun draw() {
@@ -232,18 +271,17 @@ class FeaturedWallpaper : WallpaperService() {
 
     companion object {
         private const val TAG = "FeaturedWallpaper"
-        internal const val KEY_INDEX = "wallpaper_index"
+        /** 後面接 `slotKey()`（""／":home"／":lock"）—— 每個引擎各一格 */
+        private const val KEY_INDEX = "wallpaper_index"
         /** 現在畫面上那張的 id —— 位置照它找，index 只是找不到時的退路 */
-        internal const val KEY_CUR_ID = "wallpaper_cur_id"
+        private const val KEY_CUR_ID = "wallpaper_cur_id"
 
-        /** 記下來的那一張在這份清單裡的位置 */
-        private fun position(ctx: Context, list: List<org.json.JSONObject>): Int {
-            val p = ctx.getSharedPreferences("app", Context.MODE_PRIVATE)
-            val id = p.getLong(KEY_CUR_ID, -1L)
-            val i = list.indexOfFirst { it.optLong("id") == id }
-            if (i >= 0) return i
-            val start = p.getInt(KEY_INDEX, 0)
-            return ((start % list.size) + list.size) % list.size
+        /** 換播放順序時把每個引擎存下來的位置都清掉（正在跑的引擎從手上那張接著播新順序） */
+        fun resetPositions(ctx: Context) {
+            val p = prefs(ctx)
+            val e = p.edit()
+            for (k in p.all.keys) if (k.startsWith(KEY_INDEX) || k.startsWith(KEY_CUR_ID)) e.remove(k)
+            e.apply()
         }
         private const val HOLD_MS = 6_000L
         private const val FADE_MS = 1_200L
