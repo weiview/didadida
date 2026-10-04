@@ -79,6 +79,7 @@ class Api(private val base: String, private val token: String) {
         gifBytes: ByteArray?,
         originalSize: Long?,
         allowDuplicate: Boolean,
+        restricted: Boolean = false,
     ): UploadResult {
         val webp = "image/webp".toMediaType()
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
@@ -103,6 +104,8 @@ class Api(private val base: String, private val token: String) {
             body.addFormDataPart("gif", filename, gifBytes.toRequestBody("image/gif".toMediaType()))
         }
         if (allowDuplicate) body.addFormDataPart("allow_duplicate", "1")
+        // 上傳當下就標成不開放（後端只對 canManageOthers 採用）
+        if (restricted) body.addFormDataPart("restricted", "1")
 
         Net.client.newCall(req("/upload").post(body.build()).build()).execute().use { res ->
             val text = res.body?.string().orEmpty()

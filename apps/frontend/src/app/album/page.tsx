@@ -16,6 +16,7 @@ import GoogleSyncConflictModal from "@/components/GoogleSyncConflictModal";
 import AssignPlaceModal from "@/components/AssignPlaceModal";
 import FixTimeModal from "@/components/FixTimeModal";
 import RotatePhotosModal from "@/components/RotatePhotosModal";
+import UploadPickModal from "@/components/UploadPickModal";
 import PostUploadReviewModal from "@/components/PostUploadReviewModal";
 import PlaceCheckinModal from "@/components/PlaceCheckinModal";
 import { GIF_MAX_BYTES, isGifFile, resizeImageFile } from "@/lib/imageUtils";
@@ -67,6 +68,8 @@ type PendingDuplicate = {
    *    而且要等 /admin 那支掃描回 Drive 讀一次才補得回來（同 exifData／takenAt）。
    */
   motionOffset?: number;
+  /** 上傳前那一步勾了「不開放」（見 UploadPickModal）。照樣上傳時要跟著帶 */
+  restricted?: boolean;
 };
 
 /**
@@ -235,12 +238,19 @@ function AlbumContent() {
    * 而 `UploadedPhoto` 只有 id／lat／lng，分不出來（同 IngestResult 的計數）。
    */
   const dupUploadedVideosRef = useRef(0);
+  /**
+   * 上面那一串裡標成「不開放」的有幾張照片／幾支影片。
+   * ⚠️ 全站通知要扣掉它們 —— 看不到的人會被叫去看一張他找不到的照片。
+   */
+  const dupRestrictedRef = useRef({ photos: 0, videos: 0 });
 
   // 批次刪除 State
   const [selectedPhotos, setSelectedPhotos] = useState<number[]>([]);
   const [showAssignPlace, setShowAssignPlace] = useState(false);
   const [showFixTime, setShowFixTime] = useState(false);
   const [showRotate, setShowRotate] = useState(false);
+  /** 上傳前逐張挑「不開放」那個視窗手上的檔案（null＝沒開） */
+  const [pickFiles, setPickFiles] = useState<File[] | null>(null);
   // 相簿層級的打卡補件畫面（整本攤開、照日期分組）
   const [showPlaceCheckin, setShowPlaceCheckin] = useState(false);
   // 從打卡畫面轉去指定地點時，套用完要回到打卡畫面繼續處理下一批
@@ -774,7 +784,8 @@ function AlbumContent() {
     let token: string | null = null;
     try { token = localStorage.getItem('admin_token'); } catch { /* 無痕模式之類的 */ }
     if (app && id && token) {
-      app.pickAndUpload(id, token);
+      if (app.pickAndUploadEx) app.pickAndUploadEx(id, token, !!canManageOthers);
+      else app.pickAndUpload(id, token);
       return;
     }
     fileInputRef.current?.click();
@@ -1054,8 +1065,10 @@ function AlbumContent() {
 
     const uploaded = dupUploadedRef.current;
     const videos = dupUploadedVideosRef.current;
+    const hidden = dupRestrictedRef.current;
     dupUploadedRef.current = [];
     dupUploadedVideosRef.current = 0;
+    dupRestrictedRef.current = { photos: 0, videos: 0 };
     if (uploaded.length === 0) return;
 
     /*
@@ -1065,8 +1078,8 @@ function AlbumContent() {
      */
     void announceUpload({
       albumId: id ? Number(id) : null,
-      photos: uploaded.length - videos,
-      videos,
+      photos: uploaded.length - videos - hidden.photos,
+      videos: videos - hidden.videos,
     });
 
     await loadData();
@@ -1099,7 +1112,7 @@ function AlbumContent() {
     try {
       const result = await uploadPhoto(
         id as string, item.resized, item.exifData, item.takenAt, true, item.video, item.gif,
-        item.motionOffset, item.file.size,
+        item.motionOffset, item.file.size, item.restricted,
       );
       if (result.status !== 'ok') {
         dupFailuresRef.current.push(`${name}：${result.status === 'error' ? result.reason : '上傳失敗'}`);
@@ -1127,8 +1140,10 @@ function AlbumContent() {
         }
         dupUploadedRef.current.push(result.photo);
         dupUploadedVideosRef.current++;
+        if (item.restricted) dupRestrictedRef.current.videos++;
       } else {
         dupUploadedRef.current.push(result.photo);
+        if (item.restricted) dupRestrictedRef.current.photos++;
         // Drive 沿用整批那次的授權；沒有就記進待補清單，跟一般上傳一樣
         if (driveRef.current) {
           try {
@@ -1294,7 +1309,12 @@ function AlbumContent() {
    * 一張待匯入的照片。**檔案是延後載入的**（`load()`）—— Google 匯入一批可能幾十張，
    * 先全部抓下來等於把整批原始檔一起壓在記憶體裡，這樣一次只留手上這一張。
    */
-  type IngestSource = { name: string; load: () => Promise<File> };
+  type IngestSource = {
+    name: string;
+    load: () => Promise<File>;
+    /** 上傳當下就標成「不開放」（上傳前那一步勾的，只有 canManageOthers 端得出來） */
+    restricted?: boolean;
+  };
 
   type IngestResult = {
     uploaded: UploadedPhoto[];
@@ -1323,6 +1343,7 @@ function AlbumContent() {
      *    看不出哪一筆是影片。為此把 api.ts 那個型別撐大只是為了數數，不划算。
      * ⚠️ **補備份的那幾個（`backfilled`）不算** —— 站上一格新的都沒多出來，
      *    通知別人「有新東西」是句假話。重複視窗跳過的那幾張同理。
+     * ⚠️ **標成不開放的也不算** —— 大多數人看不到它。
      */
     newPhotos: number;
     newVideos: number;
@@ -1427,7 +1448,7 @@ function AlbumContent() {
             id as string, poster, vmeta.exif ?? undefined,
             vmeta.fallbackIso ?? undefined, false, meta,
             // gif／motionOffset 影片用不到，但最後那個原始檔大小要送（重複視窗拿它給人判斷）
-            undefined, undefined, rawFile.size,
+            undefined, undefined, rawFile.size, source.restricted,
           );
           if (result.status === 'duplicate') {
             /*
@@ -1456,6 +1477,7 @@ function AlbumContent() {
               exifData: vmeta.exif ?? undefined, takenAt: vmeta.fallbackIso ?? undefined,
               reason: result.reason, existing: result.existing,
               video: meta,
+              restricted: source.restricted,
             });
           } else if (result.status === 'ok') {
             try {
@@ -1464,7 +1486,8 @@ function AlbumContent() {
                 (sent, size) => onProgress(i + 1, total, source.name, { sent, total: size }));
               uploaded.push(result.photo);
               // ⚠️ 數在這裡不是上一行：影片沒送上 Drive 是要回滾整列的（見下面的 catch）
-              newVideos++;
+              // ⚠️ 不開放的不數：通知是發給全家的，看不到的人會被叫去找一支不存在的影片
+              if (!source.restricted) newVideos++;
             } catch (err) {
               console.error(`影片 ${rawFile.name} 沒送上 Drive，收掉剛建的那一列`, err);
               // 回滾失敗要另外講：那一格還在相簿裡，而且點開只有靜止畫面
@@ -1516,11 +1539,12 @@ function AlbumContent() {
         const motionOffset = gifSource ? undefined : await readMotionOffsetFromFile(rawFile);
         const result = await uploadPhoto(
           id as string, file, exifData, takenAt || undefined, false, undefined,
-          gifSource ? { file: rawFile } : undefined, motionOffset, rawFile.size,
+          gifSource ? { file: rawFile } : undefined, motionOffset, rawFile.size, source.restricted,
         );
         if (result.status === 'ok') {
           uploaded.push(result.photo);
-          newPhotos++;
+          // 不開放的不數（理由同影片那一岔）
+          if (!source.restricted) newPhotos++;
           /*
            * 4K 與原始檔送 Drive。失敗**只是少一份備份**，照片本身已經在 R2 了。
            *
@@ -1597,6 +1621,7 @@ function AlbumContent() {
             reason: result.reason, existing: result.existing,
             ...(gifSource ? { gif: { file: rawFile } } : {}),
             motionOffset,
+            restricted: source.restricted,
           });
         } else {
           failures.push(`${source.name}：${result.reason}`);
@@ -1683,11 +1708,22 @@ function AlbumContent() {
     if (!id) return;
     const files = e.target.files;
     if (!files || files.length === 0) return;
+    const list = Array.from(files);
+    // 可管理全站內容的人先過一個「逐張挑不開放」的視窗，其他人照舊直接傳。
+    // ⚠️ input 的值要先清掉（list 已經是複本）—— 取消之後再選同一批，change 才會來
+    if (canManageOthers) {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      setPickFiles(list);
+      return;
+    }
+    await uploadFiles(list);
+  };
 
+  const uploadFiles = async (list: File[], restricted?: boolean[]) => {
     setUploading(true);
     try {
       const result = await ingestSources(
-        Array.from(files).map((f) => ({ name: f.name, load: async () => f })),
+        list.map((f, i) => ({ name: f.name, load: async () => f, restricted: !!restricted?.[i] })),
         (current, total, fileName, bytes) => setUploadProgress({ current, total, fileName, bytes }),
       );
       await finishIngest(result);
@@ -3064,6 +3100,16 @@ function AlbumContent() {
           } else {
             alert(`已為 ${updated} 張照片指定地點${skipped}。本相簿的照片皆已有位置與地名`);
           }
+        }}
+      />
+
+      <UploadPickModal
+        files={pickFiles}
+        onCancel={() => setPickFiles(null)}
+        onConfirm={(restricted) => {
+          const list = pickFiles;
+          setPickFiles(null);
+          if (list) void uploadFiles(list, restricted);
         }}
       />
 

@@ -102,6 +102,11 @@
             android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density" />
 
+        <activity
+            android:name=".RestrictPickActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density" />
+
         <receiver android:name=".upload.NoticeDismissReceiver" android:exported="false" />
 
         <service

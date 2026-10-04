@@ -180,7 +180,7 @@ class Ingest(
 
         val result = api.upload(
             albumId, source.name, thumbs.md, thumbs.sm, vmeta.exif?.toString(), takenAt,
-            null, "video", durationMs, 0L, null, source.size, false,
+            null, "video", durationMs, 0L, null, source.size, false, source.restricted,
         )
         when (result) {
             is Api.UploadResult.Duplicate -> {
@@ -205,6 +205,7 @@ class Ingest(
                         thumbMd = thumbs.md, thumbSm = thumbs.sm, phash = null,
                         exifJson = vmeta.exif?.toString(), takenAt = takenAt,
                         mediaType = "video", durationMs = durationMs, motionOffset = 0L,
+                        restricted = source.restricted,
                     )
                 )
             }
@@ -218,7 +219,7 @@ class Ingest(
         try {
             if (folder() == null) throw IllegalStateException("無法連線至 Google Drive，影片無法儲存")
             pushVideo(id, source, onSent)
-            newVideos++   // ⚠️ 數在 Drive 成功之後：失敗是要回滾整列的
+            if (!source.restricted) newVideos++   // 不開放的不進通知。⚠️ 數在 Drive 成功之後：失敗是要回滾整列的
             return true
         } catch (e: Exception) {
             val rolled = api.deletePhoto(id)
@@ -264,12 +265,12 @@ class Ingest(
 
         val result = api.upload(
             albumId, source.name, thumbs.md, thumbs.sm, exif?.toString(), takenAt,
-            phash, kind, null, motionOffset, gifBytes, source.size, false,
+            phash, kind, null, motionOffset, gifBytes, source.size, false, source.restricted,
         )
         stage(30)
         when (result) {
             is Api.UploadResult.Created -> {
-                newPhotos++
+                if (!source.restricted) newPhotos++   // 不開放的不進「有人上傳了」
                 pushOrRecord(result.id, source, fourK = !gif, stage = stage)
             }
             is Api.UploadResult.Duplicate -> {
@@ -306,6 +307,7 @@ class Ingest(
                         thumbMd = thumbs.md, thumbSm = thumbs.sm, phash = phash,
                         exifJson = exif?.toString(), takenAt = takenAt,
                         mediaType = kind, durationMs = null, motionOffset = motionOffset,
+                        restricted = source.restricted,
                     )
                 )
             }
@@ -396,11 +398,13 @@ class Ingest(
     /** @param replaceIds 空的＝全部保留；有值＝上傳新的之後刪掉這幾列 */
     fun runDuplicate(dup: PendingDup, replaceIds: List<Long>, onSent: (Long, Long) -> Unit) {
         val source = MediaSource(context, dup.uri, dup.name, dup.mime, dup.size)
+            .also { it.restricted = dup.restricted }
         try {
             val gifBytes = if (dup.mediaType == "gif") source.readAll() else null
             val result = api.upload(
                 albumId, dup.name, dup.thumbMd, dup.thumbSm, dup.exifJson, dup.takenAt,
                 dup.phash, dup.mediaType, dup.durationMs, dup.motionOffset, gifBytes, dup.size, true,
+                dup.restricted,
             )
             val id = when (result) {
                 is Api.UploadResult.Created -> result.id
@@ -410,7 +414,7 @@ class Ingest(
             if (dup.mediaType == "video") {
                 if (!createdVideo(id, source, onSent)) return   // 回滾了，舊的不能刪
             } else {
-                newPhotos++
+                if (!dup.restricted) newPhotos++   // 不開放的不進「有人上傳了」
                 pushOrRecord(id, source, fourK = dup.mediaType != "gif")
             }
             if (replaceIds.isNotEmpty()) {
@@ -432,6 +436,7 @@ class Ingest(
         val twin = dup.existing.firstOrNull { it.id == twinId } ?: return
         if (twin.mediaType != dup.mediaType) { failures.add("${dup.name}：媒體種類不同，無法補備份"); return }
         val source = MediaSource(context, dup.uri, dup.name, dup.mime, dup.size)
+            .also { it.restricted = dup.restricted }
         try {
             if (dup.mediaType == "video") {
                 if (twin.hasOriginal) return
@@ -488,6 +493,8 @@ class PendingDup(
     val mediaType: String,
     val durationMs: Long?,
     val motionOffset: Long,
+    /** 上傳前標成不開放的（1.0.25）。「兩張都留／取代」重傳時要帶著 */
+    val restricted: Boolean = false,
 )
 
 /**

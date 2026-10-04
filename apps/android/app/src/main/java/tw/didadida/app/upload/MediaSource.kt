@@ -21,6 +21,12 @@ class MediaSource(
     override val size: Long,
 ) : ByteSource {
 
+    /**
+     * 上傳前在 `RestrictPickActivity` 標成「不開放」（1.0.25）。跟著 `POST /api/upload`
+     * 一起寫進 INSERT；後端只對 canManageOthers 採用。網路重跑時跟著這個物件走，不會掉。
+     */
+    var restricted: Boolean = false
+
     override fun read(offset: Long, len: Int): ByteArray {
         val want = minOf(len.toLong(), size - offset).coerceAtLeast(0L).toInt()
         if (want == 0) return ByteArray(0)

@@ -10,5 +10,5 @@
     <string name="wallpaper_featured_label">本次精選</string>
     <string name="wallpaper_featured_desc">全螢幕輪播站上的本次精選，鎖定畫面也看得到</string>
     <!-- 更新後第一次打開 App 跳出來的「這一版改了什麼」。每發一版就改寫這一段（不累積舊版的） -->
-    <string name="whats_new">• 小工具換圖改成一張一張換，最短 5 秒，螢幕關掉再打開不會跳回別張\n• 動態桌布的主畫面與鎖定畫面各自記住播到哪一張</string>
+    <string name="whats_new">• 上傳前可以逐張把照片標成「不開放」（限可管理全站內容的人）</string>
 </resources>

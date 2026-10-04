@@ -7259,6 +7259,14 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
         const fileSize = Number.isSafeInteger(fileSizeRaw) && fileSizeRaw > 0 ? fileSizeRaw : null;
         // 使用者在重複清單裡按了「照樣上傳」才會帶這個旗標
         const allowDuplicate = formData.get('allow_duplicate') === '1';
+        /*
+         * 上傳當下就標成「不開放」（0020 那一欄）。挑完照片後的確認畫面上逐張勾的。
+         * ⚠️ **只認 canManageOthers**，跟 PUT /api/photos/restricted 同一道閘 ——
+         *    其他人送 1 一律當 0（不回錯：照片照樣上傳，只是不會被藏起來）。
+         * 寫在 INSERT 裡而不是傳完再打一次 PUT：那樣中間會有一段公開的空窗，
+         * 而且新照片的縮圖網址還沒發給任何人，不必換鍵、也不必 bumpContentEpoch。
+         */
+        const uploadRestricted = formData.get('restricted') === '1' && me.canManageOthers ? 1 : 0;
 
         /*
          * 影片跟照片走**同一條上傳路**（0019）。從這支路由的角度看只有兩點不同：
@@ -7566,13 +7574,13 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           `INSERT INTO Photo
              (title, file_name, album_id, url, thumb_url, thumb_sm_url, exif, taken_at, file_hash, phash, file_size,
               lat, lng, geo_source, taken_at_local, tz_offset_minutes, time_source, uploaded_by,
-              media_type, duration_ms, gif_key, motion_offset, shuffle_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
+              media_type, duration_ms, gif_key, motion_offset, restricted, shuffle_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (random() & 2147483647))`
         ).bind(
           originalName, fileName, albumId, fileUrl, thumbUrl, thumbSmUrl, exifData,
           uploadTakenAt, fileHash, clientPhash, fileSize,
           geo.lat, geo.lng, geo.geoSource, geo.takenAtLocal, geo.tzOffsetMinutes,
-          uploadTimeSource, me.uid, mediaType, durationMs, gifKey, motionOffset,
+          uploadTimeSource, me.uid, mediaType, durationMs, gifKey, motionOffset, uploadRestricted,
         ).run();
 
         const newPhotoId = Number(inserted.meta?.last_row_id ?? 0);
@@ -7590,6 +7598,7 @@ async function calculateFileHash(buffer: ArrayBuffer): Promise<string> {
           lat: geo.lat,
           lng: geo.lng,
           media_type: mediaType,
+          restricted: uploadRestricted,
         }), { headers });
       }
 

@@ -57,6 +57,8 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
     /** 等選檔回來才知道要傳去哪一本、用哪張票 */
     private var pendingAlbum: Long = 0
     private var pendingToken: String = ""
+    /** 可管理全站內容的人：選完檔先進 RestrictPickActivity 逐張標「不開放」 */
+    private var pendingCanManage: Boolean = false
 
     /** 網頁自己的 `<input type="file">`（頭像、GPX…）那一條 */
     private var fileCallback: ValueCallback<Array<Uri>>? = null
@@ -81,7 +83,34 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
             }
             list.add(u)
         }
-        UploadService.upload(this, pendingAlbum, pendingToken, list)
+        startUpload(list)
+    }
+
+    /** 選好的檔：要逐張標不開放的人先過一次格子，其餘直接開傳 */
+    private fun startUpload(uris: ArrayList<Uri>) {
+        if (pendingCanManage) {
+            restrictPick.launch(
+                Intent(this, RestrictPickActivity::class.java)
+                    .putParcelableArrayListExtra(RestrictPickActivity.EXTRA_URIS, uris),
+            )
+            return
+        }
+        UploadService.upload(this, pendingAlbum, pendingToken, uris)
+        pendingToken = ""
+    }
+
+    private val restrictPick = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+        if (res.resultCode == RESULT_OK && pendingAlbum > 0 && pendingToken.isNotEmpty()) {
+            @Suppress("DEPRECATION")
+            val uris = res.data?.getParcelableArrayListExtra<Uri>(RestrictPickActivity.EXTRA_URIS)
+            val marked = res.data?.getBooleanArrayExtra(RestrictPickActivity.EXTRA_RESTRICTED)
+            if (!uris.isNullOrEmpty()) {
+                UploadService.upload(
+                    this, pendingAlbum, pendingToken, ArrayList(uris),
+                    marked?.takeIf { it.size == uris.size },
+                )
+            }
+        }
         pendingToken = ""
     }
 
@@ -92,8 +121,7 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
                 @Suppress("DEPRECATION")
                 val uris = res.data?.getParcelableArrayListExtra<Uri>(GalleryActivity.EXTRA_URIS)
                 if (uris.isNullOrEmpty() || pendingAlbum <= 0 || pendingToken.isEmpty()) return@registerForActivityResult
-                UploadService.upload(this, pendingAlbum, pendingToken, ArrayList(uris))
-                pendingToken = ""
+                startUpload(ArrayList(uris))
             }
             GalleryActivity.RESULT_USE_SYSTEM -> pickMedia.launch(arrayOf("image/*", "video/*"))
             else -> pendingToken = ""
@@ -380,12 +408,17 @@ class MainActivity : AppCompatActivity(), UploadEvents.Listener {
      */
     private inner class Bridge {
         @JavascriptInterface
-        fun pickAndUpload(albumId: String, token: String) {
+        fun pickAndUpload(albumId: String, token: String) = pickAndUploadEx(albumId, token, false)
+
+        /** 1.0.25：canManage＝選完先逐張標「不開放」（後端照樣只認 canManageOthers） */
+        @JavascriptInterface
+        fun pickAndUploadEx(albumId: String, token: String, canManage: Boolean) {
             val id = albumId.toLongOrNull() ?: return
             if (token.isBlank()) return
             runOnUiThread {
                 pendingAlbum = id
                 pendingToken = token
+                pendingCanManage = canManage
                 pickGallery.launch(Intent(this@MainActivity, GalleryActivity::class.java))
             }
         }

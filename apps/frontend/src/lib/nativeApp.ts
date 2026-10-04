@@ -14,6 +14,8 @@
 interface DidadidaAppBridge {
   /** 開原生的檔案選擇器，選完交給前景服務上傳到這本相簿 */
   pickAndUpload(albumId: string, token: string): void;
+  /** 1.0.25：canManage 為 true 時選完先逐張標「不開放」再傳（舊版 App 沒有，退回 pickAndUpload） */
+  pickAndUploadEx?(albumId: string, token: string, canManage: boolean): void;
   /** App 的版本名稱（versionName），網頁用不到，除錯時看得出是哪一版 */
   version?(): string;
   /**

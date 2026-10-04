@@ -822,6 +822,7 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
     還是要能取消不開放；上下一張的箭頭本來就更高，不受影響。
   - 補地點視窗（`PlaceCheckinModal`）**只糊、不給掀開的入口** —— 那裡是照時間地點挑照片，
     不是看照片。要看就回相簿掀開，掀開之後這裡自然跟著攤開。
+- **上傳當下就能標**（2026-10-04）：選完檔先跳一個逐張勾選的格子（網頁 `components/UploadPickModal.tsx`、App `RestrictPickActivity`，只有 `canManageOthers` 才跳），勾到的那幾張 `POST /api/upload` 帶 `restricted=1`（後端照樣只認 `me.canManageOthers`）。⚠️ 這條**不必換 R2 鍵也不必 `bumpContentEpoch()`** —— 網址從來沒發出去過。⚠️ 上傳通知的張數**不算不開放的**（別人點進去看不到）。重複視窗那條要跟著帶（`PendingDuplicate.restricted`）。
 - ⚠️ **路由要排在 `PUT /api/photos/:id` 前面**：`/api/photos/restricted` 切出來也是 4 段，
   排後面會被當成「id 叫 restricted 的照片」吃掉（跟 `/api/photos/reorder` 同一個理由）。
 - 過濾**一律寫在 SQL 的 WHERE 裡**（`RESTRICTED_VISIBLE_COND`，Photo 要別名為 `p`），
@@ -2213,6 +2214,7 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   ⚠️ App 在背景時事件收不到（listener 在 `onPause` 清掉），所以相簿頁有一支 120 秒沒動靜就收掉進度的保險。
   通知列那則前景服務通知也跟著更新（`FOREGROUND_SERVICE_IMMEDIATE`，不然 Android 12+ 前 10 秒不顯示）。
   一般瀏覽器裡 `window.DidadidaApp` 不存在，走原本那條。
+  1.0.25 起多一支選填的 `pickAndUploadEx(albumId, token, canManage)`：`canManage` 為 true 時選完先進 `RestrictPickActivity` 逐張標不開放，`UploadService.upload(..., restricted: BooleanArray)` 一路帶進 `Ingest`。網頁有它就叫它，沒有（舊 App）退回 `pickAndUpload`。
 - **挑照片是自己的格子 `GalleryActivity`**（1.0.9，使用者：「點一下就選」—— 系統的
   Photo Picker 第一張要長按才進多選）。直接讀 MediaStore 畫四欄格子，點一下勾、再點取消。
   權限：13+ `READ_MEDIA_IMAGES`／`VIDEO`（14+ 可「只允許部分相片」）、12 以下 `READ_EXTERNAL_STORAGE`；

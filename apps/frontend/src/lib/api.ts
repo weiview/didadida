@@ -2441,9 +2441,15 @@ export async function uploadPhoto(
    * ⚠️ 沒送就留 null＝「不知道」，畫面上整格不寫。
    */
   originalSize?: number,
+  /**
+   * 上傳當下就標成「不開放」（只有可管理全站內容的人看得到）。
+   * ⚠️ 後端只認 canManageOthers，其他人送了也會被當成 0 —— 這裡只是傳話。
+   */
+  restricted?: boolean,
 ): Promise<UploadResult> {
   const formData = new FormData();
   formData.append('album_id', albumId);
+  if (restricted) formData.append('restricted', '1');
   // 檔名要另外送：R2 只收縮圖，而縮圖的 blob 沒有原始檔名
   // （GIF 的 `file` 是 canvas 產的 .jpg，原始檔名只有動畫本體那份留著）
   formData.append('filename', video ? video.fileName : gif ? gif.file.name : file.name);

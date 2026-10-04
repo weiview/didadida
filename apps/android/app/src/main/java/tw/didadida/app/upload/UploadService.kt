@@ -60,8 +60,9 @@ class UploadService : Service() {
                 val uris: List<Uri> = if (Build.VERSION.SDK_INT >= 33)
                     intent.getParcelableArrayListExtra(EXTRA_URIS, Uri::class.java).orEmpty()
                 else intent.getParcelableArrayListExtra<Uri>(EXTRA_URIS).orEmpty()
+                val restricted = intent.getBooleanArrayExtra(EXTRA_RESTRICTED)
                 if (albumId > 0 && token.isNotEmpty() && uris.isNotEmpty()) {
-                    enqueue { runBatch(albumId, token, uris) }
+                    enqueue { runBatch(albumId, token, uris, restricted) }
                 }
             }
             ACTION_DUP -> {
@@ -112,9 +113,14 @@ class UploadService : Service() {
 
     /* ---- 一批 ---- */
 
-    private fun runBatch(albumId: Long, token: String, uris: List<Uri>) {
+    /** @param restricted 跟 uris 同一個順序（`RestrictPickActivity` 挑的）；null＝全部一般上傳 */
+    private fun runBatch(albumId: Long, token: String, uris: List<Uri>, restricted: BooleanArray? = null) {
         val api = Api(Config.API, token)
-        val sources = uris.mapNotNull { runCatching { MediaSource.of(this, it) }.getOrNull() }
+        // ⚠️ 旗標要在 mapNotNull 之前照索引掛上去 —— 讀不到的那幾個一拿掉，索引就對不上了
+        val sources = uris.mapIndexedNotNull { i, uri ->
+            runCatching { MediaSource.of(this, uri) }.getOrNull()
+                ?.also { it.restricted = restricted?.getOrNull(i) == true }
+        }
         val ingest = Ingest(this, api, albumId)
         ingest.tag = uris
         val unreadable = uris.size - sources.size
@@ -318,6 +324,7 @@ class UploadService : Service() {
         const val EXTRA_REPLACE = "replace"
         const val EXTRA_BACKFILL = "backfill"
         const val EXTRA_SKIP = "skip"
+        const val EXTRA_RESTRICTED = "restricted"
 
         private const val NOTIFY_PROGRESS = 1
         private const val NOTIFY_DUP = 2
@@ -336,12 +343,16 @@ class UploadService : Service() {
             )
         }
 
-        fun upload(context: Context, albumId: Long, token: String, uris: ArrayList<Uri>) {
+        fun upload(
+            context: Context, albumId: Long, token: String, uris: ArrayList<Uri>,
+            restricted: BooleanArray? = null,
+        ) {
             context.startForegroundService(
                 Intent(context, UploadService::class.java).setAction(ACTION_UPLOAD)
                     .putExtra(EXTRA_ALBUM, albumId)
                     .putExtra(EXTRA_TOKEN, token)
-                    .putParcelableArrayListExtra(EXTRA_URIS, uris),
+                    .putParcelableArrayListExtra(EXTRA_URIS, uris)
+                    .putExtra(EXTRA_RESTRICTED, restricted),
             )
         }
 
