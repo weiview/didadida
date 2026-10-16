@@ -31,7 +31,8 @@ object WhatsNew {
             Log.w("WhatsNew", "讀不到安裝時間", e)
             false
         }
-        if (!updated) return
+        // whats_new 留空＝這一版不公告（例如小彩蛋），只記版號
+        if (!updated || activity.getString(R.string.whats_new).isBlank()) return
 
         AlertDialog.Builder(activity)
             .setTitle("已更新到 ${BuildConfig.VERSION_NAME}")

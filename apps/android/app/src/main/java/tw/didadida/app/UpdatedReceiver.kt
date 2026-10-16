@@ -24,11 +24,15 @@ class UpdatedReceiver : BroadcastReceiver() {
             Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val n = NotificationCompat.Builder(context, Config.CHANNEL_NOTICE)
+        val notes = context.getString(R.string.whats_new)
+        val b = NotificationCompat.Builder(context, Config.CHANNEL_NOTICE)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentTitle("滴答滴答已更新到 ${BuildConfig.VERSION_NAME}")
-            .setContentText("點這裡看這一版改了什麼")
-            .setStyle(NotificationCompat.BigTextStyle().bigText(context.getString(R.string.whats_new)))
+        // whats_new 留空＝這一版不公告內容（例如小彩蛋）
+        if (notes.isBlank()) b.setContentText("點這裡打開")
+        else b.setContentText("點這裡看這一版改了什麼")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(notes))
+        val n = b
             .setAutoCancel(true)
             .setContentIntent(pi)
             .build()

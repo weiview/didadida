@@ -2391,13 +2391,13 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
   狀態列圖示設成深色。MainActivity 與 DuplicateActivity 都要掛；**全螢幕影片時不墊**（`customView != null`），
   進出全螢幕要 `requestApplyInsets(root)`。
 - 更新後第一次打開跳一次公告：`WhatsNew.maybeShow()`，文字是 `R.string.whats_new`
-  （**每發一版就改寫那一段，只寫這一版的**）。看過的版號記在 prefs `whats_new_seen`；
+  （**每發一版就改寫那一段，只寫這一版的**；**留空＝這一版不跳公告**，靜默更新的通知也只寫「已更新」——小彩蛋就這樣發）。看過的版號記在 prefs `whats_new_seen`；
   全新安裝（`firstInstallTime == lastUpdateTime`）不跳。靜默更新的「已更新」通知（`UpdatedReceiver`）也顯示同一段。
 
 ### 桌面圖示會換臉（1.0.8，`MoodIcon.kt`）
 
 笑臉／生氣／哭哭／離家出走四張（離家出走是 1.0.26 加的，`ic_face_runaway`）（`res/drawable-nodpi/ic_face_*.png`＋`mipmap-anydpi-v26/ic_launcher_*.xml`，白底 adaptive icon）。
-照**當地日期**算：最後看 App 是 D 日 → D、D+1 笑，D+2 生氣，D+3 哭、D+4 起離家出走（使用者拍板「隔整整一天才生氣」，哭臉之後再一天沒上線就離家出走）。
+照**當地日期**算：最後看 App 是 D 日 → D、D+1 笑，D+2 生氣，D+3 哭、D+4 起離家出走（使用者拍板「隔整整一天才生氣」，哭臉之後再一天沒上線就離家出走）。⚠️ 離家出走是**小彩蛋，不上更新公告**（使用者拍板）。
 
 - Android 沒有換圖示的 API：manifest 裡四個 `activity-alias`（`.LauncherSmile`／`Angry`／`Cry`／`Runaway`）輪流啟用，
   **MAIN/LAUNCHER 因此不在 `MainActivity` 身上**。其他地方開 App 一律用顯式 `Intent(…, MainActivity::class.java)`，不受影響。
