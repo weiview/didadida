@@ -454,6 +454,8 @@ function AlbumContent() {
    *    為什麼不重抓）。**燈箱裡改完資料那條路一律走 silent**：手上已經有一份
    *    畫得出來的清單，沒有任何理由先清空它。
    */
+  const latestAlbumId = useRef(id);
+  latestAlbumId.current = id;
   const loadData = async (opts?: { silent?: boolean }): Promise<Photo[]> => {
     if (!id) return [];
     if (!opts?.silent) setLoading(true);
@@ -463,6 +465,8 @@ function AlbumContent() {
       fetchPhotos(id),
       fetchTags()
     ]);
+    // 這一趟還在飛的時候人已經換到別本相簿了：回來的是上一本的清單，丟掉
+    if (latestAlbumId.current !== id) return [];
 
     if (current) {
       setAlbum(current);
@@ -657,6 +661,28 @@ function AlbumContent() {
   }, [displayPhotos]);
 
   const deepLinkKey = useRef<string | null>(null);
+
+  /*
+   * 換相簿（`?id=` 變了）時把上一本留下的燈箱與捲動狀態整個歸零。
+   * ⚠️ 從通知、精選、分享連結點到**另一本**時 Next 只換網址、不重新掛載這一頁 ——
+   *    不歸零的話 `selectedPhotoIndex` 還停在上一本的索引，新相簿一載完燈箱就
+   *    指到 `displayPhotos[舊索引]`，也就是「點上傳通知卻跳到別張照片」。
+   *    舊清單也要清掉，不然新相簿載完之前 deepLink／挪索引那兩段會拿舊清單比對。
+   * 第一次掛載不動（`prevAlbumId` 還是 undefined）。
+   */
+  const prevAlbumId = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const prev = prevAlbumId.current;
+    prevAlbumId.current = id;
+    if (prev === undefined || prev === id) return;
+    viewingIdRef.current = null;
+    deepLinkKey.current = null;
+    setSelectedPhotoIndex(null);
+    setPhotos([]);
+    setVisibleCount(24);
+    if (typeof window !== "undefined") window.scrollTo(0, 0);
+  }, [id]);
+
   useEffect(() => {
     if (loading || displayPhotos.length === 0) return;
     const raw = searchParams.get("photo");
@@ -2886,7 +2912,7 @@ function AlbumContent() {
 
 
       {/* Lightbox / 大圖檢視 */}
-      {selectedPhotoIndex !== null && (
+      {selectedPhotoIndex !== null && displayPhotos[selectedPhotoIndex] && (
         <PhotoLightbox 
           photo={displayPhotos[selectedPhotoIndex]}
           /*

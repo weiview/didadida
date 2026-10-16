@@ -27,6 +27,11 @@ interface PhotoImageProps {
    * 永遠不會實現的「載入中」，那比沒有提示更難懂。
    */
   pendingLabel?: string | null;
+  /**
+   * 慢慢淡入，而且 placeholder 等淡入**結束**才拆。燈箱用的：800px 換成 4K 時
+   * 要讓人感覺不出來換過，不是閃一下。格線不要開（每張多留一個 <img> 撐一秒）。
+   */
+  smooth?: boolean;
 }
 
 /**
@@ -42,16 +47,28 @@ interface PhotoImageProps {
  *    與燈箱的 `.imageContainer` 本來就都符合，不必為它改 CSS。
  */
 export default function PhotoImage({
-  src, placeholderSrc, alt, className, lazy, pendingLabel,
+  src, placeholderSrc, alt, className, lazy, pendingLabel, smooth,
 }: PhotoImageProps) {
   const [loaded, setLoaded] = useState(false);
+  /** smooth 模式下主圖淡入完了沒（placeholder 這時候才拆） */
+  const [faded, setFaded] = useState(false);
   const [placeholderLoaded, setPlaceholderLoaded] = useState(false);
 
   /*
    * 換照片（燈箱按上一張／下一張）時要回到未載入狀態。
    * 少了這一段，新的大圖還在路上就會被當成已經到了，畫面會停在上一張。
    */
-  useEffect(() => { setLoaded(false); }, [src]);
+  useEffect(() => { setLoaded(false); setFaded(false); }, [src]);
+  /*
+   * transitionend 是主要的訊號；計時器是保險 —— 分頁在背景、或圖已經在快取裡
+   * 一掛上就 opacity 1（沒有 transition 可跑）時，transitionend 不會來。
+   */
+  useEffect(() => {
+    if (!smooth || !loaded) return;
+    const t = window.setTimeout(() => setFaded(true), 1000);
+    return () => window.clearTimeout(t);
+  }, [smooth, loaded]);
+  const keepPlaceholder = smooth ? !faded : !loaded;
   useEffect(() => { setPlaceholderLoaded(false); }, [placeholderSrc]);
 
   /*
@@ -75,7 +92,7 @@ export default function PhotoImage({
         * placeholder 在主圖到了之後就拆掉，不留著疊在下面：燈箱一次只有一張照片，
         * 但格線滑很長的時候每張都多留一個 <img> 會讓瀏覽器多扛幾十張解好的點陣圖。
         */}
-      {placeholderSrc && !loaded && (
+      {placeholderSrc && keepPlaceholder && (
         <img
           ref={markPlaceholderLoaded}
           src={placeholderSrc}
@@ -91,10 +108,11 @@ export default function PhotoImage({
         ref={markLoaded}
         src={src}
         alt={alt}
-        className={`${styles.layer} ${styles.main} ${loaded ? styles.mainLoaded : ""} ${className ?? ""}`}
+        className={`${styles.layer} ${styles.main} ${smooth ? styles.mainSmooth : ""} ${loaded ? styles.mainLoaded : ""} ${className ?? ""}`}
         loading={lazy ? "lazy" : undefined}
         decoding="async"
         onLoad={() => setLoaded(true)}
+        onTransitionEnd={() => { if (loaded) setFaded(true); }}
         /*
          * 載不出來也要把轉圈圈收掉，不然壞掉的圖會永遠轉下去 —— 那正是使用者說的
          * 「以為當掉了」。轉圈圈停下來、畫面留在 placeholder 或空白，至少是個終點。

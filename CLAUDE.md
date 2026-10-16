@@ -746,10 +746,15 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   以及**點在按鈕上**（換頁箭頭、左上角那顆鎖、「點一下暫時顯示」的遮罩都是 button，
   而原生監聽器掛在整個容器上，子節點的 touchend 照樣冒泡上來，
   React 那邊的 `stopPropagation` 攔不到）。
-- ⚠️ **影片不參與收合**，跟它不參與捏合放大同一個理由：`<video>` 自己要吃點擊與
-  拖時間軸，`VideoPlayer` 的外框也刻意把 touch 擋在燈箱外。拿「點一下」當開關等於
-  搶走播放鍵，而影片一旦收起來就再也叫不出留言 —— 那是一條沒有出口的路。
-  所以影片一律從第 1 段開始。
+- ⚠️ **影片也從第 0 段（全螢幕）開始，但「點一下」不是它的開關**（2026-10-16 使用者：
+  「影片也應該跟照片一樣支援全螢幕」）。`<video>` 自己要吃點擊與拖時間軸，`VideoPlayer`
+  的外框也刻意把 touch 擋在燈箱外 —— 拿點畫面當開關等於搶走播放鍵。所以影片的出口是
+  左上角 `.cornerBtns` 裡一顆**明寫的按鈕**（只在 `isMobile && isVideo` 時出現）：
+  第 0 段寫「ⓘ 顯示資訊」、第 1 段寫「⛶ 全螢幕」。⚠️ 那顆按鈕就是影片唯一的出口，
+  拿掉它影片就再也叫不出留言。
+- **全螢幕（第 0 段）時換頁箭頭移到畫面最下方、閃動**（`.navBottom`，`navBlink` 1.6 秒，
+  disabled 不閃、`prefers-reduced-motion` 不閃）。影片多套 `.navAboveControls` 再往上 64px，
+  不然會壓在播放器的控制列上。這段 CSS 照舊排在檔案最後那個桌機區塊之前。
 - 「查看更多」刻意是一顆**文字**按鈕（使用者的原話），不做成箭頭或把手 ——
   它底下接的是留言，多一個圖示反而看不出它管的是哪一段。展開後換成
   「收起其他資訊」：只能靠點照片收回去的話，等於要人記住一個沒寫出來的手勢。
@@ -1389,6 +1394,14 @@ Google Cloud Console 的「已授權的重新導向 URI」要含**每個 worker 
   「第一次載入才看」。從右上角「★ 精選」點進來時人可能已經在 `/album` 上
   （元件不重掛），只看第一次的話第二次點什麼都不會發生。找不到那張時**不記 key**
   （清單可能還沒載完）。
+- ⚠️⚠️ **換到另一本相簿（`id` 變了、元件沒重掛）要先把上一本的狀態清乾淨**（2026-10-16
+  使用者：「點開上傳新照片通知時 有時候會跳到別張照片」）。通知連結是 `/album?id=<相簿>`，
+  而人可能正開著另一本的燈箱 —— `selectedPhotoIndex` 是索引，留著就會指到新相簿的同一格。
+  一支相依 `[id]` 的效果（第一次掛載不跑）清掉 `viewingIdRef`／`deepLinkKey`／燈箱／
+  `photos`／`visibleCount` 並捲回頂端；`loadData` 另外用 `latestAlbumId` ref 丟掉
+  **上一本晚回來的回應**。⚠️ 燈箱的 render 條件要寫成
+  `selectedPhotoIndex !== null && displayPhotos[selectedPhotoIndex]` —— 清空 `photos` 那一輪
+  索引還沒歸 null，少了後半句整頁就是 Application error（實測踩到過）。
 - **重複的那幾張：按完立刻跳下一張，事情排到背景做。**
   `resolveDuplicate()` 只負責把 `runDuplicateJob()` 接到 `dupJobsRef` 那條鏈上，
   然後 `advanceDuplicate()`。以前是 `await` 完才換下一張 —— 一張要等上傳 →
@@ -2442,6 +2455,10 @@ powershell -ExecutionPolicy Bypass -File apps/android/publish-apk.ps1
     ⚠️ **首頁相簿封面是 CSS 背景圖，不要改成 `<img>` 套 PhotoImage** ——
     背景圖＋延後掛載（`mountedCount`）省掉的是「相簿數 × 預覽張數」次 Workers 請求。
     那裡用離線 `new Image()` 探載入狀態，配 `PhotoSpinner`。
+    選填 prop `smooth`：主圖用 0.8 秒的交叉淡入（`.mainSmooth`），換圖時不會閃一下。
+    ⚠️ **App 在手機上（`nativeApp()` 存在且螢幕短邊 < 600）燈箱只載 800px 縮圖，不打 `/full`**
+    （2026-10-16 使用者：「APK 登入基本上都是手機」），配 `smooth`、不顯示「800px 縮圖」那句。
+    GIF 例外（縮圖是靜止的第一格）。平板與一般瀏覽器照舊載 4K。
 12. **燈箱的 EXIF 開關是「站台層級的偏好」，不是那一張照片的 state**
     （`lib/exifPref.ts`，module 層 store ＋ `useSyncExternalStore` ＋ localStorage）。
     以前是 `useState(false)`：換一張就收回去、關掉燈箱再開也收回去，想一路看

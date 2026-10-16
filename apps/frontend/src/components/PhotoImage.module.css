@@ -31,6 +31,10 @@
   transition: opacity 0.35s ease;
 }
 
+.mainSmooth {
+  transition: opacity 0.8s ease-in-out;
+}
+
 .mainLoaded {
   opacity: 1;
 }

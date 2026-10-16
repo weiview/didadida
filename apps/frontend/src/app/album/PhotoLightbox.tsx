@@ -14,6 +14,7 @@ import { setExifExpanded, useExifExpanded } from "@/lib/exifPref";
 import { DEFAULT_TZ_OFFSET_MINUTES, formatWallClock, parseExifDateTime, wallClockFromInstant } from "@/lib/geo";
 import { formatTzOffset } from "@/lib/tz";
 import { formatDuration } from "@/lib/videoUtils";
+import { nativeApp } from "@/lib/nativeApp";
 
 /*
  * 動態照片重播之間停多久。0.5 秒是使用者指定的：接成無縫的迴圈看起來像一團
@@ -121,6 +122,16 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   const [mobileStage, setMobileStage] = useState<0 | 1 | 2>(0);
   /** 手機上現在收著（＝只有照片）。桌機永遠是 false */
   const collapsed = isMobile && mobileStage === 0;
+  /*
+   * App 裝在手機上（短邊 < 600 CSS px）就不載 Drive 的 4K，燈箱直接用 800px。
+   * 手機螢幕的實際像素用不到 4K，而每張都多一趟 Worker → Drive 取檔，等於白花流量與時間。
+   * 平板（短邊 ≥ 600）與一般瀏覽器照舊。GIF 例外：它的動畫本體只在 /full。
+   * 刻意只看 App：網頁上「我就是要看原圖」的人還有桌機可以用，App 裡沒有別條路。
+   */
+  const [phoneApp] = useState(() =>
+    typeof window !== 'undefined' && !!nativeApp()
+    && Math.min(window.screen.width, window.screen.height) < 600);
+  const lowRes = phoneApp && !isGif(photo);
   /** Story 與留言要不要端出來 */
   const showBasics = !isMobile || mobileStage >= 1;
   /** 標籤／地點／照片資訊要不要端出來 */
@@ -270,16 +281,11 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
   useEffect(() => clearMotionTimer, [clearMotionTimer]);
 
   /*
-   * ⚠️ **影片不參與收合**，跟它不參與捏合放大是同一個理由：`<video>` 自己要吃
+   * ⚠️ **影片不靠「點一下」收合**，跟它不參與捏合放大是同一個理由：`<video>` 自己要吃
    *    點擊（播放／暫停）與拖時間軸那些手勢，`VideoPlayer` 的外框也刻意把 touch
-   *    擋在燈箱之外。拿「點一下」當開關就等於搶走播放鍵，而影片一旦收起來就
-   *    再也叫不出留言 —— 那是一條沒有出口的路。所以影片一律從第 1 段開始
-   *    （Story ＋ 留言看得到，「查看更多」照樣按得到）。
+   *    擋在燈箱之外。所以影片的出口是左上角那顆「全螢幕／顯示資訊」按鈕
+   *    （`videoStageBtn`）—— 有它在，影片停在第 0 段也不會是一條沒有出口的路。
    */
-  useEffect(() => {
-    if (!isVideo(photo)) return;
-    setMobileStage((s) => (s === 0 ? 1 : s));
-  }, [photo.id, photo.media_type]);
 
   /*
    * 輕點一下要做的事。放在 ref 裡是為了讓底下那個掛原生監聽器的 effect
@@ -808,8 +814,9 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             * /full 會 302 回同一張 800px，掛「載入中」等於承諾一個不會來的東西。
             */}
           <PhotoImage
-            src={photoFullSrc(photo)}
+            src={lowRes ? photoThumbSrc(photo, 'md') : photoFullSrc(photo)}
             placeholderSrc={photoThumbSrc(photo, 'md')}
+            smooth
             alt={photo.title}
             className={styles.image}
             /*
@@ -817,7 +824,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
              * （最大 25MB）—— 底下那張靜止的縮圖已經先頂著，不講的話使用者
              * 會以為這張 GIF 壞了不會動。
              */
-            pendingLabel={photo.drive_file_id ? '高畫質載入中…' : isGif(photo) ? '動畫載入中…' : null}
+            pendingLabel={lowRes ? null : photo.drive_file_id ? '高畫質載入中…' : isGif(photo) ? '動畫載入中…' : null}
           />
           </div>
           {/*
@@ -832,7 +839,7 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             *    不擋的話每一張 GIF 都會掛上一句「顯示的是 800px 縮圖」，
             *    而使用者眼前那張正在動的就是完整的原檔。
             */}
-          {!isGif(photo) && !photo.drive_file_id && (
+          {!lowRes && !isGif(photo) && !photo.drive_file_id && (
             <span className={styles.qualityNote}>
               無法連線至 Google Drive 或缺少此備份，目前顯示 800px 縮圖
             </span>
@@ -936,6 +943,20 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
               <span className={styles.restrictIcon} aria-hidden>🔗</span>
               {shareNote && <span>{shareNote}</span>}
             </button>
+          {/*
+            * 影片在手機上也從「只有影片」那一段開始，但它不能拿「點一下」當開關
+            * （那一下是播放鍵），所以進出全螢幕靠這一顆。
+            */}
+          {isMobile && isVideo(photo) && (
+            <button
+              type="button"
+              className={styles.restrictBtn}
+              onClick={(e) => { e.stopPropagation(); setMobileStage(collapsed ? 1 : 0); }}
+            >
+              <span className={styles.restrictIcon} aria-hidden>{collapsed ? 'ⓘ' : '⛶'}</span>
+              <span>{collapsed ? '顯示資訊' : '全螢幕'}</span>
+            </button>
+          )}
           {canManageOthers && (
             <>
               <button
@@ -992,12 +1013,12 @@ export default function PhotoLightbox({ photo, isAdmin, availableTags, onClose, 
             </button>
           )}
           {hasPrev && (
-            <button className={`${styles.navButton} ${styles.prevButton}`} onClick={(e) => { e.stopPropagation(); onPrev?.(); }}>
+            <button className={`${styles.navButton} ${styles.prevButton} ${collapsed ? `${styles.navBottom} ${isVideo(photo) ? styles.navAboveControls : ''}` : ''}`} onClick={(e) => { e.stopPropagation(); onPrev?.(); }}>
               &#10094;
             </button>
           )}
           {hasNext && (
-            <button className={`${styles.navButton} ${styles.nextButton}`} onClick={(e) => { e.stopPropagation(); onNext?.(); }}>
+            <button className={`${styles.navButton} ${styles.nextButton} ${collapsed ? `${styles.navBottom} ${isVideo(photo) ? styles.navAboveControls : ''}` : ''}`} onClick={(e) => { e.stopPropagation(); onNext?.(); }}>
               &#10095;
             </button>
           )}

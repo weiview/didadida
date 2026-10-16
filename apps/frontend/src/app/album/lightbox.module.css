@@ -1218,6 +1218,39 @@ input:checked + .slider:before {
 }
 
 /*
+ * 全螢幕（手機收著那一段）時，上一張／下一張移到畫面最下面那條黑邊，
+ * 而且一閃一閃 —— 照片撐滿整個畫面，箭頭擺在正中間會壓在照片上。
+ * ⚠️ 寫成 `.navButton.navBottom`：基礎的 `.navButton:hover` 是兩個選擇器的權重，
+ *    單一個 class 蓋不過它，hover 時會跑回 translateY(-50%)。
+ * ⚠️ 影片多抬一截（`.navAboveControls`），不然壓在 <video> 自己的控制列上。
+ */
+.navButton.navBottom,
+.navButton.navBottom:hover {
+  top: auto;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 12px);
+  transform: none;
+  font-size: 2.4rem;
+  animation: navBlink 1.6s ease-in-out infinite;
+}
+
+.navButton.navBottom.navAboveControls {
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 64px);
+}
+
+.navButton.navBottom:disabled {
+  animation: none;
+}
+
+@keyframes navBlink {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 0.25; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .navButton.navBottom { animation: none; }
+}
+
+/*
  * 「查看更多」／「收起其他資訊」。它在 detailsContainer（flex column）裡面，
  * 靠左對齊、做得像一行連結而不是一顆實心按鈕 —— 這一塊底下接的是留言，
  * 太搶眼會蓋過 Story 本身。
