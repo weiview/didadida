@@ -12,13 +12,13 @@ import java.time.ZoneId
 import java.time.temporal.ChronoUnit
 
 /**
- * 桌面圖示的三張臉：有來看是笑臉，隔了一整天沒來生氣，再隔一天哭哭。
+ * 桌面圖示的四張臉：有來看是笑臉，隔了一整天沒來生氣，再隔一天哭哭，再一天離家出走（1.0.26）。
  *
  * 以**當地日期**算（每天 00:00 換日）：最後一次看 App 是 D 日的話，
- * D、D+1 笑臉，D+2 生氣，D+3 起哭哭。例：週一 23:00 看過 → 週二還是笑臉、
- * 週三 00:00 生氣、週四 00:00 哭哭。
+ * D、D+1 笑臉，D+2 生氣，D+3 哭哭，D+4 起離家出走。例：週一 23:00 看過 → 週二還是笑臉、
+ * 週三 00:00 生氣、週四 00:00 哭哭、週五 00:00 離家出走。
  *
- * Android 沒有換圖示的 API，只能在 manifest 放三個 activity-alias 輪流啟用。
+ * Android 沒有換圖示的 API，只能在 manifest 放四個 activity-alias 輪流啟用。
  * ⚠️ 換的那一下，有些桌面（尤其三星）會把桌面上的捷徑拿掉，要從應用程式清單再拖一次
  *    —— 使用者知道也接受了。
  * ⚠️ **App 開著的時候不換**：停用「當初用來開 App 的那個 alias」在某些桌面會把整個
@@ -26,7 +26,7 @@ import java.time.temporal.ChronoUnit
  */
 object MoodIcon {
     private const val KEY_LAST_SEEN = "mood_last_seen_day"
-    private val ALIASES = listOf("LauncherSmile", "LauncherAngry", "LauncherCry")
+    private val ALIASES = listOf("LauncherSmile", "LauncherAngry", "LauncherCry", "LauncherRunaway")
 
     private fun prefs(ctx: Context) = ctx.getSharedPreferences("app", Context.MODE_PRIVATE)
     private fun today() = LocalDate.now(ZoneId.systemDefault())
@@ -48,18 +48,19 @@ object MoodIcon {
         schedule(ctx)
     }
 
-    /** 0 笑、1 生氣、2 哭哭。 */
+    /** 0 笑、1 生氣、2 哭哭、3 離家出走。 */
     private fun mood(ctx: Context): Int {
         val last = prefs(ctx).getLong(KEY_LAST_SEEN, today().toEpochDay())
         val days = today().toEpochDay() - last
         return when {
             days <= 1 -> 0
             days == 2L -> 1
-            else -> 2
+            days == 3L -> 2
+            else -> 3
         }
     }
 
-    /** 啟用該有的那一張、停用另外兩張；已經是對的就一個字都不動（每次換都可能讓桌面捷徑消失）。 */
+    /** 啟用該有的那一張、停用另外三張；已經是對的就一個字都不動（每次換都可能讓桌面捷徑消失）。 */
     fun apply(ctx: Context) {
         val pm = ctx.packageManager
         val want = mood(ctx)

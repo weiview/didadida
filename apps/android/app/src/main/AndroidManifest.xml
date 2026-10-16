@@ -55,7 +55,7 @@
             </intent-filter>
         </activity>
 
-        <!-- 桌面圖示的三張臉（MoodIcon.kt）。Android 沒有換圖示的 API，只能三個 alias 輪流啟用；
+        <!-- 桌面圖示的四張臉（MoodIcon.kt）。Android 沒有換圖示的 API，只能四個 alias 輪流啟用；
              LAUNCHER 因此不在 MainActivity 身上。⚠️ 必須排在 MainActivity 後面（targetActivity 要先宣告） -->
         <activity-alias
             android:name=".LauncherSmile"
@@ -83,6 +83,18 @@
             android:name=".LauncherCry"
             android:targetActivity=".MainActivity"
             android:icon="@mipmap/ic_launcher_cry"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".LauncherRunaway"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_runaway"
             android:enabled="false"
             android:exported="true">
             <intent-filter>

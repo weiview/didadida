@@ -2396,10 +2396,10 @@ APK **自架在 Pages**（`<站台>/app/didadida-<flavor>.apk`），沒有 Play 
 
 ### 桌面圖示會換臉（1.0.8，`MoodIcon.kt`）
 
-笑臉／生氣／哭哭三張（`res/drawable-nodpi/ic_face_*.png`＋`mipmap-anydpi-v26/ic_launcher_*.xml`，白底 adaptive icon）。
-照**當地日期**算：最後看 App 是 D 日 → D、D+1 笑，D+2 生氣，D+3 起哭（使用者拍板「隔整整一天才生氣」）。
+笑臉／生氣／哭哭／離家出走四張（離家出走是 1.0.26 加的，`ic_face_runaway`）（`res/drawable-nodpi/ic_face_*.png`＋`mipmap-anydpi-v26/ic_launcher_*.xml`，白底 adaptive icon）。
+照**當地日期**算：最後看 App 是 D 日 → D、D+1 笑，D+2 生氣，D+3 哭、D+4 起離家出走（使用者拍板「隔整整一天才生氣」，哭臉之後再一天沒上線就離家出走）。
 
-- Android 沒有換圖示的 API：manifest 裡三個 `activity-alias`（`.LauncherSmile`／`Angry`／`Cry`）輪流啟用，
+- Android 沒有換圖示的 API：manifest 裡四個 `activity-alias`（`.LauncherSmile`／`Angry`／`Cry`／`Runaway`）輪流啟用，
   **MAIN/LAUNCHER 因此不在 `MainActivity` 身上**。其他地方開 App 一律用顯式 `Intent(…, MainActivity::class.java)`，不受影響。
 - ⚠️ **App 開著時不換**：停用當初開 App 的那個 alias，在某些桌面上會把整個 task 收掉。
   `onResume` 只記日期（`MoodIcon.touch`），`onStop` 才換回笑臉（`onLeave`）；午夜鬧鐘遇到 `MainActivity.visible` 也跳過。
